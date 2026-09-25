@@ -209,13 +209,19 @@ fn apply(store: &mut Store, root: &Path, run: &Run, action: Action) -> Result<bo
 }
 
 pub fn drive(root: &Path, run_id: &str) -> Result<()> {
+    uuid::Uuid::parse_str(run_id).context("invalid run ID")?;
+    let lock = File::options()
+        .write(true)
+        .create(true)
+        .open(root.join(format!("run-{run_id}.lock")))?;
+    fs2::FileExt::try_lock_exclusive(&lock).context("run already active in another process")?;
     let mut store = Store::open(root)?;
     let mut run = store.run(run_id)?;
-    if matches!(
-        run.state.as_str(),
-        "completed" | "cancelled" | "waiting_recovery"
-    ) {
+    if matches!(run.state.as_str(), "completed" | "cancelled") {
         bail!("run is {}", run.state);
+    }
+    if store.unknown_count(run_id)? > 0 {
+        bail!("unknown operation outcome requires explicit reconciliation");
     }
     let unresolved = store.reconcile(run_id)?;
     run = store.run(run_id)?;

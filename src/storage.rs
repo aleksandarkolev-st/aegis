@@ -235,6 +235,13 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous: String =
+            transaction.query_row("SELECT state FROM runs WHERE id = ?1", [run_id], |row| {
+                row.get(0)
+            })?;
+        if matches!(previous.as_str(), "completed" | "cancelled") {
+            bail!("terminal run cannot change state");
+        }
         transaction.execute(
             "UPDATE runs SET state = ?2 WHERE id = ?1",
             params![run_id, state],
@@ -333,6 +340,41 @@ impl Store {
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    pub fn unknown_count(&self, run_id: &str) -> Result<i64> {
+        Ok(self.connection.query_row(
+            "SELECT COUNT(*) FROM operations WHERE run_id = ?1 AND state = 'outcome_unknown'",
+            [run_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn resolve_unknown(
+        &mut self,
+        run_id: &str,
+        operation_id: &str,
+        succeeded: bool,
+        note: &str,
+    ) -> Result<()> {
+        let operation = self.operation(operation_id)?;
+        if operation.run_id != run_id || operation.state != "outcome_unknown" {
+            bail!("operation is not an unknown outcome for this run");
+        }
+        if note.trim().is_empty() {
+            bail!("reconciliation requires a note or external receipt");
+        }
+        let artifact = self.put_artifact(note.as_bytes())?;
+        self.operation_state(
+            &operation,
+            if succeeded { "succeeded" } else { "failed" },
+            Some(&artifact),
+            json!({"reconciled_by": "user", "note_artifact": artifact}),
+        )?;
+        if self.unknown_count(run_id)? == 0 {
+            self.state(run_id, "ready", json!({"reconciled": operation_id}))?;
+        }
+        Ok(())
     }
 
     pub fn operation(&self, id: &str) -> Result<Operation> {
@@ -484,6 +526,52 @@ mod tests {
         assert_eq!(store.unresolved(&run.id)?.len(), 1);
         assert_eq!(store.unresolved(&run.id)?[0].id, safe.id);
         assert_eq!(store.run(&run.id)?.state, "waiting_recovery");
+        Ok(())
+    }
+
+    #[test]
+    fn manual_reconciliation_requires_receipt_and_unlocks_run() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "publish",
+            directory.path(),
+            "grok",
+            json!([]),
+            json!({}),
+            "receipt",
+        )?;
+        let operation = store.begin_operation(&run.id, "external.write", json!({}), false)?;
+        store.operation_state(&operation, "dispatched", None, json!({}))?;
+        store.reconcile(&run.id)?;
+        assert!(
+            store
+                .resolve_unknown(&run.id, &operation.id, true, "")
+                .is_err()
+        );
+        store.resolve_unknown(&run.id, &operation.id, true, "external receipt 123")?;
+        assert_eq!(store.unknown_count(&run.id)?, 0);
+        assert_eq!(store.run(&run.id)?.state, "ready");
+        assert!(store.has_evidence(
+            &run.id,
+            store.operation(&operation.id)?.artifact.as_deref().unwrap()
+        )?);
+        assert!(
+            store
+                .resolve_unknown(&run.id, &operation.id, true, "duplicate")
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn completed_run_cannot_be_cancelled() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run("done", directory.path(), "codex", json!([]), json!({}), "")?;
+        store.state(&run.id, "completed", json!({}))?;
+        assert!(store.state(&run.id, "cancelled", json!({})).is_err());
+        assert_eq!(store.run(&run.id)?.state, "completed");
         Ok(())
     }
 }

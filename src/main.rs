@@ -19,7 +19,7 @@ fn usage() {
         "arun [run <task> [--provider chatgpt|claude|grok] [--allow-write] [--allow-process <program>] [--actions <limit>] [--foreground]]"
     );
     println!(
-        "arun attach|status|cancel|replay <run-id> | list | inspect <artifact-hash> | login|probe <provider>"
+        "arun attach|resume|status|cancel|replay <run-id> | resolve <run-id> <op-id> succeeded|failed <note> | list | inspect <artifact-hash> | login|probe <provider>"
     );
 }
 
@@ -237,6 +237,25 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some("attach") => attach(&root, required(1)?),
+        Some("resume") => {
+            let id = required(1)?;
+            let store = Store::open(&root)?;
+            let run = store.run(id)?;
+            if matches!(run.state.as_str(), "completed" | "cancelled")
+                || store.unknown_count(id)? > 0
+            {
+                bail!("run cannot resume until unknown operations are reconciled");
+            }
+            drop(store);
+            if arguments.iter().any(|argument| argument == "--foreground") {
+                kernel::drive(&root, id)?;
+                attach(&root, id)
+            } else {
+                spawn(&root, id)?;
+                println!("resuming {id}");
+                Ok(())
+            }
+        }
         Some("status") => {
             println!(
                 "{}",
@@ -252,6 +271,19 @@ fn main() -> Result<()> {
         }
         Some("cancel") => {
             Store::open(&root)?.state(required(1)?, "cancelled", json!({"source":"user"}))?;
+            Ok(())
+        }
+        Some("resolve") => {
+            let id = required(1)?.to_owned();
+            let operation = required(2)?.to_owned();
+            let succeeded = match required(3)? {
+                "succeeded" => true,
+                "failed" => false,
+                _ => bail!("outcome must be succeeded or failed"),
+            };
+            let note = arguments.get(4..).unwrap_or_default().join(" ");
+            Store::open(&root)?.resolve_unknown(&id, &operation, succeeded, &note)?;
+            println!("reconciled {operation}; use 'arun resume {id}'");
             Ok(())
         }
         Some("replay") | Some("trace") => {

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+fs2 = "0.4"
 hex = "0.4"
 tempfile = "3"
 rusqlite = { version = "0.37", features = ["bundled"] }
