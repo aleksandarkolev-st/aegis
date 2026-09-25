@@ -574,7 +574,7 @@ impl Store {
             transaction.query_row("SELECT state FROM runs WHERE id = ?1", [run_id], |row| {
                 row.get(0)
             })?;
-        if matches!(previous.as_str(), "completed" | "cancelled") {
+        if matches!(previous.as_str(), "completed" | "cancelled" | "failed") {
             bail!("terminal run cannot change state");
         }
         transaction.execute(

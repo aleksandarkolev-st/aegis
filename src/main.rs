@@ -16,7 +16,7 @@ fn root() -> Result<PathBuf> {
 
 fn usage() {
     println!(
-        "arun [run <task> [--provider chatgpt|claude|grok] [--allow-write] [--allow-process <program> --image <local-image>] [--allow-mcp <server:tool>] [--actions <limit>] [--model-tokens <limit>] [--wall-seconds <limit>] [--foreground]]"
+        "arun [run <task> [--provider chatgpt|claude|grok] [--mode eager|lazy|artifact|durable] [--allow-write] [--allow-process <program> --image <local-image>] [--allow-mcp <server:tool>] [--actions <limit>] [--model-tokens <limit>] [--wall-seconds <limit>] [--foreground]]"
     );
     println!(
         "arun attach|resume|status|cancel|replay <run-id> | resolve <run-id> <op-id> succeeded|failed <note> | list | inspect <artifact-hash> | login|probe <provider>"
@@ -158,6 +158,7 @@ fn spawn(root: &Path, id: &str) -> Result<()> {
 
 fn run(root: &Path, args: &[String]) -> Result<()> {
     let mut provider = "codex";
+    let mut mode = "durable";
     let mut write = false;
     let mut foreground = false;
     let mut actions = 40_u64;
@@ -173,6 +174,13 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
             "--provider" => {
                 index += 1;
                 provider = args.get(index).context("--provider needs a value")?;
+            }
+            "--mode" => {
+                index += 1;
+                mode = args.get(index).context("--mode needs a value")?;
+                if !matches!(mode, "eager" | "lazy" | "artifact" | "durable") {
+                    bail!("choose eager, lazy, artifact, or durable mode");
+                }
             }
             "--allow-write" => write = true,
             "--allow-process" => {
@@ -266,7 +274,7 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
         &std::env::current_dir()?,
         provider,
         json!(grants),
-        json!({"actions": actions, "model_tokens": model_tokens, "wall_seconds": wall_seconds,
+        json!({"mode": mode, "actions": actions, "model_tokens": model_tokens, "wall_seconds": wall_seconds,
             "model_seconds": 180, "process_seconds": 60, "container_image": image}),
         "Provide evidence from successful operations",
     )?;
