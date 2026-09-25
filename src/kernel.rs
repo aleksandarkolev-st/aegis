@@ -340,11 +340,22 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
             break;
         }
         let prompt = context(&store, &run)?;
+        let manifests = if mode(&run) == "eager" {
+            let granted = grants(&run)?;
+            capability::all(&store)?
+                .into_iter()
+                .filter(|manifest| granted.iter().any(|grant| grant == &manifest.permission))
+                .collect::<Vec<_>>()
+        } else {
+            activated(&store, run_id)?
+        };
         store.event(
             run_id,
             "model.started",
-            json!({"turn": actions + 1, "prompt_chars": prompt.len()}),
+            json!({"turn": actions + 1, "prompt_chars": prompt.len(),
+                "schema_count": manifests.len(), "schema_bytes": serde_json::to_vec(&manifests)?.len()}),
         )?;
+        let model_started = Instant::now();
         let timeout = Duration::from_secs(
             run.budgets
                 .get("model_seconds")
@@ -379,7 +390,8 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
         store.event(
             run_id,
             "model.response",
-            json!({"action": action, "artifact": hash, "usage": response.usage}),
+            json!({"action": action, "artifact": hash, "usage": response.usage,
+                "elapsed_ms": model_started.elapsed().as_millis()}),
         )?;
         if let Err(error) = apply(&mut store, root, &run, action) {
             store.event(

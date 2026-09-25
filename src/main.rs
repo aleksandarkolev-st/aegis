@@ -19,7 +19,7 @@ fn usage() {
         "arun [run <task> [--provider chatgpt|claude|grok] [--mode eager|lazy|artifact|durable] [--allow-write] [--allow-process <program> --image <local-image>] [--allow-mcp <server:tool>] [--actions <limit>] [--model-tokens <limit>] [--wall-seconds <limit>] [--foreground]]"
     );
     println!(
-        "arun attach|resume|status|cancel|replay <run-id> | resolve <run-id> <op-id> succeeded|failed <note> | list | inspect <artifact-hash> | login|probe <provider>"
+        "arun attach|resume|status|cancel|replay|trace <run-id> | resolve <run-id> <op-id> succeeded|failed <note> | list | inspect <artifact-hash> | login|probe <provider>"
     );
     println!("arun tasks|context|tools|artifacts <run-id> | mcp add <name> <command> [args...]");
 }
@@ -418,7 +418,7 @@ fn main() -> Result<()> {
             let id = required(1)?;
             let store = Store::open(&root)?;
             let run = store.run(id)?;
-            if matches!(run.state.as_str(), "completed" | "cancelled")
+            if matches!(run.state.as_str(), "completed" | "cancelled" | "failed")
                 || store.unknown_count(id)? > 0
             {
                 bail!("run cannot resume until unknown operations are reconciled");
@@ -463,7 +463,13 @@ fn main() -> Result<()> {
             println!("reconciled {operation}; use 'arun resume {id}'");
             Ok(())
         }
-        Some("replay") | Some("trace") => {
+        Some("trace") => {
+            let store = Store::open(&root)?;
+            let id = required(1)?;
+            arun::trace::display(&store.run(id)?, &store.events(id)?);
+            Ok(())
+        }
+        Some("replay") => {
             for event in Store::open(&root)?.events(required(1)?)? {
                 println!("{}", serde_json::to_string(&event)?);
             }

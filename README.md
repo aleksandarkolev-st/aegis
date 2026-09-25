@@ -24,6 +24,7 @@ arun tasks <run-id>
 arun context <run-id>
 arun artifacts <run-id>
 arun replay <run-id>
+arun trace <run-id>
 arun inspect <artifact-hash>
 arun cancel <run-id>
 arun resume <run-id>
@@ -38,7 +39,7 @@ arun resolve <run-id> <operation-id> succeeded "receipt or verification note"
 arun resume <run-id>
 ```
 
-Run options include `--actions`, `--model-tokens`, and `--wall-seconds`. Provider-reported token counts are recorded where available; otherwise counts are marked estimated. Completion requires successful-operation artifact evidence, and any planned milestones must carry evidence. This is provenance checking, not a substitute for external acceptance tests.
+Run options include `--actions`, `--model-tokens`, `--wall-seconds`, and `--mode eager|lazy|artifact|durable`. Eager exposes all granted schemas; lazy discovers them on demand; artifact adds bounded result handles; durable also reconciles interrupted operations. Non-durable modes fail on process restart. Provider-reported token counts are recorded where available; otherwise counts are marked estimated. `trace` shows committed model, discovery, operation, and state transitions with schema-byte, token, and timing metrics; `replay` retains raw JSON events. Completion requires successful-operation artifact evidence, and any planned milestones must carry evidence. This is provenance checking, not a substitute for external acceptance tests.
 
 ## Capabilities and isolation
 
