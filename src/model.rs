@@ -50,6 +50,42 @@ pub struct Checkpoint {
     pub milestones: Vec<Milestone>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub source: String,
+}
+
+#[derive(Debug)]
+pub struct Response {
+    pub action: Action,
+    pub raw: String,
+    pub usage: Option<Usage>,
+}
+
+fn reported_usage(provider: &str, stdout: &str) -> Option<Usage> {
+    let value: Value = if provider == "codex" {
+        stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|event| event["type"] == "turn.completed")?
+    } else {
+        serde_json::from_str(stdout).ok()?
+    };
+    let usage = value.get("usage")?;
+    Some(Usage {
+        input_tokens: usage.get("input_tokens")?.as_u64()?,
+        output_tokens: usage.get("output_tokens")?.as_u64()?,
+        cached_input_tokens: usage
+            .get("cached_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        source: "provider".into(),
+    })
+}
+
 const SCHEMA: &str = r#"{"type":"object","properties":{"kind":{"type":"string","enum":["search_capabilities","invoke","inspect_result","checkpoint","finish","blocked"]},"query":{"type":"string"},"capability":{"type":"string"},"args":{"type":"string"},"artifact":{"type":"string"},"checkpoint":{"type":"string"},"summary":{"type":"string"},"evidence":{"type":"array","items":{"type":"string"}},"reason":{"type":"string"}},"required":["kind","query","capability","args","artifact","checkpoint","summary","evidence","reason"],"additionalProperties":false}"#;
 
 fn parse_action(raw: &str) -> Result<Action> {
@@ -92,7 +128,8 @@ pub fn call(
     directory: &Path,
     timeout: Duration,
 ) -> Result<(Action, String)> {
-    call_with_cancel(provider, prompt, directory, timeout, || false)
+    let response = call_with_cancel(provider, prompt, directory, timeout, || false)?;
+    Ok((response.action, response.raw))
 }
 
 pub fn call_with_cancel(
@@ -101,7 +138,7 @@ pub fn call_with_cancel(
     directory: &Path,
     timeout: Duration,
     cancelled: impl Fn() -> bool,
-) -> Result<(Action, String)> {
+) -> Result<Response> {
     let output = tempfile::tempdir_in(directory)?;
     let stdout_path = output.path().join("stdout");
     let stderr_path = output.path().join("stderr");
@@ -119,12 +156,29 @@ pub fn call_with_cancel(
                     "--sandbox",
                     "read-only",
                     "--skip-git-repo-check",
+                    "--json",
                     "--output-schema",
                 ])
                 .arg(&schema_path)
                 .args(["-o"])
                 .arg(output.path().join("reply"))
                 .arg("-");
+            for feature in [
+                "apps",
+                "browser_use",
+                "computer_use",
+                "image_generation",
+                "multi_agent",
+                "plugins",
+                "shell_tool",
+                "skill_search",
+                "view_image",
+                "tool_suggest",
+                "sleep_tool",
+                "goals",
+            ] {
+                command.args(["--disable", feature]);
+            }
             command
         }
         "claude" => {
@@ -210,6 +264,7 @@ pub fn call_with_cancel(
             stderr.chars().take(800).collect::<String>()
         );
     }
+    let reported = reported_usage(provider, &stdout);
     let raw = if provider == "codex" {
         std::fs::read_to_string(output.path().join("reply"))?
     } else {
@@ -221,7 +276,13 @@ pub fn call_with_cancel(
             raw.chars().take(800).collect::<String>()
         )
     })?;
-    Ok((action, raw))
+    let usage = Some(reported.unwrap_or_else(|| Usage {
+        input_tokens: (prompt.chars().count() as u64).div_ceil(4),
+        output_tokens: (raw.chars().count() as u64).div_ceil(4),
+        cached_input_tokens: 0,
+        source: "estimated".into(),
+    }));
+    Ok(Response { action, raw, usage })
 }
 
 #[cfg(test)]

@@ -59,6 +59,10 @@ fn now() -> i64 {
         .as_secs() as i64
 }
 
+pub fn unix_time() -> i64 {
+    now()
+}
+
 fn append_event(
     transaction: &Transaction<'_>,
     run_id: &str,
@@ -303,6 +307,14 @@ impl Store {
             params![run_id, kind],
             |row| row.get(0),
         )?)
+    }
+
+    pub fn model_tokens(&self, run_id: &str) -> Result<u64> {
+        let total: i64 = self.connection.query_row(
+            "SELECT COALESCE(SUM(COALESCE(json_extract(payload, '$.usage.input_tokens'), 0) + COALESCE(json_extract(payload, '$.usage.output_tokens'), 0)), 0) FROM events WHERE run_id = ?1 AND kind = 'model.response'",
+            [run_id], |row| row.get(0)
+        )?;
+        Ok(total.max(0) as u64)
     }
 
     pub fn activate(&mut self, run_id: &str, capability: &str, version: u32) -> Result<()> {

@@ -16,7 +16,7 @@ fn root() -> Result<PathBuf> {
 
 fn usage() {
     println!(
-        "arun [run <task> [--provider chatgpt|claude|grok] [--allow-write] [--allow-process <program> --image <local-image>] [--allow-mcp <server:tool>] [--actions <limit>] [--foreground]]"
+        "arun [run <task> [--provider chatgpt|claude|grok] [--allow-write] [--allow-process <program> --image <local-image>] [--allow-mcp <server:tool>] [--actions <limit>] [--model-tokens <limit>] [--wall-seconds <limit>] [--foreground]]"
     );
     println!(
         "arun attach|resume|status|cancel|replay <run-id> | resolve <run-id> <op-id> succeeded|failed <note> | list | inspect <artifact-hash> | login|probe <provider>"
@@ -50,13 +50,14 @@ fn view(root: &Path, command: &str, id: &str) -> Result<()> {
                 id, run.state, run.provider
             );
             println!(
-                "events: {}  artifacts: {}",
+                "events: {}  artifacts: {}  model tokens: {}",
                 store.events(id)?.len(),
                 store
                     .events(id)?
                     .iter()
                     .filter(|event| event.kind == "operation.succeeded")
-                    .count()
+                    .count(),
+                store.model_tokens(id)?
             );
             if let Some(checkpoint) = store.last_checkpoint(id)? {
                 println!("handoff: {}", serde_json::to_string_pretty(&checkpoint)?);
@@ -160,6 +161,8 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
     let mut write = false;
     let mut foreground = false;
     let mut actions = 40_u64;
+    let mut model_tokens = 400_000_u64;
+    let mut wall_seconds = 3600_u64;
     let mut programs = Vec::new();
     let mut image = None;
     let mut mcp_tools = Vec::new();
@@ -207,6 +210,26 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
                     bail!("action limit must be 1..1000");
                 }
             }
+            "--model-tokens" => {
+                index += 1;
+                model_tokens = args
+                    .get(index)
+                    .context("--model-tokens needs a limit")?
+                    .parse()?;
+                if model_tokens == 0 {
+                    bail!("model token limit must be positive");
+                }
+            }
+            "--wall-seconds" => {
+                index += 1;
+                wall_seconds = args
+                    .get(index)
+                    .context("--wall-seconds needs a limit")?
+                    .parse()?;
+                if wall_seconds == 0 {
+                    bail!("wall-clock limit must be positive");
+                }
+            }
             argument if argument.starts_with('-') => bail!("unknown option: {argument}"),
             argument => task.push(argument),
         }
@@ -243,7 +266,8 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
         &std::env::current_dir()?,
         provider,
         json!(grants),
-        json!({"actions": actions, "model_seconds": 180, "process_seconds": 60, "container_image": image}),
+        json!({"actions": actions, "model_tokens": model_tokens, "wall_seconds": wall_seconds,
+            "model_seconds": 180, "process_seconds": 60, "container_image": image}),
         "Provide evidence from successful operations",
     )?;
     println!("run: {} provider: {}", run.id, run.provider);

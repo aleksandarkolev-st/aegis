@@ -267,6 +267,16 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
         .get("actions")
         .and_then(Value::as_u64)
         .unwrap_or(40);
+    let max_tokens = run
+        .budgets
+        .get("model_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(400_000);
+    let wall_seconds = run
+        .budgets
+        .get("wall_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(3600);
     loop {
         if store.run(run_id)?.state != "running" {
             break;
@@ -280,43 +290,57 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
             )?;
             break;
         }
-        store.event(run_id, "model.started", json!({"turn": actions + 1}))?;
+        if store.model_tokens(run_id)? >= max_tokens
+            || crate::storage::unix_time().saturating_sub(run.created_at) as u64 >= wall_seconds
+        {
+            store.state(
+                run_id,
+                "waiting_recovery",
+                json!({"reason": "token or wall-clock budget exhausted"}),
+            )?;
+            break;
+        }
         let prompt = context(&store, &run)?;
+        store.event(
+            run_id,
+            "model.started",
+            json!({"turn": actions + 1, "prompt_chars": prompt.len()}),
+        )?;
         let timeout = Duration::from_secs(
             run.budgets
                 .get("model_seconds")
                 .and_then(Value::as_u64)
                 .unwrap_or(180),
         );
-        let (action, raw) =
-            match model::call_with_cancel(&run.provider, &prompt, root, timeout, || {
-                Store::open(root)
-                    .and_then(|current| current.run(run_id))
-                    .is_ok_and(|current| current.state == "cancelled")
-            }) {
-                Ok(response) => response,
-                Err(error) => {
-                    store.event(
-                        run_id,
-                        "model.failed",
-                        json!({"error": format!("{error:#}")}),
-                    )?;
-                    if store.run(run_id)?.state == "cancelled" {
-                        break;
-                    }
-                    store.state(
-                        run_id,
-                        "waiting_recovery",
-                        json!({"reason": "model unavailable"}),
-                    )?;
+        let response = match model::call_with_cancel(&run.provider, &prompt, root, timeout, || {
+            Store::open(root)
+                .and_then(|current| current.run(run_id))
+                .is_ok_and(|current| current.state == "cancelled")
+        }) {
+            Ok(response) => response,
+            Err(error) => {
+                store.event(
+                    run_id,
+                    "model.failed",
+                    json!({"error": format!("{error:#}")}),
+                )?;
+                if store.run(run_id)?.state == "cancelled" {
                     break;
                 }
-            };
-        let hash = store.put_artifact(raw.as_bytes())?;
+                store.state(
+                    run_id,
+                    "waiting_recovery",
+                    json!({"reason": "model unavailable"}),
+                )?;
+                break;
+            }
+        };
+        let action = response.action;
+        let hash = store.put_artifact(response.raw.as_bytes())?;
         store.event(
             run_id,
             "model.response",
-            json!({"action": action, "artifact": hash}),
+            json!({"action": action, "artifact": hash, "usage": response.usage}),
         )?;
         if let Err(error) = apply(&mut store, root, &run, action) {
             store.event(
