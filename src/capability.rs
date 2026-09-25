@@ -1,13 +1,16 @@
+use anyhow::{Result, bail};
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::storage::Store;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Manifest {
-    pub id: &'static str,
+    pub id: String,
     pub version: u32,
-    pub purpose: &'static str,
-    pub permission: &'static str,
-    pub side_effect: &'static str,
+    pub purpose: String,
+    pub permission: String,
+    pub side_effect: String,
     pub cost: u32,
     pub input_schema: Value,
 }
@@ -15,42 +18,58 @@ pub struct Manifest {
 pub fn registry() -> Vec<Manifest> {
     vec![
         Manifest {
-            id: "workspace.search",
+            id: "workspace.search".into(),
             version: 1,
-            purpose: "Find text in repository files by literal substring",
-            permission: "workspace.read",
-            side_effect: "none",
+            purpose: "Find text in repository files by literal substring".into(),
+            permission: "workspace.read".into(),
+            side_effect: "none".into(),
             cost: 2,
             input_schema: json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}),
         },
         Manifest {
-            id: "workspace.read",
+            id: "workspace.read".into(),
             version: 1,
-            purpose: "Read a UTF-8 workspace file by relative path",
-            permission: "workspace.read",
-            side_effect: "none",
+            purpose: "Read a UTF-8 workspace file by relative path".into(),
+            permission: "workspace.read".into(),
+            side_effect: "none".into(),
             cost: 1,
             input_schema: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
         },
         Manifest {
-            id: "workspace.write",
+            id: "workspace.write".into(),
             version: 1,
-            purpose: "Write exact UTF-8 content to a workspace file",
-            permission: "workspace.write",
-            side_effect: "workspace",
+            purpose: "Write exact UTF-8 content to a workspace file".into(),
+            permission: "workspace.write".into(),
+            side_effect: "workspace".into(),
             cost: 4,
             input_schema: json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}),
         },
         Manifest {
-            id: "process.run",
+            id: "process.run".into(),
             version: 1,
-            purpose: "Run a directly executed process with arguments in the workspace",
-            permission: "process.run",
-            side_effect: "unknown",
+            purpose: "Run a directly executed process with arguments in the workspace".into(),
+            permission: "process.run".into(),
+            side_effect: "unknown".into(),
             cost: 8,
             input_schema: json!({"type":"object","properties":{"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}}},"required":["program","args"]}),
         },
     ]
+}
+
+pub fn all(store: &Store) -> Result<Vec<Manifest>> {
+    let mut manifests = registry();
+    for tool in store.mcp_tools()? {
+        manifests.push(Manifest {
+            id: format!("mcp.{}.{}", tool.server, tool.name),
+            version: tool.version,
+            purpose: tool.description,
+            permission: format!("mcp:{}:{}", tool.server, tool.name),
+            side_effect: "unknown".into(),
+            cost: 8,
+            input_schema: tool.input_schema,
+        });
+    }
+    Ok(manifests)
 }
 
 fn words(text: &str) -> Vec<String> {
@@ -60,14 +79,19 @@ fn words(text: &str) -> Vec<String> {
         .collect()
 }
 
-pub fn resolve(query: &str, grants: &[String], limit: usize) -> Vec<Manifest> {
+pub fn resolve(
+    store: &Store,
+    query: &str,
+    grants: &[String],
+    limit: usize,
+) -> Result<Vec<Manifest>> {
     let terms = words(query);
-    let mut candidates: Vec<_> = registry()
+    let mut candidates: Vec<_> = all(store)?
         .into_iter()
-        .filter(|manifest| grants.iter().any(|grant| grant == manifest.permission))
+        .filter(|manifest| grants.iter().any(|grant| grant == &manifest.permission))
         .map(|manifest| {
-            let name = words(manifest.id);
-            let purpose = words(manifest.purpose);
+            let name = words(&manifest.id);
+            let purpose = words(&manifest.purpose);
             let score: usize = terms
                 .iter()
                 .map(|term| {
@@ -88,19 +112,46 @@ pub fn resolve(query: &str, grants: &[String], limit: usize) -> Vec<Manifest> {
         score_b
             .cmp(score_a)
             .then(manifest_a.cost.cmp(&manifest_b.cost))
-            .then(manifest_a.id.cmp(manifest_b.id))
+            .then(manifest_a.id.cmp(&manifest_b.id))
     });
-    candidates
+    Ok(candidates
         .into_iter()
         .take(limit)
         .map(|(_, manifest)| manifest)
-        .collect()
+        .collect())
 }
 
-pub fn permitted(id: &str, grants: &[String]) -> Option<Manifest> {
-    registry().into_iter().find(|manifest| {
-        manifest.id == id && grants.iter().any(|grant| grant == manifest.permission)
-    })
+pub fn permitted(store: &Store, id: &str, grants: &[String]) -> Result<Option<Manifest>> {
+    Ok(all(store)?.into_iter().find(|manifest| {
+        manifest.id == id && grants.iter().any(|grant| grant == &manifest.permission)
+    }))
+}
+
+fn local_references_only(schema: &Value) -> bool {
+    match schema {
+        Value::Object(properties) => properties.iter().all(|(key, value)| {
+            if key == "$ref" {
+                value
+                    .as_str()
+                    .is_some_and(|reference| reference.starts_with('#'))
+            } else {
+                local_references_only(value)
+            }
+        }),
+        Value::Array(items) => items.iter().all(local_references_only),
+        _ => true,
+    }
+}
+
+pub fn validate_arguments(manifest: &Manifest, arguments: &Value) -> Result<()> {
+    if !local_references_only(&manifest.input_schema) {
+        bail!("external JSON Schema references are not allowed");
+    }
+    let validator = jsonschema::validator_for(&manifest.input_schema)?;
+    if let Err(error) = validator.validate(arguments) {
+        bail!("invalid arguments for {}: {error}", manifest.id);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -109,16 +160,42 @@ mod tests {
 
     #[test]
     fn filters_before_ranking_overlapping_tools() {
-        let results = resolve("workspace write file", &["workspace.read".into()], 3);
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let results = resolve(
+            &store,
+            "workspace write file",
+            &["workspace.read".into()],
+            3,
+        )
+        .unwrap();
         assert!(
             !results
                 .iter()
                 .any(|manifest| manifest.id == "workspace.write")
         );
-        assert!(permitted("workspace.write", &["workspace.read".into()]).is_none());
+        assert!(
+            permitted(&store, "workspace.write", &["workspace.read".into()])
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
-            resolve("read file", &["workspace.read".into()], 1)[0].id,
+            resolve(&store, "read file", &["workspace.read".into()], 1).unwrap()[0].id,
             "workspace.read"
         );
+    }
+
+    #[test]
+    fn validates_arguments_without_fetching_remote_schemas() {
+        let read = registry()
+            .into_iter()
+            .find(|manifest| manifest.id == "workspace.read")
+            .unwrap();
+        assert!(validate_arguments(&read, &json!({"path":"Cargo.toml"})).is_ok());
+        assert!(validate_arguments(&read, &json!({"path":42})).is_err());
+        assert!(validate_arguments(&read, &json!({})).is_err());
+        let mut remote = read;
+        remote.input_schema = json!({"$ref":"https://example.com/schema.json"});
+        assert!(validate_arguments(&remote, &json!({})).is_err());
     }
 }

@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::mcp::{Server as McpServer, Tool as McpTool};
 use crate::model::{Checkpoint as Handoff, Milestone};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +39,7 @@ pub struct Operation {
     pub id: String,
     pub run_id: String,
     pub capability: String,
+    pub capability_version: u32,
     pub arguments: Value,
     pub idempotency_key: String,
     pub retry_safe: bool,
@@ -92,7 +94,8 @@ impl Store {
              );
              CREATE TABLE IF NOT EXISTS operations (
                id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id),
-               capability TEXT NOT NULL, arguments TEXT NOT NULL,
+               capability TEXT NOT NULL, capability_version INTEGER NOT NULL DEFAULT 1,
+               arguments TEXT NOT NULL,
                idempotency_key TEXT NOT NULL, retry_safe INTEGER NOT NULL,
                state TEXT NOT NULL, artifact TEXT,
                UNIQUE(run_id, idempotency_key)
@@ -108,6 +111,14 @@ impl Store {
              CREATE TABLE IF NOT EXISTS activated (
                run_id TEXT NOT NULL REFERENCES runs(id), capability TEXT NOT NULL,
                version INTEGER NOT NULL, PRIMARY KEY(run_id, capability)
+             );
+             CREATE TABLE IF NOT EXISTS mcp_servers (
+               name TEXT PRIMARY KEY, command TEXT NOT NULL, args TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS mcp_tools (
+               server TEXT NOT NULL REFERENCES mcp_servers(name), name TEXT NOT NULL,
+               description TEXT NOT NULL, input_schema TEXT NOT NULL, version INTEGER NOT NULL,
+               PRIMARY KEY(server, name)
              );",
         )?;
         let schema_version: i64 =
@@ -119,6 +130,16 @@ impl Store {
                  FROM events WHERE kind = 'capability.activated';
                  PRAGMA user_version=1;"
             )?;
+        }
+        if schema_version < 2 {
+            let mut statement = connection.prepare("PRAGMA table_info(operations)")?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if !columns.iter().any(|column| column == "capability_version") {
+                connection.execute_batch("ALTER TABLE operations ADD COLUMN capability_version INTEGER NOT NULL DEFAULT 1")?;
+            }
+            connection.execute_batch("PRAGMA user_version=2")?;
         }
         Ok(Self {
             connection,
@@ -280,6 +301,77 @@ impl Store {
             "SELECT capability, version FROM activated WHERE run_id = ?1 ORDER BY capability",
         )?;
         let rows = statement.query_map([run_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn register_mcp(&mut self, server: &McpServer, tools: &[McpTool]) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute("INSERT INTO mcp_servers VALUES (?1, ?2, ?3) ON CONFLICT(name) DO UPDATE SET command = excluded.command, args = excluded.args",
+            params![server.name, server.command, serde_json::to_string(&server.args)?])?;
+        transaction.execute("DELETE FROM mcp_tools WHERE server = ?1", [&server.name])?;
+        for tool in tools {
+            if tool.server != server.name {
+                bail!("MCP tool belongs to a different server");
+            }
+            transaction.execute(
+                "INSERT INTO mcp_tools VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    server.name,
+                    tool.name,
+                    tool.description,
+                    tool.input_schema.to_string(),
+                    tool.version
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn mcp_server(&self, name: &str) -> Result<McpServer> {
+        self.connection
+            .query_row(
+                "SELECT command, args FROM mcp_servers WHERE name = ?1",
+                [name],
+                |row| {
+                    let args: String = row.get(1)?;
+                    Ok(McpServer {
+                        name: name.into(),
+                        command: row.get(0)?,
+                        args: serde_json::from_str(&args).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                1,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?,
+                    })
+                },
+            )
+            .with_context(|| format!("MCP server {name} is not registered"))
+    }
+
+    pub fn mcp_tools(&self) -> Result<Vec<McpTool>> {
+        let mut statement = self.connection.prepare("SELECT server, name, description, input_schema, version FROM mcp_tools ORDER BY server, name")?;
+        let rows = statement.query_map([], |row| {
+            let schema: String = row.get(3)?;
+            Ok(McpTool {
+                server: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                input_schema: serde_json::from_str(&schema).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                version: row.get(4)?,
+            })
+        })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -457,10 +549,22 @@ impl Store {
         arguments: Value,
         retry_safe: bool,
     ) -> Result<Operation> {
+        self.begin_operation_versioned(run_id, capability, 1, arguments, retry_safe)
+    }
+
+    pub fn begin_operation_versioned(
+        &mut self,
+        run_id: &str,
+        capability: &str,
+        capability_version: u32,
+        arguments: Value,
+        retry_safe: bool,
+    ) -> Result<Operation> {
         let operation = Operation {
             id: Uuid::new_v4().to_string(),
             run_id: run_id.into(),
             capability: capability.into(),
+            capability_version,
             arguments,
             idempotency_key: Uuid::new_v4().to_string(),
             retry_safe,
@@ -471,11 +575,12 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
-            "INSERT INTO operations VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+            "INSERT INTO operations(id, run_id, capability, capability_version, arguments, idempotency_key, retry_safe, state, artifact) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
             params![
                 operation.id,
                 run_id,
                 capability,
+                capability_version,
                 operation.arguments.to_string(),
                 operation.idempotency_key,
                 retry_safe,
@@ -486,7 +591,7 @@ impl Store {
             &transaction,
             run_id,
             "operation.pending",
-            json!({"id": operation.id, "capability": capability, "arguments": operation.arguments, "idempotency_key": operation.idempotency_key}),
+            json!({"id": operation.id, "capability": capability, "version": capability_version, "arguments": operation.arguments, "idempotency_key": operation.idempotency_key}),
         )?;
         transaction.commit()?;
         Ok(operation)
@@ -517,24 +622,25 @@ impl Store {
     }
 
     pub fn unresolved(&self, run_id: &str) -> Result<Vec<Operation>> {
-        let mut statement = self.connection.prepare("SELECT id, capability, arguments, idempotency_key, retry_safe, state, artifact FROM operations WHERE run_id = ?1 AND state IN ('pending', 'dispatched') ORDER BY rowid")?;
+        let mut statement = self.connection.prepare("SELECT id, capability, capability_version, arguments, idempotency_key, retry_safe, state, artifact FROM operations WHERE run_id = ?1 AND state IN ('pending', 'dispatched') ORDER BY rowid")?;
         let rows = statement.query_map([run_id], |row| {
-            let arguments: String = row.get(2)?;
+            let arguments: String = row.get(3)?;
             Ok(Operation {
                 id: row.get(0)?,
                 run_id: run_id.into(),
                 capability: row.get(1)?,
+                capability_version: row.get(2)?,
                 arguments: serde_json::from_str(&arguments).map_err(|err| {
                     rusqlite::Error::FromSqlConversionFailure(
-                        2,
+                        3,
                         rusqlite::types::Type::Text,
                         Box::new(err),
                     )
                 })?,
-                idempotency_key: row.get(3)?,
-                retry_safe: row.get(4)?,
-                state: row.get(5)?,
-                artifact: row.get(6)?,
+                idempotency_key: row.get(4)?,
+                retry_safe: row.get(5)?,
+                state: row.get(6)?,
+                artifact: row.get(7)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -578,15 +684,16 @@ impl Store {
 
     pub fn operation(&self, id: &str) -> Result<Operation> {
         self.connection.query_row(
-            "SELECT run_id, capability, arguments, idempotency_key, retry_safe, state, artifact FROM operations WHERE id = ?1",
+            "SELECT run_id, capability, capability_version, arguments, idempotency_key, retry_safe, state, artifact FROM operations WHERE id = ?1",
             [id],
             |row| {
-                let arguments: String = row.get(2)?;
+                let arguments: String = row.get(3)?;
                 Ok(Operation {
                     id: id.into(), run_id: row.get(0)?, capability: row.get(1)?,
-                    arguments: serde_json::from_str(&arguments).map_err(|err| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(err)))?,
-                    idempotency_key: row.get(3)?, retry_safe: row.get(4)?,
-                    state: row.get(5)?, artifact: row.get(6)?,
+                    capability_version: row.get(2)?,
+                    arguments: serde_json::from_str(&arguments).map_err(|err| rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(err)))?,
+                    idempotency_key: row.get(4)?, retry_safe: row.get(5)?,
+                    state: row.get(6)?, artifact: row.get(7)?,
                 })
             },
         ).with_context(|| format!("operation {id} not found"))

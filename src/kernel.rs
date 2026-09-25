@@ -17,12 +17,12 @@ fn grants(run: &Run) -> Result<Vec<String>> {
 
 fn activated(store: &Store, run_id: &str) -> Result<Vec<Manifest>> {
     let names = store.active_capabilities(run_id)?;
-    Ok(capability::registry()
+    Ok(capability::all(store)?
         .into_iter()
         .filter(|manifest| {
             names
                 .iter()
-                .any(|(name, version)| name == manifest.id && *version == manifest.version)
+                .any(|(name, version)| name == &manifest.id && *version == manifest.version)
         })
         .collect())
 }
@@ -151,15 +151,16 @@ fn perform(store: &mut Store, root: &Path, run: &Run, operation: &Operation) -> 
 fn apply(store: &mut Store, root: &Path, run: &Run, action: Action) -> Result<bool> {
     match action {
         Action::SearchCapabilities { query } => {
-            let matches = capability::resolve(&query, &grants(run)?, 3);
+            let matches = capability::resolve(store, &query, &grants(run)?, 3)?;
             for manifest in &matches {
-                store.activate(&run.id, manifest.id, manifest.version)?;
+                store.activate(&run.id, &manifest.id, manifest.version)?;
             }
-            store.event(&run.id, "capability.search", json!({"query": query, "matches": matches.iter().map(|item| item.id).collect::<Vec<_>>()}))?;
+            store.event(&run.id, "capability.search", json!({"query": query, "matches": matches.iter().map(|item| &item.id).collect::<Vec<_>>()}))?;
         }
         Action::Invoke { capability, args } => {
-            let manifest = capability::permitted(&capability, &grants(run)?)
+            let manifest = capability::permitted(store, &capability, &grants(run)?)?
                 .context("capability not granted")?;
+            capability::validate_arguments(&manifest, &args)?;
             if !activated(store, &run.id)?
                 .iter()
                 .any(|active| active.id == capability)
@@ -167,7 +168,13 @@ fn apply(store: &mut Store, root: &Path, run: &Run, action: Action) -> Result<bo
                 bail!("capability not activated; search first");
             }
             let retry_safe = manifest.side_effect == "none";
-            let operation = store.begin_operation(&run.id, &capability, args, retry_safe)?;
+            let operation = store.begin_operation_versioned(
+                &run.id,
+                &capability,
+                manifest.version,
+                args,
+                retry_safe,
+            )?;
             return perform(store, root, run, &operation);
         }
         Action::InspectResult { artifact, query } => {

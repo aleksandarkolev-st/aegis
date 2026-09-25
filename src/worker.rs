@@ -5,8 +5,8 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::capability;
 use crate::storage::Store;
+use crate::{capability, mcp};
 
 const MAX_FILE: u64 = 2 * 1024 * 1024;
 const MAX_OUTPUT: usize = 1024 * 1024;
@@ -58,7 +58,11 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
         bail!("run is not active");
     }
     let grants: Vec<String> = serde_json::from_value(run.grants)?;
-    capability::permitted(&operation.capability, &grants).context("capability not granted")?;
+    let manifest = capability::permitted(&store, &operation.capability, &grants)?
+        .context("capability not granted")?;
+    if manifest.version != operation.capability_version {
+        bail!("capability version changed after intent was recorded");
+    }
     let workspace = Path::new(&run.workspace);
     let args = &operation.arguments;
     match operation.capability.as_str() {
@@ -154,6 +158,14 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
             Ok(
                 json!({"exit_code": output.status.code(), "output": String::from_utf8_lossy(&combined), "truncated": truncated}),
             )
+        }
+        name if name.starts_with("mcp.") => {
+            let (server_name, tool_name) = name
+                .trim_start_matches("mcp.")
+                .split_once('.')
+                .context("invalid MCP capability")?;
+            let server = store.mcp_server(server_name)?;
+            mcp::call(&server, workspace, tool_name, args.clone())
         }
         _ => bail!("unknown capability"),
     }

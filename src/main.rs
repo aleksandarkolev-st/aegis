@@ -21,7 +21,7 @@ fn usage() {
     println!(
         "arun attach|resume|status|cancel|replay <run-id> | resolve <run-id> <op-id> succeeded|failed <note> | list | inspect <artifact-hash> | login|probe <provider>"
     );
-    println!("arun tasks|context|tools|artifacts <run-id>");
+    println!("arun tasks|context|tools|artifacts <run-id> | mcp add <name> <command> [args...]");
 }
 
 fn view(root: &Path, command: &str, id: &str) -> Result<()> {
@@ -151,6 +151,7 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
     let mut foreground = false;
     let mut actions = 40_u64;
     let mut programs = Vec::new();
+    let mut mcp_tools = Vec::new();
     let mut task = Vec::new();
     let mut index = 0;
     while index < args.len() {
@@ -165,6 +166,14 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
                 programs.push(
                     args.get(index)
                         .context("--allow-process needs a program")?
+                        .clone(),
+                );
+            }
+            "--allow-mcp" => {
+                index += 1;
+                mcp_tools.push(
+                    args.get(index)
+                        .context("--allow-mcp needs server:tool")?
                         .clone(),
                 );
             }
@@ -202,6 +211,9 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
     }
     for program in programs {
         grants.push(format!("process:{program}"));
+    }
+    for tool in mcp_tools {
+        grants.push(format!("mcp:{tool}"));
     }
     let mut store = Store::open(root)?;
     let run = store.create_run(
@@ -315,6 +327,33 @@ fn main() -> Result<()> {
         Some("worker") => {
             let value = arun::worker::execute(Path::new(required(1)?), required(2)?)?;
             println!("{value}");
+            Ok(())
+        }
+        Some("mcp") => {
+            if required(1)? != "add" {
+                bail!("use 'arun mcp add <name> <command> [args...]'");
+            }
+            let name = required(2)?;
+            if name.is_empty()
+                || !name.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || character == '_' || character == '-'
+                })
+            {
+                bail!("MCP server name must be alphanumeric, underscore, or hyphen");
+            }
+            let server = arun::mcp::Server {
+                name: name.into(),
+                command: required(3)?.into(),
+                args: arguments.get(4..).unwrap_or_default().to_vec(),
+            };
+            let tools = arun::mcp::discover(&server, &std::env::current_dir()?)?;
+            Store::open(&root)?.register_mcp(&server, &tools)?;
+            for tool in tools {
+                println!(
+                    "mcp.{}.{}  grant: mcp:{}:{}",
+                    server.name, tool.name, server.name, tool.name
+                );
+            }
             Ok(())
         }
         Some("attach") => attach(&root, required(1)?),
