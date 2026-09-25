@@ -205,6 +205,23 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn recent_events(&self, run_id: &str, limit: i64) -> Result<Vec<Event>> {
+        let mut events = self.events(run_id)?;
+        let keep = limit.max(0) as usize;
+        if events.len() > keep {
+            events.drain(..events.len() - keep);
+        }
+        Ok(events)
+    }
+
+    pub fn has_evidence(&self, run_id: &str, hash: &str) -> Result<bool> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM operations WHERE run_id = ?1 AND artifact = ?2 AND state = 'succeeded'",
+            params![run_id, hash], |row| row.get(0)
+        )?;
+        Ok(count > 0)
+    }
+
     pub fn event(&mut self, run_id: &str, kind: &str, payload: Value) -> Result<()> {
         let transaction = self
             .connection
@@ -316,6 +333,22 @@ impl Store {
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    pub fn operation(&self, id: &str) -> Result<Operation> {
+        self.connection.query_row(
+            "SELECT run_id, capability, arguments, idempotency_key, retry_safe, state, artifact FROM operations WHERE id = ?1",
+            [id],
+            |row| {
+                let arguments: String = row.get(2)?;
+                Ok(Operation {
+                    id: id.into(), run_id: row.get(0)?, capability: row.get(1)?,
+                    arguments: serde_json::from_str(&arguments).map_err(|err| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(err)))?,
+                    idempotency_key: row.get(3)?, retry_safe: row.get(4)?,
+                    state: row.get(5)?, artifact: row.get(6)?,
+                })
+            },
+        ).with_context(|| format!("operation {id} not found"))
     }
 
     pub fn reconcile(&mut self, run_id: &str) -> Result<Vec<Operation>> {

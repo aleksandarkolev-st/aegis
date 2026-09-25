@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -32,7 +32,7 @@ pub enum Action {
     },
 }
 
-const SCHEMA: &str = r#"{"type":"object","properties":{"kind":{"type":"string","enum":["search_capabilities","invoke","inspect_result","finish","blocked"]},"query":{"type":"string"},"capability":{"type":"string"},"args":{"type":"object"},"artifact":{"type":"string"},"summary":{"type":"string"},"evidence":{"type":"array","items":{"type":"string"}},"reason":{"type":"string"}},"required":["kind"],"additionalProperties":false}"#;
+const SCHEMA: &str = r#"{"type":"object","properties":{"kind":{"type":"string","enum":["search_capabilities","invoke","inspect_result","finish","blocked"]},"query":{"type":"string"},"capability":{"type":"string"},"args":{"type":"string"},"artifact":{"type":"string"},"summary":{"type":"string"},"evidence":{"type":"array","items":{"type":"string"}},"reason":{"type":"string"}},"required":["kind","query","capability","args","artifact","summary","evidence","reason"],"additionalProperties":false}"#;
 
 fn parse_action(raw: &str) -> Result<Action> {
     let trimmed = raw.trim();
@@ -44,8 +44,15 @@ fn parse_action(raw: &str) -> Result<Action> {
         .strip_suffix("```")
         .unwrap_or(trimmed)
         .trim();
-    let value: Value = serde_json::from_str(trimmed).context("model response was not JSON")?;
+    let mut value: Value = serde_json::from_str(trimmed).context("model response was not JSON")?;
     if value.get("kind").is_some() {
+        if value.get("kind").and_then(Value::as_str) == Some("invoke") {
+            if let Some(arguments) = value.get("args").and_then(Value::as_str) {
+                let arguments: Value =
+                    serde_json::from_str(arguments).context("invalid invocation arguments JSON")?;
+                value["args"] = arguments;
+            }
+        }
         return serde_json::from_value(value).context("invalid model action");
     }
     for key in ["result", "response", "content"] {
@@ -87,7 +94,7 @@ pub fn call(
                 .arg(&schema_path)
                 .args(["-o"])
                 .arg(output.path().join("reply"))
-                .arg(prompt);
+                .arg("-");
             command
         }
         "claude" => {
@@ -125,12 +132,23 @@ pub fn call(
     };
     command
         .current_dir(directory)
-        .stdin(Stdio::null())
+        .stdin(if provider == "codex" {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::from(File::create(&stdout_path)?))
         .stderr(Stdio::from(File::create(&stderr_path)?));
     let mut child = command
         .spawn()
         .with_context(|| format!("start {provider}; install and log in to its CLI first"))?;
+    if provider == "codex" {
+        child
+            .stdin
+            .take()
+            .context("Codex stdin unavailable")?
+            .write_all(prompt.as_bytes())?;
+    }
     let start = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait()? {
@@ -152,7 +170,8 @@ pub fn call(
     File::open(&stderr_path)?.read_to_string(&mut stderr)?;
     if !status.success() {
         bail!(
-            "{provider} exited with {status}: {}",
+            "{provider} exited with {status}: stdout={} stderr={}",
+            stdout.chars().take(800).collect::<String>(),
             stderr.chars().take(800).collect::<String>()
         );
     }
