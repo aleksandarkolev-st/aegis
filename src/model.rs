@@ -23,6 +23,9 @@ pub enum Action {
         artifact: String,
         query: String,
     },
+    Checkpoint {
+        checkpoint: Checkpoint,
+    },
     Finish {
         summary: String,
         evidence: Vec<String>,
@@ -32,7 +35,22 @@ pub enum Action {
     },
 }
 
-const SCHEMA: &str = r#"{"type":"object","properties":{"kind":{"type":"string","enum":["search_capabilities","invoke","inspect_result","finish","blocked"]},"query":{"type":"string"},"capability":{"type":"string"},"args":{"type":"string"},"artifact":{"type":"string"},"summary":{"type":"string"},"evidence":{"type":"array","items":{"type":"string"}},"reason":{"type":"string"}},"required":["kind","query","capability","args","artifact","summary","evidence","reason"],"additionalProperties":false}"#;
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Milestone {
+    pub title: String,
+    pub state: String,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Checkpoint {
+    pub decisions: Vec<String>,
+    pub unresolved: Vec<String>,
+    pub next_action: String,
+    pub milestones: Vec<Milestone>,
+}
+
+const SCHEMA: &str = r#"{"type":"object","properties":{"kind":{"type":"string","enum":["search_capabilities","invoke","inspect_result","checkpoint","finish","blocked"]},"query":{"type":"string"},"capability":{"type":"string"},"args":{"type":"string"},"artifact":{"type":"string"},"checkpoint":{"type":"string"},"summary":{"type":"string"},"evidence":{"type":"array","items":{"type":"string"}},"reason":{"type":"string"}},"required":["kind","query","capability","args","artifact","checkpoint","summary","evidence","reason"],"additionalProperties":false}"#;
 
 fn parse_action(raw: &str) -> Result<Action> {
     let trimmed = raw.trim();
@@ -46,11 +64,15 @@ fn parse_action(raw: &str) -> Result<Action> {
         .trim();
     let mut value: Value = serde_json::from_str(trimmed).context("model response was not JSON")?;
     if value.get("kind").is_some() {
-        if value.get("kind").and_then(Value::as_str) == Some("invoke") {
-            if let Some(arguments) = value.get("args").and_then(Value::as_str) {
-                let arguments: Value =
-                    serde_json::from_str(arguments).context("invalid invocation arguments JSON")?;
-                value["args"] = arguments;
+        let encoded = match value.get("kind").and_then(Value::as_str) {
+            Some("invoke") => Some("args"),
+            Some("checkpoint") => Some("checkpoint"),
+            _ => None,
+        };
+        if let Some(key) = encoded {
+            if let Some(contents) = value.get(key).and_then(Value::as_str) {
+                value[key] = serde_json::from_str(contents)
+                    .with_context(|| format!("invalid {key} JSON"))?;
             }
         }
         return serde_json::from_value(value).context("invalid model action");

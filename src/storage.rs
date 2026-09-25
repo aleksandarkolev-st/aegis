@@ -10,6 +10,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::model::{Checkpoint as Handoff, Milestone};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Run {
     pub id: String,
@@ -97,6 +99,11 @@ impl Store {
              );
              CREATE TABLE IF NOT EXISTS artifacts (
                hash TEXT PRIMARY KEY, bytes INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS milestones (
+               run_id TEXT NOT NULL REFERENCES runs(id), position INTEGER NOT NULL,
+               title TEXT NOT NULL, state TEXT NOT NULL, evidence TEXT NOT NULL,
+               PRIMARY KEY(run_id, position)
              );",
         )?;
         Ok(Self {
@@ -150,6 +157,10 @@ impl Store {
             &run.id,
             "run.created",
             json!({"task": run.task, "provider": run.provider}),
+        )?;
+        transaction.execute(
+            "INSERT INTO milestones VALUES (?1, 0, 'Task request', 'active', '[]')",
+            [&run.id],
         )?;
         transaction.commit()?;
         Ok(run)
@@ -220,6 +231,135 @@ impl Store {
             params![run_id, hash], |row| row.get(0)
         )?;
         Ok(count > 0)
+    }
+
+    pub fn milestones(&self, run_id: &str) -> Result<Vec<Milestone>> {
+        let mut statement = self.connection.prepare(
+            "SELECT title, state, evidence FROM milestones WHERE run_id = ?1 ORDER BY position",
+        )?;
+        let rows = statement.query_map([run_id], |row| {
+            let evidence: String = row.get(2)?;
+            Ok(Milestone {
+                title: row.get(0)?,
+                state: row.get(1)?,
+                evidence: serde_json::from_str(&evidence).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn last_checkpoint(&self, run_id: &str) -> Result<Option<Handoff>> {
+        let hash: Option<String> = self.connection.query_row(
+            "SELECT json_extract(payload, '$.artifact') FROM events WHERE run_id = ?1 AND kind = 'checkpoint.created' ORDER BY seq DESC LIMIT 1",
+            [run_id], |row| row.get(0)
+        ).optional()?;
+        hash.map(|hash| serde_json::from_slice(&self.artifact(&hash)?).map_err(Into::into))
+            .transpose()
+    }
+
+    pub fn save_checkpoint(&mut self, run_id: &str, checkpoint: &Handoff) -> Result<String> {
+        if checkpoint.milestones.len() > 20
+            || checkpoint.next_action.len() > 1000
+            || checkpoint.decisions.len() > 20
+            || checkpoint.unresolved.len() > 20
+        {
+            bail!("checkpoint exceeds limits");
+        }
+        for milestone in &checkpoint.milestones {
+            if milestone.title.trim().is_empty()
+                || milestone.title.len() > 200
+                || !matches!(milestone.state.as_str(), "pending" | "active" | "completed")
+            {
+                bail!("invalid milestone");
+            }
+            if milestone.state == "completed" && milestone.evidence.is_empty() {
+                bail!("completed milestone requires evidence");
+            }
+            for hash in &milestone.evidence {
+                if !self.has_evidence(run_id, hash)? {
+                    bail!("milestone evidence not from this run: {hash}");
+                }
+            }
+        }
+        let hash = self.put_artifact(&serde_json::to_vec(checkpoint)?)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !checkpoint.milestones.is_empty() {
+            transaction.execute("DELETE FROM milestones WHERE run_id = ?1", [run_id])?;
+            for (position, milestone) in checkpoint.milestones.iter().enumerate() {
+                transaction.execute(
+                    "INSERT INTO milestones VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        run_id,
+                        position as i64,
+                        milestone.title,
+                        milestone.state,
+                        serde_json::to_string(&milestone.evidence)?
+                    ],
+                )?;
+            }
+        }
+        append_event(
+            &transaction,
+            run_id,
+            "checkpoint.created",
+            json!({"artifact": hash, "next_action": checkpoint.next_action}),
+        )?;
+        transaction.commit()?;
+        Ok(hash)
+    }
+
+    pub fn complete_run(&mut self, run_id: &str, summary: &str, evidence: &[String]) -> Result<()> {
+        if evidence.is_empty() {
+            bail!("completion requires evidence");
+        }
+        for hash in evidence {
+            if !self.has_evidence(run_id, hash)? {
+                bail!("completion evidence is not a successful operation artifact: {hash}");
+            }
+        }
+        let milestones = self.milestones(run_id)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state: String =
+            transaction.query_row("SELECT state FROM runs WHERE id = ?1", [run_id], |row| {
+                row.get(0)
+            })?;
+        if state != "running" {
+            bail!("only a running run can complete");
+        }
+        if milestones.len() == 1 && milestones[0].title == "Task request" {
+            transaction.execute(
+                "UPDATE milestones SET state = 'completed', evidence = ?2 WHERE run_id = ?1",
+                params![run_id, serde_json::to_string(evidence)?],
+            )?;
+        } else if milestones
+            .iter()
+            .any(|milestone| milestone.state != "completed")
+        {
+            bail!("all planned milestones must have evidence before completion");
+        }
+        transaction.execute(
+            "UPDATE runs SET state = 'completed' WHERE id = ?1",
+            [run_id],
+        )?;
+        append_event(
+            &transaction,
+            run_id,
+            "run.completed",
+            json!({"summary": summary, "evidence": evidence}),
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn event(&mut self, run_id: &str, kind: &str, payload: Value) -> Result<()> {
@@ -571,6 +711,57 @@ mod tests {
         let run = store.create_run("done", directory.path(), "codex", json!([]), json!({}), "")?;
         store.state(&run.id, "completed", json!({}))?;
         assert!(store.state(&run.id, "cancelled", json!({})).is_err());
+        assert_eq!(store.run(&run.id)?.state, "completed");
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_survives_restart_and_gates_completion() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "repair",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({}),
+            "test passes",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let operation = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
+        let evidence = store.put_artifact(b"observed result")?;
+        store.operation_state(&operation, "succeeded", Some(&evidence), json!({}))?;
+        let checkpoint = Handoff {
+            decisions: vec!["reproduce first".into()],
+            unresolved: vec!["test pending".into()],
+            next_action: "run test".into(),
+            milestones: vec![
+                Milestone {
+                    title: "Inspect".into(),
+                    state: "completed".into(),
+                    evidence: vec![evidence.clone()],
+                },
+                Milestone {
+                    title: "Test".into(),
+                    state: "pending".into(),
+                    evidence: vec![],
+                },
+            ],
+        };
+        store.save_checkpoint(&run.id, &checkpoint)?;
+        assert!(
+            store
+                .complete_run(&run.id, "done", &[evidence.clone()])
+                .is_err()
+        );
+        drop(store);
+        let mut store = Store::open(directory.path())?;
+        assert_eq!(store.last_checkpoint(&run.id)?, Some(checkpoint.clone()));
+        let mut completed = checkpoint;
+        completed.milestones[1].state = "completed".into();
+        completed.milestones[1].evidence = vec![evidence.clone()];
+        store.save_checkpoint(&run.id, &completed)?;
+        store.complete_run(&run.id, "done", &[evidence])?;
         assert_eq!(store.run(&run.id)?.state, "completed");
         Ok(())
     }

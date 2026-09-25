@@ -21,6 +21,66 @@ fn usage() {
     println!(
         "arun attach|resume|status|cancel|replay <run-id> | resolve <run-id> <op-id> succeeded|failed <note> | list | inspect <artifact-hash> | login|probe <provider>"
     );
+    println!("arun tasks|context|tools|artifacts <run-id>");
+}
+
+fn view(root: &Path, command: &str, id: &str) -> Result<()> {
+    let store = Store::open(root)?;
+    let run = store.run(id)?;
+    match command {
+        "tasks" => {
+            for milestone in store.milestones(id)? {
+                println!(
+                    "[{}] {}  {}",
+                    if milestone.state == "completed" {
+                        "✓"
+                    } else if milestone.state == "active" {
+                        "→"
+                    } else {
+                        " "
+                    },
+                    milestone.title,
+                    milestone.evidence.join(", ")
+                );
+            }
+        }
+        "context" => {
+            println!(
+                "run: {} state: {} provider: {}",
+                id, run.state, run.provider
+            );
+            println!(
+                "events: {}  artifacts: {}",
+                store.events(id)?.len(),
+                store
+                    .events(id)?
+                    .iter()
+                    .filter(|event| event.kind == "operation.succeeded")
+                    .count()
+            );
+            if let Some(checkpoint) = store.last_checkpoint(id)? {
+                println!("handoff: {}", serde_json::to_string_pretty(&checkpoint)?);
+            }
+        }
+        "tools" => {
+            for event in store
+                .events(id)?
+                .iter()
+                .filter(|event| event.kind == "capability.activated")
+            {
+                println!("{}", event.payload["id"]);
+            }
+        }
+        "artifacts" => {
+            for event in store.events(id)?.iter().filter(|event| {
+                event.kind == "operation.succeeded" || event.kind == "checkpoint.created"
+            }) {
+                println!("{} {}", event.kind, event.payload["artifact"]);
+            }
+        }
+        _ => bail!("unknown view"),
+    }
+    Ok(())
 }
 
 fn render(event: &Event) {
@@ -192,8 +252,29 @@ fn interactive(root: &Path) -> Result<()> {
             }
             continue;
         }
-        if line == "/cancel" {
-            println!("Use 'arun cancel <run-id>'");
+        if matches!(
+            line,
+            "/tasks" | "/context" | "/tools" | "/artifacts" | "/trace" | "/checkpoint" | "/cancel"
+        ) {
+            if let Some(run) = Store::open(root)?.runs()?.first() {
+                match line {
+                    "/tasks" => view(root, "tasks", &run.id)?,
+                    "/context" | "/checkpoint" => view(root, "context", &run.id)?,
+                    "/tools" => view(root, "tools", &run.id)?,
+                    "/artifacts" => view(root, "artifacts", &run.id)?,
+                    "/trace" => {
+                        for event in Store::open(root)?.events(&run.id)? {
+                            println!("{}", serde_json::to_string(&event)?);
+                        }
+                    }
+                    "/cancel" => {
+                        Store::open(root)?.state(&run.id, "cancelled", json!({"source":"user"}))?
+                    }
+                    _ => unreachable!(),
+                }
+            } else {
+                println!("No runs yet");
+            }
             continue;
         }
         if line.starts_with('/') {
@@ -237,6 +318,9 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some("attach") => attach(&root, required(1)?),
+        Some("tasks" | "context" | "tools" | "artifacts") => {
+            view(&root, required(0)?, required(1)?)
+        }
         Some("resume") => {
             let id = required(1)?;
             let store = Store::open(&root)?;
