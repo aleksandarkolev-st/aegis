@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use arun::kernel;
@@ -102,16 +102,12 @@ fn render(event: &Event) {
 }
 
 fn attach(root: &Path, id: &str) -> Result<()> {
+    uuid::Uuid::parse_str(id).context("invalid run ID")?;
     let mut last = 0;
+    let started = Instant::now();
     loop {
         let store = Store::open(root)?;
-        for event in store
-            .events(id)?
-            .iter()
-            .filter(|event| event.seq > last)
-            .cloned()
-            .collect::<Vec<_>>()
-        {
+        for event in store.events_since(id, last)? {
             render(&event);
             last = event.seq;
         }
@@ -119,6 +115,20 @@ fn attach(root: &Path, id: &str) -> Result<()> {
         if run.state != "running" && run.state != "ready" {
             println!("run {}: {}", id, run.state);
             break;
+        }
+        if started.elapsed() > Duration::from_secs(3) {
+            let lock = File::options()
+                .write(true)
+                .create(true)
+                .open(root.join(format!("run-{id}.lock")))?;
+            match fs2::FileExt::try_lock_exclusive(&lock) {
+                Ok(()) => {
+                    println!("! no runner holds this run; use 'arun resume {id}'");
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         thread::sleep(Duration::from_millis(500));
     }

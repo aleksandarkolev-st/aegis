@@ -54,14 +54,12 @@ const SCHEMA: &str = r#"{"type":"object","properties":{"kind":{"type":"string","
 
 fn parse_action(raw: &str) -> Result<Action> {
     let trimmed = raw.trim();
-    let trimmed = trimmed
+    let content = trimmed
         .strip_prefix("```json")
         .or_else(|| trimmed.strip_prefix("```"))
         .unwrap_or(trimmed)
-        .trim()
-        .strip_suffix("```")
-        .unwrap_or(trimmed)
         .trim();
+    let trimmed = content.strip_suffix("```").unwrap_or(content).trim();
     let mut value: Value = serde_json::from_str(trimmed).context("model response was not JSON")?;
     if value.get("kind").is_some() {
         let encoded = match value.get("kind").and_then(Value::as_str) {
@@ -224,6 +222,13 @@ mod tests {
         assert_eq!(parse_action(&raw)?, action);
         assert_eq!(
             parse_action(&serde_json::json!({"result": raw}).to_string())?,
+            action
+        );
+        assert_eq!(
+            parse_action(&format!(
+                "```json\n{}\n```",
+                serde_json::to_string(&action)?
+            ))?,
             action
         );
         Ok(())

@@ -273,6 +273,27 @@ impl Store {
         Ok(events)
     }
 
+    pub fn events_since(&self, run_id: &str, seq: i64) -> Result<Vec<Event>> {
+        let mut statement = self.connection.prepare("SELECT seq, kind, payload, created_at FROM events WHERE run_id = ?1 AND seq > ?2 ORDER BY seq")?;
+        let rows = statement.query_map(params![run_id, seq], |row| {
+            let payload: String = row.get(2)?;
+            Ok(Event {
+                seq: row.get(0)?,
+                kind: row.get(1)?,
+                payload: serde_json::from_str(&payload).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                created_at: row.get(3)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn event_count(&self, run_id: &str, kind: &str) -> Result<i64> {
         Ok(self.connection.query_row(
             "SELECT COUNT(*) FROM events WHERE run_id = ?1 AND kind = ?2",
