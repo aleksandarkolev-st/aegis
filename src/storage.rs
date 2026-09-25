@@ -104,8 +104,22 @@ impl Store {
                run_id TEXT NOT NULL REFERENCES runs(id), position INTEGER NOT NULL,
                title TEXT NOT NULL, state TEXT NOT NULL, evidence TEXT NOT NULL,
                PRIMARY KEY(run_id, position)
+             );
+             CREATE TABLE IF NOT EXISTS activated (
+               run_id TEXT NOT NULL REFERENCES runs(id), capability TEXT NOT NULL,
+               version INTEGER NOT NULL, PRIMARY KEY(run_id, capability)
              );",
         )?;
+        let schema_version: i64 =
+            connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if schema_version == 0 {
+            connection.execute_batch(
+                "INSERT OR IGNORE INTO activated(run_id, capability, version)
+                 SELECT run_id, json_extract(payload, '$.id'), COALESCE(json_extract(payload, '$.version'), 1)
+                 FROM events WHERE kind = 'capability.activated';
+                 PRAGMA user_version=1;"
+            )?;
+        }
         Ok(Self {
             connection,
             artifacts,
@@ -217,12 +231,57 @@ impl Store {
     }
 
     pub fn recent_events(&self, run_id: &str, limit: i64) -> Result<Vec<Event>> {
-        let mut events = self.events(run_id)?;
-        let keep = limit.max(0) as usize;
-        if events.len() > keep {
-            events.drain(..events.len() - keep);
-        }
+        let mut statement = self.connection.prepare("SELECT seq, kind, payload, created_at FROM events WHERE run_id = ?1 ORDER BY seq DESC LIMIT ?2")?;
+        let rows = statement.query_map(params![run_id, limit.max(0)], |row| {
+            let payload: String = row.get(2)?;
+            Ok(Event {
+                seq: row.get(0)?,
+                kind: row.get(1)?,
+                payload: serde_json::from_str(&payload).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                created_at: row.get(3)?,
+            })
+        })?;
+        let mut events = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        events.reverse();
         Ok(events)
+    }
+
+    pub fn event_count(&self, run_id: &str, kind: &str) -> Result<i64> {
+        Ok(self.connection.query_row(
+            "SELECT COUNT(*) FROM events WHERE run_id = ?1 AND kind = ?2",
+            params![run_id, kind],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn activate(&mut self, run_id: &str, capability: &str, version: u32) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute("INSERT INTO activated VALUES (?1, ?2, ?3) ON CONFLICT(run_id, capability) DO UPDATE SET version = excluded.version", params![run_id, capability, version])?;
+        append_event(
+            &transaction,
+            run_id,
+            "capability.activated",
+            json!({"id": capability, "version": version}),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn active_capabilities(&self, run_id: &str) -> Result<Vec<(String, u32)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT capability, version FROM activated WHERE run_id = ?1 ORDER BY capability",
+        )?;
+        let rows = statement.query_map([run_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn has_evidence(&self, run_id: &str, hash: &str) -> Result<bool> {

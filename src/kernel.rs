@@ -16,15 +16,14 @@ fn grants(run: &Run) -> Result<Vec<String>> {
 }
 
 fn activated(store: &Store, run_id: &str) -> Result<Vec<Manifest>> {
-    let events = store.events(run_id)?;
-    let names: Vec<_> = events
-        .iter()
-        .filter(|event| event.kind == "capability.activated")
-        .filter_map(|event| event.payload.get("id").and_then(Value::as_str))
-        .collect();
+    let names = store.active_capabilities(run_id)?;
     Ok(capability::registry()
         .into_iter()
-        .filter(|manifest| names.contains(&manifest.id))
+        .filter(|manifest| {
+            names
+                .iter()
+                .any(|(name, version)| name == manifest.id && *version == manifest.version)
+        })
         .collect())
 }
 
@@ -154,11 +153,7 @@ fn apply(store: &mut Store, root: &Path, run: &Run, action: Action) -> Result<bo
         Action::SearchCapabilities { query } => {
             let matches = capability::resolve(&query, &grants(run)?, 3);
             for manifest in &matches {
-                store.event(
-                    &run.id,
-                    "capability.activated",
-                    json!({"id": manifest.id, "version": manifest.version}),
-                )?;
+                store.activate(&run.id, manifest.id, manifest.version)?;
             }
             store.event(&run.id, "capability.search", json!({"query": query, "matches": matches.iter().map(|item| item.id).collect::<Vec<_>>()}))?;
         }
@@ -236,11 +231,7 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
         if store.run(run_id)?.state != "running" {
             break;
         }
-        let actions = store
-            .events(run_id)?
-            .iter()
-            .filter(|event| event.kind == "model.response")
-            .count() as u64;
+        let actions = store.event_count(run_id, "model.response")? as u64;
         if actions >= max_actions {
             store.state(
                 run_id,
@@ -310,11 +301,7 @@ mod tests {
         )?;
         let initial = context(&store, &run)?;
         assert!(!initial.contains("Write exact UTF-8"));
-        store.event(
-            &run.id,
-            "capability.activated",
-            json!({"id": "workspace.read"}),
-        )?;
+        store.activate(&run.id, "workspace.read", 1)?;
         assert!(context(&store, &run)?.contains("Read a UTF-8 workspace file"));
         assert!(!context(&store, &run)?.contains("Write exact UTF-8"));
         Ok(())
