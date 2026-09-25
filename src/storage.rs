@@ -119,6 +119,11 @@ impl Store {
                server TEXT NOT NULL REFERENCES mcp_servers(name), name TEXT NOT NULL,
                description TEXT NOT NULL, input_schema TEXT NOT NULL, version INTEGER NOT NULL,
                PRIMARY KEY(server, name)
+             );
+             CREATE TABLE IF NOT EXISTS operation_artifacts (
+               operation_id TEXT NOT NULL REFERENCES operations(id),
+               hash TEXT NOT NULL REFERENCES artifacts(hash), kind TEXT NOT NULL,
+               PRIMARY KEY(operation_id, hash)
              );",
         )?;
         let schema_version: i64 =
@@ -156,9 +161,7 @@ impl Store {
         budgets: Value,
         acceptance: &str,
     ) -> Result<Run> {
-        let workspace = workspace
-            .canonicalize()
-            .context("workspace does not exist")?;
+        let workspace = dunce::canonicalize(workspace).context("workspace does not exist")?;
         let run = Run {
             id: Uuid::new_v4().to_string(),
             task: task.to_owned(),
@@ -399,10 +402,18 @@ impl Store {
 
     pub fn has_evidence(&self, run_id: &str, hash: &str) -> Result<bool> {
         let count: i64 = self.connection.query_row(
-            "SELECT COUNT(*) FROM operations WHERE run_id = ?1 AND artifact = ?2 AND state = 'succeeded'",
+            "SELECT COUNT(*) FROM operations AS operation WHERE operation.run_id = ?1 AND operation.state = 'succeeded' AND (operation.artifact = ?2 OR EXISTS (SELECT 1 FROM operation_artifacts AS linked WHERE linked.operation_id = operation.id AND linked.hash = ?2))",
             params![run_id, hash], |row| row.get(0)
         )?;
         Ok(count > 0)
+    }
+
+    pub fn link_artifact(&mut self, operation_id: &str, hash: &str, kind: &str) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR IGNORE INTO operation_artifacts VALUES (?1, ?2, ?3)",
+            params![operation_id, hash, kind],
+        )?;
+        Ok(())
     }
 
     pub fn milestones(&self, run_id: &str) -> Result<Vec<Milestone>> {

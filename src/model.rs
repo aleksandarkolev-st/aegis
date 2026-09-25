@@ -92,6 +92,16 @@ pub fn call(
     directory: &Path,
     timeout: Duration,
 ) -> Result<(Action, String)> {
+    call_with_cancel(provider, prompt, directory, timeout, || false)
+}
+
+pub fn call_with_cancel(
+    provider: &str,
+    prompt: &str,
+    directory: &Path,
+    timeout: Duration,
+    cancelled: impl Fn() -> bool,
+) -> Result<(Action, String)> {
     let output = tempfile::tempdir_in(directory)?;
     let stdout_path = output.path().join("stdout");
     let stderr_path = output.path().join("stderr");
@@ -181,6 +191,11 @@ pub fn call(
                 "{provider} model call exceeded {} seconds",
                 timeout.as_secs()
             );
+        }
+        if cancelled() {
+            child.kill()?;
+            child.wait()?;
+            bail!("run cancelled during model call");
         }
         thread::sleep(Duration::from_millis(100));
     };

@@ -1,15 +1,90 @@
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::storage::Store;
+use crate::storage::{Operation, Run, Store};
 use crate::{capability, mcp};
 
 const MAX_FILE: u64 = 2 * 1024 * 1024;
-const MAX_OUTPUT: usize = 1024 * 1024;
+const MAX_OUTPUT: u64 = 32 * 1024 * 1024;
+
+pub fn container_name(operation_id: &str) -> Result<String> {
+    uuid::Uuid::parse_str(operation_id).context("invalid operation ID")?;
+    Ok(format!("arun-{operation_id}"))
+}
+
+fn docker_command(
+    run: &Run,
+    operation: &Operation,
+    program: &str,
+    arguments: &[String],
+) -> Result<Command> {
+    let image = run
+        .budgets
+        .get("container_image")
+        .and_then(Value::as_str)
+        .context("process.run requires a container image")?;
+    if image.is_empty() || image.starts_with('-') {
+        bail!("invalid container image");
+    }
+    let source = dunce::simplified(Path::new(&run.workspace)).to_string_lossy();
+    if source.contains(',') {
+        bail!("Docker bind mount cannot contain a comma");
+    }
+    let grants: Vec<String> = serde_json::from_value(run.grants.clone())?;
+    let mount = format!(
+        "type=bind,source={},target=/workspace{}",
+        source,
+        if grants.iter().any(|grant| grant == "workspace.write") {
+            ""
+        } else {
+            ",readonly"
+        }
+    );
+    let mut command = Command::new("docker");
+    command.args([
+        "run",
+        "--rm",
+        "--pull=never",
+        "--name",
+        &container_name(&operation.id)?,
+        "--network",
+        "none",
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--pids-limit",
+        "128",
+        "--memory",
+        "1g",
+        "--cpus",
+        "2",
+        "--workdir",
+        "/workspace",
+        "--mount",
+        &mount,
+        "--tmpfs",
+        "/tmp:rw,size=256m",
+        "--tmpfs",
+        "/workspace/.arun:rw,noexec,size=1m",
+        "--env",
+        "HOME=/tmp",
+        "--env",
+        "CARGO_TARGET_DIR=/tmp/target",
+        "--entrypoint",
+        program,
+        image,
+    ]);
+    command.args(arguments);
+    Ok(command)
+}
 
 fn relative(workspace: &Path, path: &str) -> Result<PathBuf> {
     let relative = Path::new(path);
@@ -48,7 +123,7 @@ fn string<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
 }
 
 pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
-    let store = Store::open(root)?;
+    let mut store = Store::open(root)?;
     let operation = store.operation(operation_id)?;
     if operation.state != "dispatched" {
         bail!("operation is not dispatched");
@@ -57,7 +132,7 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
     if run.state != "running" {
         bail!("run is not active");
     }
-    let grants: Vec<String> = serde_json::from_value(run.grants)?;
+    let grants: Vec<String> = serde_json::from_value(run.grants.clone())?;
     let manifest = capability::permitted(&store, &operation.capability, &grants)?
         .context("capability not granted")?;
     if manifest.version != operation.capability_version {
@@ -146,17 +221,36 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
                         .context("process argument must be a string")
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let output = Command::new(program)
-                .args(arguments)
-                .current_dir(workspace)
-                .output()
-                .with_context(|| format!("execute {program}"))?;
-            let mut combined = output.stdout;
-            combined.extend_from_slice(&output.stderr);
-            let truncated = combined.len() > MAX_OUTPUT;
-            combined.truncate(MAX_OUTPUT);
+            let output_dir = tempfile::tempdir_in(root)?;
+            let path = output_dir.path().join("process-output");
+            let file = File::create(&path)?;
+            let mut child = docker_command(&run, &operation, program, &arguments)?
+                .stdout(Stdio::from(file.try_clone()?))
+                .stderr(Stdio::from(file))
+                .spawn()
+                .context(
+                    "start Docker; ensure the daemon is running and image is available locally",
+                )?;
+            let status = loop {
+                if let Some(status) = child.try_wait()? {
+                    break status;
+                }
+                if fs::metadata(&path)?.len() > MAX_OUTPUT {
+                    child.kill()?;
+                    child.wait()?;
+                    bail!("process output exceeded 32 MiB");
+                }
+                thread::sleep(Duration::from_millis(100));
+            };
+            let bytes = fs::read(&path)?;
+            if bytes.len() as u64 > MAX_OUTPUT {
+                bail!("process output exceeded 32 MiB");
+            }
+            let hash = store.put_artifact(&bytes)?;
+            store.link_artifact(&operation.id, &hash, "process.output")?;
             Ok(
-                json!({"exit_code": output.status.code(), "output": String::from_utf8_lossy(&combined), "truncated": truncated}),
+                json!({"exit_code": status.code(), "output_artifact": hash, "bytes": bytes.len(),
+                "preview": String::from_utf8_lossy(&bytes).chars().take(300).collect::<String>()}),
             )
         }
         name if name.starts_with("mcp.") => {
@@ -208,6 +302,39 @@ mod tests {
         store.operation_state(&operation, "dispatched", None, json!({}))?;
         assert!(execute(&root, &operation.id).is_err());
         assert!(!directory.path().join("a.txt").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn process_command_is_containerized_without_network() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "test",
+            directory.path(),
+            "codex",
+            json!(["workspace.read", "process.run", "process:cargo"]),
+            json!({"container_image":"rust:1.98"}),
+            "",
+        )?;
+        let operation = store.begin_operation(
+            &run.id,
+            "process.run",
+            json!({"program":"cargo","args":["test"]}),
+            false,
+        )?;
+        let args = docker_command(&run, &operation, "cargo", &["test".into()])?
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.windows(2).any(|pair| pair == ["--network", "none"]));
+        assert!(args.iter().any(|argument| argument == "--pull=never"));
+        assert!(args.iter().any(|argument| argument.ends_with(",readonly")));
+        assert!(
+            args.iter()
+                .any(|argument| argument.starts_with("/workspace/.arun:"))
+        );
+        assert_eq!(args.last().unwrap(), "test");
         Ok(())
     }
 }

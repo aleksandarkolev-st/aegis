@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+dunce = "1"
 fs2 = "0.4"
 hex = "0.4"
 jsonschema = { version = "0.57", default-features = false }

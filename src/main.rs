@@ -16,7 +16,7 @@ fn root() -> Result<PathBuf> {
 
 fn usage() {
     println!(
-        "arun [run <task> [--provider chatgpt|claude|grok] [--allow-write] [--allow-process <program>] [--actions <limit>] [--foreground]]"
+        "arun [run <task> [--provider chatgpt|claude|grok] [--allow-write] [--allow-process <program> --image <local-image>] [--allow-mcp <server:tool>] [--actions <limit>] [--foreground]]"
     );
     println!(
         "arun attach|resume|status|cancel|replay <run-id> | resolve <run-id> <op-id> succeeded|failed <note> | list | inspect <artifact-hash> | login|probe <provider>"
@@ -161,6 +161,7 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
     let mut foreground = false;
     let mut actions = 40_u64;
     let mut programs = Vec::new();
+    let mut image = None;
     let mut mcp_tools = Vec::new();
     let mut task = Vec::new();
     let mut index = 0;
@@ -176,6 +177,14 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
                 programs.push(
                     args.get(index)
                         .context("--allow-process needs a program")?
+                        .clone(),
+                );
+            }
+            "--image" => {
+                index += 1;
+                image = Some(
+                    args.get(index)
+                        .context("--image needs a locally available Docker image")?
                         .clone(),
                 );
             }
@@ -206,6 +215,9 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
     if task.is_empty() {
         bail!("task is required");
     }
+    if !programs.is_empty() && image.is_none() {
+        bail!("--allow-process requires --image; native processes are not supported");
+    }
     let provider = match provider {
         "chatgpt" | "codex" => "codex",
         "claude-code" | "claude" => "claude",
@@ -231,7 +243,7 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
         &std::env::current_dir()?,
         provider,
         json!(grants),
-        json!({"actions": actions, "model_seconds": 180, "process_seconds": 60}),
+        json!({"actions": actions, "model_seconds": 180, "process_seconds": 60, "container_image": image}),
         "Provide evidence from successful operations",
     )?;
     println!("run: {} provider: {}", run.id, run.provider);

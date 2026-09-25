@@ -73,14 +73,38 @@ fn inspect(bytes: &[u8], query: &str) -> String {
     }
 }
 
-fn dispatch(root: &Path, operation_id: &str, timeout: Duration) -> Result<Value> {
+fn cleanup_container(operation: &Operation) {
+    if operation.capability != "process.run" {
+        return;
+    }
+    if let Ok(name) = crate::worker::container_name(&operation.id) {
+        if let Ok(mut cleanup) = Command::new("docker")
+            .args(["rm", "-f", &name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(5) {
+                if cleanup.try_wait().ok().flatten().is_some() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            let _ = cleanup.kill();
+            let _ = cleanup.wait();
+        }
+    }
+}
+
+fn dispatch(root: &Path, operation: &Operation, timeout: Duration) -> Result<Value> {
     let output = tempfile::tempdir_in(root)?;
     let stdout = output.path().join("result");
     let stderr = output.path().join("error");
     let mut child = Command::new(std::env::current_exe()?)
         .arg("worker")
         .arg(root)
-        .arg(operation_id)
+        .arg(&operation.id)
         .stdin(Stdio::null())
         .stdout(Stdio::from(File::create(&stdout)?))
         .stderr(Stdio::from(File::create(&stderr)?))
@@ -103,7 +127,14 @@ fn dispatch(root: &Path, operation_id: &str, timeout: Duration) -> Result<Value>
         if start.elapsed() >= timeout {
             child.kill()?;
             child.wait()?;
+            cleanup_container(operation);
             bail!("worker timed out after {} seconds", timeout.as_secs());
+        }
+        if Store::open(root)?.run(&operation.run_id)?.state == "cancelled" {
+            child.kill()?;
+            child.wait()?;
+            cleanup_container(operation);
+            bail!("run cancelled while worker was active");
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -122,7 +153,7 @@ fn perform(store: &mut Store, root: &Path, run: &Run, operation: &Operation) -> 
             .and_then(Value::as_u64)
             .unwrap_or(60),
     );
-    match dispatch(root, &operation.id, timeout) {
+    match dispatch(root, operation, timeout) {
         Ok(result) => {
             let bytes = serde_json::to_vec(&result)?;
             let hash = store.put_artifact(&bytes)?;
@@ -136,11 +167,13 @@ fn perform(store: &mut Store, root: &Path, run: &Run, operation: &Operation) -> 
             };
             store.operation_state(operation, state, None, json!({"error": error.to_string()}))?;
             if !operation.retry_safe {
-                store.state(
-                    &run.id,
-                    "waiting_recovery",
-                    json!({"operation": operation.id}),
-                )?;
+                if store.run(&run.id)?.state != "cancelled" {
+                    store.state(
+                        &run.id,
+                        "waiting_recovery",
+                        json!({"operation": operation.id}),
+                    )?;
+                }
                 return Ok(true);
             }
         }
@@ -255,22 +288,30 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
                 .and_then(Value::as_u64)
                 .unwrap_or(180),
         );
-        let (action, raw) = match model::call(&run.provider, &prompt, root, timeout) {
-            Ok(response) => response,
-            Err(error) => {
-                store.event(
-                    run_id,
-                    "model.failed",
-                    json!({"error": format!("{error:#}")}),
-                )?;
-                store.state(
-                    run_id,
-                    "waiting_recovery",
-                    json!({"reason": "model unavailable"}),
-                )?;
-                break;
-            }
-        };
+        let (action, raw) =
+            match model::call_with_cancel(&run.provider, &prompt, root, timeout, || {
+                Store::open(root)
+                    .and_then(|current| current.run(run_id))
+                    .is_ok_and(|current| current.state == "cancelled")
+            }) {
+                Ok(response) => response,
+                Err(error) => {
+                    store.event(
+                        run_id,
+                        "model.failed",
+                        json!({"error": format!("{error:#}")}),
+                    )?;
+                    if store.run(run_id)?.state == "cancelled" {
+                        break;
+                    }
+                    store.state(
+                        run_id,
+                        "waiting_recovery",
+                        json!({"reason": "model unavailable"}),
+                    )?;
+                    break;
+                }
+            };
         let hash = store.put_artifact(raw.as_bytes())?;
         store.event(
             run_id,
