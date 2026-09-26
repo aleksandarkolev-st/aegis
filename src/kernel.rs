@@ -645,6 +645,11 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
                 "elapsed_ms": model_started.elapsed().as_millis()}),
         )?;
         store.acknowledge_interrupt(run_id, crate::interrupt::Scope::Model, &model_target)?;
+        if store.model_tokens(run_id)? > max_tokens {
+            store.state(run_id, "waiting_recovery",
+                json!({"reason":"model token budget exceeded before applying response", "limit":max_tokens, "recorded_tokens":store.model_tokens(run_id)?}))?;
+            break;
+        }
         if let Err(error) = apply(&mut store, root, &run, action) {
             store.event(
                 run_id,

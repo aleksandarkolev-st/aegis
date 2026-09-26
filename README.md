@@ -98,6 +98,8 @@ Non-eager modes keep at most eight recently discovered capability schemas in the
 
 Trace accounting distinguishes recorded tokens from unaccounted attempts, including interrupted or failed model calls with no usage receipt. Known failed-call elapsed time is retained. Paired reports exclude incomplete or estimated usage from complete-token comparisons, retain partial totals separately as `recorded_model_tokens`, and count excluded pairs. Discovery timing also marks older events without measurements as unavailable. No tokenizer-exact schema counts or billed price is inferred.
 
+Model-token ceilings are enforced at turn boundaries, not as provider billing quotas: an in-flight native call may overshoot before its usage receipt arrives. Such a response is retained for audit, but its action is not applied and the task pauses before further work. Unreported usage remains explicitly unknown, not free.
+
 ### Scoped interruption
 
 Interrupting an operation does not cancel its durable task. An undispatched operation stops without executing; a claimed unsafe operation pauses with `outcome_unknown` until its external effects are reconciled. Read-only interrupted operations can stop without assuming a side effect was undone. A model-turn interrupt stops that provider call and pauses the task for resumption. Requests target an operation ID or a specific started-turn sequence, so an old request cannot interrupt a later resumed model turn. Work that already completed keeps its recorded result. Advanced automation can request `arun interrupt <run-id> operation|model`; terminal users use Ctrl+C and the task menu instead.

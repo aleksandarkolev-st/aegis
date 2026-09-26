@@ -42,6 +42,76 @@ fn request(stream: &mut TcpStream) -> Result<(String, Value)> {
 }
 
 #[test]
+fn an_over_budget_response_is_recorded_but_cannot_write_the_workspace() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let address = listener.local_addr()?;
+    let server = thread::spawn(move || -> Result<()> {
+        for turn in 0..2 {
+            let started = Instant::now();
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if started.elapsed() > Duration::from_secs(15) {
+                            bail!("budget fixture request did not arrive");
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            request(&mut stream)?;
+            let action = if turn == 0 {
+                json!({"kind":"search_capabilities","query":"write workspace file"})
+            } else {
+                json!({"kind":"invoke","capability":"workspace.write","args":{"path":"must-not-exist.txt","content":"over budget"}})
+            };
+            let response = json!({"choices":[{"message":{"content":action.to_string()}}],"usage":{"prompt_tokens":10,"completion_tokens":2}}).to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            )?;
+        }
+        Ok(())
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_arun"))
+        .current_dir(directory.path())
+        .args([
+            "run",
+            "write the fixture",
+            "--provider",
+            "custom",
+            "--endpoint",
+            &format!("http://{address}/v1"),
+            "--model",
+            "fixture-model",
+            "--model-tokens",
+            "20",
+            "--allow-write",
+            "--foreground",
+        ])
+        .output()?;
+    server.join().unwrap()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let store = Store::open(&directory.path().join(".arun"))?;
+    let run = store.runs()?.remove(0);
+    assert_eq!(run.state, "waiting_recovery");
+    assert_eq!(store.model_tokens(&run.id)?, 24);
+    assert_eq!(store.event_count(&run.id, "model.response")?, 2);
+    assert!(store.operations(&run.id)?.is_empty());
+    assert!(!directory.path().join("must-not-exist.txt").exists());
+    Ok(())
+}
+
+#[test]
 fn custom_endpoint_completes_a_kernel_run_without_persisting_its_key() -> Result<()> {
     for (interactive, response_format) in [
         (false, "schema"),
