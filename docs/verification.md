@@ -1,4 +1,4 @@
-# Local verification — 2026-09-26
+# Local verification — 2026-09-27
 
 This is a development verification record, not a success-rate or performance-improvement claim.
 
@@ -11,6 +11,9 @@ This is a development verification record, not a success-rate or performance-imp
 - A native ChatGPT/Codex-login task read `greeting.txt`, inspected its artifact, and completed with `AEGIS_TERMINAL_SMOKE_OK` and successful-operation evidence. It used four model turns, 49,502 provider-reported tokens, and 32 seconds of wall time. The provider-default model was not pinned.
 - Local task ledger: `.arun/ui-smoke/.arun/`, run `2cb451a3-e1bc-40af-afb4-bd4f91793628`.
 - Local Windows installation archive: `.arun/npm-smoke/aegis-arun-0.1.0.tgz`. This is not a public npm publication.
+- Rebuilt and replaced the existing user-global npm installation after the UI changes. The installed launcher inherits terminal I/O and hides only newly allocated subprocess console windows. Native background helpers have a Windows no-console regression test.
+- Exercised F2 provider selection, Claude alias filtering and Esc/back in the installed command's existing terminal. F6 shows visible Codex cached models; F7 opens focused settings without rerunning sign-in. A live Grok listing stalled, so model metadata cache support was added with an explicitly labeled timestamp and bounded command fallback. This is picker verification, not renewed Claude authentication.
+- Rebuilt/reinstalled again after the Grok fallback fix, then confirmed the installed F2 flow displays its cached model immediately. Exercised F6 filtering and F1 help without entering shell commands; Ctrl+D returned to the same terminal. Installed native binary SHA256: `281a0a4756d13d5e54e334d9b0bbb1f669713fc460edf2e151b11a958fa23ba5`.
 
 ## Providers
 
@@ -22,8 +25,8 @@ This is a development verification record, not a success-rate or performance-imp
 
 ## Automated checks
 
-- `cargo test --locked`: 58 unit tests and 20 integration tests passed after guided budgets, bounded capability working sets, explicit incomplete-usage accounting, and Windows parent-death ownership changes; three Docker tests are ignored by default.
-- `cargo test --test docker --test docker_acceptance --test docker_mcp -- --ignored`: all three passed separately with Docker running. They verify multi-megabyte output virtualization, hidden runtime state, immutable/read-only acceptance checks, and MCP filesystem/network/credential isolation.
+- `cargo test --locked`: 67 unit tests and 26 integration tests passed; four Docker tests are ignored by default.
+- `cargo test --test docker --test docker_acceptance --test docker_mcp -- --ignored`: all four passed separately with Docker running. They verify multi-megabyte output virtualization, hidden runtime state, fresh read-only workspaces without metadata directories, immutable/read-only acceptance checks, and MCP filesystem/network/credential isolation.
 - `npm test`: four package/platform/checksum/version tests passed.
 - Process-tree tests verify that explicit kill and drop cleanup stop a descendant heartbeat, not merely its launcher.
 - A Windows regression forcibly kills a separate supervising process and verifies that its managed child's heartbeat stops without requiring Rust drop cleanup. The same ownership behavior passed a live native-login task interruption; orphan Docker containers are separately removed during runtime recovery.
@@ -40,10 +43,11 @@ This is a development verification record, not a success-rate or performance-imp
 - The forced-read restart fixture now preserves a checkpoint across 1,100 archived detail events, fresh provider processes, and an actual runner restart. This is continuity evidence, not a multi-hour live demonstration.
 - Scoped-interruption fixtures stop an actual in-flight HTTP model request without cancelling its task, resume a new turn without inheriting the old request, and interrupt an effectful MCP call only after its external file write. The latter remains unknown and is not replayed. A direct-adapter test rejects an interrupted write before claim. Keyboard timing is tested separately; this phase does not claim a new manual terminal-key demonstration.
 - `git diff --check`: passed.
+- Model-picker fixtures verify authenticated `/models` requests, hidden-model filtering, manual fallback, preservation of permissions/budgets/history, and removal of container command access when choosing review-only mode. Native error fixtures verify readable sign-in hints in both guided and advanced flows without dumping provider JSON; raw durable diagnostics remain available separately.
 
 ## Not yet verified or delivered
 
 - Public npm publication and GitHub release assets.
 - Actual Linux/macOS release builds; the checked-in release matrix still needs to run in CI.
 - Live Claude completion after reauthentication.
-- Completion of the running paced endurance workload and the larger live paired/restart matrices. The eight-case, pinned-model read pilot already completed; see [live observations](benchmarks.md) for raw locations and measured overhead rather than an improvement claim.
+- A successful multi-hour paced endurance completion remains unverified: its final attempt exceeded the worker deadline and paused with an unknown outcome. The 48-case pinned-model matrix and eight-case forced-read restart experiment completed; see [live observations](benchmarks.md) for failures and measured overhead rather than an improvement claim. A later repair pilot encountered the provider's usage limit, not a successful two-repeat comparison.

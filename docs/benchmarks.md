@@ -27,10 +27,28 @@ The pilot demonstrates lower schema exposure, **not** lower total tokens or late
 
 ## Endurance workload
 
-A separate repair/build/log task is running under `.arun/long-live-20260926/`, run `1a9ff1ad-e805-4f2f-b49a-67a82780d917`. Its immutable contract selects the same native model and a locally pinned Node container image. The task repairs an incorrect exported addition function, checkpoints verified repair evidence, runs a frozen paced log producer, and searches the eventual output artifact for diagnostic/completion markers. Its completion check independently verifies arithmetic, the producer's source hash, a frozen absolute minimum finish time, and the terminal receipt in a read-only container.
+A separate repair/build/log task is recorded under `.arun/long-live-20260926/`, run `1a9ff1ad-e805-4f2f-b49a-67a82780d917`. Its immutable contract selects the same native model and a locally pinned Node container image. The task repairs an incorrect exported addition function, checkpoints verified repair evidence, runs a frozen paced log producer, and searches the eventual output artifact for diagnostic/completion markers. Its completion check independently verifies arithmetic, the producer's source hash, a frozen absolute minimum finish time, and the terminal receipt in a read-only container.
 
 This is a **paced synthetic endurance workload**, not two hours of compilation or a throughput benchmark. Completion is not yet claimed here.
 
 Forced interruption exposed an actual Windows ownership bug: killing the supervising runtime did not close the dependency's non-kill-on-close job, so its worker survived. The owned worker tree and named container were explicitly removed before recording a failed external receipt. The fix adds a non-inheritable kill-on-close lifetime job. A subsequent live interruption of the patched runner stopped its worker automatically within two seconds; resumed recovery removed its orphan Docker container and paused the unsafe operation as unknown. Only after host-verified receipts were committed did fresh native turns create new operation identities. The original uncertain intents were not replayed, and repair/checkpoint evidence was retained.
 
-The continued task now runs through the workspace-local installed `aegis` npm command. Its remaining timed execution and independent final acceptance are still pending; the full raw history retains both the original failure and the successful ownership regression.
+The final attempt through the workspace-local installed npm command, operation `7eb1cd1f-f1a8-4426-b077-b877f64cdf63`, exceeded the 7,200-second worker deadline. Its last inspected receipt remained started, the operation became `outcome_unknown`, and the task paused. Neither final output nor independent acceptance passed. The observed wall-clock gap exceeded the planned pacing interval; its cause is not established. Do not restart or replay this uncertain operation without authoritative reconciliation. The full raw history retains both the failure and the successful ownership regression.
+
+## Completed matrix and restart observations
+
+The completed experiment `.arun/evaluations/e3e4768c-9f5f-4942-9873-d460967593f6/` contains 48 cases: 50/100/250/500 tools, four modes, three tasks, **one repeat per condition**. It ran the binary built from the metadata-isolation fix, SHA256 `6dc4a3100d1df33fe8d87e71107775ed71750adf615f7adc1cb36052810c2c87`, before later unauthorized-program and post-response token-budget guards.
+
+| Task | Eager accepted | Lazy accepted | Artifact accepted | Durable accepted |
+| --- | ---: | ---: | ---: | ---: |
+| Read | 4/4 | 4/4 | 4/4 | 4/4 |
+| Large log | 0/4 | 0/4 | 4/4 | 4/4 |
+| Repair | 2/4 | 3/4 | 1/4 | 2/4 |
+
+All eight eager/lazy large-log cases failed the explicit inline-context limit. Repair failures include model behavior and the pre-fix ungranted-program recovery behavior; results are not retroactively attributed to newer code. One recorded response overshot the token ceiling, motivating the later guard that retains its usage receipt but refuses its action. A single repeat cannot support a useful paired bootstrap interval or reliability claim.
+
+The earlier matrix `.arun/evaluations/c3ce9b0d-9698-4fa6-9dc7-7229c9895acd/` was aborted after acceptance containers failed to mount missing metadata directories on fresh read-only workspaces. Its partial records are preserved but excluded from the completed matrix.
+
+Forced-read restart experiment `.arun/evaluations/08ffcb5c-74e9-4cdf-a3ee-3b44a371e652/` has eight cases at 50 tools, two repeats, cutting after `operation.succeeded`. All eight were actually interrupted. Both durable cases passed independent acceptance; the six non-durable cases failed by design. No repeated dispatch was observed. Durable recovery was 87/91 ms to the first post-restart state/model-start receipt, **not task completion latency**.
+
+Post-program-policy repair pilot `.arun/evaluations/5744e272-01e5-4e8d-bc01-cbf2007aa08c/` has eight cases at 50 tools. All four first-repeat cases passed. All four second-repeat cases failed; inspected native model-failure receipts report the ChatGPT usage limit. Three recorded zero successful-turn tokens but an unaccounted failed attempt, not zero cost. These records are not evidence of model reliability or a complete paired token comparison.
