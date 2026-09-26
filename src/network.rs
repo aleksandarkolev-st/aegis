@@ -1,4 +1,7 @@
+use std::fs::File;
+use std::io::Read;
 use std::net::IpAddr;
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -17,6 +20,16 @@ pub struct NetworkScopes {
 }
 
 impl NetworkScopes {
+    pub fn from_file(path: &Path) -> Result<Self> {
+        let mut bytes = Vec::new();
+        File::open(path)?.take(8193).read_to_end(&mut bytes)?;
+        if bytes.len() > 8192 {
+            bail!("network scopes file exceeds 8192 bytes");
+        }
+        let scopes: Self = serde_json::from_slice(&bytes).context("invalid network scopes file")?;
+        scopes.validate()?;
+        Ok(scopes)
+    }
     pub fn validate(&self) -> Result<()> {
         if self.domains.len() > 32 || !(1..=512 * 1024 * 1024).contains(&self.body_bytes) {
             bail!("network scopes require at most 32 domains and 1..536870912 body bytes");
@@ -145,8 +158,10 @@ pub(crate) fn fetch(store: &mut Store, operation: &Operation) -> Result<Value> {
         let addresses: Vec<_> = tokio::net::lookup_host((host.as_str(), 443))
             .await
             .context("network DNS lookup failed")?
+            .take(33)
             .collect();
         if addresses.is_empty()
+            || addresses.len() > 32
             || addresses
                 .iter()
                 .any(|address| !public_address(address.ip()))

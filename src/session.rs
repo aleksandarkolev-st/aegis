@@ -33,6 +33,8 @@ struct Profile {
     #[serde(default)]
     filesystem_scopes: Option<crate::filesystem::FileScopes>,
     #[serde(default)]
+    network_scopes: Option<crate::network::NetworkScopes>,
+    #[serde(default)]
     previous_run: Option<String>,
 }
 
@@ -207,6 +209,7 @@ fn configure_provider(terminal: &Terminal) -> Result<Option<(Profile, Option<Str
         acceptance_check: None,
         command_scopes: None,
         filesystem_scopes: None,
+        network_scopes: None,
         previous_run: None,
     };
     let mut secret = None;
@@ -352,6 +355,7 @@ fn settings(root: &Path, terminal: &mut Terminal, profile: &mut Profile) -> Resu
         "Appearance · mascot, colors and motion",
         "Project memory · remember what matters",
         "File access scopes · optional exact files / folders",
+        "Web access · optional approved HTTPS domains",
         "Back",
     ]
     .map(str::to_owned);
@@ -371,6 +375,7 @@ fn settings(root: &Path, terminal: &mut Terminal, profile: &mut Profile) -> Resu
         Some(4) => return configure_appearance(root, terminal, profile),
         Some(5) => return memory_menu(root, terminal),
         Some(6) => configure_file_scopes(terminal, &mut selected)?,
+        Some(7) => configure_network_scopes(terminal, &mut selected)?,
         _ => false,
     };
     if changed {
@@ -383,6 +388,81 @@ fn settings(root: &Path, terminal: &mut Terminal, profile: &mut Profile) -> Resu
         )?;
     }
     Ok(())
+}
+
+fn configure_network_scopes(terminal: &Terminal, profile: &mut Profile) -> Result<bool> {
+    terminal.message(Tone::Quiet,"Web access","Off by default. Optionally allow read-only HTTPS from exact public domains; this does not open container networking or share login credentials. Bodies have a durable byte budget.")?;
+    if let Some(scopes) = &profile.network_scopes {
+        terminal.message(Tone::Accent, "Domains", &scopes.domains.join(", "))?;
+        terminal.message(
+            Tone::Quiet,
+            "Body budget",
+            &format!(
+                "{} bytes for new tasks; at most 1 MiB per response",
+                scopes.body_bytes
+            ),
+        )?;
+    }
+    let choices = [
+        "Keep current web access",
+        "Approve exact domains here",
+        "Disable web access",
+        "Load reviewed network scopes JSON",
+        "Back",
+    ]
+    .map(str::to_owned);
+    profile.network_scopes = match terminal.select("Optional web access", &choices)? {
+        Some(1) => {
+            let mut domains = Vec::new();
+            loop {
+                let Some(domain) =
+                    field(terminal, "  Domain (example.com; empty finishes) › ", false)?
+                else {
+                    return Ok(false);
+                };
+                if domain.is_empty() {
+                    break;
+                }
+                if domains.len() >= 32 {
+                    terminal.message(
+                        Tone::Warning,
+                        "Domain limit",
+                        "At most 32 exact domains are supported. Existing settings are unchanged.",
+                    )?;
+                    return Ok(false);
+                }
+                domains.push(domain.trim().to_ascii_lowercase());
+            }
+            let scopes = crate::network::NetworkScopes {
+                domains,
+                body_bytes: 8 * 1024 * 1024,
+            };
+            if let Err(error) = scopes.validate() {
+                terminal.message(Tone::Warning, "Invalid domains", &error.to_string())?;
+                return Ok(false);
+            }
+            Some(scopes)
+        }
+        Some(2) => None,
+        Some(3) => {
+            let Some(path) = field(terminal, "  Reviewed JSON file › ", false)? else {
+                return Ok(false);
+            };
+            match crate::network::NetworkScopes::from_file(Path::new(&path)) {
+                Ok(scopes) => Some(scopes),
+                Err(error) => {
+                    terminal.message(
+                        Tone::Warning,
+                        "Invalid network scopes",
+                        &error.to_string(),
+                    )?;
+                    return Ok(false);
+                }
+            }
+        }
+        _ => return Ok(false),
+    };
+    Ok(true)
 }
 
 fn configure_file_scopes(terminal: &Terminal, profile: &mut Profile) -> Result<bool> {
@@ -1364,6 +1444,13 @@ fn task(
     if profile.image.is_some() {
         grants.extend(["process.run".into(), "process:*".into()]);
     }
+    if profile
+        .network_scopes
+        .as_ref()
+        .is_some_and(|scopes| !scopes.domains.is_empty())
+    {
+        grants.push("network.fetch".into());
+    }
     let acceptance = profile
         .acceptance_check
         .as_ref()
@@ -1377,6 +1464,7 @@ fn task(
     budgets["acceptance_check"] = json!(profile.acceptance_check);
     budgets["command_scopes"] = json!(profile.command_scopes);
     budgets["filesystem_scopes"] = json!(profile.filesystem_scopes);
+    budgets["network_scopes"] = json!(profile.network_scopes);
     let run = store.create_run(
         request,
         &std::env::current_dir()?,
@@ -1689,6 +1777,7 @@ mod tests {
             acceptance_check: None,
             command_scopes: None,
             filesystem_scopes: None,
+            network_scopes: None,
             previous_run: None,
         };
         save(directory.path(), &profile)?;

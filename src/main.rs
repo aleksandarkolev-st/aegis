@@ -36,6 +36,9 @@ fn usage() {
         "File access: --filesystem-scopes <reviewed.json>; optional inline file/folder scopes are available in F7 settings."
     );
     println!(
+        "Web reads: --network-scopes <reviewed.json>; optional exact HTTPS domains are available in F7 settings."
+    );
+    println!(
         "arun tasks|context|tools|artifacts <run-id> | mcp add <name> --image <local-image> [--allow-write] -- <command> [args...] | mcp add <name> --trusted-host -- <command> [args...]"
     );
     println!(
@@ -154,6 +157,7 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
     let mut acceptance_check = None;
     let mut command_scopes = None;
     let mut filesystem_scopes = None;
+    let mut network_scopes = None;
     let mut mcp_tools = Vec::new();
     let mut task = Vec::new();
     let mut index = 0;
@@ -224,6 +228,13 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
                     .get(index)
                     .context("--filesystem-scopes needs a JSON file")?;
                 filesystem_scopes = Some(arun::filesystem::FileScopes::from_file(Path::new(path))?);
+            }
+            "--network-scopes" => {
+                index += 1;
+                let path = args
+                    .get(index)
+                    .context("--network-scopes needs a JSON file")?;
+                network_scopes = Some(arun::network::NetworkScopes::from_file(Path::new(path))?);
             }
             "--command-scopes" => {
                 index += 1;
@@ -360,6 +371,12 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
         None
     };
     let mut grants = vec!["workspace.read".to_owned()];
+    if network_scopes
+        .as_ref()
+        .is_some_and(|scopes| !scopes.domains.is_empty())
+    {
+        grants.push("network.fetch".into());
+    }
     if write {
         grants.push("workspace.write".into());
     }
@@ -383,7 +400,7 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
         provider,
         json!(grants),
         json!({"model": model, "endpoint":endpoint, "mode": mode, "actions": actions, "model_tokens": model_tokens, "wall_seconds": wall_seconds, "context_chars": context_chars,
-            "model_seconds": 180, "model_response_bytes": model_response_bytes, "process_seconds": process_seconds, "container_image": image, "acceptance_check":acceptance_check, "command_scopes":command_scopes, "filesystem_scopes":filesystem_scopes}),
+            "model_seconds": 180, "model_response_bytes": model_response_bytes, "process_seconds": process_seconds, "container_image": image, "acceptance_check":acceptance_check, "command_scopes":command_scopes, "filesystem_scopes":filesystem_scopes, "network_scopes":network_scopes}),
         acceptance,
     )?;
     println!("run: {} provider: {}", run.id, run.provider);
