@@ -12,7 +12,7 @@ The scrollback interface has an animated activity line, elapsed time and token c
 - F3: select saved tasks, follow or resume them, cancel, inspect context/tools/evidence, or review interrupted outcomes.
 - F4: open native sign-in or enter a custom endpoint key privately.
 - F5: start a fresh conversation without deleting previous tasks.
-- Ctrl+C during execution: cancel the task. Ctrl+D during execution: detach without stopping it.
+- Ctrl+C once: interrupt the active operation. Press twice within 900 ms to interrupt the model turn. Ctrl+D detaches without stopping the task; cancel the entire task from its F3 menu.
 - Ctrl+D at an empty prompt: exit. Up/Down: recall task input.
 
 Set `NO_COLOR=1` to disable colors or `AEGIS_REDUCED_MOTION=1` to disable animation. Custom keys are held in session memory and passed to the model runner, not saved in the profile or forwarded to tool workers. The profile remembers only the key's environment-variable reference.
@@ -92,6 +92,10 @@ arun resume <run-id>
 
 Run options include `--actions`, `--model-tokens`, `--wall-seconds`, `--context-chars` (default 256,000), and `--mode eager|lazy|artifact|durable`. Eager exposes all granted schemas; lazy discovers them on demand. Both inline complete results and disable artifact inspection. Artifact adds bounded result handles and inspection; durable also reconciles interrupted operations. Non-durable modes fail on process restart. Context overflow is recorded as a failure, not silently truncated. Provider-reported token counts are recorded where available; otherwise counts are marked estimated. `trace` shows committed model, discovery, operation, and state transitions with schema-byte, token, and timing metrics; `replay` retains raw JSON events. Completion requires successful-operation artifact evidence, and any planned milestones must carry evidence. This is provenance checking, not a substitute for external acceptance tests.
 
+### Scoped interruption
+
+Interrupting an operation does not cancel its durable task. An undispatched operation stops without executing; a claimed unsafe operation pauses with `outcome_unknown` until its external effects are reconciled. Read-only interrupted operations can stop without assuming a side effect was undone. A model-turn interrupt stops that provider call and pauses the task for resumption. Requests target an operation ID or a specific started-turn sequence, so an old request cannot interrupt a later resumed model turn. Work that already completed keeps its recorded result. Advanced automation can request `arun interrupt <run-id> operation|model`; terminal users use Ctrl+C and the task menu instead.
+
 ### Long-history recovery
 
 Durable runs save a content-addressed recovery snapshot at startup and after roughly 256 committed events. A new runner verifies the task contract, replays only events after that snapshot, and checks the recovered state against transactional projections. Snapshots retain checkpoint references, milestones, activated capability versions, budgets/accounting, and unfinished operation identities; they never execute adapters.
@@ -167,4 +171,4 @@ Every completed evaluation writes `paired-summary.json`, matching candidate runs
 
 ## Remaining work
 
-The broader `plan.txt` still needs multi-hour live demonstrations and the proposed granular Ctrl+C operation/model-turn semantics. Forced-restart integration fixtures exercise a committed read across all four modes, checkpoint continuity through an archived history, and an unsafe in-flight MCP call; these are mock-provider correctness checks, not live comparative performance results. Live Claude completion remains pending reauthentication. The Codex CLI adapter disables its built-in tools, but its own system context still incurs substantial token overhead; measured usage is reported rather than presented as a kernel-only schema cost.
+The broader `plan.txt` still needs multi-hour live demonstrations. Forced-restart integration fixtures exercise a committed read across all four modes, checkpoint continuity through an archived history, and an unsafe in-flight MCP call; these are mock-provider correctness checks, not live comparative performance results. Live Claude completion remains pending reauthentication. The Codex CLI adapter disables its built-in tools, but its own system context still incurs substantial token overhead; measured usage is reported rather than presented as a kernel-only schema cost.

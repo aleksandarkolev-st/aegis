@@ -22,7 +22,7 @@ This is a development verification record, not a success-rate or performance-imp
 
 ## Automated checks
 
-- `cargo test --locked`: 50 unit tests and 16 integration tests passed after the snapshot/archive changes; three Docker tests are ignored by default.
+- `cargo test --locked`: 53 unit tests and 18 integration tests passed after the snapshot/archive and scoped-interruption changes; three Docker tests are ignored by default.
 - `cargo test --test docker --test docker_acceptance --test docker_mcp -- --ignored`: all three passed separately with Docker running. They verify multi-megabyte output virtualization, hidden runtime state, immutable/read-only acceptance checks, and MCP filesystem/network/credential isolation.
 - `npm test`: four package/platform/checksum/version tests passed.
 - Process-tree tests verify that explicit kill and drop cleanup stop a descendant heartbeat, not merely its launcher.
@@ -35,6 +35,7 @@ This is a development verification record, not a success-rate or performance-imp
 - A natural-exit regression covers a Windows completion-port double-wait hang discovered during Docker testing and fixed before the successful rerun.
 - Snapshot tests archive a 3,000-turn synthetic history, recover the original accounting and an executing write from fewer than 32 tail events, and reconstruct the complete ordered audit. Corrupt cold archives fail audit reads without entering normal recovery; corrupt snapshots fail recovery.
 - The forced-read restart fixture now preserves a checkpoint across 1,100 archived detail events, fresh provider processes, and an actual runner restart. This is continuity evidence, not a multi-hour live demonstration.
+- Scoped-interruption fixtures stop an actual in-flight HTTP model request without cancelling its task, resume a new turn without inheriting the old request, and interrupt an effectful MCP call only after its external file write. The latter remains unknown and is not replayed. A direct-adapter test rejects an interrupted write before claim. Keyboard timing is tested separately; this phase does not claim a new manual terminal-key demonstration.
 - `git diff --check`: passed.
 
 ## Not yet verified or delivered
@@ -43,4 +44,3 @@ This is a development verification record, not a success-rate or performance-imp
 - Actual Linux/macOS release builds; the checked-in release matrix still needs to run in CI.
 - Live Claude completion after reauthentication.
 - Multi-hour live demonstrations and live paired/restart comparisons with pinned models.
-- Granular operation/model-turn Ctrl+C semantics.

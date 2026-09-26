@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -293,10 +293,34 @@ fn secret_reference(profile: &Profile) -> Option<&str> {
         .and_then(|endpoint| endpoint.api_key_env.as_deref())
 }
 
+#[derive(Default)]
+struct InterruptKeys {
+    previous: Option<Instant>,
+}
+
+impl InterruptKeys {
+    fn next(&mut self, now: Instant) -> crate::interrupt::Scope {
+        if self.previous.is_some_and(|previous| {
+            now.saturating_duration_since(previous) <= Duration::from_millis(900)
+        }) {
+            self.previous = None;
+            crate::interrupt::Scope::Model
+        } else {
+            self.previous = Some(now);
+            crate::interrupt::Scope::Operation
+        }
+    }
+}
+
 fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
     let _raw = RawMode::enter(terminal.interactive)?;
     let mut store = Store::open(root)?;
-    let mut sequence = 0;
+    let mut sequence = store
+        .recent_events(id, 64)?
+        .first()
+        .map(|event| event.seq - 1)
+        .unwrap_or(0);
+    let mut interrupts = InterruptKeys::default();
     let started = Instant::now();
     let mut phase = "Starting task".to_owned();
     loop {
@@ -346,6 +370,9 @@ fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
         terminal.activity(&phase, started.elapsed(), store.model_tokens(id)?)?;
         if terminal.interactive && event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Release {
+                    continue;
+                }
                 if key.modifiers.contains(KeyModifiers::CONTROL) {
                     match key.code {
                         KeyCode::Char('d') => {
@@ -358,8 +385,18 @@ fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
                             return Ok(());
                         }
                         KeyCode::Char('c') => {
-                            if matches!(store.run(id)?.state.as_str(), "ready" | "running") {
-                                store.state(id, "cancelled", json!({"source":"terminal"}))?;
+                            let scope = interrupts.next(Instant::now());
+                            terminal.clear_activity()?;
+                            match store.request_interrupt(id, scope) {
+                                Ok(Some(_)) => terminal.message(Tone::Warning, "Interrupt", match scope {
+                                    crate::interrupt::Scope::Operation => "Stopping this operation; the task itself remains available.",
+                                    crate::interrupt::Scope::Model => "Interrupting this model turn; you can resume the task later.",
+                                })?,
+                                Ok(None) => terminal.message(Tone::Quiet, "Interrupt", match scope {
+                                    crate::interrupt::Scope::Operation => "No active operation. Press Ctrl+C again quickly to interrupt the model turn.",
+                                    crate::interrupt::Scope::Model => "No active model turn. Ctrl+D detaches; use the task menu to cancel the whole task.",
+                                })?,
+                                Err(error) => terminal.message(Tone::Warning, "Interrupt", &error.to_string())?,
                             }
                         }
                         _ => {}
@@ -821,7 +858,7 @@ pub fn interactive(root: &Path) -> Result<()> {
                         } else { terminal.message(Tone::Quiet, "", "No current task. Describe one to get started.")?; }
                     }
                     "/exit" | "/quit" => break,
-                    "/help" => terminal.message(Tone::Quiet, "Help", "Write a task in plain language. F2 changes provider, F3 opens tasks, F4 signs in, F5 starts a fresh conversation. Ctrl+C stops an active task; Ctrl+D detaches. Up recalls previous tasks.")?,
+                    "/help" => terminal.message(Tone::Quiet, "Help", "Write a task in plain language. F2 changes provider, F3 opens tasks, F4 signs in, F5 starts a fresh conversation. Ctrl+C interrupts an operation; press twice quickly to interrupt the model turn. Ctrl+D detaches. Cancel the entire task from its F3 menu. Up recalls previous tasks.")?,
                     _ => {
                         history.push(request.to_owned());
                         if profile.provider != "custom" && !ensure_provider(&terminal, &profile.provider)? {
@@ -847,6 +884,25 @@ pub fn interactive(root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_quick_second_press_interrupts_the_model_turn() {
+        let mut keys = InterruptKeys::default();
+        let now = Instant::now();
+        assert!(matches!(keys.next(now), crate::interrupt::Scope::Operation));
+        assert!(matches!(
+            keys.next(now + Duration::from_millis(100)),
+            crate::interrupt::Scope::Model
+        ));
+        assert!(matches!(
+            keys.next(now + Duration::from_millis(200)),
+            crate::interrupt::Scope::Operation
+        ));
+        assert!(matches!(
+            keys.next(now + Duration::from_secs(2)),
+            crate::interrupt::Scope::Operation
+        ));
+    }
 
     #[test]
     fn image_references_cannot_be_command_options_or_shell_expressions() {

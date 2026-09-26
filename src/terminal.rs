@@ -182,7 +182,7 @@ impl Terminal {
             .map(|(width, _)| width as usize)
             .unwrap_or(80);
         let text = format!(
-            "  {frame} {} · {}s · {} tokens  |  Ctrl+C stop · Ctrl+D detach",
+            "  {frame} {} · {}s · {} tokens  |  Ctrl+C interrupt · Ctrl+D detach",
             clean(label),
             elapsed.as_secs(),
             tokens
@@ -522,6 +522,11 @@ impl Terminal {
                 Tone::Warning,
                 "!",
                 &fit(payload["error"].as_str().unwrap_or("Action failed"), 500),
+            ),
+            "operation.cancelled" => self.message(
+                Tone::Warning,
+                "Interrupted",
+                "Operation stopped; no unsafe effects were assumed undone.",
             ),
             "operation.failed" | "operation.outcome_unknown" => self.message(
                 Tone::Warning,
