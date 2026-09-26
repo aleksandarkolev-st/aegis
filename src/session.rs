@@ -368,7 +368,7 @@ fn settings(root: &Path, terminal: &mut Terminal, profile: &mut Profile) -> Resu
         }
         Some(2) => configure_acceptance(terminal, &mut selected)?,
         Some(3) => configure_command_scopes(terminal, &mut selected)?,
-        Some(4) => return configure_appearance(root, terminal),
+        Some(4) => return configure_appearance(root, terminal, profile),
         Some(5) => return memory_menu(root, terminal),
         Some(6) => configure_file_scopes(terminal, &mut selected)?,
         _ => false,
@@ -557,7 +557,7 @@ fn configure_command_scopes(terminal: &Terminal, profile: &mut Profile) -> Resul
     Ok(true)
 }
 
-fn configure_appearance(root: &Path, terminal: &mut Terminal) -> Result<()> {
+fn configure_appearance(root: &Path, terminal: &mut Terminal, profile: &Profile) -> Result<()> {
     let choices = [
         "Mint + Pip · tiny shield sidekick",
         "Midnight + Byte · little robot",
@@ -592,7 +592,7 @@ fn configure_appearance(root: &Path, terminal: &mut Terminal) -> Result<()> {
     style.save(root)?;
     terminal.apply_ui(style)?;
     terminal.welcome(
-        "Your look, your workflow",
+        name(&profile.provider),
         &std::env::current_dir()?.display().to_string(),
     )?;
     terminal.message(
