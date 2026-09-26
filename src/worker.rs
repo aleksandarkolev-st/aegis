@@ -205,7 +205,7 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
                     .any(|byte| byte == b'/' || byte == 92 || byte == b':')
                 || !grants
                     .iter()
-                    .any(|grant| grant == &format!("process:{program}"))
+                    .any(|grant| grant == &format!("process:{program}") || grant == "process:*")
             {
                 bail!("program is not explicitly granted");
             }

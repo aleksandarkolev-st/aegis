@@ -1,8 +1,35 @@
-# Agent Microkernel Runtime
+# Aegis — Terminal Agent Runtime
 
 `arun` is a Rust terminal agent with a durable SQLite event log, content-addressed artifacts, permission-filtered capability discovery, and out-of-process execution. The model returns one structured action at a time; the kernel owns state, grants, retries, context assembly, and evidence.
 
-## Build and sign in
+## Open Aegis
+
+Launch `aegis` (or `arun`) with no arguments. Choose ChatGPT, Claude Code, Grok, or a custom OpenAI-compatible endpoint, choose workspace permissions, and describe your task in plain language. The terminal handles task creation, execution, progress, and evidence automatically; you do not need to enter `run`, `attach`, or task IDs.
+
+The scrollback interface has an animated activity line, elapsed time and token counts, editable input with history, and these shortcuts:
+
+- F2: choose a provider and permissions.
+- F3: select recent tasks, follow or resume them, cancel, or inspect milestones and traces.
+- F4: open native sign-in or enter a custom endpoint key privately.
+- Ctrl+C during execution: cancel the task. Ctrl+D during execution: detach without stopping it.
+- Ctrl+D at an empty prompt: exit. Up/Down: recall task input.
+
+Set `NO_COLOR=1` to disable colors or `AEGIS_REDUCED_MOTION=1` to disable animation. Custom keys are held in session memory and passed to the model runner, not saved in the profile or forwarded to tool workers. The profile remembers only the key's environment-variable reference.
+
+### Node package
+
+The package is named **`aegis-arun`**, with both `aegis` and `arun` commands. A local bundled installation can be built with:
+
+```powershell
+npm run build:native
+npm pack
+npm install -g ./aegis-arun-0.1.0.tgz
+aegis
+```
+
+Building locally requires Node 20+ and Rust. Published packages download a platform-specific native runtime with SHA-256 verification; end users do not need Rust. Public `npm install -g aegis-arun` requires publishing the package and matching GitHub release assets first; publication is not yet claimed.
+
+## Advanced CLI and source builds
 
 ```powershell
 cargo build --release

@@ -135,7 +135,7 @@ impl Terminal {
                     .unwrap_or(64) as usize,
             ),
         )?;
-        self.message(Tone::Accent, "Connected", provider)?;
+        self.message(Tone::Accent, "Provider", provider)?;
         self.message(Tone::Quiet, "Workspace", workspace)?;
         self.message(
             Tone::Quiet,
@@ -355,15 +355,23 @@ impl Terminal {
                 "Discover",
                 payload["query"].as_str().unwrap_or_default(),
             ),
-            "operation.pending" => self.message(
-                Tone::Accent,
-                "Tool",
-                &format!(
-                    "{}  {}",
-                    payload["capability"].as_str().unwrap_or_default(),
-                    payload["arguments"]
-                ),
-            ),
+            "operation.pending" => {
+                let args = &payload["arguments"];
+                let detail = args["path"]
+                    .as_str()
+                    .or_else(|| args["query"].as_str())
+                    .or_else(|| args["program"].as_str())
+                    .unwrap_or_default();
+                self.message(
+                    Tone::Accent,
+                    "Tool",
+                    &format!(
+                        "{}  {}",
+                        payload["capability"].as_str().unwrap_or_default(),
+                        fit(detail, 160)
+                    ),
+                )
+            }
             "operation.succeeded" => self.message(Tone::Success, "✓", "Result stored as evidence"),
             "run.completed" => self.message(
                 Tone::Success,

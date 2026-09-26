@@ -154,6 +154,26 @@ pub fn call(
     Ok((response.action, response.raw))
 }
 
+pub fn login(provider: &str) -> Result<()> {
+    let (program, arguments): (&str, &[&str]) = match provider {
+        "chatgpt" | "codex" => (
+            if cfg!(windows) { "codex.cmd" } else { "codex" },
+            &["login"],
+        ),
+        "claude" | "claude-code" => ("claude", &["auth", "login"]),
+        "grok" => ("grok", &["login"]),
+        _ => bail!("native login is available for ChatGPT, Claude Code, and Grok"),
+    };
+    let status = Command::new(program)
+        .args(arguments)
+        .status()
+        .with_context(|| format!("start {provider} login; its CLI must be installed"))?;
+    if !status.success() {
+        bail!("provider login did not complete successfully");
+    }
+    Ok(())
+}
+
 pub fn call_with_cancel(
     provider: &str,
     prompt: &str,

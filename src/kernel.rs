@@ -154,14 +154,23 @@ fn dispatch(root: &Path, operation: &Operation, timeout: Duration) -> Result<Val
     let output = tempfile::tempdir_in(root)?;
     let stdout = output.path().join("result");
     let stderr = output.path().join("error");
-    let mut child = Command::new(std::env::current_exe()?)
+    let mut command = Command::new(std::env::current_exe()?);
+    command
         .arg("worker")
         .arg(root)
         .arg(&operation.id)
         .stdin(Stdio::null())
         .stdout(Stdio::from(File::create(&stdout)?))
-        .stderr(Stdio::from(File::create(&stderr)?))
-        .spawn()?;
+        .stderr(Stdio::from(File::create(&stderr)?));
+    let run = Store::open(root)?.run(&operation.run_id)?;
+    if let Some(reference) = run
+        .budgets
+        .pointer("/endpoint/api_key_env")
+        .and_then(Value::as_str)
+    {
+        command.env_remove(reference);
+    }
+    let mut child = command.spawn()?;
     let start = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
@@ -237,6 +246,50 @@ pub(crate) fn perform(
         }
     }
     Ok(false)
+}
+
+pub fn spawn(root: &Path, id: &str, secret: Option<(&str, &str)>) -> Result<()> {
+    uuid::Uuid::parse_str(id).context("invalid run ID")?;
+    if is_active(root, id)? {
+        return Ok(());
+    }
+    let log = File::options()
+        .create(true)
+        .append(true)
+        .open(root.join(format!("daemon-{id}.log")))?;
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg("serve")
+        .arg(root)
+        .arg(id)
+        .stdin(Stdio::null())
+        .stderr(Stdio::from(log.try_clone()?))
+        .stdout(Stdio::from(log));
+    if let Some((name, value)) = secret {
+        command.env(name, value);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x00000008 | 0x00000200);
+    }
+    command.spawn().context("start detached task")?;
+    Ok(())
+}
+
+pub fn is_active(root: &Path, id: &str) -> Result<bool> {
+    uuid::Uuid::parse_str(id).context("invalid run ID")?;
+    let lock = File::options()
+        .write(true)
+        .create(true)
+        .open(root.join(format!("run-{id}.lock")))?;
+    match fs2::FileExt::try_lock_exclusive(&lock) {
+        Ok(()) => Ok(false),
+        Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+            Ok(true)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn apply(store: &mut Store, root: &Path, run: &Run, action: Action) -> Result<bool> {
@@ -463,6 +516,26 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attaching_to_an_active_runner_does_not_spawn_or_truncate_logs() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let id = uuid::Uuid::new_v4().to_string();
+        assert!(!is_active(directory.path(), &id)?);
+        let lock = File::options()
+            .write(true)
+            .open(directory.path().join(format!("run-{id}.lock")))?;
+        fs2::FileExt::try_lock_exclusive(&lock)?;
+        let log = directory.path().join(format!("daemon-{id}.log"));
+        std::fs::write(&log, "previous runner output")?;
+        assert!(is_active(directory.path(), &id)?);
+        spawn(directory.path(), &id, None)?;
+        assert_eq!(std::fs::read_to_string(log)?, "previous runner output");
+        drop(lock);
+        assert!(!is_active(directory.path(), &id)?);
+        assert!(is_active(directory.path(), "../invalid").is_err());
+        Ok(())
+    }
 
     #[test]
     fn context_is_bounded_and_only_exposes_activated_schemas() -> Result<()> {
