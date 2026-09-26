@@ -1296,7 +1296,7 @@ mod tests {
         );
         assert!(store.load_recovery(&run.id)?.is_some());
         drop(store);
-        let store = Store::open(directory.path())?;
+        let mut store = Store::open(directory.path())?;
         assert!(store.load_recovery(&run.id)?.is_some());
         assert_eq!(store.active_capabilities(&run.id)?.len(), 8);
         assert!(store.has_evidence(&run.id, &evidence)?);
