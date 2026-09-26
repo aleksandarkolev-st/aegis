@@ -250,10 +250,19 @@ impl Terminal {
 
     pub fn message(&self, tone: Tone, label: &str, text: &str) -> Result<()> {
         let mut output = io::stdout();
+        let width = terminal::size()
+            .map(|(width, _)| width as usize)
+            .unwrap_or(80)
+            .saturating_sub(1);
+        let label = if self.interactive {
+            fit(label, width / 2)
+        } else {
+            clean(label)
+        };
         if self.colors {
             queue!(output, SetForegroundColor(self.color(tone)))?;
         }
-        write!(output, "  {}", clean(label))?;
+        write!(output, "  {label}")?;
         if self.colors {
             queue!(output, ResetColor)?;
         }
@@ -261,8 +270,17 @@ impl Terminal {
             friendly_error(text)
         } else {
             clean(text)
-        }
-        .replace('\n', "\r\n    ");
+        };
+        let text = if self.interactive {
+            wrap_text(
+                &text,
+                width.saturating_sub(label.width() + 4),
+                width.saturating_sub(4),
+            )
+            .join("\r\n    ")
+        } else {
+            text.replace('\n', "\r\n    ")
+        };
         write!(output, "  {text}\r\n")?;
         output.flush()?;
         Ok(())
@@ -961,6 +979,42 @@ fn input_view(text: &[char], caret: usize, width: usize) -> (String, usize) {
     )
 }
 
+fn wrap_text(text: &str, first_width: usize, next_width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for paragraph in text.split('\n') {
+        let mut remaining = paragraph.trim_end();
+        if remaining.is_empty() {
+            lines.push(String::new());
+        }
+        while !remaining.is_empty() {
+            let width = if lines.is_empty() {
+                first_width
+            } else {
+                next_width
+            }
+            .max(1);
+            let fitted = fit(remaining, width);
+            if fitted.is_empty() {
+                let character = remaining.chars().next().unwrap();
+                lines.push("?".into());
+                remaining = &remaining[character.len_utf8()..];
+                continue;
+            }
+            let cut = if fitted.len() < remaining.len() {
+                fitted
+                    .rfind(char::is_whitespace)
+                    .filter(|cut| *cut > 0)
+                    .unwrap_or(fitted.len())
+            } else {
+                fitted.len()
+            };
+            lines.push(remaining[..cut].trim_end().to_owned());
+            remaining = remaining[cut..].trim_start();
+        }
+    }
+    lines
+}
+
 pub fn fit(text: &str, width: usize) -> String {
     let mut output = String::new();
     let mut occupied = 0;
@@ -978,6 +1032,25 @@ pub fn fit(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_wrapping_respects_label_space_wide_text_and_long_paths() {
+        for text in [
+            "Saved for future tasks in this workspace. No model call needed.",
+            "日本語の長い説明です",
+            "really/long/path/without/spaces/file.rs",
+        ] {
+            let lines = wrap_text(text, 12, 18);
+            assert!(lines[0].width() <= 12);
+            assert!(lines.iter().skip(1).all(|line| line.width() <= 18));
+            assert_eq!(lines.join("").replace(' ', ""), text.replace(' ', ""));
+        }
+        assert_eq!(
+            wrap_text("first\n\nsecond", 20, 20),
+            vec!["first", "", "second"]
+        );
+        assert_eq!(wrap_text("日", 1, 1), vec!["?"]);
+    }
 
     #[test]
     fn provider_errors_are_actionable_without_dumping_json_or_credentials() {
