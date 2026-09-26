@@ -6,6 +6,26 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 #[test]
+fn polling_a_natural_exit_then_dropping_does_not_wait_twice() -> Result<()> {
+    let mut command = Command::new("node");
+    command.args(["-e", "process.exit(0)"]);
+    let mut child = arun::process::spawn(command)?;
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            assert!(status.success());
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(5));
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(child.wait()?.success());
+    drop(child);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    Ok(())
+}
+
+#[test]
 fn kill_and_drop_stop_descendants_not_only_the_launcher() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let fixture = directory.path().join("tree.cjs");

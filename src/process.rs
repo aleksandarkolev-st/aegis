@@ -13,17 +13,22 @@ impl Child {
     }
 
     pub fn kill(&mut self) -> io::Result<()> {
-        self.inner.kill()
+        self.inner.start_kill()
     }
 
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
-        self.inner.wait()
+        loop {
+            if let Some(status) = self.try_wait()? {
+                return Ok(status);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }
 
 impl Drop for Child {
     fn drop(&mut self) {
-        let _ = self.inner.kill();
+        let _ = self.inner.start_kill();
     }
 }
 
