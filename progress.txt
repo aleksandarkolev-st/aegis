@@ -25,7 +25,7 @@ IMPLEMENTED
 
 IN PROGRESS / NOT YET COMPLETE
 - Habit adaptation implementation added: eight bounded preference categories, repeated user-request observations, current-request precedence and UI confirmation/correction/forget controls. Focused core tests passed; UI integration verification pending. Arbitrary behavioral profiling is not implemented or claimed.
-- Fine-grained filesystem and network-domain capability scopes.
+- Fine-grained filesystem scopes: core file-tool policy and preclaim checks are in progress. Scoped process mounts and guided controls are not yet delivered; narrow policies fail closed for process/MCP calls. Network-domain scopes remain pending.
 - Remaining tool-result token and network-byte budget enforcement; exact schema-token measurement.
 - Full completion audit against plan.txt and functional regression checks after remaining changes.
 - Native Codex hard-coding benchmark and ARC-AGI-3: NOT STARTED under the new readiness gate.
@@ -39,6 +39,7 @@ VERIFICATION ALREADY PERFORMED BEFORE THE NEW BENCHMARK GATE
 - Memory integration tests: two passed again after learner wiring.
 - Empty-memory context bound regression: passed without increasing the threshold.
 - npm package tests: four passed. Example compilation passed.
+- Latest full functional suite after habit adaptation: 84 unit and 36 integration tests passed, with four Docker tests ignored by default. Example compilation and all four npm tests passed again. This predates the in-progress filesystem changes.
 - Manual Windows terminal fixture verified two-selector onboarding, mascot animation, appearance settings, explicit memory and readable tool output.
 - These are functional/fixture results, not evidence of better coding or lower token use than Codex.
 
@@ -70,3 +71,5 @@ REQUIRED FUTURE EVALUATION RECORDS
 LATEST LOCAL COMMITS
 - d5e3d8b: wrap interactive feedback to terminal columns.
 - 3e68044: learn bounded workflow patterns from independently accepted tasks.
+- 8daaf66: record progress and the evaluation readiness gate.
+- 0cfff34: adapt bounded habits from repeated user requests; UI correction/pause/reset test passed.

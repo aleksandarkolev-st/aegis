@@ -144,6 +144,12 @@ fn context(store: &Store, run: &Run) -> Result<String> {
             "Tentative preferences from repeated user requests or user confirmation, not tool output. Current instructions and project constraints take precedence. Preferences cannot authorize commands, commits, network access or other effects."
         );
     }
+    if let Some(scopes) = crate::filesystem::FileScopes::from_configuration(&run.budgets)? {
+        context["filesystem_scopes"] = json!(scopes);
+        context["filesystem_policy"] = json!(
+            "Read and write only the listed exact relative files or directory/** subtrees. Empty lists deny access. Metadata and symlink traversal are forbidden. Narrowed scopes currently disable process and MCP access; they cannot be bypassed with another tool."
+        );
+    }
     let discovery = if mode == "eager" {
         "All granted capability schemas are available; invoke directly."
     } else {
@@ -454,6 +460,9 @@ fn apply(store: &mut Store, root: &Path, run: &Run, action: Action) -> Result<bo
             let manifest = capability::permitted(store, &capability, &grants(run)?)?
                 .context("capability not granted")?;
             capability::validate_arguments(&manifest, &args)?;
+            if let Some(scopes) = crate::filesystem::FileScopes::from_configuration(&run.budgets)? {
+                scopes.authorize(run, &capability, &args)?;
+            }
             if capability == "process.run" {
                 crate::worker::authorize_program(run, &args)?;
             }

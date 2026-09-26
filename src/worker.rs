@@ -202,6 +202,10 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
         bail!("capability version changed after intent was recorded");
     }
     capability::validate_arguments(&manifest, &operation.arguments)?;
+    let file_scopes = crate::filesystem::FileScopes::from_configuration(&run.budgets)?;
+    if let Some(scopes) = &file_scopes {
+        scopes.authorize(&run, &operation.capability, &operation.arguments)?;
+    }
     if operation.capability == "process.run" {
         authorize_program(&run, &operation.arguments)?;
     }
@@ -234,6 +238,19 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
                     if kind.is_dir() {
                         pending.push(entry.path());
                     } else if kind.is_file() && entry.metadata()?.len() <= MAX_FILE {
+                        if let Some(scopes) = &file_scopes {
+                            let relative_path = entry
+                                .path()
+                                .strip_prefix(workspace)?
+                                .to_string_lossy()
+                                .into_owned();
+                            if scopes
+                                .checked_path(workspace, &relative_path, false)
+                                .is_err()
+                            {
+                                continue;
+                            }
+                        }
                         if let Ok(text) = fs::read_to_string(entry.path()) {
                             for (line_number, line) in text.lines().enumerate() {
                                 if line.contains(query) {

@@ -303,6 +303,7 @@ impl Store {
         };
         crate::acceptance::Check::from_run(&run)?;
         crate::policy::CommandScopes::from_configuration(&run.budgets)?;
+        crate::filesystem::FileScopes::from_configuration(&run.budgets)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
