@@ -98,6 +98,44 @@ pub fn grok_output(text: &str) -> Catalog {
     }
 }
 
+pub fn grok_cache(path: &Path) -> Result<Catalog> {
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(8 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        bail!("Grok model cache is too large");
+    }
+    let value: Value = serde_json::from_slice(&bytes)?;
+    let mut models = Vec::new();
+    for (id, model) in value["models"]
+        .as_object()
+        .context("Grok cache has no model catalog")?
+    {
+        let info = &model["info"];
+        if info["hidden"].as_bool() == Some(true) {
+            continue;
+        }
+        if info.is_object() {
+            insert(
+                &mut models,
+                info["id"].as_str().unwrap_or(id),
+                info["name"].as_str().unwrap_or(id),
+            );
+        }
+    }
+    Ok(Catalog {
+        models,
+        source: format!(
+            "Grok cached catalog · {} · account access can change",
+            crate::terminal::fit(
+                value["fetched_at"].as_str().unwrap_or("date unavailable"),
+                40
+            )
+        ),
+    })
+}
+
 pub fn native(provider: &str) -> Result<Catalog> {
     match provider {
         "codex" => {
@@ -111,6 +149,11 @@ pub fn native(provider: &str) -> Result<Catalog> {
             source: "Claude Code model aliases · resolved by your CLI; account access depends on your plan".into(),
         }),
         "grok" => {
+            if let Some(home) = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }) {
+                if let Ok(catalog) = grok_cache(&std::path::PathBuf::from(home).join(".grok/models_cache.json")) {
+                    if !catalog.models.is_empty() { return Ok(catalog); }
+                }
+            }
             let directory = tempfile::tempdir()?;
             let stdout = directory.path().join("models");
             let mut command = Command::new(crate::provider::executable(provider)?);
@@ -183,6 +226,30 @@ mod tests {
                 .source
                 .contains("fallback")
         );
+    }
+
+    #[test]
+    fn grok_cache_uses_only_public_display_fields_and_skips_hidden_models() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("models_cache.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({"fetched_at":"fixture", "models": {
+                "grok-example":{"info":{"id":"grok-example","name":"Grok Example","hidden":false}, "api_key":"fixture-private-value"},
+                "grok-hidden":{"info":{"id":"grok-hidden","hidden":true}}
+            }}))?,
+        )?;
+        let catalog = grok_cache(&path)?;
+        assert_eq!(
+            catalog.models,
+            vec![Model {
+                id: "grok-example".into(),
+                label: "Grok Example".into()
+            }]
+        );
+        assert!(catalog.source.contains("cached"));
+        assert!(!catalog.source.contains("fixture-private-value"));
+        Ok(())
     }
 
     #[test]

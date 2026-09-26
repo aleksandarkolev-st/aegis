@@ -74,7 +74,7 @@ fn choose_model(
             terminal.message(
                 Tone::Quiet,
                 "Catalog",
-                &crate::terminal::friendly_error(&error.to_string()),
+                &format!("Model list unavailable · {}. Default/manual selection is still available; F4 refreshes sign-in.", if error.to_string().to_lowercase().contains("timed out") { "provider didn't respond in time" } else { "listing is unsupported or not ready" }),
             )?;
             Vec::new()
         }
