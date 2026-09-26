@@ -42,7 +42,9 @@ pub fn spawn(command: Command) -> io::Result<Child> {
     command.wrap(process_wrap::std::JobObject);
     #[cfg(unix)]
     command.wrap(process_wrap::std::ProcessGroup::leader());
-    let mut inner = command.spawn()?;
+    let inner = command.spawn()?;
+    #[cfg(windows)]
+    let mut inner = inner;
     #[cfg(windows)]
     {
         use std::os::windows::io::AsRawHandle;

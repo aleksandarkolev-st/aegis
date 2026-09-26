@@ -23,7 +23,9 @@ fn usage() {
         "arun attach|resume|status|cancel|replay|trace <run-id> | resolve <run-id> <op-id> succeeded|failed <note> | list | inspect <artifact-hash> | login|probe <provider>"
     );
     println!("arun interrupt <run-id> operation|model");
-    println!("Long commands: arun run <task> --process-seconds <1..7200> --wall-seconds <task-limit>");
+    println!(
+        "Long commands: arun run <task> --process-seconds <1..7200> --wall-seconds <task-limit>"
+    );
     println!(
         "arun tasks|context|tools|artifacts <run-id> | mcp add <name> --image <local-image> [--allow-write] -- <command> [args...] | mcp add <name> --trusted-host -- <command> [args...]"
     );
