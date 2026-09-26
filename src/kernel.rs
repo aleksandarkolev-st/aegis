@@ -384,11 +384,12 @@ pub fn is_active(root: &Path, id: &str) -> Result<bool> {
 fn apply(store: &mut Store, root: &Path, run: &Run, action: Action) -> Result<bool> {
     match action {
         Action::SearchCapabilities { query } => {
+            let started = Instant::now();
             let matches = capability::resolve(store, &query, &grants(run)?, 3)?;
             for manifest in &matches {
                 store.activate(&run.id, &manifest.id, manifest.version)?;
             }
-            store.event(&run.id, "capability.search", json!({"query": query, "matches": matches.iter().map(|item| &item.id).collect::<Vec<_>>()}))?;
+            store.event(&run.id, "capability.search", json!({"query": query, "matches": matches.iter().map(|item| &item.id).collect::<Vec<_>>(), "elapsed_ms": started.elapsed().as_millis()}))?;
         }
         Action::Invoke { capability, args } => {
             let manifest = capability::permitted(store, &capability, &grants(run)?)?

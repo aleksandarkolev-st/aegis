@@ -83,6 +83,12 @@ pub fn summarize(rows: &[Value]) -> Result<Value> {
             let mut metrics = serde_json::Map::new();
             for (label, pointer) in [
                 ("model_tokens", "/metrics/model_tokens"),
+                ("recorded_model_tokens", "/metrics/model_tokens"),
+                (
+                    "unaccounted_model_attempts",
+                    "/metrics/unaccounted_model_attempts",
+                ),
+                ("discovery_elapsed_ms", "/metrics/discovery_elapsed_ms"),
                 ("execution_ms", "/execution_ms"),
                 ("schema_bytes_peak", "/metrics/schema_bytes_peak"),
                 ("wrong_tools", "/wrong_tools"),
@@ -93,13 +99,30 @@ pub fn summarize(rows: &[Value]) -> Result<Value> {
                 let deltas: Vec<_> = pairs
                     .iter()
                     .filter_map(|(baseline, candidate)| {
+                        if label == "discovery_elapsed_ms"
+                            && [baseline, candidate].iter().any(|row| {
+                                row["metrics"]["unaccounted_searches"].as_u64() != Some(0)
+                            })
+                        {
+                            return None;
+                        }
+                        if label == "model_tokens"
+                            && [baseline, candidate].iter().any(|row| {
+                                row["metrics"]["unaccounted_model_attempts"].as_u64() != Some(0)
+                                    || row["metrics"]["estimated_turns"].as_u64() != Some(0)
+                            })
+                        {
+                            return None;
+                        }
                         Some(
                             candidate.pointer(pointer)?.as_f64()?
                                 - baseline.pointer(pointer)?.as_f64()?,
                         )
                     })
                     .collect();
-                metrics.insert(label.into(), interval(&deltas));
+                let mut result = interval(&deltas);
+                result["excluded_pairs"] = json!(pairs.len() - deltas.len());
+                metrics.insert(label.into(), result);
             }
             let acceptance: Vec<_> = pairs
                 .iter()
@@ -123,7 +146,7 @@ pub fn summarize(rows: &[Value]) -> Result<Value> {
         "method":{"pairing":"same experiment, registry size, task, restart condition, and repeat", "direction":"candidate minus eager",
             "acceptance_interval":"distribution-free Hoeffding bound for independent paired repeats, difference bounded in [-1,1]",
             "numeric_interval":"deterministic paired percentile bootstrap; 10000 resamples; null for fewer than two pairs",
-            "limitations":"Intervals assume independent repeats. Small samples, correlated provider sessions, and provider-default models limit inference. Cost deltas include failed/overflow cases and are not performance-gain claims. Missing metrics are excluded pairwise, with their counts reported. Repeated dispatches are not measured duplicate side effects."}}),
+            "limitations":"Intervals assume independent repeats. Small samples, correlated provider sessions, and provider-default models limit inference. Recorded tokens are not billed cost. Complete model-token comparisons exclude pairs with estimated usage, unaccounted attempts, or missing accounting metadata; recorded_model_tokens retains known partial totals. Failed and overflow cases are not performance-gain claims. Missing metrics are excluded pairwise, with their counts reported. Repeated dispatches are not measured duplicate side effects."}}),
     )
 }
 
@@ -150,7 +173,7 @@ mod tests {
     use super::*;
 
     fn row(mode: &str, repeat: u64, passed: bool, tokens: u64) -> Value {
-        json!({"case":{"size":50,"task":"read","repeat":repeat,"mode":mode,"root":"experiment/registry-50"},"acceptance":{"passed":passed},"metrics":{"model_tokens":tokens},"context_overflow":false})
+        json!({"case":{"size":50,"task":"read","repeat":repeat,"mode":mode,"root":"experiment/registry-50"},"acceptance":{"passed":passed},"metrics":{"model_tokens":tokens,"unaccounted_model_attempts":0,"estimated_turns":0},"context_overflow":false})
     }
 
     #[test]
@@ -172,6 +195,29 @@ mod tests {
         );
         assert_eq!(group["metrics"]["recovery_ms"]["pairs"], 0);
         assert_eq!(report, summarize(&rows)?);
+        Ok(())
+    }
+
+    #[test]
+    fn partial_unknown_or_estimated_usage_does_not_become_a_complete_token_comparison() -> Result<()>
+    {
+        let baseline = row("eager", 0, true, 100);
+        for metadata in [json!(1), Value::Null] {
+            let mut candidate = row("durable", 0, false, 20);
+            candidate["metrics"]["unaccounted_model_attempts"] = metadata;
+            let report = summarize(&[baseline.clone(), candidate])?;
+            let metrics = &report["comparisons"][0]["groups"][0]["metrics"];
+            assert_eq!(metrics["model_tokens"]["pairs"], 0);
+            assert_eq!(metrics["model_tokens"]["excluded_pairs"], 1);
+            assert_eq!(metrics["recorded_model_tokens"]["mean_delta"], -80.0);
+        }
+        let mut estimated = row("durable", 0, true, 80);
+        estimated["metrics"]["estimated_turns"] = json!(1);
+        let report = summarize(&[baseline, estimated])?;
+        assert_eq!(
+            report["comparisons"][0]["groups"][0]["metrics"]["model_tokens"]["pairs"],
+            0
+        );
         Ok(())
     }
 

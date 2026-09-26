@@ -4,7 +4,10 @@ use crate::storage::{Event, Run};
 
 #[derive(Debug, Default, Serialize)]
 pub struct Metrics {
+    pub model_attempts: usize,
     pub model_turns: usize,
+    pub failed_model_turns: usize,
+    pub unaccounted_model_attempts: usize,
     pub model_tokens: u64,
     pub estimated_turns: usize,
     pub schema_bytes_initial: u64,
@@ -13,6 +16,8 @@ pub struct Metrics {
     pub prompt_chars_peak: u64,
     pub model_elapsed_ms: u64,
     pub searches: usize,
+    pub discovery_elapsed_ms: u64,
+    pub unaccounted_searches: usize,
     pub invocations: usize,
     pub succeeded: usize,
     pub rejected: usize,
@@ -24,6 +29,7 @@ pub fn metrics(events: &[Event]) -> Metrics {
     let mut summary = Metrics::default();
     let mut dispatched = std::collections::HashSet::new();
     let mut first_schema_seen = false;
+    let mut missing_response_usage = 0;
     for event in events {
         let number = |key: &str| {
             event
@@ -34,6 +40,7 @@ pub fn metrics(events: &[Event]) -> Metrics {
         };
         match event.kind.as_str() {
             "model.started" | "context.over_limit" => {
+                summary.model_attempts += usize::from(event.kind == "model.started");
                 let schemas = number("schema_bytes");
                 if !first_schema_seen {
                     summary.schema_bytes_initial = schemas;
@@ -45,16 +52,33 @@ pub fn metrics(events: &[Event]) -> Metrics {
             }
             "model.response" => {
                 summary.model_turns += 1;
-                summary.model_tokens +=
-                    event.payload["usage"]["input_tokens"].as_u64().unwrap_or(0)
-                        + event.payload["usage"]["output_tokens"]
-                            .as_u64()
-                            .unwrap_or(0);
+                let input = event.payload["usage"]["input_tokens"].as_u64();
+                let output = event.payload["usage"]["output_tokens"].as_u64();
+                missing_response_usage += usize::from(input.is_none() || output.is_none());
+                summary.model_tokens = summary
+                    .model_tokens
+                    .saturating_add(input.unwrap_or(0))
+                    .saturating_add(output.unwrap_or(0));
                 summary.estimated_turns +=
                     usize::from(event.payload["usage"]["source"] != "provider");
-                summary.model_elapsed_ms += number("elapsed_ms");
+                summary.model_elapsed_ms = summary
+                    .model_elapsed_ms
+                    .saturating_add(number("elapsed_ms"));
             }
-            "capability.search" => summary.searches += 1,
+            "model.failed" => {
+                summary.failed_model_turns += 1;
+                summary.model_elapsed_ms = summary
+                    .model_elapsed_ms
+                    .saturating_add(number("elapsed_ms"));
+            }
+            "capability.search" => {
+                summary.searches += 1;
+                summary.unaccounted_searches +=
+                    usize::from(event.payload["elapsed_ms"].as_u64().is_none());
+                summary.discovery_elapsed_ms = summary
+                    .discovery_elapsed_ms
+                    .saturating_add(number("elapsed_ms"));
+            }
             "operation.pending" => summary.invocations += 1,
             "operation.dispatched" => {
                 if let Some(id) = event.payload["id"].as_str() {
@@ -68,6 +92,8 @@ pub fn metrics(events: &[Event]) -> Metrics {
             _ => {}
         }
     }
+    summary.unaccounted_model_attempts =
+        summary.model_attempts.saturating_sub(summary.model_turns) + missing_response_usage;
     if let (Some(first), Some(last)) = (events.first(), events.last()) {
         summary.wall_seconds = (last.created_at - first.created_at).max(0);
     }
@@ -156,6 +182,35 @@ mod tests {
         assert_eq!(result.schema_bytes_peak, 600);
         assert_eq!(result.schema_count_peak, 4);
         assert_eq!(result.searches, 1);
+        assert_eq!(result.unaccounted_searches, 1);
+        assert_eq!(result.model_attempts, 2);
+        assert_eq!(result.unaccounted_model_attempts, 1);
         assert_eq!(result.wall_seconds, 4);
+    }
+
+    #[test]
+    fn failed_and_missing_usage_attempts_are_not_reported_as_zero_cost() {
+        let event = |seq, kind: &str, payload| Event {
+            seq,
+            kind: kind.into(),
+            payload,
+            created_at: seq,
+        };
+        let events = vec![
+            event(1, "model.started", json!({})),
+            event(2, "model.failed", json!({"elapsed_ms":1200})),
+            event(3, "model.started", json!({})),
+            event(4, "model.response", json!({"usage":null,"elapsed_ms":200})),
+            event(5, "capability.search", json!({"elapsed_ms":7})),
+            event(6, "context.over_limit", json!({})),
+        ];
+        let result = metrics(&events);
+        assert_eq!(result.model_attempts, 2);
+        assert_eq!(result.model_turns, 1);
+        assert_eq!(result.failed_model_turns, 1);
+        assert_eq!(result.unaccounted_model_attempts, 2);
+        assert_eq!(result.model_elapsed_ms, 1400);
+        assert_eq!(result.discovery_elapsed_ms, 7);
+        assert_eq!(result.unaccounted_searches, 0);
     }
 }
