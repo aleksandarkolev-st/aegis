@@ -4,6 +4,7 @@ pub mod endpoint;
 pub mod evaluation;
 pub mod evaluation_report;
 pub mod history;
+pub mod interrupt;
 pub mod kernel;
 pub mod mcp;
 pub mod model;

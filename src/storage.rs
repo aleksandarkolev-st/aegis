@@ -229,6 +229,18 @@ impl Store {
                 COMMIT;",
             )?;
         }
+        if schema_version < 6 {
+            connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS interrupts (
+                    run_id TEXT NOT NULL REFERENCES runs(id), scope TEXT NOT NULL,
+                    target TEXT NOT NULL, pending INTEGER NOT NULL DEFAULT 1,
+                    PRIMARY KEY(run_id, scope, target)
+                );
+                PRAGMA user_version=6;
+                COMMIT;",
+            )?;
+        }
         Ok(Self {
             connection,
             artifacts,
