@@ -139,6 +139,9 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
     if run.state != "running" {
         bail!("run is not active");
     }
+    if crate::kernel::remaining_seconds(&store, &run)? == 0 {
+        bail!("task wall-clock budget exhausted before worker claim");
+    }
     if operation.capability == crate::acceptance::CAPABILITY {
         let check = crate::acceptance::authorized_check(&store, &run, &operation)?;
         store.claim_operation(&operation)?;
@@ -280,6 +283,13 @@ fn execute_container(
     program: &str,
     arguments: &[String],
 ) -> Result<Value> {
+    let seconds = run.budgets["process_seconds"]
+        .as_u64()
+        .unwrap_or(60)
+        .min(crate::kernel::remaining_seconds(store, run)?);
+    if seconds == 0 {
+        bail!("process deadline exhausted before launch");
+    }
     let output_dir = tempfile::tempdir_in(root)?;
     let path = output_dir.path().join("process-output");
     let file = File::create(&path)?;
@@ -291,12 +301,7 @@ fn execute_container(
     let mut child = crate::process::spawn(command)
         .context("start Docker; ensure its daemon and local image are available")?;
     let started = Instant::now();
-    let deadline = Duration::from_secs(
-        run.budgets["process_seconds"]
-            .as_u64()
-            .unwrap_or(60)
-            .min(crate::kernel::remaining_seconds(store, run)?),
-    );
+    let deadline = Duration::from_secs(seconds);
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -324,6 +329,38 @@ fn execute_container(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exhausted_tasks_cannot_claim_or_execute_a_dispatched_write() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(".arun");
+        let mut store = Store::open(&root)?;
+        let run = store.create_run(
+            "write",
+            directory.path(),
+            "codex",
+            json!(["workspace.write"]),
+            json!({"wall_seconds":0}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let operation = store.begin_operation(
+            &run.id,
+            "workspace.write",
+            json!({"path":"fixture.txt","content":"must not execute"}),
+            false,
+        )?;
+        store.operation_state(&operation, "dispatched", None, json!({}))?;
+        assert!(
+            execute(&root, &operation.id)
+                .unwrap_err()
+                .to_string()
+                .contains("budget exhausted")
+        );
+        assert_eq!(store.operation(&operation.id)?.state, "dispatched");
+        assert!(!directory.path().join("fixture.txt").exists());
+        Ok(())
+    }
 
     #[test]
     fn adapter_cannot_repeat_a_claimed_write_before_result_commit() -> Result<()> {

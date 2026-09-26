@@ -22,7 +22,7 @@ This is a development verification record, not a success-rate or performance-imp
 
 ## Automated checks
 
-- `cargo test --locked`: 45 unit tests and 16 integration tests passed after the acceptance, isolation, and restart changes; three Docker tests are ignored by default.
+- `cargo test --locked`: 46 unit tests and 16 integration tests passed after the acceptance, isolation, restart, and worker-budget changes; three Docker tests are ignored by default.
 - `cargo test --test docker --test docker_acceptance --test docker_mcp -- --ignored`: all three passed separately with Docker running. They verify multi-megabyte output virtualization, hidden runtime state, immutable/read-only acceptance checks, and MCP filesystem/network/credential isolation.
 - `npm test`: four package/platform/checksum/version tests passed.
 - Process-tree tests verify that explicit kill and drop cleanup stop a descendant heartbeat, not merely its launcher.
