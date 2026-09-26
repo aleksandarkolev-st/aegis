@@ -44,7 +44,9 @@ target/release/arun login grok
 target/release/arun probe chatgpt
 ```
 
-Each provider adapter launches its installed CLI (Codex for a ChatGPT login, Claude Code for a Claude login, Grok Build for a Grok login). Credentials stay with those CLIs; arun does not read or copy their token stores. Re-authenticate with the corresponding `login` command if a provider reports an expired session. A provider may also refuse work when its account has no remaining usage balance.
+Each provider adapter launches its installed CLI (Codex for a ChatGPT login, Claude Code for a Claude login, Grok Build for a Grok login). Missing CLIs have an in-terminal installation confirmation: Aegis uses the official npm package in `~/.aegis/providers/`, without changing your global npm installation or workspace. `AEGIS_PROVIDER_HOME` overrides this location. Existing PATH installations take priority. This distribution uses the official [Codex package](https://github.com/openai/codex), [Claude Code npm installation](https://code.claude.com/docs/en/setup#install-with-npm), and [Grok npm distribution](https://docs.x.ai/build/enterprise#additional); provider requirements can exceed Aegis's Node 20 minimum, so Node 22+ is recommended for guided installation.
+
+Credentials stay with those CLIs; arun does not read or copy their token stores. F4 opens native sign-in, and expired-login failures offer signing in and resuming inside the terminal. A provider may also refuse work when its account has no remaining usage balance.
 
 `--model <id>` pins the model for a run or evaluation and persists its ID with the task contract. CLI prompts are supplied through stdin (Codex/Claude Code) or a prompt file (Grok), rather than large command-line arguments.
 

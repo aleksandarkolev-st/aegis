@@ -342,15 +342,8 @@ pub fn command(root: &Path, args: &[String]) -> Result<()> {
         .join("evaluations")
         .join(uuid::Uuid::new_v4().to_string());
     fs::create_dir_all(&experiment)?;
-    let provider_command = if options.provider == "codex" && cfg!(windows) {
-        "codex.cmd"
-    } else {
-        &options.provider
-    };
-    let version = Command::new(provider_command)
-        .arg("--version")
-        .output()
-        .ok()
+    let version = crate::provider::find(&options.provider)?
+        .and_then(|program| Command::new(program).arg("--version").output().ok())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
     fs::write(
         experiment.join("experiment.json"),

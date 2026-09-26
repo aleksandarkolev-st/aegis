@@ -11,7 +11,7 @@ use serde_json::json;
 
 use crate::{
     endpoint::{Endpoint, ResponseFormat},
-    kernel, model,
+    kernel, model, provider,
     storage::Store,
     terminal::{Input, RawMode, Terminal, Tone},
     trace,
@@ -96,6 +96,9 @@ fn configure(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
         profile.model = Some(model);
         profile.endpoint = Some(endpoint);
     } else {
+        if !ensure_provider(terminal, &profile.provider)? {
+            return Ok(None);
+        }
         let choices = ["Use my existing sign-in", "Sign in now"].map(str::to_owned);
         if terminal.select("Authentication", &choices)? == Some(1) {
             terminal.message(
@@ -141,6 +144,23 @@ fn configure(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
         }
     }
     Ok(Some((profile, secret)))
+}
+
+fn ensure_provider(terminal: &Terminal, name: &str) -> Result<bool> {
+    if provider::find(name)?.is_some() {
+        return Ok(true);
+    }
+    let package = provider::specification(name)?.package;
+    terminal.message(Tone::Warning, "Provider setup", &format!("This provider is not installed. Aegis can download {package} into your private provider directory; it will not modify this workspace or your global npm installation."))?;
+    let choices = [format!("Install {package} and continue"), "Back".into()];
+    if terminal.select("Install the official provider CLI?", &choices)? != Some(0) {
+        return Ok(false);
+    }
+    if let Err(error) = provider::install(name) {
+        terminal.message(Tone::Warning, "Installation failed", &format!("{error:#}"))?;
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 fn save(root: &Path, profile: &Profile) -> Result<()> {
@@ -459,8 +479,10 @@ pub fn interactive(root: &Path) -> Result<()> {
                             .map(|_| "ARUN_SESSION_API_KEY".into());
                     }
                     save(root, &profile)?;
-                } else if let Err(error) = model::login(&profile.provider) {
-                    terminal.message(Tone::Warning, "!", &error.to_string())?;
+                } else if ensure_provider(&terminal, &profile.provider)? {
+                    if let Err(error) = model::login(&profile.provider) {
+                        terminal.message(Tone::Warning, "!", &error.to_string())?;
+                    }
                 }
             }
             Input::Submit(request) => {
@@ -478,6 +500,9 @@ pub fn interactive(root: &Path) -> Result<()> {
                     "/help" => terminal.message(Tone::Quiet, "Help", "Write a task in plain language. F2 changes provider, F3 opens tasks, F4 signs in, F5 starts a fresh conversation. Ctrl+C stops an active task; Ctrl+D detaches. Up recalls previous tasks.")?,
                     _ => {
                         history.push(request.to_owned());
+                        if profile.provider != "custom" && !ensure_provider(&terminal, &profile.provider)? {
+                            continue;
+                        }
                         if let Err(error) = task(root, &mut terminal, &mut profile, secret.as_deref(), request) {
                             terminal.clear_activity()?;
                             terminal.message(Tone::Warning, "!", &format!("{error:#}"))?;

@@ -155,17 +155,9 @@ pub fn call(
 }
 
 pub fn login(provider: &str) -> Result<()> {
-    let (program, arguments): (&str, &[&str]) = match provider {
-        "chatgpt" | "codex" => (
-            if cfg!(windows) { "codex.cmd" } else { "codex" },
-            &["login"],
-        ),
-        "claude" | "claude-code" => ("claude", &["auth", "login"]),
-        "grok" => ("grok", &["login"]),
-        _ => bail!("native login is available for ChatGPT, Claude Code, and Grok"),
-    };
-    let status = Command::new(program)
-        .args(arguments)
+    let info = crate::provider::specification(provider)?;
+    let status = Command::new(crate::provider::executable(provider)?)
+        .args(info.login)
         .status()
         .with_context(|| format!("start {provider} login; its CLI must be installed"))?;
     if !status.success() {
@@ -221,7 +213,7 @@ pub fn call_configured(
         "codex" => {
             let schema_path = output.path().join("schema.json");
             std::fs::write(&schema_path, SCHEMA)?;
-            let mut command = Command::new(if cfg!(windows) { "codex.cmd" } else { "codex" });
+            let mut command = Command::new(crate::provider::executable("codex")?);
             command
                 .args([
                     "exec",
@@ -257,7 +249,7 @@ pub fn call_configured(
             command
         }
         "claude" => {
-            let mut command = Command::new("claude");
+            let mut command = Command::new(crate::provider::executable("claude")?);
             command.args([
                 "-p",
                 "--tools",
@@ -273,7 +265,7 @@ pub fn call_configured(
             command
         }
         "grok" => {
-            let mut command = Command::new("grok");
+            let mut command = Command::new(crate::provider::executable("grok")?);
             command
                 .args([
                     "--no-subagents",
