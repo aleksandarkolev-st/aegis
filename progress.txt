@@ -1,0 +1,72 @@
+AEGIS IMPLEMENTATION PROGRESS
+Updated: 2026-09-26 22:34 UTC (2026-09-27 Kyiv)
+
+LATEST USER REQUIREMENTS
+- Adapt to the user's habits, not just remember explicit notes.
+- Keep memory lightweight and structured; no growing Markdown memory files.
+- Finish implementation and functional verification before starting new agent benchmarks.
+- Then measure coding correctness, correction attempts and token efficiency against native Codex.
+- Run the requested "arg agi" evaluation after the same readiness gate. Dataset/version clarification requested; do not silently assume one.
+- Record progress here, and preserve raw evaluation records as well as summaries.
+- Work in small atomic local commits. Do not publish or push without authorization.
+
+IMPLEMENTED
+- Durable Rust runtime, SQLite events, artifact-backed output, recovery and isolated workers.
+- Lazy capability discovery, bounded context, checkpoints, immutable acceptance contracts.
+- Native ChatGPT, Claude Code and Grok adapters; OpenAI-compatible custom endpoints.
+- Same-terminal interactive UI, readable errors, model picker, keyboard controls.
+- Low-friction native onboarding; optional advanced settings instead of a long setup wizard.
+- Animated mascot presets, reduced motion, colorless mode, composable Rust Skin API and bounded data-only style configuration.
+- Explicit project notes: at most 16 notes / 4 KiB, editable and resettable through the UI.
+- Initial workflow learner: at most 128 structured experiences per workspace, no copied transcripts or argv.
+  Learns only from independently accepted tasks. Two matching verified runs are required before suggesting a versioned tool path.
+  At most two relevant hints enter a new task; current grants and verifier identity filter them.
+  Inspect, pause, enable and reset controls are in Project memory.
+
+IN PROGRESS / NOT YET COMPLETE
+- Habit adaptation: the current verified-path learner does not yet learn arbitrary personal preferences.
+- Fine-grained filesystem and network-domain capability scopes.
+- Remaining tool-result token and network-byte budget enforcement; exact schema-token measurement.
+- Full completion audit against plan.txt and functional regression checks after remaining changes.
+- Native Codex hard-coding benchmark and requested AGI benchmark: NOT STARTED under the new readiness gate.
+- Public npm/release distribution and actual Linux/macOS build verification.
+- Claude live verification: intentionally pending at the user's request; fixtures are not login proof.
+
+VERIFICATION ALREADY PERFORMED BEFORE THE NEW BENCHMARK GATE
+- Full suite before the final wrap/learner changes: 79 unit and 35 integration tests passed; four Docker tests ignored by default.
+- Focused terminal wrapping tests passed; the new wrapping test brings the then-current unit total to 80.
+- Initial learner: two focused unit tests passed, including repeated acceptance, isolation, reset, expiry and the 128-record bound.
+- Memory integration tests: two passed again after learner wiring.
+- Empty-memory context bound regression: passed without increasing the threshold.
+- npm package tests: four passed. Example compilation passed.
+- Manual Windows terminal fixture verified two-selector onboarding, mascot animation, appearance settings, explicit memory and readable tool output.
+- These are functional/fixture results, not evidence of better coding or lower token use than Codex.
+
+PRE-EXISTING ENDURANCE EXPERIMENT (NOT A NEW BENCHMARK)
+- Frozen experiment: .arun/long-live-v2-20260927/
+- Run: 1df27f86-7d20-448f-a077-8318ca748880
+- Private runtime remains frozen at source 1bb0e9c; do not replace it during the experiment.
+- Latest observed owner/worker: PID 10276 / 5360; operation 59399bb0-0a84-44da-b0b6-a872048b0e5d executing; Docker container observed running.
+- Fixed producer finish time: 2026-09-26 23:54:38.812 UTC. Final acceptance has NOT passed yet.
+- Keep original failed/interrupted records; never manufacture success by changing the workload or budgets.
+
+BENCHMARK READINESS GATE
+1. Complete requested implementation and audit remaining gaps against plan.txt.
+2. Pass functional unit/integration checks and relevant isolation checks.
+3. Verify installed same-terminal UX and usable provider paths; explicitly identify any user-deferred verification.
+4. Freeze source/build hashes, task fixtures, independent graders, model/version, settings and budgets.
+5. Only then start agent evaluations. If prerequisites are missing, record them rather than claiming readiness.
+
+REQUIRED FUTURE EVALUATION RECORDS
+- One record per task/attempt: harness, model/version, fixture/hash, settings, timestamps, result and independent correctness score.
+- Original failures, correction attempts, tool errors, repeated dispatches, interruptions and timeouts.
+- Provider-reported input/output/cache tokens and usage completeness; unknown or estimated usage must not be treated as zero.
+- Tokens per independently solved task and tokens used on failed/correction attempts, with explicit denominators.
+- Paired fresh fixtures, rotated order and repeated trials for Aegis versus native Codex.
+- Separate cold-start and learned-condition runs; prevent evaluation-task solutions leaking into memory.
+- AGI dataset version/split, licenses, scoring rules and submission limits before execution.
+- Raw immutable JSONL/events, evidence handles and an honest summary including regressions. No assumed wins.
+
+LATEST LOCAL COMMITS
+- d5e3d8b: wrap interactive feedback to terminal columns.
+- 3e68044: learn bounded workflow patterns from independently accepted tasks.
