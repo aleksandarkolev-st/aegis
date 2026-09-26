@@ -22,7 +22,7 @@ This is a development verification record, not a success-rate or performance-imp
 
 ## Automated checks
 
-- `cargo test --locked`: 46 unit tests and 16 integration tests passed after the acceptance, isolation, restart, and worker-budget changes; three Docker tests are ignored by default.
+- `cargo test --locked`: 50 unit tests and 16 integration tests passed after the snapshot/archive changes; three Docker tests are ignored by default.
 - `cargo test --test docker --test docker_acceptance --test docker_mcp -- --ignored`: all three passed separately with Docker running. They verify multi-megabyte output virtualization, hidden runtime state, immutable/read-only acceptance checks, and MCP filesystem/network/credential isolation.
 - `npm test`: four package/platform/checksum/version tests passed.
 - Process-tree tests verify that explicit kill and drop cleanup stop a descendant heartbeat, not merely its launcher.
@@ -33,6 +33,8 @@ This is a development verification record, not a success-rate or performance-imp
 - Guided and advanced acceptance setup fixtures verify frozen configurations and that the private verifier is not exposed as a model tool.
 - A stalled HTTP fixture verifies that an active model request respects the remaining task wall-time budget.
 - A natural-exit regression covers a Windows completion-port double-wait hang discovered during Docker testing and fixed before the successful rerun.
+- Snapshot tests archive a 3,000-turn synthetic history, recover the original accounting and an executing write from fewer than 32 tail events, and reconstruct the complete ordered audit. Corrupt cold archives fail audit reads without entering normal recovery; corrupt snapshots fail recovery.
+- The forced-read restart fixture now preserves a checkpoint across 1,100 archived detail events, fresh provider processes, and an actual runner restart. This is continuity evidence, not a multi-hour live demonstration.
 - `git diff --check`: passed.
 
 ## Not yet verified or delivered
@@ -41,4 +43,4 @@ This is a development verification record, not a success-rate or performance-imp
 - Actual Linux/macOS release builds; the checked-in release matrix still needs to run in CI.
 - Live Claude completion after reauthentication.
 - Multi-hour live demonstrations and live paired/restart comparisons with pinned models.
-- Scalable snapshot-based recovery and granular operation/model-turn Ctrl+C semantics.
+- Granular operation/model-turn Ctrl+C semantics.

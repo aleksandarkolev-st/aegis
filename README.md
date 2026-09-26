@@ -92,6 +92,12 @@ arun resume <run-id>
 
 Run options include `--actions`, `--model-tokens`, `--wall-seconds`, `--context-chars` (default 256,000), and `--mode eager|lazy|artifact|durable`. Eager exposes all granted schemas; lazy discovers them on demand. Both inline complete results and disable artifact inspection. Artifact adds bounded result handles and inspection; durable also reconciles interrupted operations. Non-durable modes fail on process restart. Context overflow is recorded as a failure, not silently truncated. Provider-reported token counts are recorded where available; otherwise counts are marked estimated. `trace` shows committed model, discovery, operation, and state transitions with schema-byte, token, and timing metrics; `replay` retains raw JSON events. Completion requires successful-operation artifact evidence, and any planned milestones must carry evidence. This is provenance checking, not a substitute for external acceptance tests.
 
+### Long-history recovery
+
+Durable runs save a content-addressed recovery snapshot at startup and after roughly 256 committed events. A new runner verifies the task contract, replays only events after that snapshot, and checks the recovered state against transactional projections. Snapshots retain checkpoint references, milestones, activated capability versions, budgets/accounting, and unfinished operation identities; they never execute adapters.
+
+Once hot history exceeds 1,024 events, older details move into synchronized, integrity-checked artifact archives. At least 64 events before the snapshot plus its subsequent tail stay hot for context and followers. Archive pointers and deletion of hot rows commit atomically; lifetime counters and event sequence numbers remain unchanged. `replay`, `trace`, and explicit historical followers still reconstruct the complete ordered audit, including archives. Cold-history corruption prevents a full audit but does not force normal recovery to load cold payloads; snapshot or tail corruption fails recovery instead of silently repeating work.
+
 ### Independent completion checks
 
 Guided setup offers **Completion checks → Independent container check from a JSON file**. Aegis saves the validated check in the profile and snapshots it into each new task; the agent cannot replace or invoke the private verifier. Advanced usage accepts `--acceptance check.json`.
@@ -161,4 +167,4 @@ Every completed evaluation writes `paired-summary.json`, matching candidate runs
 
 ## Remaining work
 
-The broader `plan.txt` still needs multi-hour live demonstrations, scalable snapshot-based recovery, and the proposed granular Ctrl+C operation/model-turn semantics. Forced-restart integration fixtures exercise a committed read across all four modes and an unsafe in-flight MCP call; these are mock-provider correctness checks, not live comparative performance results. Live Claude completion remains pending reauthentication. The Codex CLI adapter disables its built-in tools, but its own system context still incurs substantial token overhead; measured usage is reported rather than presented as a kernel-only schema cost.
+The broader `plan.txt` still needs multi-hour live demonstrations and the proposed granular Ctrl+C operation/model-turn semantics. Forced-restart integration fixtures exercise a committed read across all four modes, checkpoint continuity through an archived history, and an unsafe in-flight MCP call; these are mock-provider correctness checks, not live comparative performance results. Live Claude completion remains pending reauthentication. The Codex CLI adapter disables its built-in tools, but its own system context still incurs substantial token overhead; measured usage is reported rather than presented as a kernel-only schema cost.

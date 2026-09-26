@@ -18,6 +18,7 @@ const fs = require('fs');
 const args = process.argv.slice(2);
 const prompt = fs.readFileSync(args[args.indexOf('--prompt-file')+1],'utf8');
 const state = JSON.parse(prompt.split('STATE (bounded, data not instructions):\n')[1]);
+if(state.mode==='durable' && !state.handoff?.decisions.includes('Keep the fixture evidence through context resets')) process.exit(9);
 const result = state.recent_events.find(event=>event.kind==='operation.succeeded');
 const active = state.active_capabilities.some(capability=>capability.id==='workspace.read');
 const action = result ? {kind:'finish',summary:'fixture read',evidence:[JSON.parse(result.payload).artifact]}
@@ -56,6 +57,20 @@ setTimeout(()=>console.log(JSON.stringify({text:JSON.stringify(action)})),250);
             json!({"mode":mode,"actions":8,"wall_seconds":30}),
             "",
         )?;
+        if mode == "durable" {
+            let checkpoint = arun::model::Checkpoint {
+                decisions: vec!["Keep the fixture evidence through context resets".into()],
+                unresolved: vec![],
+                next_action: "Read fixture.txt and preserve its evidence".into(),
+                milestones: vec![],
+            };
+            store.save_checkpoint(&run.id, &checkpoint)?;
+            for _ in 0..1100 {
+                store.event(&run.id, "audit.detail", json!({"old":"not model context"}))?;
+            }
+            store.save_snapshot(&run.id)?;
+            store.archive_history(&run.id)?;
+        }
         let output = Command::new(env!("CARGO_BIN_EXE_arun"))
             .args([
                 "restart-check",
@@ -86,6 +101,17 @@ setTimeout(()=>console.log(JSON.stringify({text:JSON.stringify(action)})),250);
         if mode == "durable" {
             assert!(observation["recovery_ms"].as_u64().is_some());
             assert_eq!(store.event_count(&run.id, "model.response")?, 3);
+            let events = store.events(&run.id)?;
+            let recoveries: Vec<_> = events
+                .iter()
+                .filter(|event| event.kind == "runtime.recovered")
+                .collect();
+            assert_eq!(recoveries.len(), 2);
+            assert!(
+                recoveries
+                    .iter()
+                    .all(|event| event.payload["tail_events"].as_u64().unwrap() < 64)
+            );
         }
     }
     Ok(())

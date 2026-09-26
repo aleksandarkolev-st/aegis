@@ -48,7 +48,7 @@ pub struct Operation {
 }
 
 pub struct Store {
-    connection: Connection,
+    pub(crate) connection: Connection,
     artifacts: PathBuf,
 }
 
@@ -63,7 +63,7 @@ pub fn unix_time() -> i64 {
     now()
 }
 
-fn append_event(
+pub(crate) fn append_event(
     transaction: &Transaction<'_>,
     run_id: &str,
     kind: &str,
@@ -213,6 +213,22 @@ impl Store {
                 PRAGMA user_version=4;
                 COMMIT;")?;
         }
+        if schema_version < 5 {
+            connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS run_snapshots (
+                    run_id TEXT PRIMARY KEY REFERENCES runs(id), sequence INTEGER NOT NULL,
+                    artifact TEXT NOT NULL REFERENCES artifacts(hash)
+                );
+                CREATE TABLE IF NOT EXISTS event_archives (
+                    run_id TEXT NOT NULL REFERENCES runs(id), first_seq INTEGER NOT NULL,
+                    last_seq INTEGER NOT NULL, artifact TEXT NOT NULL REFERENCES artifacts(hash),
+                    PRIMARY KEY(run_id, last_seq)
+                );
+                PRAGMA user_version=5;
+                COMMIT;",
+            )?;
+        }
         Ok(Self {
             connection,
             artifacts,
@@ -300,26 +316,7 @@ impl Store {
     }
 
     pub fn events(&self, run_id: &str) -> Result<Vec<Event>> {
-        let mut statement = self.connection.prepare(
-            "SELECT seq, kind, payload, created_at FROM events WHERE run_id = ?1 ORDER BY seq",
-        )?;
-        let rows = statement.query_map([run_id], |row| {
-            let payload: String = row.get(2)?;
-            Ok(Event {
-                seq: row.get(0)?,
-                kind: row.get(1)?,
-                payload: serde_json::from_str(&payload).map_err(|err| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        2,
-                        rusqlite::types::Type::Text,
-                        Box::new(err),
-                    )
-                })?,
-                created_at: row.get(3)?,
-            })
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        self.events_since(run_id, 0)
     }
 
     pub fn recent_events(&self, run_id: &str, limit: i64) -> Result<Vec<Event>> {
@@ -345,6 +342,27 @@ impl Store {
     }
 
     pub fn events_since(&self, run_id: &str, seq: i64) -> Result<Vec<Event>> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let seq = seq.max(0);
+        let mut events = self.archived_events_since(run_id, seq)?;
+        events.extend(self.hot_events_since(run_id, seq)?);
+        let last: i64 = transaction.query_row(
+            "SELECT COALESCE((SELECT last_seq FROM run_projection WHERE run_id = ?1), 0)",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if seq < last
+            && (events.first().map(|event| event.seq) != Some(seq + 1)
+                || events.last().map(|event| event.seq) != Some(last)
+                || events.windows(2).any(|pair| pair[1].seq != pair[0].seq + 1))
+        {
+            bail!("audit event sequence has a gap");
+        }
+        transaction.commit()?;
+        Ok(events)
+    }
+
+    pub(crate) fn hot_events_since(&self, run_id: &str, seq: i64) -> Result<Vec<Event>> {
         let mut statement = self.connection.prepare("SELECT seq, kind, payload, created_at FROM events WHERE run_id = ?1 AND seq > ?2 ORDER BY seq")?;
         let rows = statement.query_map(params![run_id, seq], |row| {
             let payload: String = row.get(2)?;
@@ -773,7 +791,7 @@ impl Store {
             &transaction,
             run_id,
             "operation.pending",
-            json!({"id": operation.id, "capability": capability, "version": capability_version, "arguments": operation.arguments, "idempotency_key": operation.idempotency_key}),
+            json!({"id": operation.id, "capability": capability, "version": capability_version, "arguments": operation.arguments, "idempotency_key": operation.idempotency_key, "retry_safe":retry_safe}),
         )?;
         transaction.commit()?;
         Ok(operation)
@@ -961,7 +979,7 @@ impl Store {
         Ok(unresolved)
     }
 
-    pub fn put_artifact(&mut self, bytes: &[u8]) -> Result<String> {
+    pub fn put_artifact(&self, bytes: &[u8]) -> Result<String> {
         let hash = hex::encode(Sha256::digest(bytes));
         let path = self.artifacts.join(&hash);
         if !path.exists() {

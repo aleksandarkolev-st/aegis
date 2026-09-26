@@ -421,6 +421,20 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
     if matches!(run.state.as_str(), "completed" | "cancelled" | "failed") {
         bail!("run is {}", run.state);
     }
+    if mode(&run) == "durable" {
+        if store.load_recovery(run_id)?.is_none() {
+            store.save_snapshot(run_id)?;
+        }
+        let recovery = store
+            .load_recovery(run_id)?
+            .context("recovery snapshot missing")?;
+        store.event(
+            run_id,
+            "runtime.recovered",
+            json!({"snapshot_sequence":recovery.base_sequence,
+            "tail_events":recovery.tail_events,"unresolved":recovery.snapshot.unresolved.len()}),
+        )?;
+    }
     for operation in store.unresolved(run_id)? {
         cleanup_container(&operation);
     }
@@ -471,6 +485,9 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
         .and_then(Value::as_u64)
         .unwrap_or(3600);
     loop {
+        if mode(&run) == "durable" {
+            store.maintain_history(run_id)?;
+        }
         if store.run(run_id)?.state != "running" {
             break;
         }
@@ -577,6 +594,9 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
         } else if store.run(run_id)?.state != "running" {
             break;
         }
+    }
+    if mode(&run) == "durable" {
+        store.maintain_history(run_id)?;
     }
     Ok(())
 }
