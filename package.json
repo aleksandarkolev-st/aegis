@@ -1,0 +1,17 @@
+{
+  "name": "aegis-arun",
+  "version": "0.1.0",
+  "description": "A durable terminal agent runtime with native provider logins and custom endpoints",
+  "type": "module",
+  "license": "UNLICENSED",
+  "engines": { "node": ">=20" },
+  "bin": { "aegis": "bin/aegis.mjs", "arun": "bin/aegis.mjs" },
+  "files": ["bin", "scripts/install.mjs", "scripts/platform.mjs", "vendor", "README.md"],
+  "scripts": {
+    "postinstall": "node scripts/install.mjs",
+    "build:native": "node scripts/build-native.mjs",
+    "test": "node --test tests/npm/*.test.mjs"
+  },
+  "repository": { "type": "git", "url": "https://github.com/aleksandarkolev-st/aegis.git" },
+  "keywords": ["agent", "terminal", "runtime", "codex", "claude", "grok"]
+}

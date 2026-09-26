@@ -1,2 +1,4 @@
 /target/
 /.arun/
+/vendor/
+/*.tgz
