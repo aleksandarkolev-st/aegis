@@ -228,6 +228,16 @@ fn dispatch(root: &Path, operation: &Operation, timeout: Duration) -> Result<Val
             cleanup_container(operation);
             bail!("worker timed out after {} seconds", timeout.as_secs());
         }
+        if Store::open(root)?.interrupt_requested(
+            &operation.run_id,
+            crate::interrupt::Scope::Operation,
+            &operation.id,
+        )? {
+            child.kill()?;
+            child.wait()?;
+            cleanup_container(operation);
+            bail!("operation interrupted by user");
+        }
         if Store::open(root)?.run(&operation.run_id)?.state == "cancelled" {
             child.kill()?;
             child.wait()?;
@@ -252,6 +262,16 @@ pub(crate) fn perform(
     run: &Run,
     operation: &Operation,
 ) -> Result<bool> {
+    if store.interrupt_requested(&run.id, crate::interrupt::Scope::Operation, &operation.id)? {
+        store.operation_state(
+            operation,
+            "cancelled",
+            None,
+            json!({"reason":"interrupted before dispatch"}),
+        )?;
+        store.acknowledge_interrupt(&run.id, crate::interrupt::Scope::Operation, &operation.id)?;
+        return Ok(false);
+    }
     let remaining = remaining_seconds(store, run)?;
     if remaining == 0 {
         store.state(
@@ -281,13 +301,26 @@ pub(crate) fn perform(
             store.operation_state(operation, "succeeded", Some(&hash), json!({"bytes": bytes.len(), "preview": String::from_utf8_lossy(&bytes).chars().take(300).collect::<String>()}))?;
         }
         Err(error) => {
-            let state = if operation.retry_safe {
+            let interrupted = store.interrupt_requested(
+                &run.id,
+                crate::interrupt::Scope::Operation,
+                &operation.id,
+            )?;
+            let claimed = store.operation(&operation.id)?.state == "executing";
+            let state = if interrupted && (operation.retry_safe || !claimed) {
+                "cancelled"
+            } else if operation.retry_safe {
                 "failed"
             } else {
                 "outcome_unknown"
             };
             store.operation_state(operation, state, None, json!({"error": error.to_string()}))?;
-            if !operation.retry_safe {
+            store.acknowledge_interrupt(
+                &run.id,
+                crate::interrupt::Scope::Operation,
+                &operation.id,
+            )?;
+            if state == "outcome_unknown" {
                 if store.run(&run.id)?.state != "cancelled" {
                     store.state(
                         &run.id,
@@ -299,6 +332,7 @@ pub(crate) fn perform(
             }
         }
     }
+    store.acknowledge_interrupt(&run.id, crate::interrupt::Scope::Operation, &operation.id)?;
     Ok(false)
 }
 
@@ -540,6 +574,7 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
                 "schema_count": manifests.len(), "schema_bytes": serde_json::to_vec(&manifests)?.len()}),
         )?;
         let model_started = Instant::now();
+        let model_target = store.current_model_target(run_id)?;
         let timeout = Duration::from_secs(
             run.budgets
                 .get("model_seconds")
@@ -555,16 +590,33 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
             timeout,
             || {
                 Store::open(root)
-                    .and_then(|current| current.run(run_id))
-                    .is_ok_and(|current| current.state == "cancelled")
+                    .and_then(|current| {
+                        Ok(current.run(run_id)?.state == "cancelled"
+                            || current.interrupt_requested(
+                                run_id,
+                                crate::interrupt::Scope::Model,
+                                &model_target,
+                            )?)
+                    })
+                    .unwrap_or(false)
             },
         ) {
             Ok(response) => response,
             Err(error) => {
+                let interrupted = store.interrupt_requested(
+                    run_id,
+                    crate::interrupt::Scope::Model,
+                    &model_target,
+                )?;
                 store.event(
                     run_id,
                     "model.failed",
-                    json!({"error": format!("{error:#}")}),
+                    json!({"error": if interrupted { "model turn interrupted by user".into() } else { format!("{error:#}") }, "interrupted":interrupted,"elapsed_ms":model_started.elapsed().as_millis()}),
+                )?;
+                store.acknowledge_interrupt(
+                    run_id,
+                    crate::interrupt::Scope::Model,
+                    &model_target,
                 )?;
                 if store.run(run_id)?.state == "cancelled" {
                     break;
@@ -572,7 +624,7 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
                 store.state(
                     run_id,
                     "waiting_recovery",
-                    json!({"reason": "model unavailable"}),
+                    json!({"reason": if interrupted { "model turn interrupted by user" } else { "model unavailable" }}),
                 )?;
                 break;
             }
@@ -585,6 +637,7 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
             json!({"action": action, "artifact": hash, "usage": response.usage,
                 "elapsed_ms": model_started.elapsed().as_millis()}),
         )?;
+        store.acknowledge_interrupt(run_id, crate::interrupt::Scope::Model, &model_target)?;
         if let Err(error) = apply(&mut store, root, &run, action) {
             store.event(
                 run_id,

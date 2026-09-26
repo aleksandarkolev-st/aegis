@@ -22,6 +22,7 @@ fn usage() {
     println!(
         "arun attach|resume|status|cancel|replay|trace <run-id> | resolve <run-id> <op-id> succeeded|failed <note> | list | inspect <artifact-hash> | login|probe <provider>"
     );
+    println!("arun interrupt <run-id> operation|model");
     println!(
         "arun tasks|context|tools|artifacts <run-id> | mcp add <name> --image <local-image> [--allow-write] -- <command> [args...] | mcp add <name> --trusted-host -- <command> [args...]"
     );
@@ -487,6 +488,19 @@ fn main() -> Result<()> {
         }
         Some("cancel") => {
             Store::open(&root)?.state(required(1)?, "cancelled", json!({"source":"user"}))?;
+            Ok(())
+        }
+        Some("interrupt") => {
+            let scope = match required(2)? {
+                "operation" => arun::interrupt::Scope::Operation,
+                "model" => arun::interrupt::Scope::Model,
+                _ => bail!("interrupt scope must be operation or model"),
+            };
+            let target = Store::open(&root)?.request_interrupt(required(1)?, scope)?;
+            println!(
+                "{}",
+                target.as_deref().unwrap_or("no active work for this scope")
+            );
             Ok(())
         }
         Some("resolve") => {

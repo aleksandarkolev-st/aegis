@@ -89,6 +89,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_interrupted_undispatched_write_cannot_execute_through_the_adapter() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(".arun");
+        let mut store = Store::open(&root)?;
+        let run = store.create_run(
+            "write",
+            directory.path(),
+            "codex",
+            json!(["workspace.write"]),
+            json!({}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let operation = store.begin_operation(
+            &run.id,
+            "workspace.write",
+            json!({"path":"fixture.txt","content":"must not execute"}),
+            false,
+        )?;
+        store.request_interrupt(&run.id, Scope::Operation)?;
+        store.operation_state(&operation, "dispatched", None, json!({}))?;
+        assert!(
+            crate::worker::execute(&root, &operation.id)
+                .unwrap_err()
+                .to_string()
+                .contains("interrupted")
+        );
+        assert!(!crate::kernel::perform(
+            &mut store, &root, &run, &operation
+        )?);
+        assert_eq!(store.operation(&operation.id)?.state, "cancelled");
+        assert_eq!(store.run(&run.id)?.state, "running");
+        assert!(!directory.path().join("fixture.txt").exists());
+        Ok(())
+    }
+
+    #[test]
     fn model_interrupts_target_one_started_turn_not_future_recovery_turns() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let mut store = Store::open(directory.path())?;

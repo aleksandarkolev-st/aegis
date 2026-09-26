@@ -142,6 +142,9 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
     if crate::kernel::remaining_seconds(&store, &run)? == 0 {
         bail!("task wall-clock budget exhausted before worker claim");
     }
+    if store.interrupt_requested(&run.id, crate::interrupt::Scope::Operation, &operation.id)? {
+        bail!("operation interrupted before worker claim");
+    }
     if operation.capability == crate::acceptance::CAPABILITY {
         let check = crate::acceptance::authorized_check(&store, &run, &operation)?;
         store.claim_operation(&operation)?;
@@ -307,10 +310,19 @@ fn execute_container(
             break status;
         }
         let oversized = fs::metadata(&path)?.len() > MAX_OUTPUT;
-        let cancelled = Store::open(root)?.run(&run.id)?.state != "running";
-        if oversized || cancelled || started.elapsed() >= deadline {
+        let current = Store::open(root)?;
+        let cancelled = current.run(&run.id)?.state != "running";
+        let interrupted = current.interrupt_requested(
+            &run.id,
+            crate::interrupt::Scope::Operation,
+            &operation.id,
+        )?;
+        if oversized || cancelled || interrupted || started.elapsed() >= deadline {
             child.kill()?;
             crate::kernel::cleanup_container(operation);
+            if interrupted {
+                bail!("operation interrupted by user");
+            }
             bail!("container output limit, cancellation, or deadline reached");
         }
         thread::sleep(Duration::from_millis(100));
