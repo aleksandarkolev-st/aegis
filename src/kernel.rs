@@ -34,6 +34,18 @@ fn activated(store: &Store, run_id: &str) -> Result<Vec<Manifest>> {
         .collect())
 }
 
+fn visible_manifests(store: &Store, run: &Run) -> Result<Vec<Manifest>> {
+    if mode(run) == "eager" {
+        let granted = grants(run)?;
+        Ok(capability::all(store)?
+            .into_iter()
+            .filter(|manifest| granted.iter().any(|grant| grant == &manifest.permission))
+            .collect())
+    } else {
+        activated(store, &run.id)
+    }
+}
+
 fn context(store: &Store, run: &Run) -> Result<String> {
     let mode = mode(run);
     let recent: Vec<_> = store
@@ -53,19 +65,12 @@ fn context(store: &Store, run: &Run) -> Result<String> {
             "payload": payload.to_string().chars().take(if matches!(mode, "eager" | "lazy") { 65_536 } else { 500 }).collect::<String>()})
         })
         .collect();
-    let granted = grants(run)?;
-    let manifests = if mode == "eager" {
-        capability::all(store)?
-            .into_iter()
-            .filter(|manifest| granted.iter().any(|grant| grant == &manifest.permission))
-            .collect()
-    } else {
-        activated(store, &run.id)?
-    };
+    let manifests = visible_manifests(store, run)?;
     let handoff = store.last_checkpoint(&run.id)?;
     let context = json!({
         "task": run.task, "acceptance": run.acceptance, "workspace": run.workspace, "mode": mode,
-        "grants": run.grants, "recent_events": recent, "active_capabilities": manifests,
+        "permission_policy": "Discovery returns only granted capabilities; invoke only supplied schemas.",
+        "recent_events": recent, "active_capabilities": manifests,
         "milestones": store.milestones(&run.id)?, "handoff": handoff,
     });
     let discovery = if mode == "eager" {
@@ -340,15 +345,7 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
             break;
         }
         let prompt = context(&store, &run)?;
-        let manifests = if mode(&run) == "eager" {
-            let granted = grants(&run)?;
-            capability::all(&store)?
-                .into_iter()
-                .filter(|manifest| granted.iter().any(|grant| grant == &manifest.permission))
-                .collect::<Vec<_>>()
-        } else {
-            activated(&store, run_id)?
-        };
+        let manifests = visible_manifests(&store, &run)?;
         store.event(
             run_id,
             "model.started",
@@ -446,6 +443,27 @@ mod tests {
         assert!(prompt.contains("Read a UTF-8 workspace file"));
         assert!(!prompt.contains("Write exact UTF-8"));
         assert!(prompt.contains("invoke directly"));
+        Ok(())
+    }
+
+    #[test]
+    fn inactive_grant_names_do_not_enter_lazy_context() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let granted: Vec<_> = (0..500)
+            .map(|index| format!("mcp:fixture:search_{index}"))
+            .collect();
+        let run = store.create_run(
+            "find bug",
+            directory.path(),
+            "codex",
+            json!(granted),
+            json!({}),
+            "",
+        )?;
+        let prompt = context(&store, &run)?;
+        assert!(!prompt.contains("mcp:fixture:search_"));
+        assert!(prompt.len() < 3000);
         Ok(())
     }
 
