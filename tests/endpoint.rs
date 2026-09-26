@@ -278,6 +278,15 @@ fn custom_endpoint_completes_a_kernel_run_without_persisting_its_key() -> Result
                     let bytes = store.artifact(event.payload["artifact"].as_str().unwrap())?;
                     assert!(!String::from_utf8_lossy(&bytes).contains("local-fixture-secret"));
                 }
+                if event.kind == "operation.succeeded" {
+                    assert_eq!(event.payload["detail"]["capability"], "workspace.read");
+                    assert_eq!(event.payload["detail"]["target"], "fixture.txt");
+                    assert_eq!(
+                        event.payload["detail"]["output_bytes"],
+                        "expected fixture answer\n".len()
+                    );
+                    assert!(event.payload["detail"]["elapsed_ms"].is_u64());
+                }
             }
         }
         assert!(!String::from_utf8_lossy(&output.stdout).contains("local-fixture-secret"));

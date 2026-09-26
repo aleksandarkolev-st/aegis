@@ -571,14 +571,22 @@ fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
     let mut interrupts = InterruptKeys::default();
     let started = Instant::now();
     let mut phase = "Starting task".to_owned();
+    let mut context_status = crate::terminal::ContextStatus::default();
     loop {
         let events = store.events_since(id, sequence)?;
         if !events.is_empty() {
             terminal.clear_activity()?;
+            context_status.operations = store.event_count(id, "operation.pending")? as u64;
+            context_status.artifacts = store.evidence_artifacts(id)?.len();
         }
         for event in events {
             match event.kind.as_str() {
-                "model.started" => phase = "Thinking".into(),
+                "model.started" => {
+                    phase = "Thinking".into();
+                    context_status.prompt_chars = event.payload["prompt_chars"].as_u64();
+                    context_status.schema_count = event.payload["schema_count"].as_u64();
+                }
+                "checkpoint.created" => context_status.checkpoint_at = Some(event.created_at),
                 "acceptance.started" => phase = "Verifying acceptance".into(),
                 "operation.pending" => {
                     phase = format!(
@@ -615,7 +623,12 @@ fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
             )?;
             return Ok(());
         }
-        terminal.activity(&phase, started.elapsed(), store.model_tokens(id)?)?;
+        terminal.activity(
+            &phase,
+            started.elapsed(),
+            store.model_tokens(id)?,
+            &context_status,
+        )?;
         if terminal.interactive && event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Release {

@@ -39,6 +39,37 @@ pub struct Terminal {
     colors: bool,
     animations: bool,
     frame: usize,
+    activity_rows: std::cell::Cell<u16>,
+}
+
+#[derive(Default)]
+pub struct ContextStatus {
+    pub prompt_chars: Option<u64>,
+    pub schema_count: Option<u64>,
+    pub operations: u64,
+    pub artifacts: usize,
+    pub checkpoint_at: Option<i64>,
+}
+
+impl ContextStatus {
+    pub fn text(&self, now: i64) -> String {
+        let prompt = self
+            .prompt_chars
+            .map(|chars| chars.to_string())
+            .unwrap_or_else(|| "?".into());
+        let schemas = self
+            .schema_count
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "?".into());
+        let checkpoint = self
+            .checkpoint_at
+            .map(|created| format!("{}s", now.saturating_sub(created).max(0)))
+            .unwrap_or_else(|| "—".into());
+        format!(
+            "ctx {prompt} chars · schemas {schemas} · ops {} · artifacts {} · checkpoint {checkpoint}",
+            self.operations, self.artifacts
+        )
+    }
 }
 
 pub struct RawMode(bool);
@@ -151,6 +182,7 @@ impl Default for Terminal {
             colors: io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
             animations: interactive && std::env::var_os("AEGIS_REDUCED_MOTION").is_none(),
             frame: 0,
+            activity_rows: std::cell::Cell::new(0),
         }
     }
 }
@@ -232,10 +264,18 @@ impl Terminal {
 
     pub fn clear_activity(&self) -> Result<()> {
         if self.interactive {
+            let rows = self.activity_rows.replace(0);
+            if rows > 1 {
+                queue!(io::stdout(), cursor::MoveUp(rows - 1))?;
+            }
             queue!(
                 io::stdout(),
                 cursor::MoveToColumn(0),
-                Clear(ClearType::CurrentLine),
+                Clear(if rows > 0 {
+                    ClearType::FromCursorDown
+                } else {
+                    ClearType::CurrentLine
+                }),
                 cursor::Show
             )?;
             io::stdout().flush()?;
@@ -243,7 +283,13 @@ impl Terminal {
         Ok(())
     }
 
-    pub fn activity(&mut self, label: &str, elapsed: Duration, tokens: u64) -> Result<()> {
+    pub fn activity(
+        &mut self,
+        label: &str,
+        elapsed: Duration,
+        tokens: u64,
+        context: &ContextStatus,
+    ) -> Result<()> {
         if !self.interactive {
             return Ok(());
         }
@@ -258,11 +304,12 @@ impl Terminal {
             .map(|(width, _)| width as usize)
             .unwrap_or(80);
         let text = format!(
-            "  {frame} {} · {}s · {} tokens  |  Ctrl+C interrupt · Ctrl+D detach",
+            "  {frame} {} · {}s · {} recorded tokens  |  Ctrl+C interrupt · Ctrl+D detach",
             clean(label),
             elapsed.as_secs(),
             tokens
         );
+        self.clear_activity()?;
         queue!(
             io::stdout(),
             cursor::Hide,
@@ -274,6 +321,15 @@ impl Terminal {
         }
         write!(io::stdout(), "{}", fit(&text, width.saturating_sub(1)))?;
         queue!(io::stdout(), ResetColor)?;
+        write!(
+            io::stdout(),
+            "\r\n{}",
+            fit(
+                &format!("  {}", context.text(crate::storage::unix_time())),
+                width.saturating_sub(1)
+            )
+        )?;
+        self.activity_rows.set(2);
         io::stdout().flush()?;
         Ok(())
     }
@@ -643,7 +699,8 @@ impl Terminal {
                 )
             }
             "operation.succeeded" => {
-                self.message(Tone::Success, "✓", "Tool completed · evidence saved")
+                let (tone, label, text) = result_summary(payload);
+                self.message(tone, label, &text)
             }
             "run.completed" => self.message(
                 Tone::Success,
@@ -693,6 +750,59 @@ fn menu_matches(choices: &[String], query: &str) -> Vec<usize> {
         .filter(|(_, choice)| choice.to_lowercase().contains(&query))
         .map(|(index, _)| index)
         .collect()
+}
+
+fn result_summary(payload: &serde_json::Value) -> (Tone, &'static str, String) {
+    let detail = &payload["detail"];
+    let capability = detail["capability"].as_str().unwrap_or("tool");
+    let target = detail["target"].as_str().unwrap_or(capability);
+    let mut text = fit(target, 100);
+    let code = detail["exit_code"].as_i64();
+    if let Some(code) = code {
+        text.push_str(&format!(" · exit {code}"));
+    }
+    if let Some(matches) = detail["matches"].as_u64() {
+        text.push_str(&format!(" · {matches} matches"));
+    }
+    if let Some(bytes) = detail["output_bytes"].as_u64() {
+        let size = if bytes >= 1024 * 1024 {
+            format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+        } else if bytes >= 1024 {
+            format!("{:.1} KiB", bytes as f64 / 1024.0)
+        } else {
+            format!("{bytes} B")
+        };
+        text.push_str(&format!(" · {size}"));
+    }
+    if let Some(elapsed) = detail["elapsed_ms"].as_u64() {
+        text.push_str(&format!(" · {:.1}s", elapsed as f64 / 1000.0));
+    }
+    if let Some(hash) = detail["output_artifact"]
+        .as_str()
+        .or_else(|| payload["artifact"].as_str())
+    {
+        text.push_str(&format!(" · evidence {}", fit(hash, 12)));
+    } else {
+        text.push_str(" · evidence saved");
+    }
+    if capability == "process.run" && code.is_none() {
+        return (
+            Tone::Warning,
+            "Command ended",
+            format!("{text} · exit status unavailable"),
+        );
+    }
+    if code.is_some_and(|code| code != 0) {
+        return (Tone::Warning, "Command failed", text);
+    }
+    let label = match capability {
+        "workspace.write" => "Edited",
+        "workspace.read" => "Read",
+        "workspace.search" => "Found",
+        "process.run" => "Command finished",
+        _ => "Tool finished",
+    };
+    (Tone::Success, label, text)
 }
 
 fn menu_move(selected: usize, count: usize, key: KeyCode) -> usize {
@@ -770,6 +880,48 @@ mod tests {
         assert_eq!(menu_matches(&choices, "SON"), vec![2]);
         assert_eq!(menu_matches(&choices, ""), vec![0, 1, 2, 3]);
         assert!(menu_matches(&choices, "missing").is_empty());
+    }
+
+    #[test]
+    fn result_feedback_reports_exit_status_and_virtualized_size_without_json() {
+        let payload = serde_json::json!({"artifact":"0123456789abcdef", "detail":{"capability":"process.run","target":"node","exit_code":1,"output_bytes":20*1024*1024,"elapsed_ms":3800,"preview":"{private-json}"}});
+        let (tone, label, text) = result_summary(&payload);
+        assert!(matches!(tone, Tone::Warning));
+        assert_eq!(label, "Command failed");
+        assert!(text.contains("exit 1") && text.contains("20.0 MiB") && text.contains("3.8s"));
+        assert!(!text.contains("private-json"));
+        let (tone, label, _) = result_summary(
+            &serde_json::json!({"detail":{"capability":"process.run","exit_code":0}}),
+        );
+        assert!(matches!(tone, Tone::Success));
+        assert_eq!(label, "Command finished");
+        assert!(matches!(
+            result_summary(
+                &serde_json::json!({"detail":{"capability":"process.run","exit_code":null}})
+            )
+            .0,
+            Tone::Warning
+        ));
+    }
+
+    #[test]
+    fn footer_labels_character_counts_and_unknown_measurements_honestly() {
+        let status = ContextStatus {
+            prompt_chars: Some(18400),
+            schema_count: Some(4),
+            operations: 23,
+            artifacts: 7,
+            checkpoint_at: Some(100),
+        };
+        let text = status.text(112);
+        assert!(text.contains("18400 chars") && text.contains("schemas 4"));
+        assert!(
+            text.contains("ops 23")
+                && text.contains("artifacts 7")
+                && text.contains("checkpoint 12s")
+        );
+        assert!(!text.contains("tokens"));
+        assert!(ContextStatus::default().text(112).contains("ctx ? chars"));
     }
 
     #[test]

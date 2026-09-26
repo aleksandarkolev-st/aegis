@@ -297,11 +297,18 @@ pub(crate) fn perform(
             .unwrap_or(60)
             .min(remaining),
     );
+    let started = Instant::now();
     match dispatch(root, operation, timeout) {
         Ok(result) => {
             let bytes = serde_json::to_vec(&result)?;
             let hash = store.put_artifact(&bytes)?;
-            store.operation_state(operation, "succeeded", Some(&hash), json!({"bytes": bytes.len(), "preview": String::from_utf8_lossy(&bytes).chars().take(300).collect::<String>()}))?;
+            let detail = result_detail(
+                operation,
+                &result,
+                bytes.len(),
+                started.elapsed().as_millis(),
+            );
+            store.operation_state(operation, "succeeded", Some(&hash), detail)?;
         }
         Err(error) => {
             let interrupted = store.interrupt_requested(
@@ -337,6 +344,18 @@ pub(crate) fn perform(
     }
     store.acknowledge_interrupt(&run.id, crate::interrupt::Scope::Operation, &operation.id)?;
     Ok(false)
+}
+
+fn result_detail(operation: &Operation, result: &Value, bytes: usize, elapsed_ms: u128) -> Value {
+    json!({
+        "bytes":bytes, "capability":operation.capability,
+        "target":operation.arguments["path"].as_str().or_else(|| operation.arguments["program"].as_str()),
+        "output_bytes":result["bytes"].as_u64().or_else(|| result["content"].as_str().map(|content| content.len() as u64)),
+        "exit_code":result["exit_code"],
+        "matches":result["matches"].as_array().map(Vec::len),
+        "output_artifact":result["output_artifact"], "elapsed_ms":elapsed_ms,
+        "preview":result.to_string().chars().take(300).collect::<String>(),
+    })
 }
 
 pub fn spawn(root: &Path, id: &str, secret: Option<(&str, &str)>) -> Result<()> {
@@ -669,6 +688,36 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn result_metadata_keeps_real_tool_counts_exit_status_and_timing() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "inspect",
+            directory.path(),
+            "unused",
+            json!([]),
+            json!({}),
+            "",
+        )?;
+        let operation =
+            store.begin_operation(&run.id, "workspace.read", json!({"path":"file.txt"}), true)?;
+        let detail = result_detail(&operation, &json!({"content":"é"}), 100, 320);
+        assert_eq!(detail["output_bytes"], 2);
+        assert_eq!(detail["target"], "file.txt");
+        assert_eq!(detail["elapsed_ms"], 320);
+        let detail = result_detail(
+            &operation,
+            &json!({"exit_code":1,"bytes":2048,"matches":[{},{}]}),
+            100,
+            320,
+        );
+        assert_eq!(detail["exit_code"], 1);
+        assert_eq!(detail["matches"], 2);
+        assert_eq!(detail["output_bytes"], 2048);
+        Ok(())
+    }
 
     #[test]
     fn attaching_to_an_active_runner_does_not_spawn_or_truncate_logs() -> Result<()> {
