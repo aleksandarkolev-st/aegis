@@ -196,7 +196,7 @@ fn dispatch(root: &Path, operation: &Operation, timeout: Duration) -> Result<Val
     {
         command.env_remove(reference);
     }
-    let mut child = command.spawn()?;
+    let mut child = crate::process::spawn(command)?;
     let start = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {

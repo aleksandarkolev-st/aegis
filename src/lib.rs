@@ -4,6 +4,7 @@ pub mod evaluation;
 pub mod kernel;
 pub mod mcp;
 pub mod model;
+pub mod process;
 pub mod provider;
 pub mod session;
 pub mod storage;

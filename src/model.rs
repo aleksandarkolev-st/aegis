@@ -293,8 +293,7 @@ pub fn call_configured(
         })
         .stdout(Stdio::from(File::create(&stdout_path)?))
         .stderr(Stdio::from(File::create(&stderr_path)?));
-    let mut child = command
-        .spawn()
+    let mut child = crate::process::spawn(command)
         .with_context(|| format!("start {provider}; install and log in to its CLI first"))?;
     let start = Instant::now();
     let status = loop {

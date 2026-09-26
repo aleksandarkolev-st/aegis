@@ -56,6 +56,7 @@ dependencies = [
  "fs2",
  "hex",
  "jsonschema",
+ "process-wrap",
  "reqwest",
  "rmcp",
  "rusqlite",
