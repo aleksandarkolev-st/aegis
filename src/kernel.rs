@@ -97,6 +97,8 @@ fn context(store: &Store, run: &Run) -> Result<String> {
     let context = json!({
         "task": run.task, "acceptance": run.acceptance, "workspace": run.workspace, "mode": mode,
         "permission_policy": "Discovery returns only granted capabilities; invoke only supplied schemas. Non-eager modes retain at most eight recently discovered capability schemas. Search again to reactivate an evicted schema; discovery never removes recorded operations or evidence.",
+        "process_programs": grants(run)?.into_iter().filter_map(|grant| grant.strip_prefix("process:").map(str::to_owned)).collect::<Vec<_>>(),
+        "process_policy": "process.run may execute only listed process_programs inside the approved container. An empty list means no program is authorized. Do not invoke tests through an ungranted program; independent acceptance is handled by the runtime.",
         "result_policy": if matches!(mode, "eager" | "lazy") { "Tool results are inline; inspect_result is unavailable." } else { "Results are artifact-backed; use inspect_result to select relevant text." },
         "recent_events": recent, "active_capabilities": manifests,
         "milestones": store.milestones(&run.id)?, "handoff": handoff,
@@ -310,7 +312,7 @@ pub(crate) fn perform(
             let claimed = store.operation(&operation.id)?.state == "executing";
             let state = if interrupted && (operation.retry_safe || !claimed) {
                 "cancelled"
-            } else if operation.retry_safe {
+            } else if operation.retry_safe || !claimed {
                 "failed"
             } else {
                 "outcome_unknown"
@@ -395,6 +397,9 @@ fn apply(store: &mut Store, root: &Path, run: &Run, action: Action) -> Result<bo
             let manifest = capability::permitted(store, &capability, &grants(run)?)?
                 .context("capability not granted")?;
             capability::validate_arguments(&manifest, &args)?;
+            if capability == "process.run" {
+                crate::worker::authorize_program(run, &args)?;
+            }
             if mode(run) != "eager"
                 && !activated(store, &run.id)?
                     .iter()
@@ -718,6 +723,42 @@ mod tests {
         assert!(conversation(&store, &run)?.is_empty());
         run.budgets["previous_run"] = json!(run.id);
         assert!(conversation(&store, &run)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn unauthorized_programs_are_rejected_without_an_intent_or_recovery_pause() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "work",
+            directory.path(),
+            "codex",
+            json!(["process.run", "process:node"]),
+            json!({}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        store.activate(&run.id, "process.run", 1)?;
+        let prompt = context(&store, &run)?;
+        assert!(prompt.contains("\"process_programs\":[\"node\"]"));
+        assert!(
+            apply(
+                &mut store,
+                directory.path(),
+                &run,
+                Action::Invoke {
+                    capability: "process.run".into(),
+                    args: json!({"program":"cargo","args":["test"]}),
+                }
+            )
+            .unwrap_err()
+            .to_string()
+            .starts_with("program is not explicitly granted")
+        );
+        assert_eq!(store.run(&run.id)?.state, "running");
+        assert!(store.operations(&run.id)?.is_empty());
+        assert_eq!(store.unknown_count(&run.id)?, 0);
         Ok(())
     }
 

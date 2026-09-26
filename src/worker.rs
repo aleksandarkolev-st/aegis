@@ -135,6 +135,20 @@ fn string<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
         .with_context(|| format!("missing string argument: {key}"))
 }
 
+pub(crate) fn authorize_program(run: &Run, args: &Value) -> Result<()> {
+    let program = string(args, "program")?;
+    let grants: Vec<String> = serde_json::from_value(run.grants.clone())?;
+    if program.is_empty()
+        || program.bytes().any(|byte| b"/\\:\0".contains(&byte))
+        || !grants
+            .iter()
+            .any(|grant| grant == &format!("process:{program}") || grant == "process:*")
+    {
+        bail!("program is not explicitly granted; choose a listed process program");
+    }
+    Ok(())
+}
+
 pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
     uuid::Uuid::parse_str(operation_id).context("invalid operation ID")?;
     let lock = File::options()
@@ -181,6 +195,9 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
         bail!("capability version changed after intent was recorded");
     }
     capability::validate_arguments(&manifest, &operation.arguments)?;
+    if operation.capability == "process.run" {
+        authorize_program(&run, &operation.arguments)?;
+    }
     store.claim_operation(&operation)?;
     let workspace = Path::new(&run.workspace);
     let args = &operation.arguments;
@@ -243,16 +260,6 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
         }
         "process.run" => {
             let program = string(args, "program")?;
-            if program.is_empty()
-                || program
-                    .bytes()
-                    .any(|byte| byte == b'/' || byte == 92 || byte == b':')
-                || !grants
-                    .iter()
-                    .any(|grant| grant == &format!("process:{program}") || grant == "process:*")
-            {
-                bail!("program is not explicitly granted");
-            }
             let arguments = args
                 .get("args")
                 .and_then(Value::as_array)
@@ -487,6 +494,40 @@ mod tests {
         store.operation_state(&operation, "dispatched", None, json!({}))?;
         assert!(execute(&root, &operation.id).is_err());
         assert!(!directory.path().join("a.txt").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn direct_workers_cannot_claim_ungranted_programs() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(".arun");
+        let mut store = Store::open(&root)?;
+        let run = store.create_run(
+            "work",
+            directory.path(),
+            "codex",
+            json!(["process.run", "process:node"]),
+            json!({"container_image":"node:22-alpine"}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        for program in ["cargo", "../node", "node\0bad"] {
+            let operation = store.begin_operation(
+                &run.id,
+                "process.run",
+                json!({"program":program,"args":["test"]}),
+                false,
+            )?;
+            store.operation_state(&operation, "dispatched", None, json!({}))?;
+            assert!(
+                execute(&root, &operation.id)
+                    .unwrap_err()
+                    .to_string()
+                    .starts_with("program is not explicitly granted")
+            );
+            assert_eq!(store.operation(&operation.id)?.state, "dispatched");
+        }
+        assert_eq!(store.event_count(&run.id, "operation.executing")?, 0);
         Ok(())
     }
 
