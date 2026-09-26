@@ -219,6 +219,8 @@ impl Terminal {
         self.animations = self.interactive
             && options.motion
             && std::env::var_os("AEGIS_REDUCED_MOTION").is_none();
+        self.colors =
+            io::stdout().is_terminal() && options.colors && std::env::var_os("NO_COLOR").is_none();
         self.skin = Box::new(options);
         Ok(())
     }
@@ -394,8 +396,8 @@ impl Terminal {
             .map(|(width, _)| width as usize)
             .unwrap_or(80);
         let text = format!(
-            "  {frame} {} · {}s · {} recorded tokens  |  Ctrl+C interrupt · Ctrl+D detach",
-            clean(label),
+            "  {frame} {} · {}s · {} recorded tokens · ^C interrupt / ^D detach",
+            fit(label, 20),
             elapsed.as_secs(),
             tokens
         );

@@ -41,7 +41,7 @@ Memory stays deliberately small: at most 16 notes, 512 UTF-8 bytes each, 4 KiB o
 
 Pip, Aegis's tiny shield sidekick, blinks while thinking and perks up when tools are working. The default look is ready immediately; appearance is never an onboarding step. F7 → **Appearance** switches between Mint/Pip, Midnight/Byte, Solar/Orbit or Calm (no mascot/motion). `NO_COLOR` and `AEGIS_REDUCED_MOTION` still take precedence. Rendering stays in normal terminal scrollback—no separate window or alternate screen.
 
-Optional `.arun/ui.json` is a small, validated data file. Mix and reorder welcome `blocks` (`mascot`, `provider`, `workspace`, `hint`, `shortcuts`), set RGB `palette` values, choose `mascot`, change `input_prefix`, hide the context footer with `show_context`, and supply your own `portrait`, `frames`, `frame_millis` and `motion`. F7 can load a style from another file. Missing styles use defaults; invalid ones fall back without blocking startup. Files cannot execute scripts or embed terminal control sequences.
+Optional `.arun/ui.json` is a small, validated data file. Mix and reorder welcome `blocks` (`mascot`, `provider`, `workspace`, `hint`, `shortcuts`), set RGB `palette` values or turn `colors` off, choose `mascot`, change `input_prefix`, hide the context footer with `show_context`, and supply your own `portrait`, `frames`, `frame_millis` and `motion`. F7 can load a style from another file. Missing styles use defaults; invalid ones fall back without blocking startup. Files cannot execute scripts or embed terminal control sequences.
 
 ```json
 {

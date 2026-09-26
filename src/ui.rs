@@ -78,6 +78,7 @@ pub struct UiOptions {
     pub palette: Palette,
     pub mascot: Mascot,
     pub motion: bool,
+    pub colors: bool,
     pub frame_millis: u64,
     pub blocks: Vec<WelcomeBlock>,
     pub frames: Vec<String>,
@@ -92,6 +93,7 @@ impl Default for UiOptions {
             palette: Palette::default(),
             mascot: Mascot::Pip,
             motion: true,
+            colors: true,
             frame_millis: 400,
             blocks: vec![
                 WelcomeBlock::Mascot,
@@ -134,6 +136,7 @@ impl UiOptions {
             3 => Self {
                 mascot: Mascot::Off,
                 motion: false,
+                colors: false,
                 ..Self::default()
             },
             _ => Self::default(),
