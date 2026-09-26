@@ -232,16 +232,10 @@ fn command(
             &mount,
             "--tmpfs",
             "/tmp:rw,size=256m",
-            "--tmpfs",
-            "/workspace/.arun:rw,noexec,size=1m",
             "--env",
             "HOME=/tmp",
         ]);
-        if workspace.join(".git").is_dir() {
-            command.args(["--tmpfs", "/workspace/.git:rw,noexec,size=1m"]);
-        } else if workspace.join(".git").exists() {
-            bail!("isolated MCP does not support workspaces with a .git metadata file");
-        }
+        crate::worker::mask_metadata(command.as_std_mut(), &workspace)?;
         command.args(["--entrypoint", &server.command, image]);
         command.args(&server.args).kill_on_drop(true);
         Ok((command, Some(container)))
@@ -376,6 +370,7 @@ mod tests {
     #[test]
     fn container_commands_do_not_accept_server_annotations_as_policy() -> Result<()> {
         let directory = tempfile::tempdir()?;
+        std::fs::create_dir(directory.path().join(".arun"))?;
         std::fs::create_dir(directory.path().join(".git"))?;
         let server = Server {
             name: "fixture".into(),

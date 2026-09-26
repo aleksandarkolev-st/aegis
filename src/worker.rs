@@ -18,6 +18,22 @@ pub fn container_name(operation_id: &str) -> Result<String> {
     Ok(format!("arun-{operation_id}"))
 }
 
+pub(crate) fn mask_metadata(command: &mut Command, workspace: &Path) -> Result<()> {
+    for name in [".arun", ".git"] {
+        match fs::symlink_metadata(workspace.join(name)) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                command.args(["--tmpfs", &format!("/workspace/{name}:rw,noexec,size=1m")]);
+            }
+            Ok(_) => bail!(
+                "isolated commands require {name} metadata to be a directory, not a file or link"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 fn docker_command(
     run: &Run,
     operation: &Operation,
@@ -72,16 +88,13 @@ fn docker_command(
         &mount,
         "--tmpfs",
         "/tmp:rw,size=256m",
-        "--tmpfs",
-        "/workspace/.arun:rw,noexec,size=1m",
         "--env",
         "HOME=/tmp",
         "--env",
         "CARGO_TARGET_DIR=/tmp/target",
-        "--entrypoint",
-        program,
-        image,
     ]);
+    mask_metadata(&mut command, Path::new(&run.workspace))?;
+    command.args(["--entrypoint", program, image]);
     command.args(arguments);
     Ok(command)
 }
@@ -480,7 +493,8 @@ mod tests {
     #[test]
     fn process_command_is_containerized_without_network() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let mut store = Store::open(directory.path())?;
+        let mut store = Store::open(&directory.path().join(".arun"))?;
+        fs::create_dir(directory.path().join(".git"))?;
         let run = store.create_run(
             "test",
             directory.path(),
@@ -507,6 +521,24 @@ mod tests {
                 .any(|argument| argument.starts_with("/workspace/.arun:"))
         );
         assert_eq!(args.last().unwrap(), "test");
+        assert!(
+            args.iter()
+                .any(|argument| argument.starts_with("/workspace/.git:"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_mounts_skip_absent_paths_and_reject_metadata_files() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut command = Command::new("docker");
+        mask_metadata(&mut command, directory.path())?;
+        assert_eq!(command.get_args().count(), 0);
+        fs::write(directory.path().join(".git"), "gitdir: ../private")?;
+        assert!(mask_metadata(&mut command, directory.path()).is_err());
+        fs::remove_file(directory.path().join(".git"))?;
+        fs::write(directory.path().join(".arun"), "not a directory")?;
+        assert!(mask_metadata(&mut command, directory.path()).is_err());
         Ok(())
     }
 }

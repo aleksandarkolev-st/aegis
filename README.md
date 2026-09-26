@@ -134,6 +134,8 @@ arun run "Run the tests" --allow-process node --image node:22-alpine
 
 The worker uses a read-only root filesystem, a bind-mounted workspace (read-only unless `--allow-write`), no container network, dropped capabilities, resource limits, and an ephemeral mount hiding `.arun`. Task execution never pulls images. Guided setup can download an image only after you explicitly choose it, or continue with commands disabled. Process output up to 32 MiB is stored as a separate artifact instead of being dumped into model context. Docker Desktop or an equivalent Docker daemon must be running for this capability.
 
+Process workers and isolated MCP servers hide existing `.arun` and `.git` directories behind ephemeral mounts. Metadata files and links, including Git worktree `.git` files, are rejected rather than exposed. Missing metadata paths are not mounted or created, so read-only commands and acceptance checks also work in fresh workspaces whose runtime state lives elsewhere. These protections do not turn explicit trusted-host MCP execution into a sandbox.
+
 Register an isolated stdio MCP server and grant individual tools. The server executable and script must be available inside the chosen image or workspace:
 
 ```powershell
