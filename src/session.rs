@@ -1075,6 +1075,12 @@ fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
                 "model.started" => {
                     phase = "Thinking".into();
                     context_status.prompt_chars = event.payload["prompt_chars"].as_u64();
+                    context_status.normalized_tokens =
+                        if event.payload["context_tokenizer"] == crate::tokenization::ENCODING {
+                            event.payload["raw_prompt_tokens"].as_u64()
+                        } else {
+                            None
+                        };
                     context_status.schema_count = event.payload["schema_count"].as_u64();
                 }
                 "checkpoint.created" => context_status.checkpoint_at = Some(event.created_at),

@@ -48,6 +48,7 @@ pub struct Terminal {
 #[derive(Default)]
 pub struct ContextStatus {
     pub prompt_chars: Option<u64>,
+    pub normalized_tokens: Option<u64>,
     pub schema_count: Option<u64>,
     pub operations: u64,
     pub artifacts: usize,
@@ -68,8 +69,12 @@ impl ContextStatus {
             .checkpoint_at
             .map(|created| format!("{}s", now.saturating_sub(created).max(0)))
             .unwrap_or_else(|| "—".into());
+        let context = self
+            .normalized_tokens
+            .map(|tokens| format!("ctx {tokens} o200k units"))
+            .unwrap_or_else(|| format!("ctx {prompt} chars"));
         format!(
-            "ctx {prompt} chars · schemas {schemas} · ops {} · artifacts {} · checkpoint {checkpoint}",
+            "{context} · schemas {schemas} · ops {} · artifacts {} · checkpoint {checkpoint}",
             self.operations, self.artifacts
         )
     }
@@ -811,6 +816,7 @@ impl Terminal {
                     .as_str()
                     .or_else(|| args["query"].as_str())
                     .or_else(|| args["program"].as_str())
+                    .or_else(|| args["url"].as_str())
                     .unwrap_or_default();
                 let capability = payload["capability"].as_str().unwrap_or("tool");
                 let label = match capability {
@@ -818,6 +824,7 @@ impl Terminal {
                     "workspace.write" => "Edit",
                     "workspace.search" => "Search",
                     "process.run" => "Run",
+                    "network.fetch" => "Fetch",
                     _ => "Tool",
                 };
                 self.message(
@@ -1103,6 +1110,7 @@ mod tests {
     fn footer_labels_character_counts_and_unknown_measurements_honestly() {
         let status = ContextStatus {
             prompt_chars: Some(18400),
+            normalized_tokens: None,
             schema_count: Some(4),
             operations: 23,
             artifacts: 7,
@@ -1117,6 +1125,12 @@ mod tests {
         );
         assert!(!text.contains("tokens"));
         assert!(ContextStatus::default().text(112).contains("ctx ? chars"));
+        let measured = ContextStatus {
+            normalized_tokens: Some(4200),
+            ..status
+        };
+        assert!(measured.text(112).contains("ctx 4200 o200k units"));
+        assert!(!measured.text(112).contains("4200 chars"));
     }
 
     #[test]
