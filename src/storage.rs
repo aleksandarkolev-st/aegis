@@ -317,6 +317,14 @@ impl Store {
         Ok(total.max(0) as u64)
     }
 
+    pub fn run_started_at(&self, run_id: &str) -> Result<Option<i64>> {
+        Ok(self.connection.query_row(
+            "SELECT MIN(created_at) FROM events WHERE run_id = ?1 AND kind = 'run.running'",
+            [run_id],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn activate(&mut self, run_id: &str, capability: &str, version: u32) -> Result<()> {
         let transaction = self
             .connection
@@ -821,6 +829,30 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_clock_starts_at_first_running_event() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "queued",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({}),
+            "",
+        )?;
+        assert_eq!(store.run_started_at(&run.id)?, None);
+        store.state(&run.id, "running", json!({}))?;
+        store.connection.execute(
+            "UPDATE events SET created_at = 100 WHERE run_id = ?1 AND kind = 'run.running'",
+            [&run.id],
+        )?;
+        store.state(&run.id, "waiting_recovery", json!({}))?;
+        store.state(&run.id, "running", json!({}))?;
+        assert_eq!(store.run_started_at(&run.id)?, Some(100));
+        Ok(())
+    }
 
     #[test]
     fn reopens_with_ordered_events_and_artifacts() -> Result<()> {

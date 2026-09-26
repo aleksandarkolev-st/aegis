@@ -193,7 +193,12 @@ fn dispatch(root: &Path, operation: &Operation, timeout: Duration) -> Result<Val
     }
 }
 
-fn perform(store: &mut Store, root: &Path, run: &Run, operation: &Operation) -> Result<bool> {
+pub(crate) fn perform(
+    store: &mut Store,
+    root: &Path,
+    run: &Run,
+    operation: &Operation,
+) -> Result<bool> {
     store.operation_state(
         operation,
         "dispatched",
@@ -322,6 +327,9 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
         return Ok(());
     }
     store.state(run_id, "running", json!({}))?;
+    let started_at = store
+        .run_started_at(run_id)?
+        .context("run start event missing")?;
     for operation in unresolved.iter().filter(|operation| operation.retry_safe) {
         if perform(&mut store, root, &run, operation)? {
             return Ok(());
@@ -356,7 +364,7 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
             break;
         }
         if store.model_tokens(run_id)? >= max_tokens
-            || crate::storage::unix_time().saturating_sub(run.created_at) as u64 >= wall_seconds
+            || crate::storage::unix_time().saturating_sub(started_at) as u64 >= wall_seconds
         {
             store.state(
                 run_id,

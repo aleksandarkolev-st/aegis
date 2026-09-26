@@ -1,4 +1,5 @@
 pub mod capability;
+pub mod evaluation;
 pub mod kernel;
 pub mod mcp;
 pub mod model;

@@ -69,6 +69,18 @@ cargo test --test docker -- --ignored
 
 The ignored Docker test requires a running daemon and the local `node:22-alpine` image. It verifies a multi-megabyte output handle and that the runtime database is hidden in the container. The runtime contracts, crash cases, and evaluation design are in `docs/contracts.md`.
 
+## Paired evaluation
+
+```powershell
+arun eval --prepare-only
+arun eval --provider chatgpt --sizes 50 --modes eager,lazy,artifact,durable --tasks read,log
+arun eval --provider chatgpt --repeats 3 --image node:22-alpine
+```
+
+The default matrix has 48 cases: three fixtures, four modes, and registries of 50, 100, 250, and 500 tools. Each repeat rotates mode order. Fixtures, exact manifests, immutable run configurations, CLI versions, JSONL events, artifacts, and results are saved under `.arun/evaluations/<id>/`. `--prepare-only` creates cases without model calls. Other runs consume the selected provider's usage allowance. Budgets include `--actions`, `--model-tokens`, `--context-chars`, and `--wall-seconds`; queued cases start their execution clock on first dispatch rather than at preparation.
+
+Read and large-log fixtures require both the expected final answer and matching successful-operation evidence. Repair is checked independently by Node assertions in a network-disabled Docker container; the selected image must already exist. Results distinguish execution time from acceptance-check time, record wrong-tool and invalid-argument counts, and report context overflow explicitly. Schema exposure is measured in UTF-8 bytes, not claimed as exact tokenizer tokens. Models currently use provider defaults; version metadata records that limitation. Raw observations are not success-rate claims or uncertainty estimates.
+
 ## Remaining work
 
-The broader `plan.txt` also calls for reproducible paired evaluation across eager/lazy/artifact/durable modes, forced-restart benchmarks, a richer trace inspector, full MCP server isolation, and externally checked task completion. These are not yet claimed as implemented. The Codex CLI adapter disables its built-in tools, but its own system context still incurs substantial token overhead; measured usage is reported rather than presented as a kernel-only schema cost.
+The broader `plan.txt` also calls for forced-restart benchmarks, pinned model configurations, paired uncertainty reporting, full MCP server isolation, and configurable external acceptance for ordinary runs. These are not yet claimed as implemented. The Codex CLI adapter disables its built-in tools, but its own system context still incurs substantial token overhead; measured usage is reported rather than presented as a kernel-only schema cost.

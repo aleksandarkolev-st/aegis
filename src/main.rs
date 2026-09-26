@@ -22,6 +22,9 @@ fn usage() {
         "arun attach|resume|status|cancel|replay|trace <run-id> | resolve <run-id> <op-id> succeeded|failed <note> | list | inspect <artifact-hash> | login|probe <provider>"
     );
     println!("arun tasks|context|tools|artifacts <run-id> | mcp add <name> <command> [args...]");
+    println!(
+        "arun eval [--provider chatgpt|claude|grok] [--sizes 50,100,250,500] [--modes eager,lazy,artifact,durable] [--tasks read,log,repair] [--repeats 1] [--prepare-only]"
+    );
 }
 
 fn view(root: &Path, command: &str, id: &str) -> Result<()> {
@@ -388,6 +391,7 @@ fn main() -> Result<()> {
     match arguments.first().map(String::as_str) {
         None => interactive(&root),
         Some("run") => run(&root, &arguments[1..]),
+        Some("eval") => arun::evaluation::command(&root, &arguments[1..]),
         Some("serve") => kernel::drive(Path::new(required(1)?), required(2)?),
         Some("worker") => {
             let value = arun::worker::execute(Path::new(required(1)?), required(2)?)?;
