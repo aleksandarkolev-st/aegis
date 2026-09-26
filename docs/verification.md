@@ -28,8 +28,8 @@ This is a development verification record, not a success-rate or performance-imp
 
 ## Automated checks
 
-- `cargo test --locked`: 76 unit tests and 31 integration tests passed after exact command scopes and command receipt identities; four Docker tests are ignored by default. Six focused terminal tests also passed after the earlier owned-row repaint change.
-- `cargo test --test docker --test docker_acceptance --test docker_mcp -- --ignored`: all four passed separately with Docker running. They verify multi-megabyte output virtualization, hidden runtime state, fresh read-only workspaces without metadata directories, immutable/read-only acceptance checks, and MCP filesystem/network/credential isolation.
+- `cargo test --locked`: 87 unit tests and 38 integration tests passed after mascot/styles, bounded notes, habit/workflow learning and guided file scopes; five Docker tests are ignored by default. Raw functional output is saved at `.arun/functional-20260927.log`; this is not a new agent benchmark.
+- `cargo test --test docker --test docker_acceptance --test docker_mcp --test filesystem_scopes -- --ignored`: all five passed separately with Docker running. They verify multi-megabyte output virtualization, hidden runtime state, fresh read-only workspaces without metadata directories, immutable/read-only acceptance checks, MCP filesystem/network/credential isolation and narrow scoped container read/write mounts.
 - `npm test`: four package/platform/checksum/version tests passed.
 - Process-tree tests verify that explicit kill and drop cleanup stop a descendant heartbeat, not merely its launcher.
 - A Windows regression forcibly kills a separate supervising process and verifies that its managed child's heartbeat stops without requiring Rust drop cleanup. The same ownership behavior passed a live native-login task interruption; orphan Docker containers are separately removed during runtime recovery.

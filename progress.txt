@@ -1,5 +1,5 @@
 AEGIS IMPLEMENTATION PROGRESS
-Updated: 2026-09-26 22:34 UTC (2026-09-27 Kyiv)
+Updated: 2026-09-26 23:00 UTC (2026-09-27 Kyiv)
 
 LATEST USER REQUIREMENTS
 - Adapt to the user's habits, not just remember explicit notes.
@@ -22,10 +22,12 @@ IMPLEMENTED
   Learns only from independently accepted tasks. Two matching verified runs are required before suggesting a versioned tool path.
   At most two relevant hints enter a new task; current grants and verifier identity filter them.
   Inspect, pause, enable and reset controls are in Project memory.
+- Habit adaptation: eight bounded preference categories, repeated user-request observations, current-request precedence, and UI confirmation/correction/forget controls. Core and UI integration checks passed. No extra model calls or copied transcripts. Arbitrary behavioral profiling is not claimed.
+- Optional exact-file/subtree permissions for file tools and container mounts, with inline F7 configuration. Five Docker checks passed, including scoped read/write enforcement and hidden nested existing metadata. Restrictions apply to future tasks and require confirmation before removal.
 
 IN PROGRESS / NOT YET COMPLETE
-- Habit adaptation implementation added: eight bounded preference categories, repeated user-request observations, current-request precedence and UI confirmation/correction/forget controls. Focused core tests passed; UI integration verification pending. Arbitrary behavioral profiling is not implemented or claimed.
-- Fine-grained filesystem scopes: file-tool preflight/preclaim checks and bounded scoped container mounts are implemented. A real Docker fixture passed: unapproved host files stayed invisible, read-only writes failed, the approved exact file changed, and nested existing metadata stayed hidden. F7 inline controls have been added; their integration checks are in progress. Narrowed scopes reject MCP rather than letting it bypass permissions. Network-domain scopes remain pending.
+- Network-domain scopes and scoped network-body byte budgets remain pending. Containers still have no network by default; narrowed file scopes reject MCP rather than letting it bypass permissions.
+- Coding usability audit: ensure safe file writes can scaffold missing parent directories instead of making users create folders manually.
 - Remaining tool-result token and network-byte budget enforcement; exact schema-token measurement.
 - Full completion audit against plan.txt and functional regression checks after remaining changes.
 - Native Codex hard-coding benchmark and ARC-AGI-3: NOT STARTED under the new readiness gate.
@@ -41,6 +43,7 @@ VERIFICATION ALREADY PERFORMED BEFORE THE NEW BENCHMARK GATE
 - npm package tests: four passed. Example compilation passed.
 - Latest full functional suite after habit adaptation: 84 unit and 36 integration tests passed, with four Docker tests ignored by default. Example compilation and all four npm tests passed again. This predates the in-progress filesystem changes.
 - Filesystem core/preflight focused checks passed, and all five Docker isolation/acceptance fixtures passed after scoped mounts. No agent/model benchmark was started.
+- Full functional suite after guided file scopes: 87 unit and 38 integration tests passed; five Docker tests ignored by default and all five passed separately. Raw functional log: .arun/functional-20260927.log. This is not a Codex/ARC benchmark result.
 - Manual Windows terminal fixture verified two-selector onboarding, mascot animation, appearance settings, explicit memory and readable tool output.
 - These are functional/fixture results, not evidence of better coding or lower token use than Codex.
 
@@ -76,3 +79,10 @@ LATEST LOCAL COMMITS
 - 0cfff34: adapt bounded habits from repeated user requests; UI correction/pause/reset test passed.
 - efb28a4: enforce file-tool exact/subtree scopes before claim.
 - fbde45c: enforce scoped container mounts without broadening host access; all five Docker checks passed.
+- ab1607c: configure optional file scopes inline without extending first-run setup; guided preservation/confirmation checks passed.
+
+NEXT IMPLEMENTATION WORK
+- Close the safe directory-scaffolding UX gap.
+- Add explicitly scoped, bounded network access without opening ambient container networking or bypassing grants.
+- Finish remaining resource accounting, provider/build verification and the complete plan audit.
+- Only after readiness: native Codex coding comparisons and ARC-AGI-3, preserving every attempt and correction outcome.
