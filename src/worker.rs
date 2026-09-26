@@ -125,7 +125,8 @@ fn docker_command(
 }
 
 fn relative(workspace: &Path, path: &str) -> Result<PathBuf> {
-    let relative = Path::new(path);
+    let normalized = crate::filesystem::path_name(path)?;
+    let relative = Path::new(&normalized);
     if relative.as_os_str().is_empty()
         || relative
             .components()
@@ -641,6 +642,10 @@ mod tests {
         assert!(relative(directory.path(), "../outside").is_err());
         assert!(relative(directory.path(), ".git/config").is_err());
         assert!(relative(directory.path(), "C:/outside").is_err());
+        assert!(relative(directory.path(), "..\\outside").is_err());
+        assert!(relative(directory.path(), "file.txt:stream").is_err());
+        assert!(relative(directory.path(), "NUL.txt").is_err());
+        assert!(relative(directory.path(), "file.txt.").is_err());
         assert!(relative(directory.path(), "safe.txt").is_ok());
         Ok(())
     }

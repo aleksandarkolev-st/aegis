@@ -33,7 +33,7 @@ pub(crate) fn linked(metadata: &fs::Metadata) -> bool {
     }
 }
 
-fn path_name(path: &str) -> Result<String> {
+pub(crate) fn path_name(path: &str) -> Result<String> {
     let path = path.replace('\\', "/");
     if path.is_empty()
         || path.len() > 512
@@ -77,7 +77,9 @@ fn path_name(path: &str) -> Result<String> {
                 || part.eq_ignore_ascii_case(".arun")
         })
     {
-        bail!("file scopes require a relative file or directory/** without traversal or metadata");
+        bail!(
+            "file paths must be relative portable names without traversal, reserved devices or metadata"
+        );
     }
     Ok(path)
 }
