@@ -29,10 +29,9 @@ impl CommandScopes {
         for command in &self.commands {
             if command.program.is_empty()
                 || command.program.len() > 160
-                || command.program.chars().any(|character| {
-                    character.is_whitespace()
-                        || character.is_control()
-                        || "/\\:".contains(character)
+                || matches!(command.program.as_str(), "." | "..")
+                || !command.program.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || "._-+".contains(character)
                 })
             {
                 bail!(
@@ -129,6 +128,7 @@ mod tests {
             json!({"command_scopes":{}}),
             json!({"command_scopes":{"commands":[],"wildcard":true}}),
             json!({"command_scopes":{"commands":[{"program":"../cargo","args":[]}]}}),
+            json!({"command_scopes":{"commands":[{"program":"cargo;echo","args":[]}]}}),
             json!({"command_scopes":{"commands":[{"program":"cargo","args":["\0"]}]}}),
         ] {
             assert!(CommandScopes::from_configuration(&configuration).is_err());

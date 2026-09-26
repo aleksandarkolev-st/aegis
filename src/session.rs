@@ -29,6 +29,8 @@ struct Profile {
     #[serde(default)]
     acceptance_check: Option<crate::acceptance::Check>,
     #[serde(default)]
+    command_scopes: Option<crate::policy::CommandScopes>,
+    #[serde(default)]
     previous_run: Option<String>,
 }
 
@@ -201,6 +203,7 @@ fn configure_provider(terminal: &Terminal) -> Result<Option<(Profile, Option<Str
         image: None,
         limits: crate::budget::Limits::default(),
         acceptance_check: None,
+        command_scopes: None,
         previous_run: None,
     };
     let mut secret = None;
@@ -359,6 +362,7 @@ fn settings(root: &Path, terminal: &Terminal, profile: &mut Profile) -> Result<(
         "Workspace permissions and command environment",
         "Task budgets",
         "Completion checks",
+        "Exact command scopes",
         "Back",
     ]
     .map(str::to_owned);
@@ -374,6 +378,7 @@ fn settings(root: &Path, terminal: &Terminal, profile: &mut Profile) -> Result<(
             }
         }
         Some(2) => configure_acceptance(terminal, &mut selected)?,
+        Some(3) => configure_command_scopes(terminal, &mut selected)?,
         _ => false,
     };
     if changed {
@@ -386,6 +391,95 @@ fn settings(root: &Path, terminal: &Terminal, profile: &mut Profile) -> Result<(
         )?;
     }
     Ok(())
+}
+
+fn configure_command_scopes(terminal: &Terminal, profile: &mut Profile) -> Result<bool> {
+    terminal.message(Tone::Quiet, "Command scopes", "Limit commands to exact program/argument pairs. This narrows existing permissions; it does not enable commands or change the approved image. Do not include secrets: this policy is saved in task contracts.")?;
+    let choices = [
+        "Keep current scopes",
+        "Choose exact commands here",
+        "Load a reviewed command scopes JSON file",
+        "Deny every command",
+        "Remove argument limits (existing program grants still apply)",
+    ]
+    .map(str::to_owned);
+    let scopes = match terminal.select("Command authorization", &choices)? {
+        Some(1) => {
+            let mut commands = Vec::new();
+            loop {
+                let Some(program) = field(terminal, "  Program name › ", false)? else {
+                    return Ok(false);
+                };
+                terminal.message(Tone::Quiet, "Arguments", "Enter one exact argument at a time. Empty input ends the list. No shell parsing, wildcards or implicit flags.")?;
+                let mut args = Vec::new();
+                loop {
+                    let Some(argument) = field(terminal, "  Argument (Enter to finish) › ", false)?
+                    else {
+                        return Ok(false);
+                    };
+                    if argument.is_empty() {
+                        break;
+                    }
+                    args.push(argument);
+                    if args.len() > 128 {
+                        terminal.message(
+                            Tone::Warning,
+                            "Scope limit",
+                            "At most 128 arguments are allowed. Existing settings are unchanged.",
+                        )?;
+                        return Ok(false);
+                    }
+                }
+                commands.push(crate::policy::CommandScope { program, args });
+                let candidate = crate::policy::CommandScopes {
+                    commands: commands.clone(),
+                };
+                if let Err(error) = candidate.validate() {
+                    terminal.message(Tone::Warning, "Invalid scope", &error.to_string())?;
+                    return Ok(false);
+                }
+                let next = ["Add another exact command", "Save these scopes"].map(str::to_owned);
+                match terminal.select("Command scopes", &next)? {
+                    Some(0) => {}
+                    Some(1) => break Some(candidate),
+                    _ => return Ok(false),
+                }
+            }
+        }
+        Some(2) => {
+            let Some(path) = field(terminal, "  Reviewed JSON file › ", false)? else {
+                return Ok(false);
+            };
+            match crate::policy::CommandScopes::from_file(Path::new(&path)) {
+                Ok(scopes) => Some(scopes),
+                Err(error) => {
+                    terminal.message(Tone::Warning, "Invalid scopes", &error.to_string())?;
+                    return Ok(false);
+                }
+            }
+        }
+        Some(3) => Some(crate::policy::CommandScopes {
+            commands: Vec::new(),
+        }),
+        Some(4) => {
+            let confirm = [
+                "Keep argument restrictions",
+                "Remove argument restrictions for new tasks",
+            ]
+            .map(str::to_owned);
+            if terminal.select("Confirm broader command access", &confirm)? != Some(1) {
+                return Ok(false);
+            }
+            None
+        }
+        _ => return Ok(false),
+    };
+    terminal.message(Tone::Accent, "Command scopes", &match &scopes {
+        Some(scopes) => format!("{} exact commands approved for new tasks; other arguments are rejected before execution.", scopes.commands.len()),
+        None => "Argument restrictions removed for new tasks; approved program grants and container isolation still apply.".into(),
+    })?;
+    profile.command_scopes = scopes;
+    Ok(true)
 }
 
 fn help(terminal: &Terminal) -> Result<()> {
@@ -1013,6 +1107,7 @@ fn task(
     budgets["container_image"] = json!(profile.image);
     budgets["previous_run"] = json!(profile.previous_run);
     budgets["acceptance_check"] = json!(profile.acceptance_check);
+    budgets["command_scopes"] = json!(profile.command_scopes);
     let run = store.create_run(
         request,
         &std::env::current_dir()?,
@@ -1312,6 +1407,7 @@ mod tests {
             image: None,
             limits: crate::budget::Limits::default(),
             acceptance_check: None,
+            command_scopes: None,
             previous_run: None,
         };
         save(directory.path(), &profile)?;

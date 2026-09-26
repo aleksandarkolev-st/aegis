@@ -30,6 +30,9 @@ fn usage() {
         "Long commands: arun run <task> --process-seconds <1..7200> --wall-seconds <task-limit>"
     );
     println!(
+        "Exact commands: --command-scopes <reviewed.json> --image <local-image>; guided scopes are available in F7 settings."
+    );
+    println!(
         "arun tasks|context|tools|artifacts <run-id> | mcp add <name> --image <local-image> [--allow-write] -- <command> [args...] | mcp add <name> --trusted-host -- <command> [args...]"
     );
     println!(
@@ -148,6 +151,7 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
     let mut programs = Vec::new();
     let mut image = None;
     let mut acceptance_check = None;
+    let mut command_scopes = None;
     let mut mcp_tools = Vec::new();
     let mut task = Vec::new();
     let mut index = 0;
@@ -211,6 +215,13 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
                         .context("--allow-process needs a program")?
                         .clone(),
                 );
+            }
+            "--command-scopes" => {
+                index += 1;
+                let path = args
+                    .get(index)
+                    .context("--command-scopes needs a JSON file")?;
+                command_scopes = Some(arun::policy::CommandScopes::from_file(Path::new(path))?);
             }
             "--image" => {
                 index += 1;
@@ -295,6 +306,16 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
     if task.is_empty() {
         bail!("task is required");
     }
+    if let Some(scopes) = &command_scopes {
+        programs.extend(
+            scopes
+                .commands
+                .iter()
+                .map(|command| command.program.clone()),
+        );
+        programs.sort();
+        programs.dedup();
+    }
     if !programs.is_empty() && image.is_none() {
         bail!("--allow-process requires --image; native processes are not supported");
     }
@@ -353,7 +374,7 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
         provider,
         json!(grants),
         json!({"model": model, "endpoint":endpoint, "mode": mode, "actions": actions, "model_tokens": model_tokens, "wall_seconds": wall_seconds, "context_chars": context_chars,
-            "model_seconds": 180, "model_response_bytes": model_response_bytes, "process_seconds": process_seconds, "container_image": image, "acceptance_check":acceptance_check}),
+            "model_seconds": 180, "model_response_bytes": model_response_bytes, "process_seconds": process_seconds, "container_image": image, "acceptance_check":acceptance_check, "command_scopes":command_scopes}),
         acceptance,
     )?;
     println!("run: {} provider: {}", run.id, run.provider);

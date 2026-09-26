@@ -10,6 +10,7 @@ fn process_output_is_virtualized_and_state_is_masked() -> Result<()> {
     let mut store = Store::open(&root)?;
     std::fs::create_dir(directory.path().join(".git"))?;
     std::fs::write(directory.path().join(".git/config"), "HOST_GIT_SECRET")?;
+    let script = "const fs=require('fs');const assert=require('assert');assert.equal(fs.existsSync('/workspace/.git/config'),false);fs.writeFileSync('/workspace/.git/config','only ephemeral overlay');console.log(fs.existsSync('/workspace/.arun/runs.sqlite'));process.stdout.write('X'.repeat(2000000))";
     let run = store.create_run(
         "test",
         directory.path(),
@@ -20,11 +21,10 @@ fn process_output_is_virtualized_and_state_is_masked() -> Result<()> {
             "process.run",
             "process:node"
         ]),
-        json!({"container_image":"node:22-alpine"}),
+        json!({"container_image":"node:22-alpine","command_scopes":{"commands":[{"program":"node","args":["-e",script]}]}}),
         "",
     )?;
     store.state(&run.id, "running", json!({}))?;
-    let script = "const fs=require('fs');const assert=require('assert');assert.equal(fs.existsSync('/workspace/.git/config'),false);fs.writeFileSync('/workspace/.git/config','only ephemeral overlay');console.log(fs.existsSync('/workspace/.arun/runs.sqlite'));process.stdout.write('X'.repeat(2000000))";
     let operation = store.begin_operation(
         &run.id,
         "process.run",

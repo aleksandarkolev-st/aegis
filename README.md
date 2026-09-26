@@ -108,6 +108,14 @@ Trace accounting distinguishes recorded tokens from unaccounted attempts, includ
 
 Model-token ceilings are enforced at turn boundaries, not as provider billing quotas: an in-flight native call may overshoot before its usage receipt arrives. Such a response is retained for audit, but its action is not applied and the task pauses before further work. Unreported usage remains explicitly unknown, not free.
 
+### Exact command scopes
+
+F7 → **Exact command scopes** lets you approve commands inline: enter a program and one argument at a time, then save. No shell commands or JSON editing are needed. You can also load a reviewed JSON file. Existing container/program permissions still apply; scopes only narrow them. Removing argument restrictions requires confirmation and affects new tasks only.
+
+Advanced usage: `arun run "Run the tests" --command-scopes commands.json --image rust:1.98`. A scopes file contains `{"commands":[{"program":"cargo","args":["test","--offline"]}]}`. Only that exact argument vector is allowed; extra flags, shell wrappers, changed order and combined arguments are rejected both before intent creation and by direct workers before claim. Empty `commands` denies every command. The reviewed file is copied into the immutable contract, not reread later. Do not put credentials in arguments: scopes are durable task data. For an empty-string argument, use the JSON file rather than the inline wizard's empty-input terminator.
+
+These scopes do not constrain every filesystem access a permitted program can make within its workspace mount, or explicitly trusted-host MCP tools. Independent acceptance runs its own separately frozen read-only check.
+
 ### Provider response budgets
 
 Native provider output is monitored against a per-turn `model_response_bytes` budget (8 MiB by default, configurable from 1 KiB to 32 MiB using `--model-response-bytes` or F7 custom budgets). Stdout, stderr and Codex's reply file share the allowance; oversized responses are stopped and rejected before parsing or executing actions. Reads are independently bounded, including after a fast natural exit. Monitoring can briefly overshoot in temporary files between polls; this is not an operating-system disk quota. Custom endpoint bodies honor the same configured allowance while streaming, including responses without Content-Length. Native CLI network transfer remains unobservable and is not reported as zero.
