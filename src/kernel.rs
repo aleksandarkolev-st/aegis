@@ -51,25 +51,29 @@ fn context(store: &Store, run: &Run) -> Result<String> {
     let recent: Vec<_> = store
         .recent_events(&run.id, 12)?
         .into_iter()
-        .map(|event| {
+        .map(|event| -> Result<Value> {
             let mut payload = event.payload;
             if matches!(mode, "eager" | "lazy") && event.kind == "operation.succeeded" {
                 if let Some(hash) = payload.get("artifact").and_then(Value::as_str) {
-                    if let Ok(bytes) = store.artifact(hash) {
-                        payload["inline_result"] = json!(String::from_utf8_lossy(&bytes)
-                            .chars().take(65_536).collect::<String>());
+                    let bytes = store.artifact(hash)?;
+                    let mut result: Value = serde_json::from_slice(&bytes)?;
+                    if let Some(output) = result.get("output_artifact").and_then(Value::as_str) {
+                        let bytes = store.artifact(output)?;
+                        result["output"] = json!(String::from_utf8_lossy(&bytes));
                     }
+                    payload["inline_result"] = result;
                 }
             }
-            json!({"seq": event.seq, "kind": event.kind,
-            "payload": payload.to_string().chars().take(if matches!(mode, "eager" | "lazy") { 65_536 } else { 500 }).collect::<String>()})
+            Ok(json!({"seq": event.seq, "kind": event.kind,
+            "payload": if matches!(mode, "eager" | "lazy") { payload.to_string() } else { payload.to_string().chars().take(500).collect::<String>() }}))
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     let manifests = visible_manifests(store, run)?;
     let handoff = store.last_checkpoint(&run.id)?;
     let context = json!({
         "task": run.task, "acceptance": run.acceptance, "workspace": run.workspace, "mode": mode,
         "permission_policy": "Discovery returns only granted capabilities; invoke only supplied schemas.",
+        "result_policy": if matches!(mode, "eager" | "lazy") { "Tool results are inline; inspect_result is unavailable." } else { "Results are artifact-backed; use inspect_result to select relevant text." },
         "recent_events": recent, "active_capabilities": manifests,
         "milestones": store.milestones(&run.id)?, "handoff": handoff,
     });
@@ -261,6 +265,9 @@ fn apply(store: &mut Store, root: &Path, run: &Run, action: Action) -> Result<bo
             return perform(store, root, run, &operation);
         }
         Action::InspectResult { artifact, query } => {
+            if matches!(mode(run), "eager" | "lazy") {
+                bail!("inline mode has no artifact inspection; use the inline result");
+            }
             if !store.has_evidence(&run.id, &artifact)? {
                 bail!("artifact does not belong to this run");
             }
@@ -360,10 +367,31 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
         }
         let prompt = context(&store, &run)?;
         let manifests = visible_manifests(&store, &run)?;
+        let prompt_chars = prompt.chars().count();
+        let context_limit = run
+            .budgets
+            .get("context_chars")
+            .and_then(Value::as_u64)
+            .unwrap_or(256_000);
+        if prompt_chars as u64 > context_limit {
+            store.event(
+                run_id,
+                "context.over_limit",
+                json!({"prompt_chars": prompt_chars,
+                "limit": context_limit, "schema_count": manifests.len(),
+                "schema_bytes": serde_json::to_vec(&manifests)?.len()}),
+            )?;
+            store.state(
+                run_id,
+                "failed",
+                json!({"reason": "model context limit exceeded"}),
+            )?;
+            break;
+        }
         store.event(
             run_id,
             "model.started",
-            json!({"turn": actions + 1, "prompt_chars": prompt.len(),
+            json!({"turn": actions + 1, "prompt_chars": prompt_chars,
                 "schema_count": manifests.len(), "schema_bytes": serde_json::to_vec(&manifests)?.len()}),
         )?;
         let model_started = Instant::now();
@@ -492,6 +520,66 @@ mod tests {
         assert!(excerpt.contains("70001: error: AEGIS_EVAL_LOG_FAILURE"));
         assert!(!excerpt.contains("warning"));
         assert!(excerpt.len() < 200);
+        Ok(())
+    }
+
+    #[test]
+    fn inline_and_artifact_modes_apply_different_result_context_policies() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let hash = store.put_artifact(&serde_json::to_vec(
+            &json!({"content": "warning\n".repeat(100_000)}),
+        )?)?;
+        for mode in ["eager", "lazy", "artifact", "durable"] {
+            let run = store.create_run(
+                "find error",
+                directory.path(),
+                "codex",
+                json!(["workspace.read"]),
+                json!({"mode":mode}),
+                "",
+            )?;
+            store.event(&run.id, "operation.succeeded", json!({"artifact":hash}))?;
+            let prompt = context(&store, &run)?;
+            if matches!(mode, "eager" | "lazy") {
+                assert!(prompt.len() > 800_000);
+                assert!(
+                    apply(
+                        &mut store,
+                        directory.path(),
+                        &run,
+                        Action::InspectResult {
+                            artifact: hash.clone(),
+                            query: "warning".into()
+                        }
+                    )
+                    .is_err()
+                );
+            } else {
+                assert!(prompt.len() < 5000);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn context_overflow_fails_without_calling_the_provider() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "find error",
+            directory.path(),
+            "codex",
+            json!(["workspace.read"]),
+            json!({"mode":"eager", "context_chars":100}),
+            "",
+        )?;
+        drop(store);
+        drive(directory.path(), &run.id)?;
+        let store = Store::open(directory.path())?;
+        assert_eq!(store.run(&run.id)?.state, "failed");
+        assert_eq!(store.event_count(&run.id, "context.over_limit")?, 1);
+        assert_eq!(store.event_count(&run.id, "model.started")?, 0);
         Ok(())
     }
 

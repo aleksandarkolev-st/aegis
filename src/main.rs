@@ -164,6 +164,7 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
     let mut actions = 40_u64;
     let mut model_tokens = 400_000_u64;
     let mut wall_seconds = 3600_u64;
+    let mut context_chars = 256_000_u64;
     let mut programs = Vec::new();
     let mut image = None;
     let mut mcp_tools = Vec::new();
@@ -238,6 +239,16 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
                     bail!("wall-clock limit must be positive");
                 }
             }
+            "--context-chars" => {
+                index += 1;
+                context_chars = args
+                    .get(index)
+                    .context("--context-chars needs a limit")?
+                    .parse()?;
+                if context_chars == 0 {
+                    bail!("context limit must be positive");
+                }
+            }
             argument if argument.starts_with('-') => bail!("unknown option: {argument}"),
             argument => task.push(argument),
         }
@@ -274,7 +285,7 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
         &std::env::current_dir()?,
         provider,
         json!(grants),
-        json!({"mode": mode, "actions": actions, "model_tokens": model_tokens, "wall_seconds": wall_seconds,
+        json!({"mode": mode, "actions": actions, "model_tokens": model_tokens, "wall_seconds": wall_seconds, "context_chars": context_chars,
             "model_seconds": 180, "process_seconds": 60, "container_image": image}),
         "Provide evidence from successful operations",
     )?;

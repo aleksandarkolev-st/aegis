@@ -33,7 +33,7 @@ pub fn metrics(events: &[Event]) -> Metrics {
                 .unwrap_or(0)
         };
         match event.kind.as_str() {
-            "model.started" => {
+            "model.started" | "context.over_limit" => {
                 let schemas = number("schema_bytes");
                 if !first_schema_seen {
                     summary.schema_bytes_initial = schemas;
