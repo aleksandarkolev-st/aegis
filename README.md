@@ -25,7 +25,7 @@ Reopening an interactive terminal offers continuing your unfinished task. Interr
 
 ### Model selection and terminal feedback
 
-F6 opens a model picker; F2 switches providers without resetting workspace permissions, budgets or saved tasks. The current provider and model are shown after startup and selection. Saved tasks retain their original provider/model; selections apply to new tasks. Full setup remains available through `/settings`.
+F6 opens a searchable model picker; F2 switches providers without resetting workspace permissions, budgets or saved tasks. The current provider and model are shown after startup and selection. Saved tasks retain their original provider/model; selections apply to new tasks. F7 opens focused settings for permissions, budgets or completion checks without signing in again. F1 explains the keyboard controls; slash commands are optional. Menus stay in terminal scrollback, with arrow navigation and text filtering. Animated task activity respects `AEGIS_REDUCED_MOTION`; `NO_COLOR` disables colors.
 
 ChatGPT models come from the official Codex CLI's non-secret `models_cache.json` under `CODEX_HOME` (or `~/.codex`), excluding hidden entries. Cache age is displayed; cached visibility is not a guarantee of current account access. Claude choices use documented [Claude Code model aliases](https://code.claude.com/docs/en/model-config), resolved by the installed CLI rather than guessing versioned IDs. Grok choices come from its native `grok models` command, with unauthenticated fallback catalogs labeled explicitly. Custom endpoints use an authenticated, five-second bounded `GET /models` request, without following redirects; manual IDs remain available when listing is unsupported.
 

@@ -17,7 +17,7 @@ use crate::{
     trace,
 };
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Profile {
     provider: String,
     model: Option<String>,
@@ -268,6 +268,20 @@ fn configure(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
     let Some((mut profile, secret)) = configure_provider(terminal)? else {
         return Ok(None);
     };
+    if !configure_environment(terminal, &mut profile)? {
+        return Ok(None);
+    }
+    let Some(limits) = configure_limits(terminal)? else {
+        return Ok(None);
+    };
+    profile.limits = limits;
+    if !configure_acceptance(terminal, &mut profile)? {
+        return Ok(None);
+    }
+    Ok(Some((profile, secret)))
+}
+
+fn configure_environment(terminal: &Terminal, profile: &mut Profile) -> Result<bool> {
     let permissions = [
         "Allow workspace edits",
         "Review only — no edits",
@@ -275,9 +289,10 @@ fn configure(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
     ]
     .map(str::to_owned);
     let Some(permission) = terminal.select("Workspace permissions", &permissions)? else {
-        return Ok(None);
+        return Ok(false);
     };
     profile.write = permission != 1;
+    profile.image = None;
     if permission == 2 {
         let docker = provider::system_executable("docker");
         let output = docker.as_ref().and_then(|program| {
@@ -308,21 +323,22 @@ fn configure(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
             profile.image = Some(images[index].clone());
         }
     }
-    let Some(limits) = configure_limits(terminal)? else {
-        return Ok(None);
-    };
-    profile.limits = limits;
+    Ok(true)
+}
+
+fn configure_acceptance(terminal: &Terminal, profile: &mut Profile) -> Result<bool> {
     let choices = [
         "Successful-operation evidence",
         "Independent container check from a JSON file",
     ]
     .map(str::to_owned);
     let Some(choice) = terminal.select("Completion checks", &choices)? else {
-        return Ok(None);
+        return Ok(false);
     };
+    profile.acceptance_check = None;
     if choice == 1 {
         let Some(path) = field(terminal, "  Acceptance JSON file › ", false)? else {
-            return Ok(None);
+            return Ok(false);
         };
         match crate::acceptance::Check::from_file(Path::new(&path)) {
             Ok(check) => {
@@ -331,11 +347,60 @@ fn configure(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
             }
             Err(error) => {
                 terminal.message(Tone::Warning, "Invalid check", &format!("{error:#}"))?;
-                return Ok(None);
+                return Ok(false);
             }
         }
     }
-    Ok(Some((profile, secret)))
+    Ok(true)
+}
+
+fn settings(root: &Path, terminal: &Terminal, profile: &mut Profile) -> Result<()> {
+    let choices = [
+        "Workspace permissions and command environment",
+        "Task budgets",
+        "Completion checks",
+        "Back",
+    ]
+    .map(str::to_owned);
+    let mut selected = profile.clone();
+    let changed = match terminal.select("Settings · no provider reset", &choices)? {
+        Some(0) => configure_environment(terminal, &mut selected)?,
+        Some(1) => {
+            if let Some(limits) = configure_limits(terminal)? {
+                selected.limits = limits;
+                true
+            } else {
+                false
+            }
+        }
+        Some(2) => configure_acceptance(terminal, &mut selected)?,
+        _ => false,
+    };
+    if changed {
+        save(root, &selected)?;
+        *profile = selected;
+        terminal.message(
+            Tone::Success,
+            "Settings saved",
+            "Applies to new tasks. Existing tasks retain their approved permissions and budgets.",
+        )?;
+    }
+    Ok(())
+}
+
+fn help(terminal: &Terminal) -> Result<()> {
+    terminal.message(Tone::Accent, "How to use Aegis", "Describe an outcome in plain language. The agent discovers tools, edits permitted files, runs approved isolated commands and saves evidence automatically.")?;
+    terminal.message(
+        Tone::Quiet,
+        "Choose",
+        "F2 provider · F4 sign in · F6 searchable model picker · F7 permissions and budgets",
+    )?;
+    terminal.message(
+        Tone::Quiet,
+        "Continue",
+        "F3 saved tasks and recovery · F5 new conversation · Up recalls previous requests",
+    )?;
+    terminal.message(Tone::Quiet, "Control", "Ctrl+C interrupts an operation; twice quickly interrupts the model turn. Ctrl+D detaches. Cancel the entire task from F3. No shell commands needed.")
 }
 
 fn download_image(terminal: &Terminal, docker: &Path) -> Result<Option<String>> {
@@ -1010,6 +1075,8 @@ pub fn interactive(root: &Path) -> Result<()> {
                 switch_provider(root, &terminal, &mut profile, &mut secret)?;
             }
             Input::Models => switch_model(root, &terminal, &mut profile, secret.as_deref())?,
+            Input::Settings => settings(root, &terminal, &mut profile)?,
+            Input::Help => help(&terminal)?,
             Input::Sessions => sessions(root, &mut terminal, &profile, secret.as_deref())?,
             Input::NewConversation => {
                 new_conversation(root, &terminal, &mut profile)?;
@@ -1040,31 +1107,63 @@ pub fn interactive(root: &Path) -> Result<()> {
                     "/provider" => {
                         switch_provider(root, &terminal, &mut profile, &mut secret)?;
                     }
-                    "/model" | "/models" => switch_model(root, &terminal, &mut profile, secret.as_deref())?,
-                    "/settings" => {
-                        if let Some(mut configured) = configure(&terminal)? { configured.0.previous_run = profile.previous_run.clone(); profile = configured.0; secret = configured.1; save(root, &profile)?; show_selection(&terminal, &profile)?; }
+                    "/model" | "/models" => {
+                        switch_model(root, &terminal, &mut profile, secret.as_deref())?
                     }
-                    "/new" => { new_conversation(root, &terminal, &mut profile)?; history.clear(); }
-                    "/sessions" | "/status" => sessions(root, &mut terminal, &profile, secret.as_deref())?,
+                    "/settings" => {
+                        settings(root, &terminal, &mut profile)?;
+                    }
+                    "/new" => {
+                        new_conversation(root, &terminal, &mut profile)?;
+                        history.clear();
+                    }
+                    "/sessions" | "/status" => {
+                        sessions(root, &mut terminal, &profile, secret.as_deref())?
+                    }
                     "/context" | "/tools" | "/artifacts" | "/trace" | "/tasks" => {
                         if let Some(id) = &profile.previous_run {
                             match request {
                                 "/context" => context_view(root, id, &terminal)?,
                                 "/tools" => tools_view(root, id, &terminal)?,
                                 "/artifacts" => artifacts(root, id, &terminal)?,
-                                "/trace" => { let store = Store::open(root)?; trace::display(&store.run(id)?, &store.events(id)?); },
-                                _ => { for milestone in Store::open(root)?.milestones(id)? { terminal.message(Tone::Quiet, &milestone.state, &milestone.title)?; } }
+                                "/trace" => {
+                                    let store = Store::open(root)?;
+                                    trace::display(&store.run(id)?, &store.events(id)?);
+                                }
+                                _ => {
+                                    for milestone in Store::open(root)?.milestones(id)? {
+                                        terminal.message(
+                                            Tone::Quiet,
+                                            &milestone.state,
+                                            &milestone.title,
+                                        )?;
+                                    }
+                                }
                             }
-                        } else { terminal.message(Tone::Quiet, "", "No current task. Describe one to get started.")?; }
+                        } else {
+                            terminal.message(
+                                Tone::Quiet,
+                                "",
+                                "No current task. Describe one to get started.",
+                            )?;
+                        }
                     }
                     "/exit" | "/quit" => break,
-                    "/help" => terminal.message(Tone::Quiet, "Help", "Write a task in plain language. F2 changes provider, F3 opens tasks, F4 signs in, F5 starts a fresh conversation, F6 chooses a model. /settings changes permissions and budgets. Ctrl+C interrupts an operation; press twice quickly to interrupt the model turn. Ctrl+D detaches. Cancel the entire task from its F3 menu. Up recalls previous tasks.")?,
+                    "/help" => help(&terminal)?,
                     _ => {
                         history.push(request.to_owned());
-                        if profile.provider != "custom" && !ensure_provider(&terminal, &profile.provider)? {
+                        if profile.provider != "custom"
+                            && !ensure_provider(&terminal, &profile.provider)?
+                        {
                             continue;
                         }
-                        if let Err(error) = task(root, &mut terminal, &mut profile, secret.as_deref(), request) {
+                        if let Err(error) = task(
+                            root,
+                            &mut terminal,
+                            &mut profile,
+                            secret.as_deref(),
+                            request,
+                        ) {
                             terminal.clear_activity()?;
                             terminal.message(Tone::Warning, "!", &format!("{error:#}"))?;
                         }

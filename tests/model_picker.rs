@@ -12,6 +12,44 @@ fn profile() -> Value {
 }
 
 #[test]
+fn settings_change_only_the_selected_section_and_remove_unapproved_commands() -> Result<()> {
+    for environment in [false, true] {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(".arun");
+        fs::create_dir(&root)?;
+        let original = profile();
+        fs::write(root.join("profile.json"), serde_json::to_vec(&original)?)?;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_arun"))
+            .current_dir(directory.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child.stdin.take().unwrap().write_all(if environment {
+            b"/settings\n1\n2\n/quit\n"
+        } else {
+            b"/settings\n2\n2\n/quit\n"
+        })?;
+        let output = child.wait_with_output()?;
+        assert!(output.status.success());
+        let saved: Value = serde_json::from_slice(&fs::read(root.join("profile.json"))?)?;
+        for key in ["provider", "model", "endpoint", "previous_run"] {
+            assert_eq!(saved[key], original[key]);
+        }
+        if environment {
+            assert_eq!(saved["write"], false);
+            assert!(saved["image"].is_null());
+            assert_eq!(saved["limits"], original["limits"]);
+        } else {
+            assert_eq!(saved["limits"]["wall_seconds"], 3600);
+            assert_eq!(saved["write"], original["write"]);
+            assert_eq!(saved["image"], original["image"]);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn model_and_provider_switches_keep_permissions_budgets_and_task_history() -> Result<()> {
     for provider_switch in [false, true] {
         let directory = tempfile::tempdir()?;

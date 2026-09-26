@@ -4,7 +4,7 @@ import { ensureNative } from '../scripts/install.mjs';
 
 try {
   const executable = process.env.ARUN_BINARY || await ensureNative();
-  const child = spawn(executable, process.argv.slice(2), { stdio: 'inherit', windowsHide: false });
+  const child = spawn(executable, process.argv.slice(2), { stdio: 'inherit', windowsHide: true });
   child.on('error', error => {
     console.error('aegis: ' + error.message);
     process.exitCode = 1;

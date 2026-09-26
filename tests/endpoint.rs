@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use arun::storage::Store;
 use serde_json::{Value, json};
 
@@ -30,11 +30,15 @@ fn request(stream: &mut TcpStream) -> Result<(String, Value)> {
                         .then(|| value.trim().parse().ok())
                         .flatten()
                 })
-                .context("content length missing")?;
+                .unwrap_or(0);
             if bytes.len() >= end + 4 + length {
                 return Ok((
                     headers,
-                    serde_json::from_slice(&bytes[end + 4..end + 4 + length])?,
+                    if length == 0 {
+                        Value::Null
+                    } else {
+                        serde_json::from_slice(&bytes[end + 4..end + 4 + length])?
+                    },
                 ));
             }
         }
@@ -128,7 +132,7 @@ fn custom_endpoint_completes_a_kernel_run_without_persisting_its_key() -> Result
         listener.set_nonblocking(true)?;
         let address = listener.local_addr()?;
         let server = thread::spawn(move || -> Result<()> {
-            for turn in 0..if interactive { 9 } else { 3 } {
+            for request_index in 0..if interactive { 10 } else { 3 } {
                 let started = Instant::now();
                 let mut stream = loop {
                     match listener.accept() {
@@ -143,6 +147,17 @@ fn custom_endpoint_completes_a_kernel_run_without_persisting_its_key() -> Result
                     }
                 };
                 let (headers, body) = request(&mut stream)?;
+                if interactive && request_index == 0 {
+                    assert!(headers.starts_with("GET /v1/models HTTP/1.1"));
+                    let response = json!({"data":[{"id":"fixture-model"}]}).to_string();
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                        response.len()
+                    )?;
+                    continue;
+                }
+                let turn = request_index - usize::from(interactive);
                 assert!(headers.starts_with("POST /v1/chat/completions HTTP/1.1"));
                 assert!(
                     headers
@@ -218,7 +233,7 @@ fn custom_endpoint_completes_a_kernel_run_without_persisting_its_key() -> Result
                 "none" => 3,
                 _ => 1,
             };
-            child.stdin.take().unwrap().write_all(format!("4\nhttp://{address}/v1\nfixture-model\n{format_choice}\nlocal-fixture-secret\n2\n1\n1\nRead fixture.txt\nRead that file again\n/new\nRead fixture.txt in a fresh conversation\n/quit\n").as_bytes())?;
+            child.stdin.take().unwrap().write_all(format!("4\nhttp://{address}/v1\n{format_choice}\nlocal-fixture-secret\n1\n2\n1\n1\nRead fixture.txt\nRead that file again\n/new\nRead fixture.txt in a fresh conversation\n/quit\n").as_bytes())?;
             child.wait_with_output()?
         } else {
             command

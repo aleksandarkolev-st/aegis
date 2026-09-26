@@ -18,6 +18,8 @@ pub enum Input {
     Submit(String),
     Providers,
     Models,
+    Settings,
+    Help,
     Sessions,
     Login,
     NewConversation,
@@ -217,7 +219,12 @@ impl Terminal {
         self.message(
             Tone::Quiet,
             "",
-            "F2 provider · F3 sessions · F4 sign in · F5 new · F6 models",
+            "F2 provider · F3 tasks · F4 sign in · F6 models · F7 settings",
+        )?;
+        self.message(
+            Tone::Quiet,
+            "",
+            "F1 help · F5 new conversation · Ctrl+D exit",
         )?;
         println!();
         Ok(())
@@ -367,6 +374,14 @@ impl Terminal {
                             write!(io::stdout(), "\r\n")?;
                             return Ok(Input::Models);
                         }
+                        KeyCode::F(7) if !secret => {
+                            write!(io::stdout(), "\r\n")?;
+                            return Ok(Input::Settings);
+                        }
+                        KeyCode::F(1) if !secret => {
+                            write!(io::stdout(), "\r\n")?;
+                            return Ok(Input::Help);
+                        }
                         KeyCode::Left => caret = caret.saturating_sub(1),
                         KeyCode::Right => caret = (caret + 1).min(text.len()),
                         KeyCode::Home => caret = 0,
@@ -440,6 +455,7 @@ impl Terminal {
             .min(choices.len());
         let mut selected = 0_usize;
         let mut digits = String::new();
+        let mut query = String::new();
         let mut rendered = false;
         loop {
             let width = terminal::size()
@@ -448,8 +464,21 @@ impl Terminal {
             if rendered {
                 queue!(io::stdout(), cursor::MoveUp(rows as u16))?;
             }
-            let start = selected.saturating_sub(rows / 2).min(choices.len() - rows);
-            for (index, choice) in choices.iter().enumerate().skip(start).take(rows) {
+            let matches = menu_matches(choices, &query);
+            selected = selected.min(matches.len().saturating_sub(1));
+            let start = selected
+                .saturating_sub(rows / 2)
+                .min(matches.len().saturating_sub(rows));
+            for row in 0..rows {
+                let position = start + row;
+                let index = matches.get(position).copied();
+                let choice = index
+                    .map(|index| choices[index].as_str())
+                    .unwrap_or(if row == 0 {
+                        "No matching options · Backspace clears the filter"
+                    } else {
+                        ""
+                    });
                 queue!(
                     io::stdout(),
                     cursor::MoveToColumn(0),
@@ -458,19 +487,28 @@ impl Terminal {
                 if self.colors {
                     queue!(
                         io::stdout(),
-                        SetForegroundColor(self.color(if index == selected {
-                            Tone::Accent
-                        } else {
-                            Tone::Quiet
-                        }))
+                        SetForegroundColor(self.color(
+                            if index.is_some() && position == selected {
+                                Tone::Accent
+                            } else {
+                                Tone::Quiet
+                            }
+                        ))
                     )?;
                 }
-                let marker = if index == selected { "›" } else { " " };
+                let marker = if index.is_some() && position == selected {
+                    "›"
+                } else {
+                    " "
+                };
+                let number = index
+                    .map(|index| (index + 1).to_string())
+                    .unwrap_or_default();
                 write!(
                     io::stdout(),
                     "{}\r\n",
                     fit(
-                        &format!("  {marker} {}  {choice}", index + 1),
+                        &format!("  {marker} {number}  {choice}"),
                         width.saturating_sub(1)
                     )
                 )?;
@@ -486,7 +524,7 @@ impl Terminal {
                 io::stdout(),
                 "{}",
                 fit(
-                    "  ↑ ↓ choose · Enter confirm · Esc back",
+                    &format!("  ↑ ↓ choose · Enter confirm · Esc back · Filter: {query}"),
                     width.saturating_sub(1)
                 )
             )?;
@@ -498,8 +536,10 @@ impl Terminal {
                 }
                 match key.code {
                     KeyCode::Enter => {
-                        write!(io::stdout(), "\r\n")?;
-                        return Ok(Some(selected));
+                        if let Some(index) = matches.get(selected) {
+                            write!(io::stdout(), "\r\n")?;
+                            return Ok(Some(*index));
+                        }
                     }
                     KeyCode::Esc => {
                         write!(io::stdout(), "\r\n")?;
@@ -509,7 +549,7 @@ impl Terminal {
                         write!(io::stdout(), "\r\n")?;
                         return Ok(None);
                     }
-                    KeyCode::Char(digit) if digit.is_ascii_digit() => {
+                    KeyCode::Char(digit) if digit.is_ascii_digit() && query.is_empty() => {
                         digits.push(digit);
                         if let Ok(number) = digits.parse::<usize>() {
                             if (1..=choices.len()).contains(&number) {
@@ -519,9 +559,23 @@ impl Terminal {
                             }
                         }
                     }
+                    KeyCode::Backspace => {
+                        query.pop();
+                        digits.clear();
+                        selected = 0;
+                    }
+                    KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if query.len() < 160 {
+                            query.push(character);
+                        }
+                        digits.clear();
+                        selected = 0;
+                    }
                     code => {
                         digits.clear();
-                        selected = menu_move(selected, choices.len(), code);
+                        if !matches.is_empty() {
+                            selected = menu_move(selected, matches.len(), code);
+                        }
                     }
                 }
             }
@@ -570,12 +624,20 @@ impl Terminal {
                     .or_else(|| args["query"].as_str())
                     .or_else(|| args["program"].as_str())
                     .unwrap_or_default();
+                let capability = payload["capability"].as_str().unwrap_or("tool");
+                let label = match capability {
+                    "workspace.read" => "Read",
+                    "workspace.write" => "Edit",
+                    "workspace.search" => "Search",
+                    "process.run" => "Run",
+                    _ => "Tool",
+                };
                 self.message(
                     Tone::Accent,
-                    "Tool",
+                    label,
                     &format!(
                         "{}  {}",
-                        payload["capability"].as_str().unwrap_or_default(),
+                        if label == "Tool" { capability } else { "" },
                         fit(detail, 160)
                     ),
                 )
@@ -621,6 +683,16 @@ impl Terminal {
             _ => Ok(()),
         }
     }
+}
+
+fn menu_matches(choices: &[String], query: &str) -> Vec<usize> {
+    let query = query.to_lowercase();
+    choices
+        .iter()
+        .enumerate()
+        .filter(|(_, choice)| choice.to_lowercase().contains(&query))
+        .map(|(index, _)| index)
+        .collect()
 }
 
 fn menu_move(selected: usize, count: usize, key: KeyCode) -> usize {
@@ -690,6 +762,14 @@ mod tests {
             "file not found: src/main.rs"
         );
         assert!(friendly_error(&"failure ".repeat(100)).width() <= 240);
+    }
+
+    #[test]
+    fn menu_filter_preserves_original_choice_indices() {
+        let choices = ["Provider default", "Opus", "Sonnet", "Haiku"].map(str::to_owned);
+        assert_eq!(menu_matches(&choices, "SON"), vec![2]);
+        assert_eq!(menu_matches(&choices, ""), vec![0, 1, 2, 3]);
+        assert!(menu_matches(&choices, "missing").is_empty());
     }
 
     #[test]
