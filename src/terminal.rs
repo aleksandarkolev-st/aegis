@@ -43,8 +43,10 @@ impl RawMode {
     pub fn enter(enabled: bool) -> Result<Self> {
         if enabled {
             terminal::enable_raw_mode()?;
+            let guard = Self(true);
             queue!(io::stdout(), event::EnableBracketedPaste)?;
             io::stdout().flush()?;
+            return Ok(guard);
         }
         Ok(Self(enabled))
     }
@@ -217,7 +219,8 @@ impl Terminal {
             let width = terminal::size()
                 .map(|(width, _)| width as usize)
                 .unwrap_or(80);
-            let available = width.saturating_sub(label.width() + 2).max(1);
+            let label = fit(label, width.saturating_sub(2));
+            let available = width.saturating_sub(label.width() + 1).max(1);
             let displayed: Vec<_> = text
                 .iter()
                 .map(|character| {
@@ -232,9 +235,7 @@ impl Terminal {
                     }
                 })
                 .collect();
-            let start = caret.saturating_sub(available / 2);
-            let visible = fit(&displayed[start..].iter().collect::<String>(), available);
-            let before = displayed[start..caret].iter().collect::<String>();
+            let (visible, caret_width) = input_view(&displayed, caret, available);
             queue!(
                 io::stdout(),
                 cursor::MoveToColumn(0),
@@ -248,12 +249,12 @@ impl Terminal {
             write!(io::stdout(), "{visible}")?;
             queue!(
                 io::stdout(),
-                cursor::MoveToColumn((label.width() + before.width()) as u16)
+                cursor::MoveToColumn((label.width() + caret_width) as u16)
             )?;
             io::stdout().flush()?;
             match event::read()? {
                 Event::Paste(paste) => {
-                    let characters: Vec<_> = paste.chars().collect();
+                    let characters: Vec<_> = clean(&paste).chars().collect();
                     text.splice(caret..caret, characters.iter().copied());
                     caret += characters.len();
                 }
@@ -325,7 +326,13 @@ impl Terminal {
     }
 
     pub fn select(&self, title: &str, choices: &[String]) -> Result<Option<usize>> {
+        if choices.is_empty() {
+            return Ok(None);
+        }
         self.message(Tone::Accent, "◇", title)?;
+        if self.interactive {
+            return self.menu(choices);
+        }
         for (index, choice) in choices.iter().enumerate() {
             self.message(Tone::Quiet, &format!("{}", index + 1), choice)?;
         }
@@ -343,6 +350,102 @@ impl Terminal {
                 }
                 Input::Exit => return Ok(None),
                 _ => {}
+            }
+        }
+    }
+
+    fn menu(&self, choices: &[String]) -> Result<Option<usize>> {
+        let _raw = RawMode::enter(true)?;
+        let rows = terminal::size()
+            .map(|(_, height)| height.saturating_sub(5).max(1) as usize)
+            .unwrap_or(8)
+            .min(choices.len());
+        let mut selected = 0_usize;
+        let mut digits = String::new();
+        let mut rendered = false;
+        loop {
+            let width = terminal::size()
+                .map(|(width, _)| width as usize)
+                .unwrap_or(80);
+            if rendered {
+                queue!(io::stdout(), cursor::MoveUp(rows as u16))?;
+            }
+            let start = selected.saturating_sub(rows / 2).min(choices.len() - rows);
+            for (index, choice) in choices.iter().enumerate().skip(start).take(rows) {
+                queue!(
+                    io::stdout(),
+                    cursor::MoveToColumn(0),
+                    Clear(ClearType::CurrentLine)
+                )?;
+                if self.colors {
+                    queue!(
+                        io::stdout(),
+                        SetForegroundColor(self.color(if index == selected {
+                            Tone::Accent
+                        } else {
+                            Tone::Quiet
+                        }))
+                    )?;
+                }
+                let marker = if index == selected { "›" } else { " " };
+                write!(
+                    io::stdout(),
+                    "{}\r\n",
+                    fit(
+                        &format!("  {marker} {}  {choice}", index + 1),
+                        width.saturating_sub(1)
+                    )
+                )?;
+            }
+            queue!(
+                io::stdout(),
+                cursor::MoveToColumn(0),
+                Clear(ClearType::CurrentLine),
+                ResetColor,
+                cursor::Hide
+            )?;
+            write!(
+                io::stdout(),
+                "{}",
+                fit(
+                    "  ↑ ↓ choose · Enter confirm · Esc back",
+                    width.saturating_sub(1)
+                )
+            )?;
+            io::stdout().flush()?;
+            rendered = true;
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Release {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Enter => {
+                        write!(io::stdout(), "\r\n")?;
+                        return Ok(Some(selected));
+                    }
+                    KeyCode::Esc => {
+                        write!(io::stdout(), "\r\n")?;
+                        return Ok(None);
+                    }
+                    KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        write!(io::stdout(), "\r\n")?;
+                        return Ok(None);
+                    }
+                    KeyCode::Char(digit) if digit.is_ascii_digit() => {
+                        digits.push(digit);
+                        if let Ok(number) = digits.parse::<usize>() {
+                            if (1..=choices.len()).contains(&number) {
+                                selected = number - 1;
+                            } else {
+                                digits.clear();
+                            }
+                        }
+                    }
+                    code => {
+                        digits.clear();
+                        selected = menu_move(selected, choices.len(), code);
+                    }
+                }
             }
         }
     }
@@ -408,6 +511,40 @@ impl Terminal {
     }
 }
 
+fn menu_move(selected: usize, count: usize, key: KeyCode) -> usize {
+    match key {
+        KeyCode::Up => (selected + count - 1) % count,
+        KeyCode::Down => (selected + 1) % count,
+        KeyCode::Home => 0,
+        KeyCode::End => count - 1,
+        _ => selected,
+    }
+}
+
+fn input_view(text: &[char], caret: usize, width: usize) -> (String, usize) {
+    let prefix_width: usize = text[..caret]
+        .iter()
+        .map(|character| character.width().unwrap_or(0))
+        .sum();
+    if prefix_width <= width {
+        return (fit(&text.iter().collect::<String>(), width), prefix_width);
+    }
+    let mut start = caret;
+    let mut caret_width = 0;
+    while start > 0 {
+        let size = text[start - 1].width().unwrap_or(0);
+        if caret_width + size > width / 2 {
+            break;
+        }
+        caret_width += size;
+        start -= 1;
+    }
+    (
+        fit(&text[start..].iter().collect::<String>(), width),
+        caret_width,
+    )
+}
+
 pub fn fit(text: &str, width: usize) -> String {
     let mut output = String::new();
     let mut occupied = 0;
@@ -425,6 +562,21 @@ pub fn fit(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn menu_navigation_wraps_and_input_cursor_respects_wide_characters() {
+        assert_eq!(menu_move(0, 4, KeyCode::Up), 3);
+        assert_eq!(menu_move(3, 4, KeyCode::Down), 0);
+        assert_eq!(menu_move(2, 4, KeyCode::Home), 0);
+        assert_eq!(menu_move(0, 4, KeyCode::End), 3);
+        let text: Vec<_> = "こんにちはhello".chars().collect();
+        for caret in 0..=text.len() {
+            let (visible, column) = input_view(&text, caret, 7);
+            assert!(visible.width() <= 7);
+            assert!(column <= 7);
+        }
+        assert_eq!(input_view(&['h', 'i'], 2, 20), ("hi".into(), 2));
+    }
 
     #[test]
     fn clips_unicode_to_terminal_width_and_removes_control_sequences() {
