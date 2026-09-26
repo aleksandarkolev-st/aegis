@@ -1,12 +1,12 @@
 import readline from 'node:readline';
 
 const count = Number(process.argv[2]);
-if (![50, 100, 250, 500].includes(count)) process.exit(2);
+if (!Number.isInteger(count) || count < 1 || count > 500) process.exit(2);
 
 const names = ['search_code', 'search_repositories', 'search_commits', 'grep', 'find', 'read_file'];
 const tools = Array.from({ length: count }, (_, index) => ({
-  name: names[index % names.length] + '_' + String(index).padStart(3, '0'),
-  description: 'Find text in repository files by literal substring; search code, logs, and documents',
+  name: index === 0 ? 'build_log' : names[index % names.length] + '_' + String(index).padStart(3, '0'),
+  description: index === 0 ? 'Read compiler output from the latest build log' : 'Find text in repository files by literal substring; search code, logs, and documents',
   inputSchema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
 }));
 
@@ -24,6 +24,9 @@ input.on('line', (line) => {
   } else if (request.method === 'tools/list') {
     send(request.id, { tools });
   } else if (request.method === 'tools/call') {
-    send(request.id, { content: [{ type: 'text', text: 'No matching repository result' }], isError: false });
+    const text = request.params.name === 'build_log'
+      ? 'warning: unused temporary value\n'.repeat(70000) + 'error: AEGIS_EVAL_LOG_FAILURE at codec.rs:73\n'
+      : 'No matching repository result';
+    send(request.id, { content: [{ type: 'text', text }], isError: false });
   }
 });
