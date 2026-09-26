@@ -41,6 +41,7 @@ if (process.argv[2] === 'child') {
   cp.spawn(process.execPath, [__filename, 'child', process.argv[3]], {stdio:'ignore'});
   setInterval(() => {}, 1000);
 }
+
 "#,
     )?;
     for explicit_kill in [false, true] {
