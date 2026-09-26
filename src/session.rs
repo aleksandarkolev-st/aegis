@@ -532,6 +532,7 @@ fn memory_menu(root: &Path, terminal: &Terminal) -> Result<()> {
             .iter()
             .map(|note| crate::terminal::fit(&note.text, 100)),
     );
+    choices.push("Workflow learning · inspect / pause / reset".into());
     choices.push("Back".into());
     let Some(choice) = terminal.select("What should Aegis remember?", &choices)? else {
         return Ok(());
@@ -539,6 +540,41 @@ fn memory_menu(root: &Path, terminal: &Terminal) -> Result<()> {
     if choice == 0 {
         if let Some(text) = field(terminal, "  Remember › ", false)? {
             remember(root, terminal, &text, None)?;
+        }
+    } else if choice == notes.len() + 1 {
+        terminal.message(Tone::Accent, "Workflow learning", &format!("{} verified experiences saved. Learning is {}. Only independently accepted tasks teach bounded tool paths; no transcripts or command arguments are copied.", store.learning_count(&workspace)?, if store.learning_enabled(&workspace)? {"on"} else {"paused"}))?;
+        for (steps, count) in store.learning_paths(&workspace)? {
+            terminal.message(
+                Tone::Quiet,
+                &format!("{count} accepted"),
+                &steps
+                    .iter()
+                    .map(|step| format!("{} v{}", step.capability, step.version))
+                    .collect::<Vec<_>>()
+                    .join(" → "),
+            )?;
+        }
+        let actions = [
+            "Keep",
+            "Pause learning",
+            "Enable learning",
+            "Reset learned experiences",
+        ]
+        .map(str::to_owned);
+        match terminal.select("Learning controls", &actions)? {
+            Some(1) => store.set_learning(&workspace, false)?,
+            Some(2) => store.set_learning(&workspace, true)?,
+            Some(3) => {
+                let confirmation = ["Keep experiences", "Reset future learning"].map(str::to_owned);
+                if terminal.select(
+                    "Existing task snapshots and audit records remain saved",
+                    &confirmation,
+                )? == Some(1)
+                {
+                    store.reset_learning(&workspace)?;
+                }
+            }
+            _ => {}
         }
     } else if let Some(note) = notes.get(choice - 1) {
         terminal.message(Tone::Accent, "Memory", &note.text)?;

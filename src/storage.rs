@@ -145,6 +145,13 @@ impl Store {
                updated_at INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS project_memory_workspace ON project_memory(workspace);
+             CREATE TABLE IF NOT EXISTS learning_settings (workspace TEXT PRIMARY KEY, enabled INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS workflow_experience (
+               run_id TEXT PRIMARY KEY REFERENCES runs(id), workspace TEXT NOT NULL,
+               topics TEXT NOT NULL, steps TEXT NOT NULL, verifier TEXT NOT NULL,
+               evidence TEXT NOT NULL REFERENCES artifacts(hash), created_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS workflow_experience_workspace ON workflow_experience(workspace);
              CREATE TABLE IF NOT EXISTS milestones (
                run_id TEXT NOT NULL REFERENCES runs(id), position INTEGER NOT NULL,
                title TEXT NOT NULL, state TEXT NOT NULL, evidence TEXT NOT NULL,
@@ -273,6 +280,9 @@ impl Store {
             bail!("run configuration must be an object");
         }
         budgets["project_memory"] = json!(self.project_memory(&workspace)?);
+        budgets["learning_enabled"] = json!(self.learning_enabled(&workspace)?);
+        budgets["workflow_patterns"] =
+            json!(self.learned_patterns(&workspace, task, &budgets, &grants)?);
         let run = Run {
             id: Uuid::new_v4().to_string(),
             task: task.to_owned(),
@@ -822,8 +832,8 @@ impl Store {
 
     pub fn complete_run(&mut self, run_id: &str, summary: &str, evidence: &[String]) -> Result<()> {
         self.validate_completion(run_id, evidence)?;
-        let acceptance =
-            crate::acceptance::verified_result(self, &self.run(run_id)?, summary, evidence)?;
+        let run = self.run(run_id)?;
+        let acceptance = crate::acceptance::verified_result(self, &run, summary, evidence)?;
         let proposal = self.completion_proposal(run_id)?;
         let milestones = self.milestones(run_id)?;
         let transaction = self
@@ -865,6 +875,9 @@ impl Store {
             "run.completed",
             json!({"summary": summary, "evidence": evidence, "acceptance":acceptance}),
         )?;
+        if let Some(verified) = acceptance.as_deref() {
+            crate::learning::record(&transaction, &run, verified)?;
+        }
         transaction.commit()?;
         Ok(())
     }
