@@ -4,7 +4,7 @@
 
 ## Open Aegis
 
-Launch `aegis` (or `arun`) with no arguments. Choose ChatGPT, Claude Code, Grok, or a custom OpenAI-compatible endpoint, choose workspace permissions, and describe your task in plain language. The terminal handles task creation, execution, progress, and evidence automatically; you do not need to enter `run`, `attach`, or task IDs.
+Launch `aegis` (or `arun`) with no arguments. Choose ChatGPT, Claude Code, Grok, or a custom OpenAI-compatible endpoint, choose your model and workspace permissions, and describe your task in plain language. Custom endpoints also offer schema, JSON-object, or prompt-only response modes. The terminal handles task creation, execution, progress, and evidence automatically; you do not need to enter `run`, `attach`, or task IDs.
 
 The scrollback interface has an animated activity line, elapsed time and token counts, editable input with history, and these shortcuts:
 

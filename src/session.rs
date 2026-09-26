@@ -77,6 +77,15 @@ fn configure(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
             terminal.message(Tone::Warning, "!", "A custom endpoint needs a model ID.")?;
             return Ok(None);
         }
+        let formats = [
+            "Strict JSON schema — recommended when supported",
+            "JSON object — for servers without schema support",
+            "Prompt-only JSON — for minimal compatible servers",
+        ]
+        .map(str::to_owned);
+        let Some(format) = terminal.select("Endpoint response format", &formats)? else {
+            return Ok(None);
+        };
         let Some(key) = field(terminal, "  API key (hidden; optional) › ", true)? else {
             return Ok(None);
         };
@@ -86,7 +95,11 @@ fn configure(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
         let endpoint = Endpoint {
             base_url: url,
             api_key_env: secret.as_ref().map(|_| "ARUN_SESSION_API_KEY".into()),
-            response_format: ResponseFormat::Schema,
+            response_format: match format {
+                1 => ResponseFormat::Json,
+                2 => ResponseFormat::None,
+                _ => ResponseFormat::Schema,
+            },
             allow_insecure: false,
         };
         if let Err(error) = endpoint.url() {
@@ -100,7 +113,10 @@ fn configure(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
             return Ok(None);
         }
         let choices = ["Use my existing sign-in", "Sign in now"].map(str::to_owned);
-        if terminal.select("Authentication", &choices)? == Some(1) {
+        let Some(authentication) = terminal.select("Authentication", &choices)? else {
+            return Ok(None);
+        };
+        if authentication == 1 {
             terminal.message(
                 Tone::Accent,
                 "Sign in",
@@ -109,6 +125,20 @@ fn configure(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
             if let Err(error) = model::login(&profile.provider) {
                 terminal.message(Tone::Warning, "!", &error.to_string())?;
             }
+        }
+        let choices = ["Use the provider's default model", "Choose a model ID"].map(str::to_owned);
+        let Some(model) = terminal.select("Model", &choices)? else {
+            return Ok(None);
+        };
+        if model == 1 {
+            let Some(id) = field(terminal, "  Model ID › ", false)? else {
+                return Ok(None);
+            };
+            if id.trim().is_empty() {
+                terminal.message(Tone::Warning, "!", "A model ID cannot be empty.")?;
+                return Ok(None);
+            }
+            profile.model = Some(id);
         }
     }
     let permissions = [

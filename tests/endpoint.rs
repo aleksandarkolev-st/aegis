@@ -43,7 +43,12 @@ fn request(stream: &mut TcpStream) -> Result<(String, Value)> {
 
 #[test]
 fn custom_endpoint_completes_a_kernel_run_without_persisting_its_key() -> Result<()> {
-    for interactive in [false, true] {
+    for (interactive, response_format) in [
+        (false, "schema"),
+        (true, "schema"),
+        (true, "json"),
+        (true, "none"),
+    ] {
         let directory = tempfile::tempdir()?;
         fs::write(
             directory.path().join("fixture.txt"),
@@ -75,7 +80,11 @@ fn custom_endpoint_completes_a_kernel_run_without_persisting_its_key() -> Result
                         .contains("authorization: bearer local-fixture-secret")
                 );
                 assert_eq!(body["model"], "fixture-model");
-                assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+                match response_format {
+                    "schema" => assert_eq!(body["response_format"]["json_schema"]["strict"], true),
+                    "json" => assert_eq!(body["response_format"]["type"], "json_object"),
+                    _ => assert!(body.get("response_format").is_none()),
+                }
                 let prompt = body["messages"][0]["content"].as_str().unwrap();
                 let state: Value = serde_json::from_str(
                     prompt
@@ -134,7 +143,12 @@ fn custom_endpoint_completes_a_kernel_run_without_persisting_its_key() -> Result
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()?;
-            child.stdin.take().unwrap().write_all(format!("4\nhttp://{address}/v1\nfixture-model\nlocal-fixture-secret\n2\nRead fixture.txt\nRead that file again\n/new\nRead fixture.txt in a fresh conversation\n/quit\n").as_bytes())?;
+            let format_choice = match response_format {
+                "json" => 2,
+                "none" => 3,
+                _ => 1,
+            };
+            child.stdin.take().unwrap().write_all(format!("4\nhttp://{address}/v1\nfixture-model\n{format_choice}\nlocal-fixture-secret\n2\nRead fixture.txt\nRead that file again\n/new\nRead fixture.txt in a fresh conversation\n/quit\n").as_bytes())?;
             child.wait_with_output()?
         } else {
             command
@@ -149,6 +163,8 @@ fn custom_endpoint_completes_a_kernel_run_without_persisting_its_key() -> Result
                     "fixture-model",
                     "--api-key-env",
                     "AEGIS_TEST_KEY",
+                    "--response-format",
+                    response_format,
                     "--foreground",
                 ])
                 .env("AEGIS_TEST_KEY", "local-fixture-secret")
