@@ -20,3 +20,10 @@ export function binaryPath(root, platform = process.platform, architecture = pro
   const info = platformTarget(platform, architecture);
   return path.join(root, 'vendor', info.target, info.executable);
 }
+
+export function releaseTargets() {
+  return Object.keys(targets).map(key => {
+    const [platform, architecture] = key.split('-');
+    return platformTarget(platform, architecture);
+  });
+}
