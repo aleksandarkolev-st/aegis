@@ -98,7 +98,8 @@ fn context(store: &Store, run: &Run) -> Result<String> {
         "task": run.task, "acceptance": run.acceptance, "workspace": run.workspace, "mode": mode,
         "permission_policy": "Discovery returns only granted capabilities; invoke only supplied schemas. Non-eager modes retain at most eight recently discovered capability schemas. Search again to reactivate an evicted schema; discovery never removes recorded operations or evidence.",
         "process_programs": grants(run)?.into_iter().filter_map(|grant| grant.strip_prefix("process:").map(str::to_owned)).collect::<Vec<_>>(),
-        "process_policy": "process.run may execute only listed process_programs inside the approved container. An empty list means no program is authorized. Do not invoke tests through an ungranted program; independent acceptance is handled by the runtime.",
+        "command_scopes": crate::policy::CommandScopes::from_configuration(&run.budgets)?,
+        "process_policy": "process.run may execute only listed process_programs inside the approved container. If command_scopes is nonnull, only its exact program/args pairs are permitted, even with process:*. Preserve argument boundaries and order; do not add flags or wrap in a shell. Empty commands denies all commands. An empty process_programs list also means no program is authorized. Independent acceptance is handled by the runtime.",
         "result_policy": if matches!(mode, "eager" | "lazy") { "Tool results are inline; inspect_result is unavailable." } else { "Results are artifact-backed; use inspect_result to select relevant text." },
         "recent_events": recent, "active_capabilities": manifests,
         "milestones": store.milestones(&run.id)?, "handoff": handoff,
@@ -813,6 +814,47 @@ mod tests {
         assert_eq!(store.run(&run.id)?.state, "running");
         assert!(store.operations(&run.id)?.is_empty());
         assert_eq!(store.unknown_count(&run.id)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn exact_command_scopes_reject_actions_without_recording_an_intent() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "restricted commands", directory.path(), "codex",
+            json!(["process.run", "process:*"]),
+            json!({"command_scopes":{"commands":[{"program":"cargo","args":["test","--offline"]}]}}), "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        store.activate(&run.id, "process.run", 1)?;
+        assert!(context(&store, &run)?.contains("\"args\":[\"test\",\"--offline\"]"));
+        let error = apply(
+            &mut store,
+            directory.path(),
+            &run,
+            Action::Invoke {
+                capability: "process.run".into(),
+                args: json!({"program":"cargo","args":["test","--offline","--release"]}),
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("exact command scopes"));
+        assert!(store.operations(&run.id)?.is_empty());
+        assert_eq!(store.run(&run.id)?.state, "running");
+        assert_eq!(store.unknown_count(&run.id)?, 0);
+        assert!(
+            store
+                .create_run(
+                    "bad policy",
+                    directory.path(),
+                    "codex",
+                    json!([]),
+                    json!({"command_scopes":{"commands":null}}),
+                    ""
+                )
+                .is_err()
+        );
         Ok(())
     }
 

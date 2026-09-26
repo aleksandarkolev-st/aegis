@@ -10,6 +10,7 @@ pub mod interrupt;
 pub mod kernel;
 pub mod mcp;
 pub mod model;
+pub mod policy;
 pub mod process;
 pub mod provider;
 pub mod restart;

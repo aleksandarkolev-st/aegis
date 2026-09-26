@@ -269,6 +269,7 @@ impl Store {
             created_at: now(),
         };
         crate::acceptance::Check::from_run(&run)?;
+        crate::policy::CommandScopes::from_configuration(&run.budgets)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;

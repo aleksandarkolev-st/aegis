@@ -146,6 +146,9 @@ pub(crate) fn authorize_program(run: &Run, args: &Value) -> Result<()> {
     {
         bail!("program is not explicitly granted; choose a listed process program");
     }
+    if let Some(scopes) = crate::policy::CommandScopes::from_configuration(&run.budgets)? {
+        scopes.authorize(args)?;
+    }
     Ok(())
 }
 
@@ -528,6 +531,45 @@ mod tests {
             assert_eq!(store.operation(&operation.id)?.state, "dispatched");
         }
         assert_eq!(store.event_count(&run.id, "operation.executing")?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn exact_command_scopes_reject_direct_workers_before_claim() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(".arun");
+        let mut store = Store::open(&root)?;
+        let run = store.create_run(
+            "restricted commands",
+            directory.path(),
+            "codex",
+            json!(["process.run", "process:*"]),
+            json!({"command_scopes":{"commands":[{"program":"cargo","args":["test","--offline"]}]}}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        authorize_program(
+            &run,
+            &json!({"program":"cargo","args":["test","--offline"]}),
+        )?;
+        for args in [json!(["test"]), json!(["test", "--offline", "--release"])] {
+            let operation = store.begin_operation(
+                &run.id,
+                "process.run",
+                json!({"program":"cargo","args":args}),
+                false,
+            )?;
+            store.operation_state(&operation, "dispatched", None, json!({}))?;
+            assert!(
+                execute(&root, &operation.id)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("exact command scopes")
+            );
+            assert_eq!(store.operation(&operation.id)?.state, "dispatched");
+        }
+        assert_eq!(store.event_count(&run.id, "operation.executing")?, 0);
+        assert_eq!(store.unknown_count(&run.id)?, 0);
         Ok(())
     }
 
