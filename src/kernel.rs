@@ -84,7 +84,21 @@ fn context(store: &Store, run: &Run) -> Result<String> {
 }
 
 fn inspect(bytes: &[u8], query: &str) -> String {
-    let text = String::from_utf8_lossy(bytes);
+    let raw = String::from_utf8_lossy(bytes);
+    let text = serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .and_then(|value| match value.get("content") {
+            Some(Value::String(content)) => Some(content.clone()),
+            Some(Value::Array(blocks)) => Some(
+                blocks
+                    .iter()
+                    .filter_map(|block| block.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            _ => None,
+        })
+        .unwrap_or_else(|| raw.into_owned());
     if query.is_empty() {
         return text.chars().take(4000).collect();
     }
@@ -464,6 +478,20 @@ mod tests {
         let prompt = context(&store, &run)?;
         assert!(!prompt.contains("mcp:fixture:search_"));
         assert!(prompt.len() < 3000);
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_inspection_searches_structured_text_not_encoded_json() -> Result<()> {
+        let log = format!(
+            "{}error: AEGIS_EVAL_LOG_FAILURE\n",
+            "warning: unused value\n".repeat(70_000)
+        );
+        let bytes = serde_json::to_vec(&json!({"content":[{"type":"text","text":log}]}))?;
+        let excerpt = inspect(&bytes, "error");
+        assert!(excerpt.contains("70001: error: AEGIS_EVAL_LOG_FAILURE"));
+        assert!(!excerpt.contains("warning"));
+        assert!(excerpt.len() < 200);
         Ok(())
     }
 
