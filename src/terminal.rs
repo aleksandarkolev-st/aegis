@@ -20,6 +20,8 @@ pub enum Input {
     Models,
     Settings,
     Help,
+    Checkpoint,
+    CancelTask,
     Sessions,
     Login,
     NewConversation,
@@ -77,6 +79,9 @@ pub struct RawMode(bool);
 impl RawMode {
     pub fn enter(enabled: bool) -> Result<Self> {
         if enabled {
+            if terminal::is_raw_mode_enabled()? {
+                return Ok(Self(false));
+            }
             terminal::enable_raw_mode()?;
             let guard = Self(true);
             queue!(io::stdout(), event::EnableBracketedPaste)?;
@@ -437,6 +442,14 @@ impl Terminal {
                         KeyCode::F(1) if !secret => {
                             write!(io::stdout(), "\r\n")?;
                             return Ok(Input::Help);
+                        }
+                        KeyCode::F(8) if !secret => {
+                            write!(io::stdout(), "\r\n")?;
+                            return Ok(Input::Checkpoint);
+                        }
+                        KeyCode::F(9) if !secret => {
+                            write!(io::stdout(), "\r\n")?;
+                            return Ok(Input::CancelTask);
                         }
                         KeyCode::Left => caret = caret.saturating_sub(1),
                         KeyCode::Right => caret = (caret + 1).min(text.len()),

@@ -398,9 +398,54 @@ fn help(terminal: &Terminal) -> Result<()> {
     terminal.message(
         Tone::Quiet,
         "Continue",
-        "F3 saved tasks and recovery · F5 new conversation · Up recalls previous requests",
+        "F3 saved tasks and recovery · F5 new conversation · F8 checkpoint · Up recalls previous requests",
     )?;
-    terminal.message(Tone::Quiet, "Control", "Ctrl+C interrupts an operation; twice quickly interrupts the model turn. Ctrl+D detaches. Cancel the entire task from F3. No shell commands needed.")
+    terminal.message(Tone::Quiet, "Control", "Ctrl+C interrupts an operation; twice quickly interrupts the model turn. Ctrl+D detaches. F9 asks before cancelling the entire task. No shell commands needed.")
+}
+
+fn checkpoint_view(root: &Path, id: Option<&str>, terminal: &Terminal) -> Result<()> {
+    let Some(id) = id else {
+        return terminal.message(Tone::Quiet, "Checkpoint", "No current task yet.");
+    };
+    let store = Store::open(root)?;
+    let Some(checkpoint) = store.last_checkpoint(id)? else {
+        return terminal.message(Tone::Quiet, "Checkpoint", "No structured handoff saved yet. Runtime events and completed tool evidence are still durable.");
+    };
+    terminal.message(Tone::Accent, "Checkpoint", &checkpoint.next_action)?;
+    for decision in checkpoint.decisions {
+        terminal.message(Tone::Quiet, "Decision", &decision)?;
+    }
+    for question in checkpoint.unresolved {
+        terminal.message(Tone::Warning, "Unresolved", &question)?;
+    }
+    for milestone in store.milestones(id)? {
+        terminal.message(Tone::Quiet, &milestone.state, &milestone.title)?;
+    }
+    Ok(())
+}
+
+fn cancel_task(root: &Path, id: Option<&str>, terminal: &Terminal) -> Result<()> {
+    let Some(id) = id else {
+        return terminal.message(Tone::Quiet, "Cancel", "No current task yet.");
+    };
+    let mut store = Store::open(root)?;
+    if matches!(
+        store.run(id)?.state.as_str(),
+        "completed" | "cancelled" | "failed"
+    ) {
+        return terminal.message(Tone::Quiet, "Cancel", "This task has already ended.");
+    }
+    terminal.message(Tone::Warning, "Cancel whole task?", "The worker/model will stop. Completed edits are not undone; uncertain effects still require reconciliation.")?;
+    let choices = ["Keep the task", "Cancel the entire task"].map(str::to_owned);
+    if terminal.select("Confirm cancellation", &choices)? == Some(1) {
+        store.state(id, "cancelled", json!({"source":"terminal_cancel"}))?;
+        terminal.message(
+            Tone::Warning,
+            "Cancelled",
+            "Task stopped. Its events, evidence and any uncertain operation outcomes remain saved.",
+        )?;
+    }
+    Ok(())
 }
 
 fn download_image(terminal: &Terminal, docker: &Path) -> Result<Option<String>> {
@@ -633,6 +678,14 @@ fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Release {
                     continue;
+                }
+                if key.code == KeyCode::F(8) {
+                    terminal.clear_activity()?;
+                    checkpoint_view(root, Some(id), terminal)?;
+                }
+                if key.code == KeyCode::F(9) {
+                    terminal.clear_activity()?;
+                    cancel_task(root, Some(id), terminal)?;
                 }
                 if key.modifiers.contains(KeyModifiers::CONTROL) {
                     match key.code {
@@ -916,7 +969,7 @@ fn sessions(
             resume(root, &run.id, terminal, credentials)?;
         }
         Some(2) if !matches!(run.state.as_str(), "completed" | "cancelled" | "failed") => {
-            Store::open(root)?.state(&run.id, "cancelled", json!({"source":"terminal"}))?
+            cancel_task(root, Some(&run.id), terminal)?;
         }
         Some(3) => {
             for milestone in store.milestones(&run.id)? {
@@ -1094,6 +1147,8 @@ pub fn interactive(root: &Path) -> Result<()> {
             Input::Models => switch_model(root, &terminal, &mut profile, secret.as_deref())?,
             Input::Settings => settings(root, &terminal, &mut profile)?,
             Input::Help => help(&terminal)?,
+            Input::Checkpoint => checkpoint_view(root, profile.previous_run.as_deref(), &terminal)?,
+            Input::CancelTask => cancel_task(root, profile.previous_run.as_deref(), &terminal)?,
             Input::Sessions => sessions(root, &mut terminal, &profile, secret.as_deref())?,
             Input::NewConversation => {
                 new_conversation(root, &terminal, &mut profile)?;
@@ -1166,6 +1221,10 @@ pub fn interactive(root: &Path) -> Result<()> {
                         }
                     }
                     "/exit" | "/quit" => break,
+                    "/checkpoint" => {
+                        checkpoint_view(root, profile.previous_run.as_deref(), &terminal)?
+                    }
+                    "/cancel" => cancel_task(root, profile.previous_run.as_deref(), &terminal)?,
                     "/help" => help(&terminal)?,
                     _ => {
                         history.push(request.to_owned());
