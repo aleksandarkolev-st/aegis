@@ -5,11 +5,43 @@ use arun::{capability, mcp, storage::Store, worker};
 use serde_json::json;
 
 #[test]
+fn legacy_registrations_do_not_silently_gain_host_trust() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join(".arun");
+    let mut store = Store::open(&root)?;
+    let server = mcp::Server {
+        name: "legacy".into(),
+        command: "node".into(),
+        args: vec![],
+        policy: mcp::Policy {
+            trusted_host: true,
+            ..Default::default()
+        },
+    };
+    store.register_mcp(&server, &[])?;
+    let connection = rusqlite::Connection::open(root.join("runs.sqlite"))?;
+    connection.execute("UPDATE mcp_servers SET policy = '{}'", [])?;
+    let legacy = store.mcp_server("legacy")?;
+    assert!(!legacy.policy.trusted_host);
+    assert!(
+        mcp::discover(&legacy, directory.path())
+            .unwrap_err()
+            .to_string()
+            .contains("explicit trusted-host")
+    );
+    Ok(())
+}
+
+#[test]
 fn discovers_and_invokes_only_locally_granted_mcp_tool() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let root = directory.path().join(".arun");
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp.mjs");
     let server = mcp::Server {
+        policy: mcp::Policy {
+            trusted_host: true,
+            ..Default::default()
+        },
         name: "fixture".into(),
         command: "node".into(),
         args: vec![fixture.to_string_lossy().into_owned()],

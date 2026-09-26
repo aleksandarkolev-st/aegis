@@ -254,7 +254,19 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
                 .split_once('.')
                 .context("invalid MCP capability")?;
             let server = store.mcp_server(server_name)?;
-            mcp::call(&server, workspace, tool_name, args.clone())
+            let allow_write = run.grants.as_array().is_some_and(|grants| {
+                grants
+                    .iter()
+                    .any(|grant| grant.as_str() == Some("workspace.write"))
+            });
+            mcp::call_with_access(
+                &server,
+                workspace,
+                tool_name,
+                args.clone(),
+                allow_write,
+                Some(&operation.id),
+            )
         }
         _ => bail!("unknown capability"),
     }

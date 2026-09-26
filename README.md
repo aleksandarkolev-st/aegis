@@ -118,14 +118,16 @@ arun run "Run the tests" --allow-process node --image node:22-alpine
 
 The worker uses a read-only root filesystem, a bind-mounted workspace (read-only unless `--allow-write`), no container network, dropped capabilities, resource limits, and an ephemeral mount hiding `.arun`. Task execution never pulls images. Guided setup can download an image only after you explicitly choose it, or continue with commands disabled. Process output up to 32 MiB is stored as a separate artifact instead of being dumped into model context. Docker Desktop or an equivalent Docker daemon must be running for this capability.
 
-Register a trusted local stdio MCP server and grant individual tools:
+Register an isolated stdio MCP server and grant individual tools. The server executable and script must be available inside the chosen image or workspace:
 
 ```powershell
-arun mcp add fixture node tests/fixtures/mcp.mjs
+arun mcp add fixture --image node:22-alpine -- node tests/fixtures/mcp.mjs
 arun run "Use the echo tool" --allow-mcp fixture:echo
 ```
 
-MCP annotations and descriptions do not grant permissions or retry safety. **MCP server processes themselves are currently trusted local code, not OS-sandboxed.** Only register servers you trust; stronger per-server filesystem/network isolation remains required for untrusted servers.
+MCP annotations and descriptions do not grant permissions or retry safety. Untrusted servers execute inside network-disabled, resource-limited containers with a read-only root, hidden runtime/Git directories, no inherited provider credentials, and a read-only workspace. Optional registration `--allow-write` permits workspace writes only when the task also grants `workspace.write`; discovery always stays read-only. Images are never downloaded implicitly. Containers have operation-derived names and are removed on completion, timeout, or recovery; interrupted MCP effects still require reconciliation rather than blind retries.
+
+Explicitly trusted local servers can opt out with `arun mcp add fixture --trusted-host -- node tests/fixtures/mcp.mjs`. This executes host code and is not a sandbox. Existing registrations without a stored policy must be registered again; they do not silently inherit trust. The benchmark's bundled fixture explicitly uses this trusted-host path. Isolated MCP currently rejects Git worktrees using a `.git` metadata file rather than exposing that file.
 
 ## Validation
 
@@ -152,4 +154,4 @@ Read and large-log fixtures require both the expected final answer and matching 
 
 ## Remaining work
 
-The broader `plan.txt` also calls for forced-restart benchmarks, paired uncertainty reporting, and full MCP server isolation. These are not yet claimed as implemented. The Codex CLI adapter disables its built-in tools, but its own system context still incurs substantial token overhead; measured usage is reported rather than presented as a kernel-only schema cost.
+The broader `plan.txt` also calls for forced-restart benchmarks and paired uncertainty reporting. These are not yet claimed as implemented. The Codex CLI adapter disables its built-in tools, but its own system context still incurs substantial token overhead; measured usage is reported rather than presented as a kernel-only schema cost.

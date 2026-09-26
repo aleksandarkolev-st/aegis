@@ -150,6 +150,18 @@ impl Store {
             }
             connection.execute_batch("PRAGMA user_version=2")?;
         }
+        if schema_version < 3 {
+            let mut statement = connection.prepare("PRAGMA table_info(mcp_servers)")?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if !columns.iter().any(|column| column == "policy") {
+                connection.execute_batch(
+                    "ALTER TABLE mcp_servers ADD COLUMN policy TEXT NOT NULL DEFAULT '{}'",
+                )?;
+            }
+            connection.execute_batch("PRAGMA user_version=3")?;
+        }
         Ok(Self {
             connection,
             artifacts,
@@ -359,11 +371,12 @@ impl Store {
     }
 
     pub fn register_mcp(&mut self, server: &McpServer, tools: &[McpTool]) -> Result<()> {
+        crate::mcp::validate(server)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute("INSERT INTO mcp_servers VALUES (?1, ?2, ?3) ON CONFLICT(name) DO UPDATE SET command = excluded.command, args = excluded.args",
-            params![server.name, server.command, serde_json::to_string(&server.args)?])?;
+        transaction.execute("INSERT INTO mcp_servers(name, command, args, policy) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(name) DO UPDATE SET command = excluded.command, args = excluded.args, policy = excluded.policy",
+            params![server.name, server.command, serde_json::to_string(&server.args)?, serde_json::to_string(&server.policy)?])?;
         transaction.execute("DELETE FROM mcp_tools WHERE server = ?1", [&server.name])?;
         for tool in tools {
             if tool.server != server.name {
@@ -387,13 +400,21 @@ impl Store {
     pub fn mcp_server(&self, name: &str) -> Result<McpServer> {
         self.connection
             .query_row(
-                "SELECT command, args FROM mcp_servers WHERE name = ?1",
+                "SELECT command, args, policy FROM mcp_servers WHERE name = ?1",
                 [name],
                 |row| {
                     let args: String = row.get(1)?;
+                    let policy: String = row.get(2)?;
                     Ok(McpServer {
                         name: name.into(),
                         command: row.get(0)?,
+                        policy: serde_json::from_str(&policy).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                2,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?,
                         args: serde_json::from_str(&args).map_err(|error| {
                             rusqlite::Error::FromSqlConversionFailure(
                                 1,

@@ -155,10 +155,18 @@ pub(crate) fn inspect(bytes: &[u8], query: &str) -> String {
 pub(crate) fn cleanup_container(operation: &Operation) {
     if operation.capability != "process.run"
         && operation.capability != crate::acceptance::CAPABILITY
+        && !operation.capability.starts_with("mcp.")
     {
         return;
     }
-    if let Ok(name) = crate::worker::container_name(&operation.id) {
+    let name = if operation.capability.starts_with("mcp.") {
+        uuid::Uuid::parse_str(&operation.id)
+            .map(|id| format!("arun-mcp-{id}"))
+            .map_err(anyhow::Error::from)
+    } else {
+        crate::worker::container_name(&operation.id)
+    };
+    if let Ok(name) = name {
         if let Ok(mut cleanup) = Command::new("docker")
             .args(["rm", "-f", &name])
             .stdout(Stdio::null())
@@ -423,6 +431,9 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
     }
     if store.unknown_count(run_id)? > 0 {
         bail!("unknown operation outcome requires explicit reconciliation");
+    }
+    for operation in store.unresolved(run_id)? {
+        cleanup_container(&operation);
     }
     let unresolved = store.reconcile(run_id)?;
     run = store.run(run_id)?;

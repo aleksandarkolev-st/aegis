@@ -22,7 +22,9 @@ fn usage() {
     println!(
         "arun attach|resume|status|cancel|replay|trace <run-id> | resolve <run-id> <op-id> succeeded|failed <note> | list | inspect <artifact-hash> | login|probe <provider>"
     );
-    println!("arun tasks|context|tools|artifacts <run-id> | mcp add <name> <command> [args...]");
+    println!(
+        "arun tasks|context|tools|artifacts <run-id> | mcp add <name> --image <local-image> [--allow-write] -- <command> [args...] | mcp add <name> --trusted-host -- <command> [args...]"
+    );
     println!(
         "arun eval [--provider chatgpt|claude|grok] [--sizes 50,100,250,500] [--modes eager,lazy,artifact,durable] [--tasks read,log,repair] [--repeats 1] [--prepare-only]"
     );
@@ -381,7 +383,7 @@ fn main() -> Result<()> {
         }
         Some("mcp") => {
             if required(1)? != "add" {
-                bail!("use 'arun mcp add <name> <command> [args...]'");
+                bail!("use 'arun mcp add <name> --image <local-image> -- <command> [args...]'");
             }
             let name = required(2)?;
             if name.is_empty()
@@ -391,10 +393,30 @@ fn main() -> Result<()> {
             {
                 bail!("MCP server name must be alphanumeric, underscore, or hyphen");
             }
+            let mut policy = arun::mcp::Policy::default();
+            let mut index = 3;
+            while let Some(flag) = arguments.get(index) {
+                match flag.as_str() {
+                    "--image" => {
+                        index += 1;
+                        policy.image = Some(required(index)?.into());
+                    }
+                    "--allow-write" => policy.write = true,
+                    "--trusted-host" => policy.trusted_host = true,
+                    "--" => {
+                        index += 1;
+                        break;
+                    }
+                    flag if flag.starts_with('-') => bail!("unknown MCP policy option: {flag}"),
+                    _ => break,
+                }
+                index += 1;
+            }
             let server = arun::mcp::Server {
                 name: name.into(),
-                command: required(3)?.into(),
-                args: arguments.get(4..).unwrap_or_default().to_vec(),
+                command: required(index)?.into(),
+                args: arguments.get(index + 1..).unwrap_or_default().to_vec(),
+                policy,
             };
             let tools = arun::mcp::discover(&server, &std::env::current_dir()?)?;
             Store::open(&root)?.register_mcp(&server, &tools)?;

@@ -10,6 +10,10 @@ fn evaluation_registries_have_exact_sizes_and_large_log_results() -> Result<()> 
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/eval.mjs");
     for size in [50, 100, 250, 500] {
         let server = mcp::Server {
+            policy: mcp::Policy {
+                trusted_host: true,
+                ..Default::default()
+            },
             name: "eval".into(),
             command: "node".into(),
             args: vec![

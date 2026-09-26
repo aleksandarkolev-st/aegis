@@ -203,6 +203,10 @@ fn prepare(root: &Path, options: &Options) -> Result<Vec<Case>> {
     for size in &options.sizes {
         let state_root = root.join(format!("registry-{size}"));
         let server = mcp::Server {
+            policy: mcp::Policy {
+                trusted_host: true,
+                ..Default::default()
+            },
             name: "eval".into(),
             command: "node".into(),
             args: vec![
