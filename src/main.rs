@@ -162,6 +162,10 @@ fn spawn(root: &Path, id: &str) -> Result<()> {
 fn run(root: &Path, args: &[String]) -> Result<()> {
     let mut provider = "codex";
     let mut model = None;
+    let mut endpoint_url = None;
+    let mut api_key_env = None;
+    let mut response_format = arun::endpoint::ResponseFormat::Schema;
+    let mut allow_insecure = false;
     let mut mode = "durable";
     let mut write = false;
     let mut foreground = false;
@@ -188,6 +192,32 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
                 }
                 model = Some(value.clone());
             }
+            "--endpoint" => {
+                index += 1;
+                endpoint_url = Some(args.get(index).context("--endpoint needs a URL")?.clone());
+            }
+            "--api-key-env" => {
+                index += 1;
+                api_key_env = Some(
+                    args.get(index)
+                        .context("--api-key-env needs a variable name")?
+                        .clone(),
+                );
+            }
+            "--response-format" => {
+                index += 1;
+                response_format = match args
+                    .get(index)
+                    .context("--response-format needs schema, json, or none")?
+                    .as_str()
+                {
+                    "schema" => arun::endpoint::ResponseFormat::Schema,
+                    "json" => arun::endpoint::ResponseFormat::Json,
+                    "none" => arun::endpoint::ResponseFormat::None,
+                    _ => bail!("response format must be schema, json, or none"),
+                };
+            }
+            "--allow-insecure-endpoint" => allow_insecure = true,
             "--mode" => {
                 index += 1;
                 mode = args.get(index).context("--mode needs a value")?;
@@ -276,7 +306,32 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
         "chatgpt" | "codex" => "codex",
         "claude-code" | "claude" => "claude",
         "grok" => "grok",
-        _ => bail!("choose chatgpt, claude, or grok"),
+        "custom" => "custom",
+        _ => bail!("choose chatgpt, claude, grok, or custom"),
+    };
+    let endpoint = if provider == "custom" {
+        if model.is_none() {
+            bail!("custom endpoints require a model ID");
+        }
+        let endpoint = arun::endpoint::Endpoint {
+            base_url: endpoint_url.context("custom endpoints require a URL")?,
+            api_key_env,
+            response_format,
+            allow_insecure,
+        };
+        endpoint.url()?;
+        Some(endpoint)
+    } else {
+        if endpoint_url.is_some()
+            || api_key_env.is_some()
+            || allow_insecure
+            || response_format != arun::endpoint::ResponseFormat::Schema
+        {
+            bail!(
+                "endpoint options require the custom provider; native providers use their CLI login"
+            );
+        }
+        None
     };
     let mut grants = vec!["workspace.read".to_owned()];
     if write {
@@ -297,7 +352,7 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
         &std::env::current_dir()?,
         provider,
         json!(grants),
-        json!({"model": model, "mode": mode, "actions": actions, "model_tokens": model_tokens, "wall_seconds": wall_seconds, "context_chars": context_chars,
+        json!({"model": model, "endpoint":endpoint, "mode": mode, "actions": actions, "model_tokens": model_tokens, "wall_seconds": wall_seconds, "context_chars": context_chars,
             "model_seconds": 180, "process_seconds": 60, "container_image": image}),
         "Provide evidence from successful operations",
     )?;

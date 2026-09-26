@@ -100,7 +100,11 @@ fn reported_usage(provider: &str, stdout: &str) -> Option<Usage> {
 
 const SCHEMA: &str = r#"{"type":"object","properties":{"kind":{"type":"string","enum":["search_capabilities","invoke","inspect_result","checkpoint","finish","blocked"]},"query":{"type":"string"},"capability":{"type":"string"},"args":{"type":"string"},"artifact":{"type":"string"},"checkpoint":{"type":"string"},"summary":{"type":"string"},"evidence":{"type":"array","items":{"type":"string"}},"reason":{"type":"string"}},"required":["kind","query","capability","args","artifact","checkpoint","summary","evidence","reason"],"additionalProperties":false}"#;
 
-fn parse_action(raw: &str) -> Result<Action> {
+pub(crate) fn schema() -> Result<Value> {
+    Ok(serde_json::from_str(SCHEMA)?)
+}
+
+pub(crate) fn parse_action(raw: &str) -> Result<Action> {
     let trimmed = raw.trim();
     let content = trimmed
         .strip_prefix("```json")
@@ -175,6 +179,19 @@ pub fn call_configured(
     timeout: Duration,
     cancelled: impl Fn() -> bool,
 ) -> Result<Response> {
+    if provider == "custom" {
+        let endpoint: crate::endpoint::Endpoint = serde_json::from_value(
+            configuration
+                .get("endpoint")
+                .context("custom endpoint configuration missing")?
+                .clone(),
+        )?;
+        let model = configuration
+            .get("model")
+            .and_then(Value::as_str)
+            .context("custom endpoints require a model ID")?;
+        return endpoint.call(model, prompt, timeout, cancelled);
+    }
     let output = tempfile::tempdir_in(directory)?;
     let prompt_path = output.path().join("prompt.txt");
     std::fs::write(&prompt_path, prompt)?;
