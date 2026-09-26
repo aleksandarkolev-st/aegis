@@ -191,6 +191,7 @@ pub fn call_configured(
     timeout: Duration,
     cancelled: impl Fn() -> bool,
 ) -> Result<Response> {
+    let response_bytes = crate::budget::response_bytes(configuration)?;
     if provider == "custom" {
         let endpoint: crate::endpoint::Endpoint = serde_json::from_value(
             configuration
@@ -202,7 +203,7 @@ pub fn call_configured(
             .get("model")
             .and_then(Value::as_str)
             .context("custom endpoints require a model ID")?;
-        return endpoint.call(model, prompt, timeout, cancelled);
+        return endpoint.call_bounded(model, prompt, timeout, cancelled, response_bytes);
     }
     let output = tempfile::tempdir_in(directory)?;
     let prompt_path = output.path().join("prompt.txt");
@@ -297,6 +298,15 @@ pub fn call_configured(
         .with_context(|| format!("start {provider}; install and log in to its CLI first"))?;
     let start = Instant::now();
     let status = loop {
+        if capture_bytes(&[&stdout_path, &stderr_path, &output.path().join("reply")])?
+            > response_bytes
+        {
+            child.kill()?;
+            child.wait()?;
+            bail!(
+                "{provider} output exceeded the configured response capture limit ({response_bytes} bytes)"
+            );
+        }
         if let Some(status) = child.try_wait()? {
             break status;
         }
@@ -315,10 +325,14 @@ pub fn call_configured(
         }
         thread::sleep(Duration::from_millis(100));
     };
-    let mut stdout = String::new();
-    File::open(&stdout_path)?.read_to_string(&mut stdout)?;
-    let mut stderr = String::new();
-    File::open(&stderr_path)?.read_to_string(&mut stderr)?;
+    if capture_bytes(&[&stdout_path, &stderr_path, &output.path().join("reply")])? > response_bytes
+    {
+        bail!(
+            "{provider} output exceeded the configured response capture limit ({response_bytes} bytes)"
+        );
+    }
+    let stdout = read_captured(&stdout_path, response_bytes)?;
+    let stderr = read_captured(&stderr_path, response_bytes)?;
     if !status.success() {
         bail!(
             "{provider} exited with {status}: stdout={} stderr={}",
@@ -328,7 +342,7 @@ pub fn call_configured(
     }
     let reported = reported_usage(provider, &stdout);
     let raw = if provider == "codex" {
-        std::fs::read_to_string(output.path().join("reply"))?
+        read_captured(&output.path().join("reply"), response_bytes)?
     } else {
         stdout
     };
@@ -345,6 +359,27 @@ pub fn call_configured(
         source: "estimated".into(),
     }));
     Ok(Response { action, raw, usage })
+}
+
+fn capture_bytes(paths: &[&Path]) -> Result<u64> {
+    let mut bytes = 0_u64;
+    for path in paths {
+        match std::fs::metadata(path) {
+            Ok(metadata) => bytes = bytes.saturating_add(metadata.len()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(bytes)
+}
+
+fn read_captured(path: &Path, limit: u64) -> Result<String> {
+    let mut bytes = Vec::new();
+    File::open(path)?.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        bail!("provider response capture limit exceeded");
+    }
+    String::from_utf8(bytes).context("provider output was not UTF-8")
 }
 
 #[cfg(test)]

@@ -7,8 +7,6 @@ use serde_json::{Value, json};
 
 use crate::model::{self, Response, Usage};
 
-const MAX_RESPONSE: usize = 8 * 1024 * 1024;
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponseFormat {
@@ -127,6 +125,24 @@ impl Endpoint {
         timeout: Duration,
         cancelled: impl Fn() -> bool,
     ) -> Result<Response> {
+        self.call_bounded(
+            model_id,
+            prompt,
+            timeout,
+            cancelled,
+            crate::budget::DEFAULT_MODEL_RESPONSE_BYTES,
+        )
+    }
+
+    pub fn call_bounded(
+        &self,
+        model_id: &str,
+        prompt: &str,
+        timeout: Duration,
+        cancelled: impl Fn() -> bool,
+        max_response: u64,
+    ) -> Result<Response> {
+        crate::budget::validate_response_bytes(max_response)?;
         let url = self.url()?;
         if model_id.trim().is_empty() {
             bail!("custom endpoints require a model ID");
@@ -166,12 +182,12 @@ impl Endpoint {
                 if !response.status().is_success() {
                     bail!("custom endpoint returned HTTP {}; response body omitted to protect credentials", response.status().as_u16());
                 }
-                if response.content_length().is_some_and(|bytes| bytes > MAX_RESPONSE as u64) {
-                    bail!("custom endpoint response exceeds 8 MiB");
+                if response.content_length().is_some_and(|bytes| bytes > max_response) {
+                    bail!("custom endpoint response exceeds configured byte limit");
                 }
                 let mut bytes = Vec::new();
                 while let Some(chunk) = response.chunk().await.context("custom endpoint response interrupted")? {
-                    if bytes.len() + chunk.len() > MAX_RESPONSE { bail!("custom endpoint response exceeds 8 MiB"); }
+                    if (bytes.len() + chunk.len()) as u64 > max_response { bail!("custom endpoint response exceeds configured byte limit"); }
                     bytes.extend_from_slice(&chunk);
                 }
                 Ok::<_, anyhow::Error>(bytes)

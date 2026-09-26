@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 fn profile() -> Value {
-    json!({"provider":"codex", "model":"old-model", "endpoint":null, "write":true, "image":"approved-image", "previous_run":"saved-task", "limits":{"actions":99,"wall_seconds":10800,"model_tokens":123456,"model_seconds":180,"process_seconds":900,"context_chars":256000}})
+    json!({"provider":"codex", "model":"old-model", "endpoint":null, "write":true, "image":"approved-image", "previous_run":"saved-task", "limits":{"actions":99,"wall_seconds":10800,"model_tokens":123456,"model_seconds":180,"process_seconds":900,"context_chars":256000,"model_response_bytes":8388608}})
 }
 
 #[test]

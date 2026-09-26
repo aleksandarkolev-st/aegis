@@ -108,6 +108,10 @@ Trace accounting distinguishes recorded tokens from unaccounted attempts, includ
 
 Model-token ceilings are enforced at turn boundaries, not as provider billing quotas: an in-flight native call may overshoot before its usage receipt arrives. Such a response is retained for audit, but its action is not applied and the task pauses before further work. Unreported usage remains explicitly unknown, not free.
 
+### Provider response budgets
+
+Native provider output is monitored against a per-turn `model_response_bytes` budget (8 MiB by default, configurable from 1 KiB to 32 MiB using `--model-response-bytes` or F7 custom budgets). Stdout, stderr and Codex's reply file share the allowance; oversized responses are stopped and rejected before parsing or executing actions. Reads are independently bounded, including after a fast natural exit. Monitoring can briefly overshoot in temporary files between polls; this is not an operating-system disk quota. Custom endpoint bodies honor the same configured allowance while streaming, including responses without Content-Length. Native CLI network transfer remains unobservable and is not reported as zero.
+
 ### Scoped interruption
 
 Interrupting an operation does not cancel its durable task. An undispatched operation stops without executing; a claimed unsafe operation pauses with `outcome_unknown` until its external effects are reconciled. Read-only interrupted operations can stop without assuming a side effect was undone. A model-turn interrupt stops that provider call and pauses the task for resumption. Requests target an operation ID or a specific started-turn sequence, so an old request cannot interrupt a later resumed model turn. Work that already completed keeps its recorded result. Advanced automation can request `arun interrupt <run-id> operation|model`; terminal users use Ctrl+C and the task menu instead.

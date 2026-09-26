@@ -24,6 +24,9 @@ fn usage() {
     );
     println!("arun interrupt <run-id> operation|model");
     println!(
+        "Provider capture budget: --model-response-bytes <1024..33554432> (default 8388608); also available in F7 custom budgets."
+    );
+    println!(
         "Long commands: arun run <task> --process-seconds <1..7200> --wall-seconds <task-limit>"
     );
     println!(
@@ -141,6 +144,7 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
     let mut wall_seconds = 3600_u64;
     let mut process_seconds = 60_u64;
     let mut context_chars = 256_000_u64;
+    let mut model_response_bytes = arun::budget::DEFAULT_MODEL_RESPONSE_BYTES;
     let mut programs = Vec::new();
     let mut image = None;
     let mut acceptance_check = None;
@@ -265,6 +269,14 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
                     bail!("context limit must be positive");
                 }
             }
+            "--model-response-bytes" => {
+                index += 1;
+                model_response_bytes = args
+                    .get(index)
+                    .context("--model-response-bytes needs a byte limit")?
+                    .parse()?;
+                arun::budget::validate_response_bytes(model_response_bytes)?;
+            }
             "--process-seconds" => {
                 index += 1;
                 process_seconds = args
@@ -341,7 +353,7 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
         provider,
         json!(grants),
         json!({"model": model, "endpoint":endpoint, "mode": mode, "actions": actions, "model_tokens": model_tokens, "wall_seconds": wall_seconds, "context_chars": context_chars,
-            "model_seconds": 180, "process_seconds": process_seconds, "container_image": image, "acceptance_check":acceptance_check}),
+            "model_seconds": 180, "model_response_bytes": model_response_bytes, "process_seconds": process_seconds, "container_image": image, "acceptance_check":acceptance_check}),
         acceptance,
     )?;
     println!("run: {} provider: {}", run.id, run.provider);

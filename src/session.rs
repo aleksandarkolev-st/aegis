@@ -468,6 +468,10 @@ fn configure_limits(terminal: &Terminal) -> Result<Option<crate::budget::Limits>
             ("Command deadline in seconds", &mut limits.process_seconds),
             ("Model-turn deadline in seconds", &mut limits.model_seconds),
             ("Context characters", &mut limits.context_chars),
+            (
+                "Model response capture bytes",
+                &mut limits.model_response_bytes,
+            ),
         ] {
             let Some(input) = field(terminal, &format!("  {label} [{}] › ", *value), false)?
             else {

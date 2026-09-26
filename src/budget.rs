@@ -1,6 +1,26 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
+pub const DEFAULT_MODEL_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
+
+pub fn validate_response_bytes(bytes: u64) -> Result<()> {
+    if !(1024..=32 * 1024 * 1024).contains(&bytes) {
+        bail!("model response capture limit must be 1024..33554432 bytes");
+    }
+    Ok(())
+}
+
+pub fn response_bytes(configuration: &serde_json::Value) -> Result<u64> {
+    let bytes = match configuration.get("model_response_bytes") {
+        Some(value) => value.as_u64().ok_or_else(|| {
+            anyhow::anyhow!("model response capture limit must be an unsigned byte count")
+        })?,
+        None => DEFAULT_MODEL_RESPONSE_BYTES,
+    };
+    validate_response_bytes(bytes)?;
+    Ok(bytes)
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
@@ -10,6 +30,7 @@ pub struct Limits {
     pub model_seconds: u64,
     pub process_seconds: u64,
     pub context_chars: u64,
+    pub model_response_bytes: u64,
 }
 
 impl Default for Limits {
@@ -21,6 +42,7 @@ impl Default for Limits {
             model_seconds: 180,
             process_seconds: 600,
             context_chars: 256_000,
+            model_response_bytes: DEFAULT_MODEL_RESPONSE_BYTES,
         }
     }
 }
@@ -36,6 +58,7 @@ impl Limits {
     }
 
     pub fn validate(&self) -> Result<()> {
+        validate_response_bytes(self.model_response_bytes)?;
         if !(1..=1000).contains(&self.actions) {
             bail!("action limit must be 1..1000");
         }
@@ -61,6 +84,28 @@ impl Limits {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_limits_default_for_legacy_contracts_and_reject_invalid_values() -> Result<()> {
+        assert_eq!(
+            response_bytes(&serde_json::json!({}))?,
+            DEFAULT_MODEL_RESPONSE_BYTES
+        );
+        assert_eq!(
+            response_bytes(&serde_json::json!({"model_response_bytes":1024}))?,
+            1024
+        );
+        for value in [
+            serde_json::json!(0),
+            serde_json::json!(1023),
+            serde_json::json!(33554433),
+            serde_json::json!("1024"),
+            serde_json::json!(null),
+        ] {
+            assert!(response_bytes(&serde_json::json!({"model_response_bytes":value})).is_err());
+        }
+        Ok(())
+    }
 
     #[test]
     fn default_and_partial_saved_limits_support_bounded_multi_hour_work() -> Result<()> {

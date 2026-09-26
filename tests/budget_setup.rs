@@ -10,7 +10,12 @@ fn guided_presets_and_custom_limits_are_saved_without_terminal_commands() -> Res
     for (choice, fields, seconds, command_seconds) in [
         ("1", "", 14_400, 600),
         ("2", "", 3600, 60),
-        ("3", "20\n400000\n10800\n7200\n180\n256000\n", 10_800, 7200),
+        (
+            "3",
+            "20\n400000\n10800\n7200\n180\n256000\n\n",
+            10_800,
+            7200,
+        ),
     ] {
         let directory = tempfile::tempdir()?;
         let mut child = Command::new(env!("CARGO_BIN_EXE_arun"))
