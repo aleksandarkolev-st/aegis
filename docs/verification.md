@@ -28,7 +28,7 @@ This is a development verification record, not a success-rate or performance-imp
 
 ## Automated checks
 
-- `cargo test --locked`: 71 unit tests and 29 integration tests passed; four Docker tests are ignored by default. Six focused terminal tests also passed after the final owned-row repaint change.
+- `cargo test --locked`: 76 unit tests and 31 integration tests passed after exact command scopes and command receipt identities; four Docker tests are ignored by default. Six focused terminal tests also passed after the earlier owned-row repaint change.
 - `cargo test --test docker --test docker_acceptance --test docker_mcp -- --ignored`: all four passed separately with Docker running. They verify multi-megabyte output virtualization, hidden runtime state, fresh read-only workspaces without metadata directories, immutable/read-only acceptance checks, and MCP filesystem/network/credential isolation.
 - `npm test`: four package/platform/checksum/version tests passed.
 - Process-tree tests verify that explicit kill and drop cleanup stop a descendant heartbeat, not merely its launcher.
@@ -49,6 +49,8 @@ This is a development verification record, not a success-rate or performance-imp
 - Model-picker fixtures verify authenticated `/models` requests, hidden-model filtering, manual fallback, preservation of permissions/budgets/history, and removal of container command access when choosing review-only mode. Native error fixtures verify readable sign-in hints in both guided and advanced flows without dumping provider JSON; raw durable diagnostics remain available separately.
 - Response capture tests reject oversized native stdout, stderr, their combined size, Codex reply files, and fast-exiting providers before applying any action. HTTP tests cover declared and chunked response bodies. Poll-based native capture can briefly overshoot between checks; it is not an operating-system disk quota.
 - Checkpoint/cancellation fixtures preserve an uncertain write without replay, distinguish keep-running from confirmed cancellation, and verify that cancellation does not falsely reconcile unknown effects. Result metadata tests cover UTF-8 byte counts, exit status, search counts and elapsed time; footer counts are explicitly characters, not tokenizer-exact tokens.
+- Exact command scope tests cover argument order/boundaries/case, extra flags, shell wrappers, unrecognized fields, empty-deny versus absent legacy policy, bounded files and immutable copies. Kernel rejection creates no intent; direct-worker rejection creates no claim or effect. Guided fixtures approve commands without shell commands and require confirmation before removing restrictions; advanced fixtures freeze reviewed files and grant only their programs. The Docker large-output fixture executes the approved exact command and verifies its operation/idempotency receipt values.
+- Built and installed the scopes/receipt build in both the user-global package and a separate private endurance prefix. Both binaries match SHA256 `73c2978ae13ba2191d201a04032b8085b05606b2d5281b6d4de97046326309b5`; the private binary stays frozen while the experiment is running. All four Docker tests and four npm tests passed again.
 
 ## Not yet verified or delivered
 
