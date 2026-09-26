@@ -1,4 +1,4 @@
-use std::fs::{self, File};
+use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -195,15 +195,10 @@ fn ensure_provider(terminal: &Terminal, name: &str) -> Result<bool> {
 
 fn save(root: &Path, profile: &Profile) -> Result<()> {
     let path = root.join("profile.json");
-    let temporary = root.join(format!("profile-{}.tmp", uuid::Uuid::new_v4()));
-    let mut file = File::create(&temporary)?;
-    file.write_all(&serde_json::to_vec_pretty(profile)?)?;
-    file.sync_all()?;
-    drop(file);
-    if path.exists() {
-        fs::remove_file(&path)?;
-    }
-    fs::rename(temporary, path)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(root)?;
+    temporary.write_all(&serde_json::to_vec_pretty(profile)?)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
     Ok(())
 }
 
@@ -765,7 +760,7 @@ mod tests {
     #[test]
     fn profile_persists_only_secret_references() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let profile = Profile {
+        let mut profile = Profile {
             provider: "custom".into(),
             model: Some("model".into()),
             endpoint: Some(Endpoint {
@@ -779,9 +774,13 @@ mod tests {
             previous_run: None,
         };
         save(directory.path(), &profile)?;
+        profile.write = true;
+        save(directory.path(), &profile)?;
         let saved: Profile =
             serde_json::from_slice(&fs::read(directory.path().join("profile.json"))?)?;
         assert_eq!(secret_reference(&saved), Some("ARUN_SESSION_API_KEY"));
+        assert!(saved.write);
+        assert_eq!(fs::read_dir(directory.path())?.count(), 1);
         assert!(is_auth_error("OAuth access token has expired. HTTP 401"));
         assert!(!is_auth_error("usage balance exhausted"));
         Ok(())
