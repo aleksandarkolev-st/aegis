@@ -8,6 +8,7 @@ pub mod mcp;
 pub mod model;
 pub mod process;
 pub mod provider;
+pub mod restart;
 pub mod session;
 pub mod storage;
 pub mod terminal;

@@ -33,6 +33,7 @@ pub struct Options {
     pub wall_seconds: u64,
     pub image: String,
     pub prepare_only: bool,
+    pub restart_at: Option<String>,
 }
 
 impl Default for Options {
@@ -52,6 +53,7 @@ impl Default for Options {
             wall_seconds: 600,
             image: "node:22-alpine".into(),
             prepare_only: false,
+            restart_at: None,
         }
     }
 }
@@ -101,6 +103,20 @@ impl Options {
                 "--context-chars" => options.context_chars = value.parse()?,
                 "--wall-seconds" => options.wall_seconds = value.parse()?,
                 "--image" => options.image = value.clone(),
+                "--restart-at" => {
+                    if ![
+                        "operation.executing",
+                        "operation.succeeded",
+                        "checkpoint.created",
+                    ]
+                    .contains(&value.as_str())
+                    {
+                        bail!(
+                            "restart boundary must be operation.executing, operation.succeeded, or checkpoint.created"
+                        );
+                    }
+                    options.restart_at = Some(value.clone());
+                }
                 _ => bail!("unknown evaluation option: {flag}"),
             }
             index += 1;
@@ -170,6 +186,7 @@ struct Case {
     repeat: usize,
     root: PathBuf,
     run_id: String,
+    restart_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -257,6 +274,7 @@ fn prepare(root: &Path, options: &Options) -> Result<Vec<Case>> {
                         repeat,
                         root: state_root.clone(),
                         run_id: run.id,
+                        restart_at: options.restart_at.clone(),
                     });
                 }
             }
@@ -378,9 +396,16 @@ pub fn command(root: &Path, args: &[String]) -> Result<()> {
     let mut rows = Vec::new();
     for case in cases {
         let started = Instant::now();
-        let error = kernel::drive(&case.root, &case.run_id)
-            .err()
-            .map(|error| format!("{error:#}"));
+        let (error, restart) = if let Some(cut) = &case.restart_at {
+            crate::restart::execute(&case.root, &case.run_id, cut, options.wall_seconds)?
+        } else {
+            (
+                kernel::drive(&case.root, &case.run_id)
+                    .err()
+                    .map(|error| format!("{error:#}")),
+                Value::Null,
+            )
+        };
         let execution_ms = started.elapsed().as_millis();
         let mut store = Store::open(&case.root)?;
         let run = store.run(&case.run_id)?;
@@ -430,7 +455,7 @@ pub fn command(root: &Path, args: &[String]) -> Result<()> {
         let row = json!({"case":case, "state":run.state, "acceptance":acceptance, "metrics":trace::metrics(&events),
             "wrong_tools":wrong_tools, "invalid_arguments":invalid_arguments, "execution_ms":execution_ms,
             "execution_and_acceptance_ms":started.elapsed().as_millis(), "runtime_error":error,
-            "context_overflow":events.iter().any(|event| event.kind == "context.over_limit")});
+            "context_overflow":events.iter().any(|event| event.kind == "context.over_limit"),"restart":restart});
         writeln!(report, "{}", serde_json::to_string(&row)?)?;
         report.sync_all()?;
         rows.push(row);

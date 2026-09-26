@@ -146,14 +146,17 @@ See `docs/verification.md` for the dated local package/UI checks, live ChatGPT a
 arun eval --prepare-only
 arun eval --provider chatgpt --sizes 50 --modes eager,lazy,artifact,durable --tasks read,log
 arun eval --provider chatgpt --repeats 3 --image node:22-alpine
+arun eval --provider chatgpt --tasks read --restart-at operation.succeeded
 ```
 
 The default matrix has 48 cases: three fixtures, four modes, and registries of 50, 100, 250, and 500 tools. Each repeat rotates mode order. Fixtures, exact manifests, immutable run configurations, CLI versions, JSONL events, artifacts, and results are saved under `.arun/evaluations/<id>/`. `--prepare-only` creates cases without model calls. Other runs consume the selected provider's usage allowance. Budgets include `--actions`, `--model-tokens`, `--context-chars`, and `--wall-seconds`; queued cases start their execution clock on first dispatch rather than at preparation.
 
 Read and large-log fixtures require both the expected final answer and matching successful-operation evidence. Repair is checked independently by Node assertions in a network-disabled Docker container; the selected image must already exist. Results distinguish execution time from acceptance-check time, record wrong-tool and invalid-argument counts, and report context overflow explicitly. Schema exposure is measured in UTF-8 bytes, not claimed as exact tokenizer tokens. Supply `--model` for pinned comparisons; otherwise metadata explicitly records a provider-default model. Raw observations are not success-rate claims or uncertainty estimates.
 
-## Remaining work
+Use `--restart-at operation.executing`, `operation.succeeded`, or `checkpoint.created` to terminate the supervised runner process tree after observing that durable event and launch a fresh runner. Results record whether the boundary was reached, the operation's persisted state after termination, recovery latency, and whether reconciliation is required. Fast operations may finish before termination; the recorded state distinguishes this from an interrupted execution. Unsafe interrupted effects remain paused, rather than being retried just to improve benchmark acceptance. Non-durable modes fail after interruption. Budgets and provider usage still apply, and unreached boundaries are not represented as successful forced restarts.
 
 Every completed evaluation writes `paired-summary.json`, matching candidate runs to eager runs by registry size, task, restart condition, and repeat. Acceptance differences include distribution-free 95% bounds; numeric differences use a deterministic paired bootstrap, with no interval for a single pair. Missing pairs and metrics are counted explicitly. Cost differences include failures and context overflow, so they are not automatically improvements. Regenerate a summary from saved observations with `arun eval-report <results.jsonl>`.
 
-The broader `plan.txt` also calls for forced-restart benchmarks; these are not yet claimed as implemented. The Codex CLI adapter disables its built-in tools, but its own system context still incurs substantial token overhead; measured usage is reported rather than presented as a kernel-only schema cost.
+## Remaining work
+
+The broader `plan.txt` still needs multi-hour live demonstrations, scalable snapshot-based recovery, and the proposed granular Ctrl+C operation/model-turn semantics. Forced-restart integration fixtures exercise a committed read across all four modes and an unsafe in-flight MCP call; these are mock-provider correctness checks, not live comparative performance results. Live Claude completion remains pending reauthentication. The Codex CLI adapter disables its built-in tools, but its own system context still incurs substantial token overhead; measured usage is reported rather than presented as a kernel-only schema cost.

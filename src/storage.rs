@@ -866,7 +866,13 @@ impl Store {
     pub fn reconcile(&mut self, run_id: &str) -> Result<Vec<Operation>> {
         let unresolved = self.unresolved(run_id)?;
         for operation in &unresolved {
-            if operation.retry_safe {
+            if operation.state == "pending" {
+                self.event(
+                    run_id,
+                    "operation.dispatch_ready",
+                    json!({"id":operation.id,"reason":"intent was never dispatched"}),
+                )?;
+            } else if operation.retry_safe {
                 self.event(
                     run_id,
                     "operation.retry_ready",

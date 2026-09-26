@@ -18,6 +18,8 @@ fn prepares_paired_saved_cases_without_running_models() -> Result<()> {
             "read",
             "--modes",
             "eager,durable",
+            "--restart-at",
+            "operation.executing",
         ])
         .current_dir(directory.path())
         .output()?;
@@ -37,6 +39,7 @@ fn prepares_paired_saved_cases_without_running_models() -> Result<()> {
         let id = case["run_id"].as_str().unwrap();
         let run = store.run(id)?;
         assert_eq!(run.state, "ready");
+        assert_eq!(case["restart_at"], "operation.executing");
         assert_eq!(store.event_count(id, "model.started")?, 0);
         assert_eq!(
             capability::all(&store)?.len() as u64,

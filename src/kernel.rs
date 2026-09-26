@@ -421,6 +421,9 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
     if matches!(run.state.as_str(), "completed" | "cancelled" | "failed") {
         bail!("run is {}", run.state);
     }
+    for operation in store.unresolved(run_id)? {
+        cleanup_container(&operation);
+    }
     if mode(&run) != "durable" && run.state == "running" {
         store.state(
             run_id,
@@ -432,9 +435,6 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
     if store.unknown_count(run_id)? > 0 {
         bail!("unknown operation outcome requires explicit reconciliation");
     }
-    for operation in store.unresolved(run_id)? {
-        cleanup_container(&operation);
-    }
     let unresolved = store.reconcile(run_id)?;
     run = store.run(run_id)?;
     if run.state == "waiting_recovery" {
@@ -445,7 +445,8 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
         .run_started_at(run_id)?
         .context("run start event missing")?;
     for operation in unresolved.iter().filter(|operation| {
-        operation.retry_safe && operation.capability != crate::acceptance::CAPABILITY
+        (operation.retry_safe || operation.state == "pending")
+            && operation.capability != crate::acceptance::CAPABILITY
     }) {
         if perform(&mut store, root, &run, operation)? {
             return Ok(());

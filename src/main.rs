@@ -26,7 +26,7 @@ fn usage() {
         "arun tasks|context|tools|artifacts <run-id> | mcp add <name> --image <local-image> [--allow-write] -- <command> [args...] | mcp add <name> --trusted-host -- <command> [args...]"
     );
     println!(
-        "arun eval [--provider chatgpt|claude|grok] [--sizes 50,100,250,500] [--modes eager,lazy,artifact,durable] [--tasks read,log,repair] [--repeats 1] [--prepare-only]"
+        "arun eval [--provider chatgpt|claude|grok] [--sizes 50,100,250,500] [--modes eager,lazy,artifact,durable] [--tasks read,log,repair] [--repeats 1] [--restart-at operation.executing|operation.succeeded|checkpoint.created] [--prepare-only] | eval-report <results.jsonl>"
     );
 }
 
@@ -382,6 +382,15 @@ fn main() -> Result<()> {
                     required(1)?
                 ))?)?
             );
+            Ok(())
+        }
+        Some("restart-check") => {
+            let (error, observation) =
+                arun::restart::execute(Path::new(required(1)?), required(2)?, required(3)?, 60)?;
+            println!("{}", serde_json::to_string_pretty(&observation)?);
+            if let Some(error) = error {
+                bail!(error);
+            }
             Ok(())
         }
         Some("serve") => kernel::drive(Path::new(required(1)?), required(2)?),
