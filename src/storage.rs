@@ -681,6 +681,27 @@ impl Store {
         Ok(())
     }
 
+    pub fn claim_operation(&mut self, operation: &Operation) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE operations SET state = 'executing' WHERE id = ?1 AND run_id = ?2 AND state = 'dispatched' AND EXISTS (SELECT 1 FROM runs WHERE id = ?2 AND state = 'running')",
+            params![operation.id, operation.run_id],
+        )?;
+        if changed != 1 {
+            bail!("operation has already been claimed or is no longer dispatched");
+        }
+        append_event(
+            &transaction,
+            &operation.run_id,
+            "operation.executing",
+            json!({"id":operation.id,"worker_pid":std::process::id()}),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn operations(&self, run_id: &str) -> Result<Vec<Operation>> {
         let mut statement = self.connection.prepare("SELECT id, capability, capability_version, arguments, idempotency_key, retry_safe, state, artifact FROM operations WHERE run_id = ?1 ORDER BY rowid")?;
         let rows = statement.query_map([run_id], |row| {
@@ -719,7 +740,12 @@ impl Store {
         Ok(self
             .operations(run_id)?
             .into_iter()
-            .filter(|operation| matches!(operation.state.as_str(), "pending" | "dispatched"))
+            .filter(|operation| {
+                matches!(
+                    operation.state.as_str(),
+                    "pending" | "dispatched" | "executing"
+                )
+            })
             .collect())
     }
 

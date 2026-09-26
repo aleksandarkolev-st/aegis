@@ -55,6 +55,19 @@ fn discovers_and_invokes_only_locally_granted_mcp_tool() -> Result<()> {
         .unwrap()
         .version = version.wrapping_add(1);
     store.register_mcp(&server, &changed)?;
-    assert!(worker::execute(&root, &operation.id).is_err());
+    let stale = store.begin_operation_versioned(
+        &run.id,
+        "mcp.fixture.echo",
+        version,
+        json!({"text":"must not invoke"}),
+        false,
+    )?;
+    store.operation_state(&stale, "dispatched", None, json!({}))?;
+    assert!(
+        worker::execute(&root, &stale.id)
+            .unwrap_err()
+            .to_string()
+            .contains("version changed")
+    );
     Ok(())
 }

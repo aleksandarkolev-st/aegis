@@ -123,6 +123,13 @@ fn string<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
 }
 
 pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
+    uuid::Uuid::parse_str(operation_id).context("invalid operation ID")?;
+    let lock = File::options()
+        .write(true)
+        .create(true)
+        .open(root.join(format!("operation-{operation_id}.lock")))?;
+    fs2::FileExt::try_lock_exclusive(&lock)
+        .context("operation already executing in another worker")?;
     let mut store = Store::open(root)?;
     let operation = store.operation(operation_id)?;
     if operation.state != "dispatched" {
@@ -138,6 +145,8 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
     if manifest.version != operation.capability_version {
         bail!("capability version changed after intent was recorded");
     }
+    capability::validate_arguments(&manifest, &operation.arguments)?;
+    store.claim_operation(&operation)?;
     let workspace = Path::new(&run.workspace);
     let args = &operation.arguments;
     match operation.capability.as_str() {
@@ -268,6 +277,73 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adapter_cannot_repeat_a_claimed_write_before_result_commit() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(".arun");
+        let target = directory.path().join("fixture.txt");
+        fs::write(&target, "original")?;
+        let mut store = Store::open(&root)?;
+        let run = store.create_run(
+            "write",
+            directory.path(),
+            "codex",
+            json!(["workspace.write"]),
+            json!({}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let operation = store.begin_operation(
+            &run.id,
+            "workspace.write",
+            json!({"path":"fixture.txt","content":"written once"}),
+            false,
+        )?;
+        store.operation_state(&operation, "dispatched", None, json!({}))?;
+        execute(&root, &operation.id)?;
+        assert_eq!(store.operation(&operation.id)?.state, "executing");
+        fs::write(&target, "later external edit")?;
+        assert!(execute(&root, &operation.id).is_err());
+        assert_eq!(fs::read_to_string(target)?, "later external edit");
+        assert_eq!(store.event_count(&run.id, "operation.executing")?, 1);
+        store.reconcile(&run.id)?;
+        assert_eq!(store.operation(&operation.id)?.state, "outcome_unknown");
+        assert_eq!(store.run(&run.id)?.state, "waiting_recovery");
+        Ok(())
+    }
+
+    #[test]
+    fn worker_revalidates_schema_before_claiming_an_operation() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(".arun");
+        let mut store = Store::open(&root)?;
+        let run = store.create_run(
+            "write",
+            directory.path(),
+            "codex",
+            json!(["workspace.write"]),
+            json!({}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let operation = store.begin_operation(
+            &run.id,
+            "workspace.write",
+            json!({"path":"fixture.txt","content":7}),
+            false,
+        )?;
+        store.operation_state(&operation, "dispatched", None, json!({}))?;
+        assert!(
+            execute(&root, &operation.id)
+                .unwrap_err()
+                .to_string()
+                .starts_with("invalid arguments")
+        );
+        assert_eq!(store.operation(&operation.id)?.state, "dispatched");
+        assert!(!directory.path().join("fixture.txt").exists());
+        Ok(())
+    }
 
     #[test]
     fn rejects_traversal_and_internal_metadata() -> Result<()> {
