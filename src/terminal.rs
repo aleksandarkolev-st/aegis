@@ -276,13 +276,24 @@ impl Terminal {
             queue!(
                 io::stdout(),
                 cursor::MoveToColumn(0),
-                Clear(if rows > 0 {
-                    ClearType::FromCursorDown
-                } else {
-                    ClearType::CurrentLine
-                }),
+                Clear(ClearType::CurrentLine),
                 cursor::Show
             )?;
+            for _ in 1..rows {
+                queue!(
+                    io::stdout(),
+                    cursor::MoveDown(1),
+                    cursor::MoveToColumn(0),
+                    Clear(ClearType::CurrentLine)
+                )?;
+            }
+            if rows > 1 {
+                queue!(
+                    io::stdout(),
+                    cursor::MoveUp(rows - 1),
+                    cursor::MoveToColumn(0)
+                )?;
+            }
             io::stdout().flush()?;
         }
         Ok(())
@@ -314,7 +325,10 @@ impl Terminal {
             elapsed.as_secs(),
             tokens
         );
-        self.clear_activity()?;
+        let rows = self.activity_rows.get();
+        if rows > 1 {
+            queue!(io::stdout(), cursor::MoveUp(rows - 1))?;
+        }
         queue!(
             io::stdout(),
             cursor::Hide,
@@ -326,9 +340,15 @@ impl Terminal {
         }
         write!(io::stdout(), "{}", fit(&text, width.saturating_sub(1)))?;
         queue!(io::stdout(), ResetColor)?;
+        write!(io::stdout(), "\r\n")?;
+        queue!(
+            io::stdout(),
+            cursor::MoveToColumn(0),
+            Clear(ClearType::CurrentLine)
+        )?;
         write!(
             io::stdout(),
-            "\r\n{}",
+            "{}",
             fit(
                 &format!("  {}", context.text(crate::storage::unix_time())),
                 width.saturating_sub(1)
