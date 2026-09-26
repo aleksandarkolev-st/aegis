@@ -17,7 +17,7 @@ fn usage() {
         "aegis / arun: launch with no arguments for guided terminal tasks, login, and settings."
     );
     println!(
-        "arun run <task> [--provider chatgpt|claude|grok|custom] [--model <id>] [--endpoint <url> --api-key-env <name> --response-format schema|json|none] [--mode eager|lazy|artifact|durable] [--allow-write] [--allow-process <program> --image <local-image>] [--acceptance <check.json>] [--allow-mcp <server:tool>] [--actions <limit>] [--model-tokens <limit>] [--wall-seconds <limit>] [--context-chars <limit>] [--foreground]"
+        "arun run <task> [--provider chatgpt|claude|grok|custom] [--model <id>] [--endpoint <url> --api-key-env <name> --response-format schema|json|none] [--mode eager|lazy|artifact|durable] [--allow-write] [--allow-process <program> --image <local-image>] [--acceptance <check.json>] [--allow-mcp <server:tool>] [--actions <limit>] [--model-tokens <limit>] [--tool-result-tokens <limit>] [--wall-seconds <limit>] [--context-chars <limit>] [--foreground]"
     );
     println!(
         "arun attach|resume|status|cancel|replay|trace <run-id> | resolve <run-id> <op-id> succeeded|failed <note> | list | inspect <artifact-hash> | login|probe <provider>"
