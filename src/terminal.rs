@@ -821,7 +821,7 @@ impl Terminal {
                 let capability = payload["capability"].as_str().unwrap_or("tool");
                 let label = match capability {
                     "workspace.read" => "Read",
-                    "workspace.write" => "Edit",
+                    "workspace.write" | "workspace.patch" => "Edit",
                     "workspace.search" => "Search",
                     "process.run" => "Run",
                     "network.fetch" => "Fetch",
@@ -943,7 +943,7 @@ fn result_summary(payload: &serde_json::Value) -> (Tone, &'static str, String) {
         return (Tone::Warning, "Command failed", text);
     }
     let label = match capability {
-        "workspace.write" => "Edited",
+        "workspace.write" | "workspace.patch" => "Edited",
         "workspace.read" => "Read",
         "workspace.search" => "Found",
         "process.run" => "Command finished",

@@ -272,12 +272,12 @@ impl FileScopes {
 
     pub fn authorize(&self, run: &Run, capability: &str, arguments: &Value) -> Result<()> {
         match capability {
-            "workspace.read" | "workspace.write" => {
+            "workspace.read" | "workspace.write" | "workspace.patch" => {
                 let path = arguments["path"].as_str().context("file path missing")?;
                 self.checked_path(
                     Path::new(&run.workspace),
                     path,
-                    capability == "workspace.write",
+                    capability != "workspace.read",
                 )?;
             }
             "workspace.search" if self.read.is_empty() => {

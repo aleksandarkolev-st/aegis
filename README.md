@@ -190,6 +190,8 @@ The image must already be installed locally. Verification runs with a read-only 
 
 ## Capabilities and isolation
 
+For existing code, `workspace.patch` accepts up to 32 small exact replacements (64 KiB combined) instead of returning the entire file to write it back. Each old string must match exactly once; edits refer to disjoint ranges of the original file, not earlier replacements. Stale, missing, ambiguous or overlapping input fails before the worker claims an edit. `workspace.read` reports a content SHA256; supplying it as `expected_sha256` protects against edits based on an older inspected version. Replacement is atomic, preserves file permissions and shares the write grant and exact file scopes. A crash after claim still has an uncertain outcome and is never blindly replayed. External host edits racing the final replacement are not prevented by an OS file lock.
+
 Read-only workspace search/read are granted by default. Add `--allow-write` to grant exact workspace writes. Paths cannot traverse out of the workspace or enter `.git` or `.arun` through the built-in file tools. `process.run` is disabled unless a specific program and a locally available Docker image are granted:
 
 ```powershell

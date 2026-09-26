@@ -45,6 +45,15 @@ pub fn registry() -> Vec<Manifest> {
             input_schema: json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}),
         },
         Manifest {
+            id: "workspace.patch".into(),
+            version: 1,
+            purpose: "Edit an existing UTF-8 file using small unique exact text replacements; preserve unrelated content".into(),
+            permission: "workspace.write".into(),
+            side_effect: "workspace".into(),
+            cost: 3,
+            input_schema: json!({"type":"object","additionalProperties":false,"properties":{"path":{"type":"string"},"expected_sha256":{"type":"string","pattern":"^[a-f0-9]{64}$"},"edits":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","additionalProperties":false,"properties":{"old":{"type":"string","minLength":1},"new":{"type":"string"}},"required":["old","new"]}}},"required":["path","edits"]}),
+        },
+        Manifest {
             id: "process.run".into(),
             version: 1,
             purpose: "Run a directly executed process with arguments in the workspace".into(),

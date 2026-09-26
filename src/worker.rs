@@ -1,4 +1,5 @@
 use std::fs::{self, File};
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -245,6 +246,26 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
             .context("network access has not been approved")?
             .authorize(string(&operation.arguments, "url")?)?;
     }
+    let patch = if operation.capability == "workspace.patch" {
+        let path = relative(
+            Path::new(&run.workspace),
+            string(&operation.arguments, "path")?,
+        )?;
+        let mut original = String::new();
+        File::open(&path)?
+            .take(MAX_FILE + 1)
+            .read_to_string(&mut original)?;
+        let edits: Vec<crate::patch::Edit> =
+            serde_json::from_value(operation.arguments["edits"].clone())?;
+        let updated = crate::patch::apply(
+            &original,
+            &edits,
+            operation.arguments["expected_sha256"].as_str(),
+        )?;
+        Some((path, original, updated, edits.len()))
+    } else {
+        None
+    };
     store.claim_operation(&operation)?;
     let workspace = Path::new(&run.workspace);
     let args = &operation.arguments;
@@ -255,7 +276,11 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
             if fs::metadata(&path)?.len() > MAX_FILE {
                 bail!("file too large; use search");
             }
-            Ok(json!({"content": fs::read_to_string(path)?}))
+            let content = fs::read_to_string(path)?;
+            use sha2::Digest;
+            Ok(
+                json!({"sha256":hex::encode(sha2::Sha256::digest(content.as_bytes())),"content":content}),
+            )
         }
         "workspace.search" => {
             let query = string(args, "query")?;
@@ -319,6 +344,27 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
                 }
             }
             Ok(json!({"matches": matches, "truncated": false}))
+        }
+        "workspace.patch" => {
+            let (path, original, updated, edits) = patch.context("prepared patch missing")?;
+            let mut current = String::new();
+            File::open(&path)?
+                .take(MAX_FILE + 1)
+                .read_to_string(&mut current)?;
+            if current != original {
+                bail!("file changed during patch preparation; review its outcome before retrying");
+            }
+            let mut temporary = tempfile::NamedTempFile::new_in(root)?;
+            temporary.write_all(updated.as_bytes())?;
+            fs::set_permissions(temporary.path(), fs::metadata(&path)?.permissions())?;
+            temporary.as_file().sync_all()?;
+            temporary.persist(&path).map_err(|error| {
+                anyhow::anyhow!("atomic patch replacement failed: {}", error.error)
+            })?;
+            use sha2::Digest;
+            Ok(
+                json!({"path":path.strip_prefix(workspace)?.to_string_lossy(),"bytes":updated.len(),"edits":edits,"sha256":hex::encode(sha2::Sha256::digest(updated.as_bytes()))}),
+            )
         }
         "workspace.write" => {
             let path = relative(workspace, string(args, "path")?)?;

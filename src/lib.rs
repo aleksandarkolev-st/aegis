@@ -14,6 +14,7 @@ pub mod learning;
 pub mod mcp;
 pub mod model;
 pub mod network;
+pub mod patch;
 pub mod policy;
 pub mod process;
 pub mod provider;

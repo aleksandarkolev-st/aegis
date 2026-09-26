@@ -70,6 +70,40 @@ fn conversation(store: &Store, run: &Run) -> Result<Vec<Value>> {
     Ok(history)
 }
 
+fn bounded_event(payload: &Value) -> String {
+    let full = payload.to_string();
+    if full.chars().count() <= 500 {
+        return full;
+    }
+    let mut bounded = json!({"truncated":true});
+    for key in [
+        "artifact",
+        "id",
+        "capability",
+        "sha256",
+        "exit_code",
+        "output_bytes",
+        "excerpt",
+        "error",
+        "next_action",
+        "interrupted",
+    ] {
+        let Some(value) = payload.get(key).or_else(|| payload["detail"].get(key)) else {
+            continue;
+        };
+        let value = match value {
+            Value::String(text) => json!(text.chars().take(140).collect::<String>()),
+            value if value.is_number() || value.is_boolean() => value.clone(),
+            _ => continue,
+        };
+        bounded[key] = value;
+        if bounded.to_string().chars().count() > 500 {
+            bounded.as_object_mut().unwrap().remove(key);
+        }
+    }
+    bounded.to_string()
+}
+
 fn context(store: &Store, run: &Run) -> Result<String> {
     let mode = mode(run);
     let recent: Vec<_> = store
@@ -89,7 +123,7 @@ fn context(store: &Store, run: &Run) -> Result<String> {
                 }
             }
             Ok(json!({"seq": event.seq, "kind": event.kind,
-            "payload": if matches!(mode, "eager" | "lazy") { payload.to_string() } else { payload.to_string().chars().take(500).collect::<String>() }}))
+            "payload": if matches!(mode, "eager" | "lazy") { payload.to_string() } else { bounded_event(&payload) }}))
         })
         .collect::<Result<Vec<_>>>()?;
     let manifests = visible_manifests(store, run)?;
@@ -401,6 +435,7 @@ fn result_detail(operation: &Operation, result: &Value, bytes: usize, elapsed_ms
         "bytes":bytes, "capability":operation.capability,
         "target":operation.arguments["path"].as_str().or_else(|| operation.arguments["program"].as_str()),
         "output_bytes":result["bytes"].as_u64().or_else(|| result["content"].as_str().map(|content| content.len() as u64)),
+        "sha256":result["sha256"], "edits":result["edits"],
         "exit_code":result["exit_code"],
         "matches":result["matches"].as_array().map(Vec::len),
         "output_artifact":result["output_artifact"], "elapsed_ms":elapsed_ms,
@@ -1088,6 +1123,24 @@ mod tests {
         assert_eq!(store.run(&run.id)?.state, "failed");
         assert_eq!(store.event_count(&run.id, "context.over_limit")?, 1);
         assert_eq!(store.event_count(&run.id, "model.started")?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_events_preserve_valid_json_artifact_handles_and_file_digests() -> Result<()> {
+        let artifact = "a".repeat(64);
+        let digest = "b".repeat(64);
+        let payload = json!({"artifact":artifact,"id":"operation","detail":{"sha256":digest,"preview":"β".repeat(10000),"output_bytes":10000},"excerpt":"a diagnostic".repeat(100)});
+        let encoded = bounded_event(&payload);
+        assert!(encoded.chars().count() <= 500);
+        let decoded: Value = serde_json::from_str(&encoded)?;
+        assert_eq!(decoded["artifact"], artifact);
+        assert_eq!(decoded["sha256"], digest);
+        assert_eq!(decoded["truncated"], true);
+        assert_eq!(
+            bounded_event(&json!({"artifact":artifact})),
+            json!({"artifact":artifact}).to_string()
+        );
         Ok(())
     }
 
