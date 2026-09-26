@@ -1,6 +1,7 @@
 pub mod acceptance;
 pub mod budget;
 pub mod capability;
+pub mod catalog;
 pub mod endpoint;
 pub mod evaluation;
 pub mod evaluation_report;

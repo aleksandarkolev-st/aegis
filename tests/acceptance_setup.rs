@@ -20,7 +20,7 @@ fn guided_setup_snapshots_the_approved_acceptance_check() -> Result<()> {
         .spawn()?;
     child.stdin.take().unwrap().write_all(
         format!(
-            "4\nhttp://127.0.0.1:9/v1\nfixture\n1\n\n2\n1\n2\n{}\n/quit\n",
+            "4\nhttp://127.0.0.1:9/v1\n1\n\nfixture\n2\n1\n2\n{}\n/quit\n",
             path.display()
         )
         .as_bytes(),

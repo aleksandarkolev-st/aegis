@@ -49,7 +49,139 @@ fn field(terminal: &Terminal, label: &str, secret: bool) -> Result<Option<String
     }
 }
 
-fn configure(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
+fn choose_model(
+    terminal: &Terminal,
+    profile: &Profile,
+    secret: Option<&str>,
+) -> Result<Option<Option<String>>> {
+    terminal.message(Tone::Quiet, "Models", "Loading the provider catalog…")?;
+    let catalog = if let Some(endpoint) = &profile.endpoint {
+        endpoint
+            .models(secret)
+            .map(|models| crate::catalog::Catalog {
+                models,
+                source: "Your endpoint's /models catalog".into(),
+            })
+    } else {
+        crate::catalog::native(&profile.provider)
+    };
+    let models = match catalog {
+        Ok(catalog) => {
+            terminal.message(Tone::Quiet, "Catalog", &catalog.source)?;
+            catalog.models
+        }
+        Err(error) => {
+            terminal.message(
+                Tone::Quiet,
+                "Catalog",
+                &crate::terminal::friendly_error(&error.to_string()),
+            )?;
+            Vec::new()
+        }
+    };
+    let native = profile.provider != "custom";
+    let mut choices = Vec::new();
+    let mut values = Vec::new();
+    if native {
+        choices.push("Provider default · let your CLI choose".into());
+        values.push(None);
+    }
+    for model in models {
+        let current = if profile.model.as_deref() == Some(model.id.as_str()) {
+            " · current"
+        } else {
+            ""
+        };
+        choices.push(format!("{}  [{}]{current}", model.label, model.id));
+        values.push(Some(model.id));
+    }
+    if let Some(current) = &profile.model {
+        if !values.iter().any(|value| value.as_ref() == Some(current)) {
+            choices.push(format!("{current} · current (not in catalog)"));
+            values.push(Some(current.clone()));
+        }
+    }
+    let manual = choices.len();
+    choices.push("Enter another model ID…".into());
+    let selected = if choices.len() == 1 {
+        Some(0)
+    } else {
+        terminal.select(
+            &format!("{} · choose a model", name(&profile.provider)),
+            &choices,
+        )?
+    };
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    if selected == manual {
+        let Some(id) = field(terminal, "  Model ID › ", false)? else {
+            return Ok(None);
+        };
+        let id = id.trim();
+        if !crate::catalog::valid_id(id) {
+            terminal.message(
+                Tone::Warning,
+                "Model",
+                "Use a nonempty model ID without spaces or control characters (up to 160 bytes).",
+            )?;
+            return Ok(None);
+        }
+        return Ok(Some(Some(id.into())));
+    }
+    Ok(Some(values[selected].clone()))
+}
+
+fn show_selection(terminal: &Terminal, profile: &Profile) -> Result<()> {
+    terminal.message(
+        Tone::Accent,
+        "Connected",
+        &format!(
+            "{} · {}",
+            name(&profile.provider),
+            profile.model.as_deref().unwrap_or("provider default")
+        ),
+    )
+}
+
+fn switch_provider(
+    root: &Path,
+    terminal: &Terminal,
+    profile: &mut Profile,
+    secret: &mut Option<String>,
+) -> Result<()> {
+    if let Some((selected, key)) = configure_provider(terminal)? {
+        profile.provider = selected.provider;
+        profile.model = selected.model;
+        profile.endpoint = selected.endpoint;
+        *secret = key;
+        save(root, profile)?;
+        show_selection(terminal, profile)?;
+        terminal.message(Tone::Quiet, "Settings kept", "Workspace permissions, budgets and saved tasks are unchanged. This selection applies to new tasks; saved tasks retain their original provider.")?;
+    }
+    Ok(())
+}
+
+fn switch_model(
+    root: &Path,
+    terminal: &Terminal,
+    profile: &mut Profile,
+    secret: Option<&str>,
+) -> Result<()> {
+    if let Some(model) = choose_model(terminal, profile, secret)? {
+        profile.model = model;
+        save(root, profile)?;
+        show_selection(terminal, profile)?;
+        terminal.message(
+            Tone::Quiet,
+            "",
+            "New tasks use this model; saved tasks keep their original selection.",
+        )?;
+    }
+    Ok(())
+}
+
+fn configure_provider(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
     let choices = [
         "ChatGPT — use your Codex login",
         "Claude Code — use your Claude login",
@@ -76,13 +208,6 @@ fn configure(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
         let Some(url) = field(terminal, "  Endpoint URL › ", false)? else {
             return Ok(None);
         };
-        let Some(model) = field(terminal, "  Model ID › ", false)? else {
-            return Ok(None);
-        };
-        if model.trim().is_empty() {
-            terminal.message(Tone::Warning, "!", "A custom endpoint needs a model ID.")?;
-            return Ok(None);
-        }
         let formats = [
             "Strict JSON schema — recommended when supported",
             "JSON object — for servers without schema support",
@@ -112,7 +237,6 @@ fn configure(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
             terminal.message(Tone::Warning, "!", &error.to_string())?;
             return Ok(None);
         }
-        profile.model = Some(model);
         profile.endpoint = Some(endpoint);
     } else {
         if !ensure_provider(terminal, &profile.provider)? {
@@ -132,21 +256,18 @@ fn configure(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
                 terminal.message(Tone::Warning, "!", &error.to_string())?;
             }
         }
-        let choices = ["Use the provider's default model", "Choose a model ID"].map(str::to_owned);
-        let Some(model) = terminal.select("Model", &choices)? else {
-            return Ok(None);
-        };
-        if model == 1 {
-            let Some(id) = field(terminal, "  Model ID › ", false)? else {
-                return Ok(None);
-            };
-            if id.trim().is_empty() {
-                terminal.message(Tone::Warning, "!", "A model ID cannot be empty.")?;
-                return Ok(None);
-            }
-            profile.model = Some(id);
-        }
     }
+    let Some(model) = choose_model(terminal, &profile, secret.as_deref())? else {
+        return Ok(None);
+    };
+    profile.model = model;
+    Ok(Some((profile, secret)))
+}
+
+fn configure(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
+    let Some((mut profile, secret)) = configure_provider(terminal)? else {
+        return Ok(None);
+    };
     let permissions = [
         "Allow workspace edits",
         "Review only — no edits",
@@ -274,7 +395,7 @@ fn configure_limits(terminal: &Terminal) -> Result<Option<crate::budget::Limits>
         crate::budget::Limits::default()
     };
     if choice == 2 {
-        terminal.message(Tone::Warning, "Custom budget", "These are hard task limits, not a price estimate. Provider usage allowances still apply. Press Enter to keep each default.")?;
+        terminal.message(Tone::Warning, "Custom budget", "Task and command deadlines are enforced. Token limits are checked after each model turn, not a price estimate. Provider usage allowances still apply. Press Enter to keep each default.")?;
         for (label, value) in [
             ("Action limit", &mut limits.actions),
             ("Model token limit", &mut limits.model_tokens),
@@ -848,6 +969,7 @@ pub fn interactive(root: &Path) -> Result<()> {
         name(&profile.provider),
         &std::env::current_dir()?.display().to_string(),
     )?;
+    show_selection(&terminal, &profile)?;
     if terminal.interactive {
         if let Some(id) = &profile.previous_run {
             let store = Store::open(root)?;
@@ -885,14 +1007,9 @@ pub fn interactive(root: &Path) -> Result<()> {
         match terminal.input("  › ", false, &history)? {
             Input::Exit => break,
             Input::Providers => {
-                if let Some(mut configured) = configure(&terminal)? {
-                    configured.0.previous_run = profile.previous_run.clone();
-                    profile = configured.0;
-                    secret = configured.1;
-                    save(root, &profile)?;
-                    terminal.message(Tone::Accent, "Provider", name(&profile.provider))?;
-                }
+                switch_provider(root, &terminal, &mut profile, &mut secret)?;
             }
+            Input::Models => switch_model(root, &terminal, &mut profile, secret.as_deref())?,
             Input::Sessions => sessions(root, &mut terminal, &profile, secret.as_deref())?,
             Input::NewConversation => {
                 new_conversation(root, &terminal, &mut profile)?;
@@ -921,7 +1038,11 @@ pub fn interactive(root: &Path) -> Result<()> {
                 }
                 match request {
                     "/provider" => {
-                        if let Some(mut configured) = configure(&terminal)? { configured.0.previous_run = profile.previous_run.clone(); profile = configured.0; secret = configured.1; save(root, &profile)?; }
+                        switch_provider(root, &terminal, &mut profile, &mut secret)?;
+                    }
+                    "/model" | "/models" => switch_model(root, &terminal, &mut profile, secret.as_deref())?,
+                    "/settings" => {
+                        if let Some(mut configured) = configure(&terminal)? { configured.0.previous_run = profile.previous_run.clone(); profile = configured.0; secret = configured.1; save(root, &profile)?; show_selection(&terminal, &profile)?; }
                     }
                     "/new" => { new_conversation(root, &terminal, &mut profile)?; history.clear(); }
                     "/sessions" | "/status" => sessions(root, &mut terminal, &profile, secret.as_deref())?,
@@ -937,7 +1058,7 @@ pub fn interactive(root: &Path) -> Result<()> {
                         } else { terminal.message(Tone::Quiet, "", "No current task. Describe one to get started.")?; }
                     }
                     "/exit" | "/quit" => break,
-                    "/help" => terminal.message(Tone::Quiet, "Help", "Write a task in plain language. F2 changes provider, F3 opens tasks, F4 signs in, F5 starts a fresh conversation. Ctrl+C interrupts an operation; press twice quickly to interrupt the model turn. Ctrl+D detaches. Cancel the entire task from its F3 menu. Up recalls previous tasks.")?,
+                    "/help" => terminal.message(Tone::Quiet, "Help", "Write a task in plain language. F2 changes provider, F3 opens tasks, F4 signs in, F5 starts a fresh conversation, F6 chooses a model. /settings changes permissions and budgets. Ctrl+C interrupts an operation; press twice quickly to interrupt the model turn. Ctrl+D detaches. Cancel the entire task from its F3 menu. Up recalls previous tasks.")?,
                     _ => {
                         history.push(request.to_owned());
                         if profile.provider != "custom" && !ensure_provider(&terminal, &profile.provider)? {

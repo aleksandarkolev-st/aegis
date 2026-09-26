@@ -29,6 +29,51 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
+    pub fn models(&self, session_key: Option<&str>) -> Result<Vec<crate::catalog::Model>> {
+        let mut url = self.url()?;
+        let path = url.path().trim_end_matches("/chat/completions");
+        url.set_path(&format!("{path}/models"));
+        let key = session_key.map(str::to_owned).or_else(|| {
+            self.api_key_env
+                .as_ref()
+                .and_then(|name| std::env::var(name).ok())
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let bytes = runtime.block_on(async {
+            let client = Client::builder()
+                .timeout(Duration::from_secs(5))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?;
+            let mut request = client.get(url);
+            if let Some(key) = &key {
+                request = request.bearer_auth(key);
+            }
+            let mut response = request
+                .send()
+                .await
+                .context("Endpoint model discovery unavailable")?;
+            if !response.status().is_success() {
+                bail!(
+                    "Endpoint model list returned HTTP {}; you can still enter a model ID",
+                    response.status().as_u16()
+                );
+            }
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await? {
+                if bytes.len() + chunk.len() > 1024 * 1024 {
+                    bail!("Endpoint model catalog exceeds 1 MiB");
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok::<_, anyhow::Error>(bytes)
+        })?;
+        crate::catalog::endpoint_value(
+            &serde_json::from_slice(&bytes).context("Endpoint model catalog was not JSON")?,
+        )
+    }
+
     pub fn url(&self) -> Result<Url> {
         let mut url = Url::parse(&self.base_url).context("invalid custom endpoint URL")?;
         if !url.username().is_empty()

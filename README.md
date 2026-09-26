@@ -23,6 +23,14 @@ Follow-up tasks carry bounded summaries of the previous four tasks, including af
 
 Reopening an interactive terminal offers continuing your unfinished task. Interrupted non-idempotent calls remain paused: the recovery menu lets you select the operation and record an externally verified success or failure with a receipt, without entering operation IDs or replaying uncertain side effects. Evidence inspection uses bounded previews or text search, even for large stored logs.
 
+### Model selection and terminal feedback
+
+F6 opens a model picker; F2 switches providers without resetting workspace permissions, budgets or saved tasks. The current provider and model are shown after startup and selection. Saved tasks retain their original provider/model; selections apply to new tasks. Full setup remains available through `/settings`.
+
+ChatGPT models come from the official Codex CLI's non-secret `models_cache.json` under `CODEX_HOME` (or `~/.codex`), excluding hidden entries. Cache age is displayed; cached visibility is not a guarantee of current account access. Claude choices use documented [Claude Code model aliases](https://code.claude.com/docs/en/model-config), resolved by the installed CLI rather than guessing versioned IDs. Grok choices come from its native `grok models` command, with unauthenticated fallback catalogs labeled explicitly. Custom endpoints use an authenticated, five-second bounded `GET /models` request, without following redirects; manual IDs remain available when listing is unsupported.
+
+Normal task feedback shows readable operations, saved evidence and short recovery hints instead of dumping provider JSON. Raw events remain available in explicit replay/diagnostic views. Windows workers, model calls, MCP helpers and discovery probes do not allocate separate console windows; native login stays attached to the calling terminal (the provider may open a browser for authentication).
+
 ### Node package
 
 The package is named **`aegis-arun`**, with both `aegis` and `arun` commands. A local bundled installation can be built with:

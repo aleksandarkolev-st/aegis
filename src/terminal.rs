@@ -17,6 +17,7 @@ use crate::storage::Event as RunEvent;
 pub enum Input {
     Submit(String),
     Providers,
+    Models,
     Sessions,
     Login,
     NewConversation,
@@ -216,7 +217,7 @@ impl Terminal {
         self.message(
             Tone::Quiet,
             "",
-            "F2 provider · F3 sessions · F4 sign in · F5 new · Ctrl+D exit",
+            "F2 provider · F3 sessions · F4 sign in · F5 new · F6 models",
         )?;
         println!();
         Ok(())
@@ -361,6 +362,10 @@ impl Terminal {
                         KeyCode::F(5) if !secret => {
                             write!(io::stdout(), "\r\n")?;
                             return Ok(Input::NewConversation);
+                        }
+                        KeyCode::F(6) if !secret => {
+                            write!(io::stdout(), "\r\n")?;
+                            return Ok(Input::Models);
                         }
                         KeyCode::Left => caret = caret.saturating_sub(1),
                         KeyCode::Right => caret = (caret + 1).min(text.len()),
