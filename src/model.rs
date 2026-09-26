@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -75,13 +75,25 @@ fn reported_usage(provider: &str, stdout: &str) -> Option<Usage> {
         serde_json::from_str(stdout).ok()?
     };
     let usage = value.get("usage")?;
+    let cached = usage
+        .get("cached_input_tokens")
+        .or_else(|| usage.get("cache_read_input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let input = usage.get("input_tokens")?.as_u64()?;
     Some(Usage {
-        input_tokens: usage.get("input_tokens")?.as_u64()?,
+        input_tokens: input
+            + if matches!(provider, "claude" | "grok") {
+                cached
+                    + usage
+                        .get("cache_creation_input_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+            } else {
+                0
+            },
         output_tokens: usage.get("output_tokens")?.as_u64()?,
-        cached_input_tokens: usage
-            .get("cached_input_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        cached_input_tokens: cached,
         source: "provider".into(),
     })
 }
@@ -111,7 +123,13 @@ fn parse_action(raw: &str) -> Result<Action> {
         }
         return serde_json::from_value(value).context("invalid model action");
     }
-    for key in ["result", "response", "content"] {
+    if let Some(inner) = value
+        .get("structured_output")
+        .filter(|inner| inner.is_object())
+    {
+        return parse_action(&inner.to_string());
+    }
+    for key in ["result", "response", "content", "text"] {
         if let Some(inner) = value.get(key).and_then(Value::as_str) {
             return parse_action(inner);
         }
@@ -139,7 +157,27 @@ pub fn call_with_cancel(
     timeout: Duration,
     cancelled: impl Fn() -> bool,
 ) -> Result<Response> {
+    call_configured(
+        provider,
+        &Value::Null,
+        prompt,
+        directory,
+        timeout,
+        cancelled,
+    )
+}
+
+pub fn call_configured(
+    provider: &str,
+    configuration: &Value,
+    prompt: &str,
+    directory: &Path,
+    timeout: Duration,
+    cancelled: impl Fn() -> bool,
+) -> Result<Response> {
     let output = tempfile::tempdir_in(directory)?;
+    let prompt_path = output.path().join("prompt.txt");
+    std::fs::write(&prompt_path, prompt)?;
     let stdout_path = output.path().join("stdout");
     let stderr_path = output.path().join("stderr");
     let mut command = match provider {
@@ -194,30 +232,33 @@ pub fn call_with_cancel(
                 "json",
                 "--json-schema",
                 SCHEMA,
-                prompt,
             ]);
             command
         }
         "grok" => {
             let mut command = Command::new("grok");
-            command.args([
-                "--no-subagents",
-                "--tools",
-                "",
-                "--verbatim",
-                "--json-schema",
-                SCHEMA,
-                "--single",
-                prompt,
-            ]);
+            command
+                .args([
+                    "--no-subagents",
+                    "--tools",
+                    "",
+                    "--verbatim",
+                    "--json-schema",
+                    SCHEMA,
+                    "--prompt-file",
+                ])
+                .arg(&prompt_path);
             command
         }
         other => bail!("unsupported provider: {other}"),
     };
+    if let Some(model) = configuration.get("model").and_then(Value::as_str) {
+        command.args(["--model", model]);
+    }
     command
         .current_dir(directory)
-        .stdin(if provider == "codex" {
-            Stdio::piped()
+        .stdin(if matches!(provider, "codex" | "claude") {
+            Stdio::from(File::open(&prompt_path)?)
         } else {
             Stdio::null()
         })
@@ -226,13 +267,6 @@ pub fn call_with_cancel(
     let mut child = command
         .spawn()
         .with_context(|| format!("start {provider}; install and log in to its CLI first"))?;
-    if provider == "codex" {
-        child
-            .stdin
-            .take()
-            .context("Codex stdin unavailable")?
-            .write_all(prompt.as_bytes())?;
-    }
     let start = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait()? {
@@ -301,6 +335,14 @@ mod tests {
             action
         );
         assert_eq!(
+            parse_action(&serde_json::json!({"text":raw}).to_string())?,
+            action
+        );
+        assert_eq!(
+            parse_action(&serde_json::json!({"structured_output":action}).to_string())?,
+            action
+        );
+        assert_eq!(
             parse_action(&format!(
                 "```json\n{}\n```",
                 serde_json::to_string(&action)?
@@ -308,5 +350,15 @@ mod tests {
             action
         );
         Ok(())
+    }
+
+    #[test]
+    fn accounts_for_cli_cache_read_tokens() {
+        let raw = serde_json::json!({"usage":{"input_tokens":10,"output_tokens":3,"cache_read_input_tokens":20,"cache_creation_input_tokens":5}}).to_string();
+        for provider in ["claude", "grok"] {
+            let usage = reported_usage(provider, &raw).unwrap();
+            assert_eq!(usage.input_tokens, 35);
+            assert_eq!(usage.cached_input_tokens, 20);
+        }
     }
 }

@@ -14,6 +14,8 @@ target/release/arun probe chatgpt
 
 Each provider adapter launches its installed CLI (Codex for a ChatGPT login, Claude Code for a Claude login, Grok Build for a Grok login). Credentials stay with those CLIs; arun does not read or copy their token stores. Re-authenticate with the corresponding `login` command if a provider reports an expired session. A provider may also refuse work when its account has no remaining usage balance.
 
+`--model <id>` pins the model for a run or evaluation and persists its ID with the task contract. CLI prompts are supplied through stdin (Codex/Claude Code) or a prompt file (Grok), rather than large command-line arguments.
+
 ## Run and recover
 
 ```powershell
@@ -79,8 +81,8 @@ arun eval --provider chatgpt --repeats 3 --image node:22-alpine
 
 The default matrix has 48 cases: three fixtures, four modes, and registries of 50, 100, 250, and 500 tools. Each repeat rotates mode order. Fixtures, exact manifests, immutable run configurations, CLI versions, JSONL events, artifacts, and results are saved under `.arun/evaluations/<id>/`. `--prepare-only` creates cases without model calls. Other runs consume the selected provider's usage allowance. Budgets include `--actions`, `--model-tokens`, `--context-chars`, and `--wall-seconds`; queued cases start their execution clock on first dispatch rather than at preparation.
 
-Read and large-log fixtures require both the expected final answer and matching successful-operation evidence. Repair is checked independently by Node assertions in a network-disabled Docker container; the selected image must already exist. Results distinguish execution time from acceptance-check time, record wrong-tool and invalid-argument counts, and report context overflow explicitly. Schema exposure is measured in UTF-8 bytes, not claimed as exact tokenizer tokens. Models currently use provider defaults; version metadata records that limitation. Raw observations are not success-rate claims or uncertainty estimates.
+Read and large-log fixtures require both the expected final answer and matching successful-operation evidence. Repair is checked independently by Node assertions in a network-disabled Docker container; the selected image must already exist. Results distinguish execution time from acceptance-check time, record wrong-tool and invalid-argument counts, and report context overflow explicitly. Schema exposure is measured in UTF-8 bytes, not claimed as exact tokenizer tokens. Supply `--model` for pinned comparisons; otherwise metadata explicitly records a provider-default model. Raw observations are not success-rate claims or uncertainty estimates.
 
 ## Remaining work
 
-The broader `plan.txt` also calls for forced-restart benchmarks, pinned model configurations, paired uncertainty reporting, full MCP server isolation, and configurable external acceptance for ordinary runs. These are not yet claimed as implemented. The Codex CLI adapter disables its built-in tools, but its own system context still incurs substantial token overhead; measured usage is reported rather than presented as a kernel-only schema cost.
+The broader `plan.txt` also calls for forced-restart benchmarks, paired uncertainty reporting, full MCP server isolation, and configurable external acceptance for ordinary runs. These are not yet claimed as implemented. The Codex CLI adapter disables its built-in tools, but its own system context still incurs substantial token overhead; measured usage is reported rather than presented as a kernel-only schema cost.

@@ -22,6 +22,7 @@ const LOG_ERROR: &str = "AEGIS_EVAL_LOG_FAILURE";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Options {
     pub provider: String,
+    pub model: Option<String>,
     pub sizes: Vec<usize>,
     pub modes: Vec<String>,
     pub tasks: Vec<String>,
@@ -38,6 +39,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             provider: "codex".into(),
+            model: None,
             sizes: vec![50, 100, 250, 500],
             modes: ["eager", "lazy", "artifact", "durable"]
                 .map(str::to_owned)
@@ -84,6 +86,12 @@ impl Options {
                         .split(',')
                         .map(str::parse)
                         .collect::<std::result::Result<_, _>>()?
+                }
+                "--model" => {
+                    if value.trim().is_empty() {
+                        bail!("model ID cannot be empty");
+                    }
+                    options.model = Some(value.clone());
                 }
                 "--modes" => options.modes = value.split(',').map(str::to_owned).collect(),
                 "--tasks" => options.tasks = value.split(',').map(str::to_owned).collect(),
@@ -234,7 +242,7 @@ fn prepare(root: &Path, options: &Options) -> Result<Vec<Case>> {
                         "export function sum(left, right) { return left - right; }\n",
                     )?;
                     let run = store.create_run(prompt(task), &workspace, &options.provider, json!(grants),
-                        json!({"mode": mode, "actions": options.actions, "model_tokens":options.model_tokens,
+                        json!({"model":options.model, "mode": mode, "actions": options.actions, "model_tokens":options.model_tokens,
                             "context_chars":options.context_chars, "wall_seconds":options.wall_seconds,
                             "model_seconds":180, "process_seconds":60}),
                         "Independent fixture evidence checks; repair uses containerized Node assertions")?;
@@ -348,7 +356,7 @@ pub fn command(root: &Path, args: &[String]) -> Result<()> {
         experiment.join("experiment.json"),
         serde_json::to_vec_pretty(&json!({
             "options":options, "runtime_version":env!("CARGO_PKG_VERSION"), "provider_cli_version":version,
-            "model":"provider default; not pinned", "model_seed":"unsupported by these CLI adapters",
+            "model":options.model.as_deref().unwrap_or("provider default; not pinned"), "model_seed":"unsupported by these CLI adapters",
             "fixture_sha256":hex::encode(Sha256::digest(SERVER_SOURCE.as_bytes())), "created_at":crate::storage::unix_time(),
             "schema_metric":"UTF-8 bytes, not tokenizer-specific tokens", "cost_metric":"unavailable; no price assumptions"
         }))?,

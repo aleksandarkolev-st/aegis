@@ -409,11 +409,18 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
                 .and_then(Value::as_u64)
                 .unwrap_or(180),
         );
-        let response = match model::call_with_cancel(&run.provider, &prompt, root, timeout, || {
-            Store::open(root)
-                .and_then(|current| current.run(run_id))
-                .is_ok_and(|current| current.state == "cancelled")
-        }) {
+        let response = match model::call_configured(
+            &run.provider,
+            &run.budgets,
+            &prompt,
+            root,
+            timeout,
+            || {
+                Store::open(root)
+                    .and_then(|current| current.run(run_id))
+                    .is_ok_and(|current| current.state == "cancelled")
+            },
+        ) {
             Ok(response) => response,
             Err(error) => {
                 store.event(

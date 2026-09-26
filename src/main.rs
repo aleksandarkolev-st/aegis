@@ -161,6 +161,7 @@ fn spawn(root: &Path, id: &str) -> Result<()> {
 
 fn run(root: &Path, args: &[String]) -> Result<()> {
     let mut provider = "codex";
+    let mut model = None;
     let mut mode = "durable";
     let mut write = false;
     let mut foreground = false;
@@ -178,6 +179,14 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
             "--provider" => {
                 index += 1;
                 provider = args.get(index).context("--provider needs a value")?;
+            }
+            "--model" => {
+                index += 1;
+                let value = args.get(index).context("--model needs an ID")?;
+                if value.trim().is_empty() {
+                    bail!("model ID cannot be empty");
+                }
+                model = Some(value.clone());
             }
             "--mode" => {
                 index += 1;
@@ -288,7 +297,7 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
         &std::env::current_dir()?,
         provider,
         json!(grants),
-        json!({"mode": mode, "actions": actions, "model_tokens": model_tokens, "wall_seconds": wall_seconds, "context_chars": context_chars,
+        json!({"model": model, "mode": mode, "actions": actions, "model_tokens": model_tokens, "wall_seconds": wall_seconds, "context_chars": context_chars,
             "model_seconds": 180, "process_seconds": 60, "container_image": image}),
         "Provide evidence from successful operations",
     )?;
