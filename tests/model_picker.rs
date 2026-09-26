@@ -85,7 +85,7 @@ fn model_and_provider_switches_keep_permissions_budgets_and_task_history() -> Re
             .stderr(Stdio::piped())
             .spawn()?;
         child.stdin.take().unwrap().write_all(if provider_switch {
-            b"/provider\n2\n1\n2\n/quit\n"
+            b"/provider\n2\n/models\n2\n/quit\n"
         } else {
             b"/models\n2\n/quit\n"
         })?;
@@ -167,7 +167,7 @@ fn custom_setup_lists_authenticated_endpoint_models_without_saving_the_key() -> 
         .stderr(Stdio::piped())
         .spawn()?;
     child.stdin.take().unwrap().write_all(
-        format!("4\nhttp://{address}/v1\n1\nfixture-catalog-key\n2\n2\n1\n1\n/quit\n").as_bytes(),
+        format!("4\nhttp://{address}/v1\n1\nfixture-catalog-key\n2\n2\n/quit\n").as_bytes(),
     )?;
     let output = child.wait_with_output()?;
     server.join().unwrap()?;

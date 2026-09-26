@@ -4,7 +4,7 @@
 
 ## Open Aegis
 
-Launch `aegis` (or `arun`) with no arguments. Choose ChatGPT, Claude Code, Grok, or a custom OpenAI-compatible endpoint, choose your model and workspace permissions, and describe your task in plain language. Custom endpoints also offer schema, JSON-object, or prompt-only response modes. The terminal handles task creation, execution, progress, and evidence automatically; you do not need to enter `run`, `attach`, or task IDs.
+Launch `aegis` (or `arun`) with no arguments. Pick a provider and workspace access, then describe what you want to build. Native providers use your existing login and their default model—no authentication, model, budget or acceptance wizard to get through first. F4 signs in when needed, F6 changes models, and F7 opens optional settings. Custom endpoints need a URL/key/model and offer compatible response modes. The terminal handles task creation, execution, progress, and evidence automatically; you do not need to enter `run`, `attach`, or task IDs.
 
 The scrollback interface has an animated activity line, elapsed time and token counts, editable input with history, and these shortcuts:
 
@@ -17,7 +17,7 @@ The scrollback interface has an animated activity line, elapsed time and token c
 
 Set `NO_COLOR=1` to disable colors or `AEGIS_REDUCED_MOTION=1` to disable animation. Custom keys are held in session memory and passed to the model runner, not saved in the profile or forwarded to tool workers. The profile remembers only the key's environment-variable reference.
 
-Setup offers a **Task budget**: Standard allows four hours, 200 model turns, 800,000 model tokens, and ten-minute commands; Quick allows one hour and one-minute commands. Custom limits support tasks up to 24 hours and individual commands up to two hours, with separate turn/token/context bounds. The chosen limits are saved in the profile and copied into each immutable task contract. Provider usage allowances still apply; these limits are not price estimates. Advanced runs can set `--process-seconds` separately from `--wall-seconds`. A command deadline is always clamped to the task's remaining time.
+Sensible budgets and evidence checks are enabled by default. Optional F7 **Task budgets** settings offer Standard (four hours, 200 model turns, 800,000 model tokens and ten-minute commands), Quick (one hour and one-minute commands), or custom limits up to 24 hours per task and two hours per command. Limits are saved in the profile and copied into immutable task contracts. Provider usage allowances still apply; these limits are not price estimates. Advanced runs can set `--process-seconds` separately from `--wall-seconds`. A command deadline is always clamped to the task's remaining time.
 
 Follow-up tasks carry bounded summaries of the previous four tasks, including after reopening Aegis or switching providers. Earlier summaries do not grant permissions or count as evidence for a new task. F5 (or optional `/new`) clears that continuation; task history remains available under F3.
 

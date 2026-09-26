@@ -245,25 +245,14 @@ fn configure_provider(terminal: &Terminal) -> Result<Option<(Profile, Option<Str
         if !ensure_provider(terminal, &profile.provider)? {
             return Ok(None);
         }
-        let choices = ["Use my existing sign-in", "Sign in now"].map(str::to_owned);
-        let Some(authentication) = terminal.select("Authentication", &choices)? else {
+        terminal.message(Tone::Quiet, "Ready", "Using your existing provider login and default model. F4 signs in if needed; F6 lets you pick another model.")?;
+    }
+    if profile.provider == "custom" {
+        let Some(model) = choose_model(terminal, &profile, secret.as_deref())? else {
             return Ok(None);
         };
-        if authentication == 1 {
-            terminal.message(
-                Tone::Accent,
-                "Sign in",
-                "Opening the provider's native login flow…",
-            )?;
-            if let Err(error) = model::login(&profile.provider) {
-                terminal.message(Tone::Warning, "!", &error.to_string())?;
-            }
-        }
+        profile.model = model;
     }
-    let Some(model) = choose_model(terminal, &profile, secret.as_deref())? else {
-        return Ok(None);
-    };
-    profile.model = model;
     Ok(Some((profile, secret)))
 }
 
@@ -274,13 +263,7 @@ fn configure(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
     if !configure_environment(terminal, &mut profile)? {
         return Ok(None);
     }
-    let Some(limits) = configure_limits(terminal)? else {
-        return Ok(None);
-    };
-    profile.limits = limits;
-    if !configure_acceptance(terminal, &mut profile)? {
-        return Ok(None);
-    }
+    terminal.message(Tone::Success, "You're set", "Describe what you want to build. Sensible budgets and evidence checks are already on; F7 is there if you want to customize them.")?;
     Ok(Some((profile, secret)))
 }
 
@@ -1178,6 +1161,7 @@ pub fn interactive(root: &Path) -> Result<()> {
     let saved = fs::read(root.join("profile.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Profile>(&bytes).ok());
+    let returning = saved.is_some();
     let (mut profile, mut secret) = match saved {
         Some(profile) => (profile, None),
         None => {
@@ -1195,10 +1179,12 @@ pub fn interactive(root: &Path) -> Result<()> {
     if secret_reference(&profile).is_some() && secret.is_none() {
         secret = field(&terminal, "  API key for this session (hidden) › ", true)?;
     }
-    terminal.welcome(
-        name(&profile.provider),
-        &std::env::current_dir()?.display().to_string(),
-    )?;
+    if returning {
+        terminal.welcome(
+            name(&profile.provider),
+            &std::env::current_dir()?.display().to_string(),
+        )?;
+    }
     show_selection(&terminal, &profile)?;
     if terminal.interactive {
         if let Some(id) = &profile.previous_run {
