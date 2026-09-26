@@ -619,7 +619,7 @@ fn context_view(root: &Path, id: &str, terminal: &Terminal) -> Result<()> {
             name(&run.provider),
             run.state,
             store.model_tokens(id)?,
-            store.active_capabilities(id)?.len(),
+            store.working_capabilities(id)?.len(),
             store.evidence_artifacts(id)?.len()
         ),
     )?;
@@ -638,7 +638,7 @@ fn context_view(root: &Path, id: &str, terminal: &Terminal) -> Result<()> {
 
 fn tools_view(root: &Path, id: &str, terminal: &Terminal) -> Result<()> {
     let store = Store::open(root)?;
-    let active = store.active_capabilities(id)?;
+    let active = store.working_capabilities(id)?;
     if active.is_empty() {
         terminal.message(
             Tone::Quiet,

@@ -110,6 +110,12 @@ impl Snapshot {
                 )
             }
             "completion.resolved" => self.proposal = None,
+            "capability.deactivated" => {
+                let capability = event.payload["id"]
+                    .as_str()
+                    .context("deactivated capability missing")?;
+                self.activated.retain(|(id, _)| id != capability);
+            }
             "capability.activated" => {
                 let capability = event.payload["id"]
                     .as_str()

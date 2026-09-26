@@ -436,7 +436,36 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute("INSERT INTO activated VALUES (?1, ?2, ?3) ON CONFLICT(run_id, capability) DO UPDATE SET version = excluded.version", params![run_id, capability, version])?;
+        transaction.execute(
+            "DELETE FROM activated WHERE run_id = ?1 AND capability = ?2",
+            params![run_id, capability],
+        )?;
+        transaction.execute(
+            "INSERT INTO activated VALUES (?1, ?2, ?3)",
+            params![run_id, capability, version],
+        )?;
+        let evicted = {
+            let mut statement = transaction.prepare(
+                "SELECT capability, version FROM activated WHERE run_id = ?1 ORDER BY rowid DESC LIMIT -1 OFFSET 8",
+            )?;
+            statement
+                .query_map([run_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (id, version) in evicted {
+            transaction.execute(
+                "DELETE FROM activated WHERE run_id = ?1 AND capability = ?2",
+                params![run_id, id],
+            )?;
+            append_event(
+                &transaction,
+                run_id,
+                "capability.deactivated",
+                json!({"id": id, "version": version, "reason": "bounded working set"}),
+            )?;
+        }
         append_event(
             &transaction,
             run_id,
@@ -450,6 +479,15 @@ impl Store {
     pub fn active_capabilities(&self, run_id: &str) -> Result<Vec<(String, u32)>> {
         let mut statement = self.connection.prepare(
             "SELECT capability, version FROM activated WHERE run_id = ?1 ORDER BY capability",
+        )?;
+        let rows = statement.query_map([run_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn working_capabilities(&self, run_id: &str) -> Result<Vec<(String, u32)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT capability, version FROM activated WHERE run_id = ?1 ORDER BY rowid DESC LIMIT 8",
         )?;
         let rows = statement.query_map([run_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1224,6 +1262,65 @@ mod tests {
         store.state(&run.id, "completed", json!({}))?;
         assert!(store.state(&run.id, "cancelled", json!({})).is_err());
         assert_eq!(store.run(&run.id)?.state, "completed");
+        Ok(())
+    }
+
+    #[test]
+    fn capability_working_sets_evict_durably_and_reactivate_without_losing_history() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run("work", directory.path(), "codex", json!([]), json!({}), "")?;
+        let operation = store.begin_operation(&run.id, "tool_00", json!({}), true)?;
+        let evidence = store.put_artifact(b"recorded before schema eviction")?;
+        store.operation_state(&operation, "succeeded", Some(&evidence), json!({}))?;
+        for index in 0..12 {
+            store.activate(&run.id, &format!("tool_{index:02}"), 1)?;
+        }
+        let active = store.active_capabilities(&run.id)?;
+        assert_eq!(active.len(), 8);
+        assert_eq!(active[0].0, "tool_04");
+        store.save_snapshot(&run.id)?;
+        store.activate(&run.id, "tool_04", 2)?;
+        store.activate(&run.id, "tool_12", 1)?;
+        assert_eq!(store.working_capabilities(&run.id)?.len(), 8);
+        assert!(
+            store
+                .active_capabilities(&run.id)?
+                .contains(&("tool_04".into(), 2))
+        );
+        assert!(
+            !store
+                .active_capabilities(&run.id)?
+                .iter()
+                .any(|(id, _)| id == "tool_05")
+        );
+        assert!(store.load_recovery(&run.id)?.is_some());
+        drop(store);
+        let store = Store::open(directory.path())?;
+        assert!(store.load_recovery(&run.id)?.is_some());
+        assert_eq!(store.active_capabilities(&run.id)?.len(), 8);
+        assert!(store.has_evidence(&run.id, &evidence)?);
+        assert_eq!(store.operation(&operation.id)?.state, "succeeded");
+        assert_eq!(store.event_count(&run.id, "capability.deactivated")?, 5);
+        assert_eq!(store.event_count(&run.id, "capability.activated")?, 14);
+        let legacy = store.create_run(
+            "legacy",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({}),
+            "",
+        )?;
+        for index in 0..12 {
+            store.connection.execute(
+                "INSERT INTO activated VALUES (?1, ?2, 1)",
+                params![legacy.id, format!("legacy_{index:02}")],
+            )?;
+        }
+        assert_eq!(store.active_capabilities(&legacy.id)?.len(), 12);
+        let working = store.working_capabilities(&legacy.id)?;
+        assert_eq!(working.len(), 8);
+        assert_eq!(working[0].0, "legacy_11");
         Ok(())
     }
 

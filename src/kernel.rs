@@ -23,7 +23,7 @@ fn mode(run: &Run) -> &str {
 }
 
 fn activated(store: &Store, run_id: &str) -> Result<Vec<Manifest>> {
-    let names = store.active_capabilities(run_id)?;
+    let names = store.working_capabilities(run_id)?;
     Ok(capability::all(store)?
         .into_iter()
         .filter(|manifest| {
@@ -96,7 +96,7 @@ fn context(store: &Store, run: &Run) -> Result<String> {
     let handoff = store.last_checkpoint(&run.id)?;
     let context = json!({
         "task": run.task, "acceptance": run.acceptance, "workspace": run.workspace, "mode": mode,
-        "permission_policy": "Discovery returns only granted capabilities; invoke only supplied schemas.",
+        "permission_policy": "Discovery returns only granted capabilities; invoke only supplied schemas. Non-eager modes retain at most eight recently discovered capability schemas. Search again to reactivate an evicted schema; discovery never removes recorded operations or evidence.",
         "result_policy": if matches!(mode, "eager" | "lazy") { "Tool results are inline; inspect_result is unavailable." } else { "Results are artifact-backed; use inspect_result to select relevant text." },
         "recent_events": recent, "active_capabilities": manifests,
         "milestones": store.milestones(&run.id)?, "handoff": handoff,
