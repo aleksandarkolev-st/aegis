@@ -14,6 +14,8 @@ This is a development verification record, not a success-rate or performance-imp
 - Rebuilt and replaced the existing user-global npm installation after the UI changes. The installed launcher inherits terminal I/O and hides only newly allocated subprocess console windows. Native background helpers have a Windows no-console regression test.
 - Exercised F2 provider selection, Claude alias filtering and Esc/back in the installed command's existing terminal. F6 shows visible Codex cached models; F7 opens focused settings without rerunning sign-in. A live Grok listing stalled, so model metadata cache support was added with an explicitly labeled timestamp and bounded command fallback. This is picker verification, not renewed Claude authentication.
 - Rebuilt/reinstalled again after the Grok fallback fix, then confirmed the installed F2 flow displays its cached model immediately. Exercised F6 filtering and F1 help without entering shell commands; Ctrl+D returned to the same terminal. Installed native binary SHA256: `281a0a4756d13d5e54e334d9b0bbb1f669713fc460edf2e151b11a958fa23ba5`.
+- Exercised the two-line live context/operation/evidence/checkpoint footer, F9 keep-running confirmation, and F8 checkpoint inspection in an installed Windows PTY using a delayed local decision fixture. Read results displayed measured bytes, elapsed time, and an evidence handle. This fixture is not Claude authentication evidence. Activity repaint was subsequently restricted to its two owned rows, preserving the surrounding viewport and scrollback.
+- A fresh native ChatGPT login task, run `067d9612-9da8-4fcf-b7bd-d82b12899a81` under `.arun/ui-smoke/.arun/`, completed with pinned `gpt-5.5`, three model turns and 31,371 provider-reported tokens. It read the marker file without edits or process commands under the configured 8 MiB response capture budget; normal feedback showed the 24-byte result, elapsed time and evidence handle rather than JSON.
 
 ## Providers
 
@@ -25,7 +27,7 @@ This is a development verification record, not a success-rate or performance-imp
 
 ## Automated checks
 
-- `cargo test --locked`: 67 unit tests and 26 integration tests passed; four Docker tests are ignored by default.
+- `cargo test --locked`: 71 unit tests and 29 integration tests passed; four Docker tests are ignored by default. Six focused terminal tests also passed after the final owned-row repaint change.
 - `cargo test --test docker --test docker_acceptance --test docker_mcp -- --ignored`: all four passed separately with Docker running. They verify multi-megabyte output virtualization, hidden runtime state, fresh read-only workspaces without metadata directories, immutable/read-only acceptance checks, and MCP filesystem/network/credential isolation.
 - `npm test`: four package/platform/checksum/version tests passed.
 - Process-tree tests verify that explicit kill and drop cleanup stop a descendant heartbeat, not merely its launcher.
@@ -44,10 +46,12 @@ This is a development verification record, not a success-rate or performance-imp
 - Scoped-interruption fixtures stop an actual in-flight HTTP model request without cancelling its task, resume a new turn without inheriting the old request, and interrupt an effectful MCP call only after its external file write. The latter remains unknown and is not replayed. A direct-adapter test rejects an interrupted write before claim. Keyboard timing is tested separately; this phase does not claim a new manual terminal-key demonstration.
 - `git diff --check`: passed.
 - Model-picker fixtures verify authenticated `/models` requests, hidden-model filtering, manual fallback, preservation of permissions/budgets/history, and removal of container command access when choosing review-only mode. Native error fixtures verify readable sign-in hints in both guided and advanced flows without dumping provider JSON; raw durable diagnostics remain available separately.
+- Response capture tests reject oversized native stdout, stderr, their combined size, Codex reply files, and fast-exiting providers before applying any action. HTTP tests cover declared and chunked response bodies. Poll-based native capture can briefly overshoot between checks; it is not an operating-system disk quota.
+- Checkpoint/cancellation fixtures preserve an uncertain write without replay, distinguish keep-running from confirmed cancellation, and verify that cancellation does not falsely reconcile unknown effects. Result metadata tests cover UTF-8 byte counts, exit status, search counts and elapsed time; footer counts are explicitly characters, not tokenizer-exact tokens.
 
 ## Not yet verified or delivered
 
 - Public npm publication and GitHub release assets.
 - Actual Linux/macOS release builds; the checked-in release matrix still needs to run in CI.
 - Live Claude completion after reauthentication.
-- A successful multi-hour paced endurance completion remains unverified: its final attempt exceeded the worker deadline and paused with an unknown outcome. The 48-case pinned-model matrix and eight-case forced-read restart experiment completed; see [live observations](benchmarks.md) for failures and measured overhead rather than an improvement claim. A later repair pilot encountered the provider's usage limit, not a successful two-repeat comparison.
+- A successful multi-hour paced endurance completion remains unverified: its final attempt exceeded the worker deadline and initially paused with an unknown outcome. A later host-verified failed receipt reconciled that operation; resume honored the expired wall budget without replay or another model call. No final acceptance passed. The 48-case pinned-model matrix and eight-case forced-read restart experiment completed; see [live observations](benchmarks.md) for failures and measured overhead rather than an improvement claim. A later repair pilot encountered the provider's usage limit, not a successful two-repeat comparison.

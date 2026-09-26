@@ -35,6 +35,8 @@ Forced interruption exposed an actual Windows ownership bug: killing the supervi
 
 The final attempt through the workspace-local installed npm command, operation `7eb1cd1f-f1a8-4426-b077-b877f64cdf63`, exceeded the 7,200-second worker deadline. Its last inspected receipt remained started, the operation became `outcome_unknown`, and the task paused. Neither final output nor independent acceptance passed. The observed wall-clock gap exceeded the planned pacing interval; its cause is not established. Do not restart or replay this uncertain operation without authoritative reconciliation. The full raw history retains both the failure and the successful ownership regression.
 
+Subsequent host verification confirmed that the named container and known worker were absent, the final receipt was still started rather than completed, and the frozen producer hash was unchanged. An explicit failed reconciliation receipt was committed. Resume recovered with zero unresolved operations, then paused on the expired immutable wall budget without another model call or tool replay. The final operation is now failed, not unknown; this reconciliation does not imply that partial writes were undone or that acceptance passed.
+
 ## Completed matrix and restart observations
 
 The completed experiment `.arun/evaluations/e3e4768c-9f5f-4942-9873-d460967593f6/` contains 48 cases: 50/100/250/500 tools, four modes, three tasks, **one repeat per condition**. It ran the binary built from the metadata-isolation fix, SHA256 `6dc4a3100d1df33fe8d87e71107775ed71750adf615f7adc1cb36052810c2c87`, before later unauthorized-program and post-response token-budget guards.
