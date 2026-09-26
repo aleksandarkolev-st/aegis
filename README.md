@@ -31,6 +31,12 @@ ChatGPT models come from the official Codex CLI's model metadata cache under `CO
 
 Normal task feedback shows readable operations, saved evidence and short recovery hints instead of dumping provider JSON. Tool completion shows its path/program, measured bytes, exit code, elapsed time and evidence handle when available. A nonzero command exit is a warning, not a verified success. The live two-line activity area includes last-model context characters/schema count, durable operation/evidence counts and the last observed checkpoint age; characters are not mislabeled as tokens, and unknown measurements stay unknown. Raw events remain available in explicit replay/diagnostic views. Windows workers, model calls, MCP helpers and discovery probes do not allocate separate console windows; native login stays attached to the calling terminal (the provider may open a browser for authentication).
 
+### Persistent project memory
+
+Say **“Remember: use pnpm and preserve the lockfile”** at the prompt. Aegis saves it immediately without calling a model. F7 → **Project memory** lets you add, edit or forget notes; no setup is required. Memories survive restart and provider changes, are scoped to this workspace, and are frozen into new task contracts. Existing tasks keep their original snapshot when you edit or forget a note.
+
+Memory stays deliberately small: at most 16 notes, 512 UTF-8 bytes each, 4 KiB of text total; duplicates are not added twice. Only explicit user notes are saved—tool output cannot silently become memory. Obvious credential formats are rejected; never store secrets. Notes provide context, not permission or completion evidence, and remembered technical facts must be verified against the current workspace. Forgetting affects future tasks, not old run records or SQLite backups. This bounded context is not an ever-growing chat transcript, and it is not a measured token-savings claim.
+
 ### Make it yours
 
 Pip, Aegis's tiny shield sidekick, blinks while thinking and perks up when tools are working. The default look is ready immediately; appearance is never an onboarding step. F7 → **Appearance** switches between Mint/Pip, Midnight/Byte, Solar/Orbit or Calm (no mascot/motion). `NO_COLOR` and `AEGIS_REDUCED_MOTION` still take precedence. Rendering stays in normal terminal scrollback—no separate window or alternate screen.

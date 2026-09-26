@@ -27,6 +27,13 @@ pub struct Run {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectMemory {
+    pub id: String,
+    pub text: String,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     pub seq: i64,
     pub kind: String,
@@ -133,6 +140,11 @@ impl Store {
              CREATE TABLE IF NOT EXISTS artifacts (
                hash TEXT PRIMARY KEY, bytes INTEGER NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS project_memory (
+               id TEXT PRIMARY KEY, workspace TEXT NOT NULL, text TEXT NOT NULL,
+               updated_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS project_memory_workspace ON project_memory(workspace);
              CREATE TABLE IF NOT EXISTS milestones (
                run_id TEXT NOT NULL REFERENCES runs(id), position INTEGER NOT NULL,
                title TEXT NOT NULL, state TEXT NOT NULL, evidence TEXT NOT NULL,
@@ -253,10 +265,14 @@ impl Store {
         workspace: &Path,
         provider: &str,
         grants: Value,
-        budgets: Value,
+        mut budgets: Value,
         acceptance: &str,
     ) -> Result<Run> {
         let workspace = dunce::canonicalize(workspace).context("workspace does not exist")?;
+        if !budgets.is_object() {
+            bail!("run configuration must be an object");
+        }
+        budgets["project_memory"] = json!(self.project_memory(&workspace)?);
         let run = Run {
             id: Uuid::new_v4().to_string(),
             task: task.to_owned(),
@@ -299,6 +315,95 @@ impl Store {
         )?;
         transaction.commit()?;
         Ok(run)
+    }
+
+    pub fn project_memory(&self, workspace: &Path) -> Result<Vec<ProjectMemory>> {
+        let workspace = dunce::canonicalize(workspace)?
+            .to_string_lossy()
+            .into_owned();
+        let mut statement = self.connection.prepare("SELECT id,text,updated_at FROM project_memory WHERE workspace=?1 ORDER BY updated_at,id")?;
+        statement
+            .query_map([workspace], |row| {
+                Ok(ProjectMemory {
+                    id: row.get(0)?,
+                    text: row.get(1)?,
+                    updated_at: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn remember(
+        &mut self,
+        workspace: &Path,
+        text: &str,
+        replace: Option<&str>,
+    ) -> Result<String> {
+        let text = text.trim();
+        if text.is_empty() || text.len() > 512 || crate::terminal::clean(text) != text {
+            bail!("memory must be safe, nonempty text of at most 512 UTF-8 bytes");
+        }
+        let lower = text.to_lowercase();
+        if lower.contains("ghp_")
+            || lower.contains("bearer ")
+            || lower.split_whitespace().any(|word| word.starts_with("sk-"))
+        {
+            bail!("do not store credentials in project memory");
+        }
+        let workspace = dunce::canonicalize(workspace)?
+            .to_string_lossy()
+            .into_owned();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if replace.is_none() {
+            if let Some(id) = transaction
+                .query_row(
+                    "SELECT id FROM project_memory WHERE workspace=?1 AND text=?2",
+                    params![workspace, text],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                return Ok(id);
+            }
+        }
+        let id = replace
+            .map(str::to_owned)
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        if replace.is_some()
+            && transaction.query_row(
+                "SELECT COUNT(*) FROM project_memory WHERE workspace=?1 AND id=?2",
+                params![workspace, id],
+                |row| row.get::<_, u64>(0),
+            )? == 0
+        {
+            bail!("memory does not belong to this workspace");
+        }
+        let (count, bytes) = transaction.query_row("SELECT COUNT(*),COALESCE(SUM(length(CAST(text AS BLOB))),0) FROM project_memory WHERE workspace=?1 AND id<>?2", params![workspace,id], |row| Ok((row.get::<_,u64>(0)?,row.get::<_,u64>(1)?)))?;
+        if count >= 16 || bytes + text.len() as u64 > 4096 {
+            bail!(
+                "project memory is limited to 16 notes and 4096 UTF-8 bytes; edit or remove an old note first"
+            );
+        }
+        transaction.execute("INSERT INTO project_memory(id,workspace,text,updated_at) VALUES (?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET text=excluded.text,updated_at=excluded.updated_at", params![id,workspace,text,now()])?;
+        transaction.commit()?;
+        Ok(id)
+    }
+
+    pub fn forget(&mut self, workspace: &Path, id: &str) -> Result<()> {
+        let workspace = dunce::canonicalize(workspace)?
+            .to_string_lossy()
+            .into_owned();
+        if self.connection.execute(
+            "DELETE FROM project_memory WHERE workspace=?1 AND id=?2",
+            params![workspace, id],
+        )? != 1
+        {
+            bail!("memory does not belong to this workspace");
+        }
+        Ok(())
     }
 
     pub fn run(&self, id: &str) -> Result<Run> {

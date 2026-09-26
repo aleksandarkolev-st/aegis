@@ -347,6 +347,7 @@ fn settings(root: &Path, terminal: &mut Terminal, profile: &mut Profile) -> Resu
         "Completion checks",
         "Exact command scopes",
         "Appearance · mascot, colors and motion",
+        "Project memory · remember what matters",
         "Back",
     ]
     .map(str::to_owned);
@@ -364,6 +365,7 @@ fn settings(root: &Path, terminal: &mut Terminal, profile: &mut Profile) -> Resu
         Some(2) => configure_acceptance(terminal, &mut selected)?,
         Some(3) => configure_command_scopes(terminal, &mut selected)?,
         Some(4) => return configure_appearance(root, terminal),
+        Some(5) => return memory_menu(root, terminal),
         _ => false,
     };
     if changed {
@@ -510,6 +512,51 @@ fn configure_appearance(root: &Path, terminal: &mut Terminal) -> Result<()> {
         "Looking good",
         "Saved for this workspace. Permissions, models and task history are unchanged.",
     )
+}
+
+fn remember(root: &Path, terminal: &Terminal, text: &str, replace: Option<&str>) -> Result<()> {
+    match Store::open(root)?.remember(&std::env::current_dir()?, text, replace) {
+        Ok(_) => terminal.message(Tone::Success, "Remembered", "Saved for future tasks in this workspace. No model call needed; existing tasks keep their original memory snapshot."),
+        Err(error) => terminal.message(Tone::Quiet, "Memory unchanged", &error.to_string()),
+    }
+}
+
+fn memory_menu(root: &Path, terminal: &Terminal) -> Result<()> {
+    let workspace = std::env::current_dir()?;
+    let mut store = Store::open(root)?;
+    let notes = store.project_memory(&workspace)?;
+    terminal.message(Tone::Quiet, "Project memory", "Small, durable notes you control. Say 'Remember: use pnpm for this project' to save one directly. Up to 16 notes / 4 KiB; never store credentials.")?;
+    let mut choices = vec!["Add a memory".to_owned()];
+    choices.extend(
+        notes
+            .iter()
+            .map(|note| crate::terminal::fit(&note.text, 100)),
+    );
+    choices.push("Back".into());
+    let Some(choice) = terminal.select("What should Aegis remember?", &choices)? else {
+        return Ok(());
+    };
+    if choice == 0 {
+        if let Some(text) = field(terminal, "  Remember › ", false)? {
+            remember(root, terminal, &text, None)?;
+        }
+    } else if let Some(note) = notes.get(choice - 1) {
+        terminal.message(Tone::Accent, "Memory", &note.text)?;
+        let actions = ["Keep", "Edit this memory", "Forget this memory"].map(str::to_owned);
+        match terminal.select("This memory", &actions)? {
+            Some(1) => {
+                if let Some(text) = field(terminal, "  Replacement › ", false)? {
+                    remember(root, terminal, &text, Some(&note.id))?;
+                }
+            }
+            Some(2) => {
+                store.forget(&workspace, &note.id)?;
+                terminal.message(Tone::Quiet, "Forgotten", "Removed from future tasks. Existing task contracts retain their original snapshots.")?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn help(terminal: &Terminal) -> Result<()> {
@@ -1304,6 +1351,12 @@ pub fn interactive(root: &Path) -> Result<()> {
                 if request.is_empty() {
                     continue;
                 }
+                if let Some((prefix, text)) = request.split_once(':') {
+                    if prefix.eq_ignore_ascii_case("remember") {
+                        remember(root, &terminal, text, None)?;
+                        continue;
+                    }
+                }
                 match request {
                     "/provider" => {
                         switch_provider(root, &terminal, &mut profile, &mut secret)?;
@@ -1314,6 +1367,7 @@ pub fn interactive(root: &Path) -> Result<()> {
                     "/settings" => {
                         settings(root, &mut terminal, &mut profile)?;
                     }
+                    "/memory" => memory_menu(root, &terminal)?,
                     "/new" => {
                         new_conversation(root, &terminal, &mut profile)?;
                         history.clear();
