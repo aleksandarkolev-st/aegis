@@ -39,7 +39,12 @@ pub fn spawn(command: Command) -> io::Result<Child> {
     let lifetime_job = lifetime_job()?;
     let mut command = CommandWrap::from(command);
     #[cfg(windows)]
-    command.wrap(process_wrap::std::JobObject);
+    {
+        let mut flags = process_wrap::std::CreationFlags(Default::default());
+        flags.0.0 = 0x08000000;
+        command.wrap(flags);
+        command.wrap(process_wrap::std::JobObject);
+    }
     #[cfg(unix)]
     command.wrap(process_wrap::std::ProcessGroup::leader());
     let inner = command.spawn()?;
@@ -63,6 +68,15 @@ pub fn spawn(command: Command) -> io::Result<Child> {
         #[cfg(windows)]
         _lifetime_job: lifetime_job,
     })
+}
+
+pub fn background(command: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    command
 }
 
 #[cfg(windows)]

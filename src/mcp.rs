@@ -236,6 +236,7 @@ fn command(
             "HOME=/tmp",
         ]);
         crate::worker::mask_metadata(command.as_std_mut(), &workspace)?;
+        crate::process::background(command.as_std_mut());
         command.args(["--entrypoint", &server.command, image]);
         command.args(&server.args).kill_on_drop(true);
         Ok((command, Some(container)))
@@ -245,6 +246,7 @@ fn command(
                 .args(&server.args)
                 .current_dir(workspace)
                 .kill_on_drop(true);
+            crate::process::background(command.as_std_mut());
         });
         Ok((command, None))
     }

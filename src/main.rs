@@ -95,21 +95,7 @@ fn view(root: &Path, command: &str, id: &str) -> Result<()> {
 }
 
 fn render(event: &Event) {
-    match event.kind.as_str() {
-        "model.response" => println!("● {}", event.payload.get("action").unwrap_or(&json!(null))),
-        "operation.succeeded" => println!(
-            "✓ operation {} artifact {}",
-            event.payload["id"], event.payload["artifact"]
-        ),
-        "operation.failed" | "operation.outcome_unknown" | "action.rejected" | "model.failed" => {
-            println!("! {} {}", event.kind, event.payload)
-        }
-        "run.completed" | "run.waiting_recovery" | "run.cancelled" => {
-            println!("✓ {} {}", event.kind, event.payload)
-        }
-        "capability.search" => println!("● discovered {}", event.payload["matches"]),
-        _ => {}
-    }
+    let _ = arun::terminal::Terminal::default().render_event(event);
 }
 
 fn attach(root: &Path, id: &str) -> Result<()> {
@@ -381,7 +367,17 @@ fn login(provider: &str) -> Result<()> {
     arun::model::login(provider)
 }
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(error) = execute() {
+        eprintln!(
+            "Aegis: {}",
+            arun::terminal::friendly_error(&format!("{error:#}"))
+        );
+        std::process::exit(1);
+    }
+}
+
+fn execute() -> Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let root = root()?;
     let required =

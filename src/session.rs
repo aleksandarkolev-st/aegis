@@ -160,7 +160,7 @@ fn configure(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
     if permission == 2 {
         let docker = provider::system_executable("docker");
         let output = docker.as_ref().and_then(|program| {
-            Command::new(program)
+            crate::process::background(&mut Command::new(program))
                 .args(["image", "ls", "--format", "{{.Repository}}:{{.Tag}}"])
                 .stderr(Stdio::null())
                 .output()

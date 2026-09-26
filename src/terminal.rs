@@ -77,6 +77,69 @@ pub fn clean(text: &str) -> String {
         .collect()
 }
 
+pub fn friendly_error(error: &str) -> String {
+    let lower = error.to_lowercase();
+    if [
+        "401",
+        "token has expired",
+        "not authenticated",
+        "not logged in",
+        "please log in",
+        "authentication_error",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        return "Your provider sign-in has expired or is missing. Press F4 to sign in, then continue the saved task from F3.".into();
+    }
+    if [
+        "429",
+        "rate limit",
+        "usage limit",
+        "quota",
+        "too many requests",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        return "The provider's usage limit was reached. Wait for it to reset, or choose another provider/model with F2 or F6. Your task is saved.".into();
+    }
+    if [
+        "model_not_found",
+        "model not found",
+        "model is not available",
+        "unsupported model",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        return "This model isn't available for your account. Press F6 to choose another model."
+            .into();
+    }
+    if ["timed out", "timeout", "deadline"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        return "The operation exceeded its time limit. Your task is saved; review its outcome in F3 before continuing.".into();
+    }
+    if lower.contains("context")
+        && ["exceed", "too long", "overflow", "limit"]
+            .iter()
+            .any(|needle| lower.contains(needle))
+    {
+        return "The provider's context limit was reached. Open F3 to review the saved task and its context.".into();
+    }
+    if error.contains('{')
+        || error.contains('[')
+        || lower.contains("bearer ")
+        || lower.contains("ghp_")
+        || lower.contains("sk-")
+    {
+        return "The provider or tool returned an error. Your task is saved; open F3 for recovery and use the trace view for diagnostics.".into();
+    }
+    fit(error, 240)
+}
+
 impl Default for Terminal {
     fn default() -> Self {
         let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
@@ -120,7 +183,12 @@ impl Terminal {
         if self.colors {
             queue!(output, ResetColor)?;
         }
-        let text = clean(text).replace('\n', "\r\n    ");
+        let text = if matches!(tone, Tone::Warning) {
+            friendly_error(text)
+        } else {
+            clean(text)
+        }
+        .replace('\n', "\r\n    ");
         write!(output, "  {text}\r\n")?;
         output.flush()?;
         Ok(())
@@ -507,7 +575,9 @@ impl Terminal {
                     ),
                 )
             }
-            "operation.succeeded" => self.message(Tone::Success, "✓", "Result stored as evidence"),
+            "operation.succeeded" => {
+                self.message(Tone::Success, "✓", "Tool completed · evidence saved")
+            }
             "run.completed" => self.message(
                 Tone::Success,
                 "Done",
@@ -521,7 +591,7 @@ impl Terminal {
             "action.rejected" | "model.failed" => self.message(
                 Tone::Warning,
                 "!",
-                &fit(payload["error"].as_str().unwrap_or("Action failed"), 500),
+                &friendly_error(payload["error"].as_str().unwrap_or("Action failed")),
             ),
             "operation.cancelled" => self.message(
                 Tone::Warning,
@@ -599,6 +669,23 @@ pub fn fit(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_errors_are_actionable_without_dumping_json_or_credentials() {
+        let expired = r#"provider failed: {"error":{"type":"authentication_error","message":"OAuth access token has expired"},"token":"private-value"}"#;
+        let message = friendly_error(expired);
+        assert!(message.contains("F4"));
+        assert!(!message.contains("private-value"));
+        assert!(!message.contains('{'));
+        assert!(friendly_error("HTTP 429: quota exhausted").contains("usage limit"));
+        assert!(friendly_error("model_not_found").contains("F6"));
+        assert!(!friendly_error(r#"failed: {"arbitrary":"secret"}"#).contains("secret"));
+        assert_eq!(
+            friendly_error("file not found: src/main.rs"),
+            "file not found: src/main.rs"
+        );
+        assert!(friendly_error(&"failure ".repeat(100)).width() <= 240);
+    }
 
     #[test]
     fn menu_navigation_wraps_and_input_cursor_respects_wide_characters() {

@@ -170,7 +170,7 @@ pub(crate) fn cleanup_container(operation: &Operation) {
         crate::worker::container_name(&operation.id)
     };
     if let Ok(name) = name {
-        if let Ok(mut cleanup) = Command::new("docker")
+        if let Ok(mut cleanup) = crate::process::background(&mut Command::new("docker"))
             .args(["rm", "-f", &name])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
