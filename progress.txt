@@ -25,7 +25,7 @@ IMPLEMENTED
 
 IN PROGRESS / NOT YET COMPLETE
 - Habit adaptation implementation added: eight bounded preference categories, repeated user-request observations, current-request precedence and UI confirmation/correction/forget controls. Focused core tests passed; UI integration verification pending. Arbitrary behavioral profiling is not implemented or claimed.
-- Fine-grained filesystem scopes: file-tool preflight/preclaim checks and bounded scoped container mounts are implemented. A real Docker fixture passed: unapproved host files stayed invisible, read-only writes failed, the approved exact file changed, and nested existing metadata stayed hidden. Guided controls remain pending. Narrowed scopes reject MCP rather than letting it bypass permissions. Network-domain scopes remain pending.
+- Fine-grained filesystem scopes: file-tool preflight/preclaim checks and bounded scoped container mounts are implemented. A real Docker fixture passed: unapproved host files stayed invisible, read-only writes failed, the approved exact file changed, and nested existing metadata stayed hidden. F7 inline controls have been added; their integration checks are in progress. Narrowed scopes reject MCP rather than letting it bypass permissions. Network-domain scopes remain pending.
 - Remaining tool-result token and network-byte budget enforcement; exact schema-token measurement.
 - Full completion audit against plan.txt and functional regression checks after remaining changes.
 - Native Codex hard-coding benchmark and ARC-AGI-3: NOT STARTED under the new readiness gate.
@@ -40,6 +40,7 @@ VERIFICATION ALREADY PERFORMED BEFORE THE NEW BENCHMARK GATE
 - Empty-memory context bound regression: passed without increasing the threshold.
 - npm package tests: four passed. Example compilation passed.
 - Latest full functional suite after habit adaptation: 84 unit and 36 integration tests passed, with four Docker tests ignored by default. Example compilation and all four npm tests passed again. This predates the in-progress filesystem changes.
+- Filesystem core/preflight focused checks passed, and all five Docker isolation/acceptance fixtures passed after scoped mounts. No agent/model benchmark was started.
 - Manual Windows terminal fixture verified two-selector onboarding, mascot animation, appearance settings, explicit memory and readable tool output.
 - These are functional/fixture results, not evidence of better coding or lower token use than Codex.
 
@@ -73,3 +74,5 @@ LATEST LOCAL COMMITS
 - 3e68044: learn bounded workflow patterns from independently accepted tasks.
 - 8daaf66: record progress and the evaluation readiness gate.
 - 0cfff34: adapt bounded habits from repeated user requests; UI correction/pause/reset test passed.
+- efb28a4: enforce file-tool exact/subtree scopes before claim.
+- fbde45c: enforce scoped container mounts without broadening host access; all five Docker checks passed.

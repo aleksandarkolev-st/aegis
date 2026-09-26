@@ -31,6 +31,8 @@ struct Profile {
     #[serde(default)]
     command_scopes: Option<crate::policy::CommandScopes>,
     #[serde(default)]
+    filesystem_scopes: Option<crate::filesystem::FileScopes>,
+    #[serde(default)]
     previous_run: Option<String>,
 }
 
@@ -204,6 +206,7 @@ fn configure_provider(terminal: &Terminal) -> Result<Option<(Profile, Option<Str
         limits: crate::budget::Limits::default(),
         acceptance_check: None,
         command_scopes: None,
+        filesystem_scopes: None,
         previous_run: None,
     };
     let mut secret = None;
@@ -348,6 +351,7 @@ fn settings(root: &Path, terminal: &mut Terminal, profile: &mut Profile) -> Resu
         "Exact command scopes",
         "Appearance · mascot, colors and motion",
         "Project memory · remember what matters",
+        "File access scopes · optional exact files / folders",
         "Back",
     ]
     .map(str::to_owned);
@@ -366,6 +370,7 @@ fn settings(root: &Path, terminal: &mut Terminal, profile: &mut Profile) -> Resu
         Some(3) => configure_command_scopes(terminal, &mut selected)?,
         Some(4) => return configure_appearance(root, terminal),
         Some(5) => return memory_menu(root, terminal),
+        Some(6) => configure_file_scopes(terminal, &mut selected)?,
         _ => false,
     };
     if changed {
@@ -378,6 +383,89 @@ fn settings(root: &Path, terminal: &mut Terminal, profile: &mut Profile) -> Resu
         )?;
     }
     Ok(())
+}
+
+fn configure_file_scopes(terminal: &Terminal, profile: &mut Profile) -> Result<bool> {
+    terminal.message(Tone::Quiet,"File access","Optional restrictions for new tasks. Exact files or src/** folder subtrees; ** means the workspace. Empty lists deny host access. Existing permission grants still apply.")?;
+    if let Some(scopes) = &profile.filesystem_scopes {
+        terminal.message(Tone::Accent, "Read", &scopes.read.join(", "))?;
+        terminal.message(Tone::Accent, "Write", &scopes.write.join(", "))?;
+    }
+    let choices = [
+        "Keep current scopes",
+        "Choose files / folders here",
+        "Load a reviewed JSON file",
+        "Deny all file access",
+        "Remove file restrictions",
+        "Back",
+    ]
+    .map(str::to_owned);
+    let scopes = match terminal.select("File access scopes", &choices)? {
+        Some(1) => {
+            let mut lists = [Vec::new(), Vec::new()];
+            for (list, label) in lists.iter_mut().zip(["Read", "Write"]) {
+                terminal.message(Tone::Quiet,label,"Enter one relative file or folder/** per line. Enter an empty line when finished.")?;
+                loop {
+                    let Some(path) = field(terminal, "  Path › ", false)? else {
+                        return Ok(false);
+                    };
+                    if path.is_empty() {
+                        break;
+                    }
+                    if list.len() >= 64 {
+                        terminal.message(
+                            Tone::Warning,
+                            "Scope limit",
+                            "At most 64 paths are allowed. Existing settings are unchanged.",
+                        )?;
+                        return Ok(false);
+                    }
+                    list.push(path);
+                }
+            }
+            let [read, write] = lists;
+            let scopes = crate::filesystem::FileScopes { read, write };
+            if let Err(error) = scopes.validate() {
+                terminal.message(Tone::Warning, "Invalid scopes", &error.to_string())?;
+                return Ok(false);
+            }
+            Some(scopes)
+        }
+        Some(2) => {
+            let Some(path) = field(terminal, "  Reviewed JSON file › ", false)? else {
+                return Ok(false);
+            };
+            match crate::filesystem::FileScopes::from_file(Path::new(&path)) {
+                Ok(scopes) => Some(scopes),
+                Err(error) => {
+                    terminal.message(Tone::Warning, "Invalid scopes", &error.to_string())?;
+                    return Ok(false);
+                }
+            }
+        }
+        Some(3) => Some(crate::filesystem::FileScopes {
+            read: Vec::new(),
+            write: Vec::new(),
+        }),
+        Some(4) => {
+            let confirmation = [
+                "Keep file restrictions",
+                "Allow the workspace under existing permissions",
+            ]
+            .map(str::to_owned);
+            if terminal.select(
+                "Confirm broader file access for future tasks",
+                &confirmation,
+            )? != Some(1)
+            {
+                return Ok(false);
+            }
+            None
+        }
+        _ => return Ok(false),
+    };
+    profile.filesystem_scopes = scopes;
+    Ok(true)
 }
 
 fn configure_command_scopes(terminal: &Terminal, profile: &mut Profile) -> Result<bool> {
@@ -1288,6 +1376,7 @@ fn task(
     budgets["previous_run"] = json!(profile.previous_run);
     budgets["acceptance_check"] = json!(profile.acceptance_check);
     budgets["command_scopes"] = json!(profile.command_scopes);
+    budgets["filesystem_scopes"] = json!(profile.filesystem_scopes);
     let run = store.create_run(
         request,
         &std::env::current_dir()?,
@@ -1599,6 +1688,7 @@ mod tests {
             limits: crate::budget::Limits::default(),
             acceptance_check: None,
             command_scopes: None,
+            filesystem_scopes: None,
             previous_run: None,
         };
         save(directory.path(), &profile)?;

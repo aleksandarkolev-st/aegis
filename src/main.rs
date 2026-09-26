@@ -33,6 +33,9 @@ fn usage() {
         "Exact commands: --command-scopes <reviewed.json> --image <local-image>; guided scopes are available in F7 settings."
     );
     println!(
+        "File access: --filesystem-scopes <reviewed.json>; optional inline file/folder scopes are available in F7 settings."
+    );
+    println!(
         "arun tasks|context|tools|artifacts <run-id> | mcp add <name> --image <local-image> [--allow-write] -- <command> [args...] | mcp add <name> --trusted-host -- <command> [args...]"
     );
     println!(
