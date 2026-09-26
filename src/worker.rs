@@ -240,10 +240,16 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
     if operation.capability == "process.run" {
         authorize_program(&run, &operation.arguments)?;
     }
+    if operation.capability == "network.fetch" {
+        crate::network::NetworkScopes::from_configuration(&run.budgets)?
+            .context("network access has not been approved")?
+            .authorize(string(&operation.arguments, "url")?)?;
+    }
     store.claim_operation(&operation)?;
     let workspace = Path::new(&run.workspace);
     let args = &operation.arguments;
     match operation.capability.as_str() {
+        "network.fetch" => crate::network::fetch(&mut store, &operation),
         "workspace.read" => {
             let path = relative(workspace, string(args, "path")?)?;
             if fs::metadata(&path)?.len() > MAX_FILE {

@@ -29,6 +29,7 @@ fn optional_appearance_settings_preserve_runtime_profile_and_reload_without_setu
         let output = child.wait_with_output()?;
         assert!(output.status.success());
         assert!(String::from_utf8_lossy(&output.stdout).contains("Looking good"));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("Your look, your workflow"));
         assert_eq!(fs::read(root.join("profile.json"))?, profile);
         let style = arun::ui::UiOptions::from_file(&root.join("ui.json"))?;
         assert_eq!(

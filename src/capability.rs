@@ -53,6 +53,16 @@ pub fn registry() -> Vec<Manifest> {
             cost: 8,
             input_schema: json!({"type":"object","properties":{"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}}},"required":["program","args"]}),
         },
+        Manifest {
+            id: "network.fetch".into(),
+            version: 1,
+            purpose: "Read a public HTTPS URL from an approved exact domain into an artifact"
+                .into(),
+            permission: "network.fetch".into(),
+            side_effect: "none".into(),
+            cost: 6,
+            input_schema: json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}),
+        },
     ]
 }
 

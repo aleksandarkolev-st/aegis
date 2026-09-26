@@ -158,6 +158,13 @@ impl Store {
                evidence TEXT NOT NULL REFERENCES artifacts(hash), created_at INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS workflow_experience_workspace ON workflow_experience(workspace);
+             CREATE TABLE IF NOT EXISTS network_receipts (
+               operation_id TEXT NOT NULL REFERENCES operations(id), attempt INTEGER NOT NULL,
+               run_id TEXT NOT NULL REFERENCES runs(id), reserved INTEGER NOT NULL,
+               received INTEGER NOT NULL, complete INTEGER NOT NULL,
+               PRIMARY KEY(operation_id,attempt)
+             );
+             CREATE INDEX IF NOT EXISTS network_receipts_run ON network_receipts(run_id);
              CREATE TABLE IF NOT EXISTS milestones (
                run_id TEXT NOT NULL REFERENCES runs(id), position INTEGER NOT NULL,
                title TEXT NOT NULL, state TEXT NOT NULL, evidence TEXT NOT NULL,
@@ -304,6 +311,7 @@ impl Store {
         crate::acceptance::Check::from_run(&run)?;
         crate::policy::CommandScopes::from_configuration(&run.budgets)?;
         crate::filesystem::FileScopes::from_configuration(&run.budgets)?;
+        crate::network::NetworkScopes::from_configuration(&run.budgets)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;

@@ -150,6 +150,12 @@ fn context(store: &Store, run: &Run) -> Result<String> {
             "Read and write only the listed exact relative files or directory/** subtrees. Empty lists deny host access. Metadata and link traversal are forbidden. Container mounts expose only existing scoped paths; writes also require workspace.write. MCP cannot bypass narrowed scopes."
         );
     }
+    if let Some(scopes) = crate::network::NetworkScopes::from_configuration(&run.budgets)? {
+        context["network_scopes"] = json!(scopes);
+        context["network_policy"] = json!(
+            "network.fetch supports only approved exact HTTPS domains on port 443, no URL credentials, redirects, proxies, cookies or custom headers. Private/special-use DNS destinations are rejected and public addresses pinned. Each body is at most 1 MiB; lifetime body reservations survive crashes. These are HTTP body bytes, not TLS/header/DNS/provider traffic. Container network remains disabled."
+        );
+    }
     let discovery = if mode == "eager" {
         "All granted capability schemas are available; invoke directly."
     } else {
@@ -460,6 +466,11 @@ fn apply(store: &mut Store, root: &Path, run: &Run, action: Action) -> Result<bo
             let manifest = capability::permitted(store, &capability, &grants(run)?)?
                 .context("capability not granted")?;
             capability::validate_arguments(&manifest, &args)?;
+            if capability == "network.fetch" {
+                crate::network::NetworkScopes::from_configuration(&run.budgets)?
+                    .context("network access has not been approved")?
+                    .authorize(args["url"].as_str().context("network URL missing")?)?;
+            }
             if let Some(scopes) = crate::filesystem::FileScopes::from_configuration(&run.budgets)? {
                 scopes.authorize(run, &capability, &args)?;
             }

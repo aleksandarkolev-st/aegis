@@ -228,7 +228,7 @@ fn prepare(root: &Path, options: &Options) -> Result<Vec<Case>> {
             command: "node".into(),
             args: vec![
                 source.to_string_lossy().into_owned(),
-                (size - 4).to_string(),
+                (size - capability::registry().len()).to_string(),
             ],
         };
         let tools = mcp::discover(&server, root)?;

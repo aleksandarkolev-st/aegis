@@ -27,8 +27,8 @@ IMPLEMENTED
 - Installed Windows package updated from source ab1607c. Vendor and user-global native SHA256 both match ff262059f77c9542205047cf4fbe19ea9c5e53a753eed4eca315ecf6a1ab2b03. The separate endurance prefix was not changed.
 
 IN PROGRESS / NOT YET COMPLETE
-- Network-domain scopes and scoped network-body byte budgets remain pending. Containers still have no network by default; narrowed file scopes reject MCP rather than letting it bypass permissions.
-- Coding usability audit: safe parent-directory scaffolding has been added; focused verification is in progress. Directory creation follows grant/scope/path validation, not a manual user step. Broken-link and resolved metadata-alias rejection have also been tightened.
+- Network-domain scopes, durable conservative body-byte reservations and a worker HTTPS adapter are in progress. The adapter rejects redirects, proxies, compression, credentials and private/special-use DNS answers; public DNS answers are pinned. Guided/advanced grant controls and positive HTTPS verification remain pending. No network grant is enabled by default; container networking stays disabled.
+- Coding usability audit: safe parent-directory scaffolding passed focused checks, with and without file scopes. Directory creation follows grant/scope/path validation, not a manual user step. Broken-link and resolved metadata-alias rejection have also been tightened; Unix-only link checks still need execution on that platform.
 - Remaining tool-result token and network-byte budget enforcement; exact schema-token measurement.
 - Full completion audit against plan.txt and functional regression checks after remaining changes.
 - Native Codex hard-coding benchmark and ARC-AGI-3: NOT STARTED under the new readiness gate.
@@ -81,6 +81,14 @@ LATEST LOCAL COMMITS
 - efb28a4: enforce file-tool exact/subtree scopes before claim.
 - fbde45c: enforce scoped container mounts without broadening host access; all five Docker checks passed.
 - ab1607c: configure optional file scopes inline without extending first-run setup; guided preservation/confirmation checks passed.
+- 0b36217: safely scaffold validated parent directories during file writes.
+- b8224a0: keep the actual selected provider label when previewing appearance.
+
+LATEST MANUAL UX CHECK
+- Installed ab1607c build opened in the existing terminal with Byte, the correct generic mascot caption and wrapped memory feedback.
+- Reviewed learning controls and F7 optional file scopes without starting a task or making a model call.
+- Calm preset applied in place, then Ctrl+D returned to the original shell; no extra window.
+- Appearance preview temporarily displayed a branding sentence as the provider label. This was corrected in b8224a0; focused appearance tests passed. The installed build must be refreshed again before claiming that correction is installed.
 
 NEXT IMPLEMENTATION WORK
 - Close the safe directory-scaffolding UX gap.

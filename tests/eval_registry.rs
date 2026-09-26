@@ -18,7 +18,7 @@ fn evaluation_registries_have_exact_sizes_and_large_log_results() -> Result<()> 
             command: "node".into(),
             args: vec![
                 fixture.to_string_lossy().into_owned(),
-                (size - 4).to_string(),
+                (size - capability::registry().len()).to_string(),
             ],
         };
         let tools = mcp::discover(&server, directory.path())?;
