@@ -22,10 +22,13 @@ This is a development verification record, not a success-rate or performance-imp
 
 ## Automated checks
 
-- `cargo test --locked`: 53 unit tests and 18 integration tests passed after the snapshot/archive and scoped-interruption changes; three Docker tests are ignored by default.
+- `cargo test --locked`: 58 unit tests and 20 integration tests passed after guided budgets, bounded capability working sets, explicit incomplete-usage accounting, and Windows parent-death ownership changes; three Docker tests are ignored by default.
 - `cargo test --test docker --test docker_acceptance --test docker_mcp -- --ignored`: all three passed separately with Docker running. They verify multi-megabyte output virtualization, hidden runtime state, immutable/read-only acceptance checks, and MCP filesystem/network/credential isolation.
 - `npm test`: four package/platform/checksum/version tests passed.
 - Process-tree tests verify that explicit kill and drop cleanup stop a descendant heartbeat, not merely its launcher.
+- A Windows regression forcibly kills a separate supervising process and verifies that its managed child's heartbeat stops without requiring Rust drop cleanup. The same ownership behavior passed a live native-login task interruption; orphan Docker containers are separately removed during runtime recovery.
+- Guided setup tests verify Standard, Quick, and custom budgets, including a four-hour task preset and bounded two-hour commands. Capability tests evict and reactivate schemas across snapshots/restarts without deleting earlier operation evidence, and bound legacy working sets during context assembly.
+- Accounting tests distinguish failed/missing-usage attempts from zero cost and exclude incomplete or estimated paired token totals. Historical discovery events without timing receipts are explicitly unaccounted.
 - Setup fixtures verify install consent, refusal without installation, private provider paths, and image download consent.
 - Recovery fixtures verify required receipts, no repeated write, and that reconciliation never revives a cancelled task.
 - Forced-restart fixtures terminate actual supervised process trees: durable recovery consumes committed read evidence once; all three non-durable modes fail on interruption; an unsafe executing MCP call pauses with an unknown outcome and is not replayed. The decision provider is mocked in these fixtures.
@@ -43,4 +46,4 @@ This is a development verification record, not a success-rate or performance-imp
 - Public npm publication and GitHub release assets.
 - Actual Linux/macOS release builds; the checked-in release matrix still needs to run in CI.
 - Live Claude completion after reauthentication.
-- Multi-hour live demonstrations and live paired/restart comparisons with pinned models.
+- Completion of the running paced endurance workload and the larger live paired/restart matrices. The eight-case, pinned-model read pilot already completed; see [live observations](benchmarks.md) for raw locations and measured overhead rather than an improvement claim.
