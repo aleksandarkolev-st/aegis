@@ -92,6 +92,10 @@ fn docker_command(
         "HOME=/tmp",
         "--env",
         "CARGO_TARGET_DIR=/tmp/target",
+        "--env",
+        &format!("ARUN_OPERATION_ID={}", operation.id),
+        "--env",
+        &format!("ARUN_IDEMPOTENCY_KEY={}", operation.idempotency_key),
     ]);
     mask_metadata(&mut command, Path::new(&run.workspace))?;
     command.args(["--entrypoint", program, image]);
@@ -598,6 +602,15 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(args.windows(2).any(|pair| pair == ["--network", "none"]));
         assert!(args.iter().any(|argument| argument == "--pull=never"));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--env", &format!("ARUN_OPERATION_ID={}", operation.id)])
+        );
+        assert!(args.windows(2).any(|pair| pair
+            == [
+                "--env",
+                &format!("ARUN_IDEMPOTENCY_KEY={}", operation.idempotency_key)
+            ]));
         assert!(args.iter().any(|argument| argument.ends_with(",readonly")));
         assert!(
             args.iter()
