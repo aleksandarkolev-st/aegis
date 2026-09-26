@@ -458,6 +458,33 @@ impl Terminal {
     pub fn render_event(&self, event: &RunEvent) -> Result<()> {
         let payload = &event.payload;
         match event.kind.as_str() {
+            "acceptance.started" => self.message(
+                Tone::Accent,
+                "Verify",
+                payload["name"]
+                    .as_str()
+                    .unwrap_or("Independent completion check"),
+            ),
+            "acceptance.passed" => self.message(
+                Tone::Success,
+                "Verified",
+                payload["name"].as_str().unwrap_or("Acceptance passed"),
+            ),
+            "acceptance.failed" => self.message(
+                Tone::Warning,
+                "Check failed",
+                &fit(
+                    payload["excerpt"]
+                        .as_str()
+                        .unwrap_or("Task remains unfinished"),
+                    500,
+                ),
+            ),
+            "acceptance.unavailable" => self.message(
+                Tone::Warning,
+                "Check unavailable",
+                "Task stays paused until its verification environment is ready.",
+            ),
             "capability.search" => self.message(
                 Tone::Accent,
                 "Discover",

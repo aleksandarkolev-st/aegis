@@ -25,6 +25,8 @@ struct Profile {
     write: bool,
     image: Option<String>,
     #[serde(default)]
+    acceptance_check: Option<crate::acceptance::Check>,
+    #[serde(default)]
     previous_run: Option<String>,
 }
 
@@ -63,6 +65,7 @@ fn configure(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
         endpoint: None,
         write: false,
         image: None,
+        acceptance_check: None,
         previous_run: None,
     };
     let mut secret = None;
@@ -181,6 +184,29 @@ fn configure(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
             profile.image = Some(images[index].clone());
         }
     }
+    let choices = [
+        "Successful-operation evidence",
+        "Independent container check from a JSON file",
+    ]
+    .map(str::to_owned);
+    let Some(choice) = terminal.select("Completion checks", &choices)? else {
+        return Ok(None);
+    };
+    if choice == 1 {
+        let Some(path) = field(terminal, "  Acceptance JSON file › ", false)? else {
+            return Ok(None);
+        };
+        match crate::acceptance::Check::from_file(Path::new(&path)) {
+            Ok(check) => {
+                terminal.message(Tone::Accent, "Acceptance", &format!("{} · {} · read-only workspace, no network. The image must already be available locally.", check.name, check.image))?;
+                profile.acceptance_check = Some(check);
+            }
+            Err(error) => {
+                terminal.message(Tone::Warning, "Invalid check", &format!("{error:#}"))?;
+                return Ok(None);
+            }
+        }
+    }
     Ok(Some((profile, secret)))
 }
 
@@ -281,6 +307,7 @@ fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
         for event in events {
             match event.kind.as_str() {
                 "model.started" => phase = "Thinking".into(),
+                "acceptance.started" => phase = "Verifying acceptance".into(),
                 "operation.pending" => {
                     phase = format!(
                         "Running {}",
@@ -623,10 +650,16 @@ fn task(
     if profile.image.is_some() {
         grants.extend(["process.run".into(), "process:*".into()]);
     }
+    let acceptance = profile
+        .acceptance_check
+        .as_ref()
+        .map(|check| check.name.as_str())
+        .unwrap_or("Complete the requested task using successful-operation evidence");
     let run = store.create_run(request, &std::env::current_dir()?, &profile.provider, json!(grants),
         json!({"model":profile.model, "endpoint":profile.endpoint, "container_image":profile.image, "previous_run":profile.previous_run,
+            "acceptance_check":profile.acceptance_check,
             "actions":80,"model_tokens":800_000,"wall_seconds":3600,"context_chars":256_000,"model_seconds":180,"process_seconds":60}),
-        "Complete the requested task using successful-operation evidence")?;
+        acceptance)?;
     drop(store);
     profile.previous_run = Some(run.id.clone());
     save(root, profile)?;
@@ -846,6 +879,7 @@ mod tests {
             }),
             write: false,
             image: None,
+            acceptance_check: None,
             previous_run: None,
         };
         save(directory.path(), &profile)?;

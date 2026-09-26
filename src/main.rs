@@ -17,7 +17,7 @@ fn usage() {
         "aegis / arun: launch with no arguments for guided terminal tasks, login, and settings."
     );
     println!(
-        "arun run <task> [--provider chatgpt|claude|grok|custom] [--model <id>] [--endpoint <url> --api-key-env <name> --response-format schema|json|none] [--mode eager|lazy|artifact|durable] [--allow-write] [--allow-process <program> --image <local-image>] [--allow-mcp <server:tool>] [--actions <limit>] [--model-tokens <limit>] [--wall-seconds <limit>] [--context-chars <limit>] [--foreground]"
+        "arun run <task> [--provider chatgpt|claude|grok|custom] [--model <id>] [--endpoint <url> --api-key-env <name> --response-format schema|json|none] [--mode eager|lazy|artifact|durable] [--allow-write] [--allow-process <program> --image <local-image>] [--acceptance <check.json>] [--allow-mcp <server:tool>] [--actions <limit>] [--model-tokens <limit>] [--wall-seconds <limit>] [--context-chars <limit>] [--foreground]"
     );
     println!(
         "arun attach|resume|status|cancel|replay|trace <run-id> | resolve <run-id> <op-id> succeeded|failed <note> | list | inspect <artifact-hash> | login|probe <provider>"
@@ -150,6 +150,7 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
     let mut context_chars = 256_000_u64;
     let mut programs = Vec::new();
     let mut image = None;
+    let mut acceptance_check = None;
     let mut mcp_tools = Vec::new();
     let mut task = Vec::new();
     let mut index = 0;
@@ -201,6 +202,11 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
                 }
             }
             "--allow-write" => write = true,
+            "--acceptance" => {
+                index += 1;
+                let path = args.get(index).context("--acceptance needs a JSON file")?;
+                acceptance_check = Some(arun::acceptance::Check::from_file(Path::new(path))?);
+            }
             "--allow-process" => {
                 index += 1;
                 programs.push(
@@ -322,14 +328,18 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
         grants.push(format!("mcp:{tool}"));
     }
     let mut store = Store::open(root)?;
+    let acceptance = acceptance_check
+        .as_ref()
+        .map(|check| check.name.as_str())
+        .unwrap_or("Provide evidence from successful operations");
     let run = store.create_run(
         &task.join(" "),
         &std::env::current_dir()?,
         provider,
         json!(grants),
         json!({"model": model, "endpoint":endpoint, "mode": mode, "actions": actions, "model_tokens": model_tokens, "wall_seconds": wall_seconds, "context_chars": context_chars,
-            "model_seconds": 180, "process_seconds": 60, "container_image": image}),
-        "Provide evidence from successful operations",
+            "model_seconds": 180, "process_seconds": 60, "container_image": image, "acceptance_check":acceptance_check}),
+        acceptance,
     )?;
     println!("run: {} provider: {}", run.id, run.provider);
     drop(store);

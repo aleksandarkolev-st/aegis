@@ -148,7 +148,7 @@ fn custom_endpoint_completes_a_kernel_run_without_persisting_its_key() -> Result
                 "none" => 3,
                 _ => 1,
             };
-            child.stdin.take().unwrap().write_all(format!("4\nhttp://{address}/v1\nfixture-model\n{format_choice}\nlocal-fixture-secret\n2\nRead fixture.txt\nRead that file again\n/new\nRead fixture.txt in a fresh conversation\n/quit\n").as_bytes())?;
+            child.stdin.take().unwrap().write_all(format!("4\nhttp://{address}/v1\nfixture-model\n{format_choice}\nlocal-fixture-secret\n2\n1\nRead fixture.txt\nRead that file again\n/new\nRead fixture.txt in a fresh conversation\n/quit\n").as_bytes())?;
             child.wait_with_output()?
         } else {
             command

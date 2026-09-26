@@ -92,6 +92,22 @@ arun resume <run-id>
 
 Run options include `--actions`, `--model-tokens`, `--wall-seconds`, `--context-chars` (default 256,000), and `--mode eager|lazy|artifact|durable`. Eager exposes all granted schemas; lazy discovers them on demand. Both inline complete results and disable artifact inspection. Artifact adds bounded result handles and inspection; durable also reconciles interrupted operations. Non-durable modes fail on process restart. Context overflow is recorded as a failure, not silently truncated. Provider-reported token counts are recorded where available; otherwise counts are marked estimated. `trace` shows committed model, discovery, operation, and state transitions with schema-byte, token, and timing metrics; `replay` retains raw JSON events. Completion requires successful-operation artifact evidence, and any planned milestones must carry evidence. This is provenance checking, not a substitute for external acceptance tests.
 
+### Independent completion checks
+
+Guided setup offers **Completion checks → Independent container check from a JSON file**. Aegis saves the validated check in the profile and snapshots it into each new task; the agent cannot replace or invoke the private verifier. Advanced usage accepts `--acceptance check.json`.
+
+```json
+{
+  "name": "Addition returns the expected answer",
+  "program": "node",
+  "args": ["-e", "require('assert').equal(require('./math.cjs')(2,3),5)"],
+  "image": "node:22-alpine",
+  "seconds": 30
+}
+```
+
+The image must already be installed locally. Verification runs with a read-only workspace, no network, and hidden runtime metadata. A nonzero exit rejects completion and returns bounded failure output to the agent for repair; unavailable verification pauses the task. Successful results are committed durably and reused after restart without repeating the check. Command arguments are frozen, but workspace test files referenced by them are not: use inline assertions or an independently controlled image for checks the agent must not weaken. Checks apply to every new task using that profile; reopen provider setup to change them.
+
 ## Capabilities and isolation
 
 Read-only workspace search/read are granted by default. Add `--allow-write` to grant exact workspace writes. Paths cannot traverse out of the workspace or enter `.git` or `.arun` through the built-in file tools. `process.run` is disabled unless a specific program and a locally available Docker image are granted:
@@ -136,4 +152,4 @@ Read and large-log fixtures require both the expected final answer and matching 
 
 ## Remaining work
 
-The broader `plan.txt` also calls for forced-restart benchmarks, paired uncertainty reporting, full MCP server isolation, and configurable external acceptance for ordinary runs. These are not yet claimed as implemented. The Codex CLI adapter disables its built-in tools, but its own system context still incurs substantial token overhead; measured usage is reported rather than presented as a kernel-only schema cost.
+The broader `plan.txt` also calls for forced-restart benchmarks, paired uncertainty reporting, and full MCP server isolation. These are not yet claimed as implemented. The Codex CLI adapter disables its built-in tools, but its own system context still incurs substantial token overhead; measured usage is reported rather than presented as a kernel-only schema cost.
