@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use arun::kernel;
-use arun::storage::{Event, Store};
+use arun::storage::Store;
 use serde_json::json;
 
 fn root() -> Result<PathBuf> {
@@ -100,18 +100,16 @@ fn view(root: &Path, command: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
-fn render(event: &Event) {
-    let _ = arun::terminal::Terminal::default().render_event(event);
-}
-
 fn attach(root: &Path, id: &str) -> Result<()> {
     uuid::Uuid::parse_str(id).context("invalid run ID")?;
     let mut last = 0;
     let started = Instant::now();
+    let mut terminal = arun::terminal::Terminal::default();
+    terminal.load_ui(root)?;
     loop {
         let store = Store::open(root)?;
         for event in store.events_since(id, last)? {
-            render(&event);
+            terminal.render_event(&event)?;
             last = event.seq;
         }
         let run = store.run(id)?;

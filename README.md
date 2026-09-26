@@ -8,7 +8,7 @@ Launch `aegis` (or `arun`) with no arguments. Pick a provider and workspace acce
 
 The scrollback interface has an animated activity line, elapsed time and token counts, editable input with history, and these shortcuts:
 
-- F2: choose a provider and permissions.
+- F2: choose a provider without resetting workspace access.
 - F3: select saved tasks, follow or resume them, cancel, inspect context/tools/evidence, or review interrupted outcomes.
 - F4: open native sign-in or enter a custom endpoint key privately.
 - F5: start a fresh conversation without deleting previous tasks.
@@ -30,6 +30,24 @@ F6 opens a searchable model picker; F2 switches providers without resetting work
 ChatGPT models come from the official Codex CLI's model metadata cache under `CODEX_HOME` (or `~/.codex`), excluding hidden entries. Claude choices use documented [Claude Code model aliases](https://code.claude.com/docs/en/model-config), resolved by the installed CLI rather than guessing versioned IDs. Grok uses only public ID/name/visibility fields from its model cache, falling back to a bounded native `grok models` command when no usable cache exists; unauthenticated fallback catalogs are labeled explicitly. Cache timestamps are displayed and do not guarantee current account access. Credentials and other cache fields are never copied into the picker or profile. Custom endpoints use an authenticated, five-second bounded `GET /models` request, without following redirects; manual IDs remain available when listing is unsupported.
 
 Normal task feedback shows readable operations, saved evidence and short recovery hints instead of dumping provider JSON. Tool completion shows its path/program, measured bytes, exit code, elapsed time and evidence handle when available. A nonzero command exit is a warning, not a verified success. The live two-line activity area includes last-model context characters/schema count, durable operation/evidence counts and the last observed checkpoint age; characters are not mislabeled as tokens, and unknown measurements stay unknown. Raw events remain available in explicit replay/diagnostic views. Windows workers, model calls, MCP helpers and discovery probes do not allocate separate console windows; native login stays attached to the calling terminal (the provider may open a browser for authentication).
+
+### Make it yours
+
+Pip, Aegis's tiny shield sidekick, blinks while thinking and perks up when tools are working. The default look is ready immediately; appearance is never an onboarding step. F7 → **Appearance** switches between Mint/Pip, Midnight/Byte, Solar/Orbit or Calm (no mascot/motion). `NO_COLOR` and `AEGIS_REDUCED_MOTION` still take precedence. Rendering stays in normal terminal scrollback—no separate window or alternate screen.
+
+Optional `.arun/ui.json` is a small, validated data file. Mix and reorder welcome `blocks` (`mascot`, `provider`, `workspace`, `hint`, `shortcuts`), set RGB `palette` values, choose `mascot`, change `input_prefix`, hide the context footer with `show_context`, and supply your own `portrait`, `frames`, `frame_millis` and `motion`. F7 can load a style from another file. Missing styles use defaults; invalid ones fall back without blocking startup. Files cannot execute scripts or embed terminal control sequences.
+
+```json
+{
+  "palette": { "accent": [183, 157, 255] },
+  "frames": ["<o.o>", "<o.->", "<^.^>"],
+  "blocks": ["mascot", "workspace", "hint", "shortcuts"],
+  "input_prefix": "build > ",
+  "frame_millis": 500
+}
+```
+
+For custom Rust rendering, the lightweight `arun::ui::Skin` trait provides the same building blocks: palette, portrait, phase-aware animation frames, frame interval, welcome layout, input prefix and context-footer visibility. Pass your implementation to `Terminal::with_skin`; `examples/custom_skin.rs` is a runnable, model-free preview. This is a composable library API, not an auto-executing plugin loader or an extra UI framework dependency. Appearance settings never change permissions, model configuration or task contracts.
 
 ### Node package
 

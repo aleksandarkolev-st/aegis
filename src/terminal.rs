@@ -42,6 +42,7 @@ pub struct Terminal {
     animations: bool,
     frame: usize,
     activity_rows: std::cell::Cell<u16>,
+    skin: Box<dyn crate::ui::Skin>,
 }
 
 #[derive(Default)]
@@ -188,30 +189,61 @@ impl Default for Terminal {
             animations: interactive && std::env::var_os("AEGIS_REDUCED_MOTION").is_none(),
             frame: 0,
             activity_rows: std::cell::Cell::new(0),
+            skin: Box::new(crate::ui::UiOptions::default()),
         }
     }
 }
 
 impl Terminal {
     fn color(&self, tone: Tone) -> Color {
-        match tone {
-            Tone::Accent => Color::Rgb {
-                r: 104,
-                g: 211,
-                b: 193,
-            },
-            Tone::Quiet => Color::DarkGrey,
-            Tone::Success => Color::Rgb {
-                r: 168,
-                g: 211,
-                b: 130,
-            },
-            Tone::Warning => Color::Rgb {
-                r: 237,
-                g: 185,
-                b: 105,
-            },
+        let palette = self.skin.palette();
+        let [r, g, b] = match tone {
+            Tone::Accent => palette.accent,
+            Tone::Quiet => palette.quiet,
+            Tone::Success => palette.success,
+            Tone::Warning => palette.warning,
+        };
+        Color::Rgb { r, g, b }
+    }
+
+    pub fn with_skin(mut self, skin: impl crate::ui::Skin + 'static) -> Self {
+        self.skin = Box::new(skin);
+        self
+    }
+
+    pub fn apply_ui(&mut self, options: crate::ui::UiOptions) -> Result<()> {
+        options.validate()?;
+        if self.activity_rows.get() > 0 {
+            self.clear_activity()?;
         }
+        self.animations = self.interactive
+            && options.motion
+            && std::env::var_os("AEGIS_REDUCED_MOTION").is_none();
+        self.skin = Box::new(options);
+        Ok(())
+    }
+
+    pub fn load_ui(&mut self, root: &std::path::Path) -> Result<()> {
+        let path = root.join("ui.json");
+        if !path.exists() {
+            return Ok(());
+        }
+        match crate::ui::UiOptions::from_file(&path) {
+            Ok(style) => self.apply_ui(style)?,
+            Err(error) => self.message(
+                Tone::Quiet,
+                "Style fallback",
+                &format!(
+                    "Couldn't load your style; defaults are ready. {}",
+                    fit(&error.to_string(), 160)
+                ),
+            )?,
+        }
+        Ok(())
+    }
+
+    pub fn input_prefix(&self) -> String {
+        fit(&self.skin.input_prefix(), 16)
     }
 
     pub fn message(&self, tone: Tone, label: &str, text: &str) -> Result<()> {
@@ -236,33 +268,61 @@ impl Terminal {
 
     pub fn welcome(&self, provider: &str, workspace: &str) -> Result<()> {
         println!();
-        self.message(Tone::Accent, "◈  A E G I S", "terminal agent runtime")?;
-        self.message(
-            Tone::Quiet,
-            "─",
-            &"─".repeat(
-                terminal::size()
-                    .map(|(width, _)| width.saturating_sub(6).min(64))
-                    .unwrap_or(64) as usize,
-            ),
-        )?;
-        self.message(Tone::Accent, "Provider", provider)?;
-        self.message(Tone::Quiet, "Workspace", workspace)?;
-        self.message(
-            Tone::Quiet,
-            "",
-            "Describe the outcome. Aegis handles the steps.",
-        )?;
-        self.message(
-            Tone::Quiet,
-            "",
-            "F2 provider · F3 tasks · F4 sign in · F6 models · F7 settings",
-        )?;
-        self.message(
-            Tone::Quiet,
-            "",
-            "F1 help · F5 new conversation · Ctrl+D exit",
-        )?;
+        let width = terminal::size()
+            .map(|(width, _)| width as usize)
+            .unwrap_or(80)
+            .saturating_sub(4);
+        for block in self.skin.blocks().into_iter().take(5) {
+            match block {
+                crate::ui::WelcomeBlock::Mascot => {
+                    let portrait = self.skin.portrait();
+                    if portrait.is_empty() {
+                        self.message(Tone::Accent, "A E G I S", "Your terminal sidekick.")?;
+                    } else {
+                        for (index, row) in portrait.iter().take(8).enumerate() {
+                            let caption = [
+                                "A E G I S",
+                                "Your terminal sidekick.",
+                                "Big ideas. Tiny footprint.",
+                            ]
+                            .get(index)
+                            .copied()
+                            .unwrap_or("");
+                            self.message(
+                                Tone::Accent,
+                                "",
+                                &fit(&format!("{row:<15} {caption}"), width),
+                            )?;
+                        }
+                    }
+                }
+                crate::ui::WelcomeBlock::Provider => self.message(
+                    Tone::Accent,
+                    "Provider",
+                    &fit(provider, width.saturating_sub(10)),
+                )?,
+                crate::ui::WelcomeBlock::Workspace => self.message(
+                    Tone::Quiet,
+                    "Workspace",
+                    &fit(workspace, width.saturating_sub(11)),
+                )?,
+                crate::ui::WelcomeBlock::Hint => {
+                    self.message(Tone::Quiet, "", "What would you like to build? Just ask.")?
+                }
+                crate::ui::WelcomeBlock::Shortcuts => {
+                    self.message(
+                        Tone::Quiet,
+                        "",
+                        &fit("F2 provider · F6 models · F7 personalize · F3 tasks", width),
+                    )?;
+                    self.message(
+                        Tone::Quiet,
+                        "",
+                        &fit("F1 help · F4 sign in · F5 fresh start · Ctrl+D exit", width),
+                    )?;
+                }
+            }
+        }
         println!();
         Ok(())
     }
@@ -310,7 +370,21 @@ impl Terminal {
             return Ok(());
         }
         let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        let frame = if self.animations {
+        let phase = if label.contains("Thinking") {
+            crate::ui::Phase::Thinking
+        } else {
+            crate::ui::Phase::Working
+        };
+        let interval = self.skin.frame_interval().as_millis().max(1);
+        let tick = if self.animations {
+            (elapsed.as_millis() / interval) as u64
+        } else {
+            0
+        };
+        let mascot = fit(&self.skin.frame(phase, tick), 24);
+        let frame = if !mascot.is_empty() {
+            mascot.as_str()
+        } else if self.animations {
             frames[self.frame % frames.len()]
         } else {
             "◆"
@@ -340,6 +414,11 @@ impl Terminal {
         }
         write!(io::stdout(), "{}", fit(&text, width.saturating_sub(1)))?;
         queue!(io::stdout(), ResetColor)?;
+        if !self.skin.show_context() {
+            self.activity_rows.set(1);
+            io::stdout().flush()?;
+            return Ok(());
+        }
         write!(io::stdout(), "\r\n")?;
         queue!(
             io::stdout(),
@@ -735,11 +814,19 @@ impl Terminal {
                 let (tone, label, text) = result_summary(payload);
                 self.message(tone, label, &text)
             }
-            "run.completed" => self.message(
-                Tone::Success,
-                "Done",
-                payload["summary"].as_str().unwrap_or_default(),
-            ),
+            "run.completed" => {
+                let face = fit(&self.skin.frame(crate::ui::Phase::Ready, 0), 24);
+                let label = if face.is_empty() {
+                    "Done".into()
+                } else {
+                    format!("{face} Done")
+                };
+                self.message(
+                    Tone::Success,
+                    &label,
+                    payload["summary"].as_str().unwrap_or_default(),
+                )
+            }
             "checkpoint.created" => self.message(
                 Tone::Quiet,
                 "Checkpoint",

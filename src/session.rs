@@ -340,12 +340,13 @@ fn configure_acceptance(terminal: &Terminal, profile: &mut Profile) -> Result<bo
     Ok(true)
 }
 
-fn settings(root: &Path, terminal: &Terminal, profile: &mut Profile) -> Result<()> {
+fn settings(root: &Path, terminal: &mut Terminal, profile: &mut Profile) -> Result<()> {
     let choices = [
         "Workspace permissions and command environment",
         "Task budgets",
         "Completion checks",
         "Exact command scopes",
+        "Appearance · mascot, colors and motion",
         "Back",
     ]
     .map(str::to_owned);
@@ -362,6 +363,7 @@ fn settings(root: &Path, terminal: &Terminal, profile: &mut Profile) -> Result<(
         }
         Some(2) => configure_acceptance(terminal, &mut selected)?,
         Some(3) => configure_command_scopes(terminal, &mut selected)?,
+        Some(4) => return configure_appearance(root, terminal),
         _ => false,
     };
     if changed {
@@ -463,6 +465,51 @@ fn configure_command_scopes(terminal: &Terminal, profile: &mut Profile) -> Resul
     })?;
     profile.command_scopes = scopes;
     Ok(true)
+}
+
+fn configure_appearance(root: &Path, terminal: &mut Terminal) -> Result<()> {
+    let choices = [
+        "Mint + Pip · tiny shield sidekick",
+        "Midnight + Byte · little robot",
+        "Solar + Orbit · pocket star",
+        "Calm · no mascot or motion",
+        "Load your own style file",
+        "Back",
+    ]
+    .map(str::to_owned);
+    let style = match terminal.select("Make Aegis yours", &choices)? {
+        Some(index @ 0..=3) => crate::ui::UiOptions::preset(index),
+        Some(4) => {
+            let Some(path) = field(terminal, "  Style file › ", false)? else {
+                return Ok(());
+            };
+            match crate::ui::UiOptions::from_file(Path::new(&path)) {
+                Ok(style) => style,
+                Err(error) => {
+                    return terminal.message(
+                        Tone::Quiet,
+                        "Style kept",
+                        &format!(
+                            "Couldn't load that style; your current look is unchanged. {}",
+                            error
+                        ),
+                    );
+                }
+            }
+        }
+        _ => return Ok(()),
+    };
+    style.save(root)?;
+    terminal.apply_ui(style)?;
+    terminal.welcome(
+        "Your look, your workflow",
+        &std::env::current_dir()?.display().to_string(),
+    )?;
+    terminal.message(
+        Tone::Success,
+        "Looking good",
+        "Saved for this workspace. Permissions, models and task history are unchanged.",
+    )
 }
 
 fn help(terminal: &Terminal) -> Result<()> {
@@ -1158,6 +1205,7 @@ fn is_auth_error(error: &str) -> bool {
 pub fn interactive(root: &Path) -> Result<()> {
     Store::open(root)?;
     let mut terminal = Terminal::default();
+    terminal.load_ui(root)?;
     let saved = fs::read(root.join("profile.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Profile>(&bytes).ok());
@@ -1220,13 +1268,13 @@ pub fn interactive(root: &Path) -> Result<()> {
         .collect();
     history.reverse();
     loop {
-        match terminal.input("  › ", false, &history)? {
+        match terminal.input(&terminal.input_prefix(), false, &history)? {
             Input::Exit => break,
             Input::Providers => {
                 switch_provider(root, &terminal, &mut profile, &mut secret)?;
             }
             Input::Models => switch_model(root, &terminal, &mut profile, secret.as_deref())?,
-            Input::Settings => settings(root, &terminal, &mut profile)?,
+            Input::Settings => settings(root, &mut terminal, &mut profile)?,
             Input::Help => help(&terminal)?,
             Input::Checkpoint => checkpoint_view(root, profile.previous_run.as_deref(), &terminal)?,
             Input::CancelTask => cancel_task(root, profile.previous_run.as_deref(), &terminal)?,
@@ -1264,7 +1312,7 @@ pub fn interactive(root: &Path) -> Result<()> {
                         switch_model(root, &terminal, &mut profile, secret.as_deref())?
                     }
                     "/settings" => {
-                        settings(root, &terminal, &mut profile)?;
+                        settings(root, &mut terminal, &mut profile)?;
                     }
                     "/new" => {
                         new_conversation(root, &terminal, &mut profile)?;

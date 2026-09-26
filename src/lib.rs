@@ -18,4 +18,5 @@ pub mod session;
 pub mod storage;
 pub mod terminal;
 pub mod trace;
+pub mod ui;
 pub mod worker;

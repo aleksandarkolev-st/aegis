@@ -102,6 +102,11 @@ writeFileSync(path.join(prefix, 'consent-install.json'), JSON.stringify(args));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Install the official provider CLI?"));
     assert!(stdout.contains("fixture provider ready"));
+    assert!(
+        !stdout.contains("Authentication")
+            && !stdout.contains("Task budget")
+            && !stdout.contains("Completion checks")
+    );
     assert!(providers.join("grok/consent-install.json").is_file());
     assert!(!directory.path().join("node_modules").exists());
     let store = Store::open(&directory.path().join(".arun"))?;
