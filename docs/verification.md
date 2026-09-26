@@ -54,6 +54,8 @@ This is a development verification record, not a success-rate or performance-imp
 
 ## Not yet verified or delivered
 
+Latest Windows regression: 95 unit and 41 integration tests passed after scoped HTTPS, directory scaffolding and normalized tool-context reservations. Four npm tests and example compilation passed. Six optional tests are ignored by default; all five Docker checks passed before these latest changes and the model-free public HTTPS check passed separately. The initial run caught two outdated profile fixtures after adding the budget field; the corrected complete rerun is saved in `.arun/functional-20260927-token-budget-rerun.log`, with the original failure retained separately. Token counts use the pinned declared text encoding, not universal provider billing tokens. No new Codex/ARC agent evaluations have begun.
+
 - Public npm publication and GitHub release assets.
 - Actual Linux/macOS release builds; the checked-in release matrix still needs to run in CI.
 - Live Claude completion after reauthentication.
