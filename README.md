@@ -120,6 +120,8 @@ cargo test --test docker -- --ignored
 
 The ignored Docker test requires a running daemon and the local `node:22-alpine` image. It verifies a multi-megabyte output handle and that the runtime database is hidden in the container. The runtime contracts, crash cases, and evaluation design are in `docs/contracts.md`.
 
+See `docs/verification.md` for the dated local package/UI checks, live ChatGPT and Grok observations, and explicit verification gaps. It does not claim all providers or public releases have been certified.
+
 ## Paired evaluation
 
 ```powershell
