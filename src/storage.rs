@@ -325,6 +325,14 @@ impl Store {
         )?)
     }
 
+    pub fn run_summary(&self, run_id: &str) -> Result<Option<String>> {
+        Ok(self.connection.query_row(
+            "SELECT substr(json_extract(payload, '$.summary'), 1, 4000) FROM events WHERE run_id = ?1 AND kind = 'run.completed' ORDER BY seq DESC LIMIT 1",
+            [run_id],
+            |row| row.get(0),
+        ).optional()?)
+    }
+
     pub fn activate(&mut self, run_id: &str, capability: &str, version: u32) -> Result<()> {
         let transaction = self
             .connection

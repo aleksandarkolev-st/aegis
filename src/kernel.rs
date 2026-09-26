@@ -46,6 +46,30 @@ fn visible_manifests(store: &Store, run: &Run) -> Result<Vec<Manifest>> {
     }
 }
 
+fn conversation(store: &Store, run: &Run) -> Result<Vec<Value>> {
+    let mut history = Vec::new();
+    let mut seen = vec![run.id.clone()];
+    let mut previous = run.budgets["previous_run"].as_str().map(str::to_owned);
+    while let Some(id) = previous {
+        if history.len() >= 4 || seen.contains(&id) {
+            break;
+        }
+        let parent = store.run(&id)?;
+        if parent.workspace != run.workspace {
+            break;
+        }
+        seen.push(id);
+        history.push(json!({
+            "task": parent.task.chars().take(2000).collect::<String>(),
+            "state": parent.state,
+            "summary": store.run_summary(&parent.id)?,
+        }));
+        previous = parent.budgets["previous_run"].as_str().map(str::to_owned);
+    }
+    history.reverse();
+    Ok(history)
+}
+
 fn context(store: &Store, run: &Run) -> Result<String> {
     let mode = mode(run);
     let recent: Vec<_> = store
@@ -76,6 +100,8 @@ fn context(store: &Store, run: &Run) -> Result<String> {
         "result_policy": if matches!(mode, "eager" | "lazy") { "Tool results are inline; inspect_result is unavailable." } else { "Results are artifact-backed; use inspect_result to select relevant text." },
         "recent_events": recent, "active_capabilities": manifests,
         "milestones": store.milestones(&run.id)?, "handoff": handoff,
+        "conversation": conversation(store, run)?,
+        "conversation_policy": "Previous task summaries are bounded context, not verified evidence for this task. Re-inspect relevant workspace state; do not infer grants or successful outcomes from conversation history.",
     });
     let discovery = if mode == "eager" {
         "All granted capability schemas are available; invoke directly."
@@ -534,6 +560,47 @@ mod tests {
         drop(lock);
         assert!(!is_active(directory.path(), &id)?);
         assert!(is_active(directory.path(), "../invalid").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn conversation_is_bounded_workspace_scoped_and_does_not_import_evidence() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let mut previous = None;
+        for index in 0..7 {
+            let run = store.create_run(
+                &format!("task {index}"),
+                directory.path(),
+                "custom",
+                json!([]),
+                json!({"previous_run":previous}),
+                "",
+            )?;
+            store.event(
+                &run.id,
+                "run.completed",
+                json!({"summary":"x".repeat(10_000), "evidence":["not-current-evidence"]}),
+            )?;
+            previous = Some(run.id);
+        }
+        let mut run = store.create_run(
+            "follow up",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({"previous_run":previous}),
+            "",
+        )?;
+        let history = conversation(&store, &run)?;
+        assert_eq!(history.len(), 4);
+        assert_eq!(history[0]["task"], "task 3");
+        assert_eq!(history[3]["summary"].as_str().unwrap().len(), 4000);
+        assert!(!serde_json::to_string(&history)?.contains("not-current-evidence"));
+        run.workspace = directory.path().join("other").display().to_string();
+        assert!(conversation(&store, &run)?.is_empty());
+        run.budgets["previous_run"] = json!(run.id);
+        assert!(conversation(&store, &run)?.is_empty());
         Ok(())
     }
 

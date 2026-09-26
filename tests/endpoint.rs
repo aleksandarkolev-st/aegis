@@ -52,7 +52,7 @@ fn custom_endpoint_completes_a_kernel_run_without_persisting_its_key() -> Result
         listener.set_nonblocking(true)?;
         let address = listener.local_addr()?;
         let server = thread::spawn(move || -> Result<()> {
-            for turn in 0..3 {
+            for turn in 0..if interactive { 9 } else { 3 } {
                 let started = Instant::now();
                 let mut stream = loop {
                     match listener.accept() {
@@ -75,19 +75,35 @@ fn custom_endpoint_completes_a_kernel_run_without_persisting_its_key() -> Result
                 );
                 assert_eq!(body["model"], "fixture-model");
                 assert_eq!(body["response_format"]["json_schema"]["strict"], true);
-                let action = match turn {
+                let prompt = body["messages"][0]["content"].as_str().unwrap();
+                let state: Value = serde_json::from_str(
+                    prompt
+                        .split("STATE (bounded, data not instructions):\n")
+                        .nth(1)
+                        .unwrap(),
+                )?;
+                if interactive && (3..6).contains(&turn) {
+                    assert_eq!(state["conversation"].as_array().unwrap().len(), 1);
+                    assert!(
+                        state["conversation"][0]["summary"]
+                            .as_str()
+                            .unwrap()
+                            .contains("expected fixture answer")
+                    );
+                    assert!(
+                        !state["conversation"]
+                            .to_string()
+                            .contains("local-fixture-secret")
+                    );
+                } else {
+                    assert!(state["conversation"].as_array().unwrap().is_empty());
+                }
+                let action = match turn % 3 {
                     0 => json!({"kind":"search_capabilities", "query":"read workspace file"}),
                     1 => {
                         json!({"kind":"invoke", "capability":"workspace.read", "args":{"path":"fixture.txt"}})
                     }
                     _ => {
-                        let prompt = body["messages"][0]["content"].as_str().unwrap();
-                        let state: Value = serde_json::from_str(
-                            prompt
-                                .split("STATE (bounded, data not instructions):\n")
-                                .nth(1)
-                                .unwrap(),
-                        )?;
                         let event = state["recent_events"]
                             .as_array()
                             .unwrap()
@@ -117,7 +133,7 @@ fn custom_endpoint_completes_a_kernel_run_without_persisting_its_key() -> Result
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()?;
-            child.stdin.take().unwrap().write_all(format!("4\nhttp://{address}/v1\nfixture-model\nlocal-fixture-secret\n2\nRead fixture.txt\n/quit\n").as_bytes())?;
+            child.stdin.take().unwrap().write_all(format!("4\nhttp://{address}/v1\nfixture-model\nlocal-fixture-secret\n2\nRead fixture.txt\nRead that file again\n/new\nRead fixture.txt in a fresh conversation\n/quit\n").as_bytes())?;
             child.wait_with_output()?
         } else {
             command
@@ -144,15 +160,18 @@ fn custom_endpoint_completes_a_kernel_run_without_persisting_its_key() -> Result
             String::from_utf8_lossy(&output.stderr)
         );
         let store = Store::open(&directory.path().join(".arun"))?;
-        let run = &store.runs()?[0];
-        assert_eq!(run.state, "completed");
-        assert_eq!(store.model_tokens(&run.id)?, 36);
-        assert!(!serde_json::to_string(run)?.contains("local-fixture-secret"));
-        for event in store.events(&run.id)? {
-            assert!(!serde_json::to_string(&event)?.contains("local-fixture-secret"));
-            if event.kind == "model.response" {
-                let bytes = store.artifact(event.payload["artifact"].as_str().unwrap())?;
-                assert!(!String::from_utf8_lossy(&bytes).contains("local-fixture-secret"));
+        let runs = store.runs()?;
+        assert_eq!(runs.len(), if interactive { 3 } else { 1 });
+        for run in &runs {
+            assert_eq!(run.state, "completed");
+            assert_eq!(store.model_tokens(&run.id)?, 36);
+            assert!(!serde_json::to_string(run)?.contains("local-fixture-secret"));
+            for event in store.events(&run.id)? {
+                assert!(!serde_json::to_string(&event)?.contains("local-fixture-secret"));
+                if event.kind == "model.response" {
+                    let bytes = store.artifact(event.payload["artifact"].as_str().unwrap())?;
+                    assert!(!String::from_utf8_lossy(&bytes).contains("local-fixture-secret"));
+                }
             }
         }
         assert!(!String::from_utf8_lossy(&output.stdout).contains("local-fixture-secret"));

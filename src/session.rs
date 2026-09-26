@@ -24,6 +24,8 @@ struct Profile {
     endpoint: Option<Endpoint>,
     write: bool,
     image: Option<String>,
+    #[serde(default)]
+    previous_run: Option<String>,
 }
 
 fn name(provider: &str) -> &str {
@@ -61,6 +63,7 @@ fn configure(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
         endpoint: None,
         write: false,
         image: None,
+        previous_run: None,
     };
     let mut secret = None;
     if profile.provider == "custom" {
@@ -334,7 +337,7 @@ fn sessions(
 fn task(
     root: &Path,
     terminal: &mut Terminal,
-    profile: &Profile,
+    profile: &mut Profile,
     secret: Option<&str>,
     request: &str,
 ) -> Result<()> {
@@ -347,10 +350,12 @@ fn task(
         grants.extend(["process.run".into(), "process:*".into()]);
     }
     let run = store.create_run(request, &std::env::current_dir()?, &profile.provider, json!(grants),
-        json!({"model":profile.model, "endpoint":profile.endpoint, "container_image":profile.image,
+        json!({"model":profile.model, "endpoint":profile.endpoint, "container_image":profile.image, "previous_run":profile.previous_run,
             "actions":80,"model_tokens":800_000,"wall_seconds":3600,"context_chars":256_000,"model_seconds":180,"process_seconds":60}),
         "Complete the requested task using successful-operation evidence")?;
     drop(store);
+    profile.previous_run = Some(run.id.clone());
+    save(root, profile)?;
     kernel::spawn(root, &run.id, secret_reference(profile).zip(secret))?;
     follow(root, &run.id, terminal)?;
     let store = Store::open(root)?;
@@ -368,6 +373,16 @@ fn task(
         }
     }
     Ok(())
+}
+
+fn new_conversation(root: &Path, terminal: &Terminal, profile: &mut Profile) -> Result<()> {
+    profile.previous_run = None;
+    save(root, profile)?;
+    terminal.message(
+        Tone::Accent,
+        "New conversation",
+        "Previous tasks remain in sessions. What would you like to do?",
+    )
 }
 
 fn is_auth_error(error: &str) -> bool {
@@ -410,12 +425,19 @@ pub fn interactive(root: &Path) -> Result<()> {
         name(&profile.provider),
         &std::env::current_dir()?.display().to_string(),
     )?;
-    let mut history = Vec::new();
+    let mut history: Vec<_> = Store::open(root)?
+        .runs()?
+        .iter()
+        .take(50)
+        .map(|run| run.task.clone())
+        .collect();
+    history.reverse();
     loop {
         match terminal.input("  › ", false, &history)? {
             Input::Exit => break,
             Input::Providers => {
-                if let Some(configured) = configure(&terminal)? {
+                if let Some(mut configured) = configure(&terminal)? {
+                    configured.0.previous_run = profile.previous_run.clone();
                     profile = configured.0;
                     secret = configured.1;
                     save(root, &profile)?;
@@ -423,6 +445,10 @@ pub fn interactive(root: &Path) -> Result<()> {
                 }
             }
             Input::Sessions => sessions(root, &mut terminal, &profile, secret.as_deref())?,
+            Input::NewConversation => {
+                new_conversation(root, &terminal, &mut profile)?;
+                history.clear();
+            }
             Input::Login => {
                 if profile.provider == "custom" {
                     secret = field(&terminal, "  API key (hidden) › ", true)?;
@@ -444,14 +470,15 @@ pub fn interactive(root: &Path) -> Result<()> {
                 }
                 match request {
                     "/provider" => {
-                        if let Some(configured) = configure(&terminal)? { profile = configured.0; secret = configured.1; save(root, &profile)?; }
+                        if let Some(mut configured) = configure(&terminal)? { configured.0.previous_run = profile.previous_run.clone(); profile = configured.0; secret = configured.1; save(root, &profile)?; }
                     }
+                    "/new" => { new_conversation(root, &terminal, &mut profile)?; history.clear(); }
                     "/sessions" | "/status" => sessions(root, &mut terminal, &profile, secret.as_deref())?,
                     "/exit" | "/quit" => break,
-                    "/help" => terminal.message(Tone::Quiet, "Help", "Write a task in plain language. F2 changes provider, F3 opens tasks, F4 signs in. Ctrl+C stops an active task; Ctrl+D detaches. Up recalls previous tasks.")?,
+                    "/help" => terminal.message(Tone::Quiet, "Help", "Write a task in plain language. F2 changes provider, F3 opens tasks, F4 signs in, F5 starts a fresh conversation. Ctrl+C stops an active task; Ctrl+D detaches. Up recalls previous tasks.")?,
                     _ => {
                         history.push(request.to_owned());
-                        if let Err(error) = task(root, &mut terminal, &profile, secret.as_deref(), request) {
+                        if let Err(error) = task(root, &mut terminal, &mut profile, secret.as_deref(), request) {
                             terminal.clear_activity()?;
                             terminal.message(Tone::Warning, "!", &format!("{error:#}"))?;
                         }
@@ -486,6 +513,7 @@ mod tests {
             }),
             write: false,
             image: None,
+            previous_run: None,
         };
         save(directory.path(), &profile)?;
         let saved: Profile =

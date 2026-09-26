@@ -11,10 +11,13 @@ The scrollback interface has an animated activity line, elapsed time and token c
 - F2: choose a provider and permissions.
 - F3: select recent tasks, follow or resume them, cancel, or inspect milestones and traces.
 - F4: open native sign-in or enter a custom endpoint key privately.
+- F5: start a fresh conversation without deleting previous tasks.
 - Ctrl+C during execution: cancel the task. Ctrl+D during execution: detach without stopping it.
 - Ctrl+D at an empty prompt: exit. Up/Down: recall task input.
 
 Set `NO_COLOR=1` to disable colors or `AEGIS_REDUCED_MOTION=1` to disable animation. Custom keys are held in session memory and passed to the model runner, not saved in the profile or forwarded to tool workers. The profile remembers only the key's environment-variable reference.
+
+Follow-up tasks carry bounded summaries of the previous four tasks, including after reopening Aegis or switching providers. Earlier summaries do not grant permissions or count as evidence for a new task. F5 (or optional `/new`) clears that continuation; task history remains available under F3.
 
 ### Node package
 
