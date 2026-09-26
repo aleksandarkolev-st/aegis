@@ -77,6 +77,22 @@ impl NetworkScopes {
             bail!("network URL exceeds limits");
         }
         let url = Url::parse(address).context("invalid network URL")?;
+        if url.query_pairs().any(|(key, _)| {
+            matches!(
+                key.to_ascii_lowercase().as_str(),
+                "api_key"
+                    | "apikey"
+                    | "access_token"
+                    | "token"
+                    | "authorization"
+                    | "password"
+                    | "secret"
+                    | "signature"
+                    | "credential"
+            )
+        }) {
+            bail!("scoped public web reads cannot carry credential query parameters");
+        }
         if url.scheme() != "https"
             || !url.username().is_empty()
             || url.password().is_some()
@@ -135,6 +151,38 @@ where
         .context("scoped network deadline exceeded")?
 }
 
+async fn read_body(mut response: reqwest::Response, limit: u64) -> Result<(Vec<u8>, u16)> {
+    if !response.status().is_success() {
+        bail!(
+            "scoped HTTPS returned HTTP {}; response body omitted",
+            response.status().as_u16()
+        );
+    }
+    if response
+        .headers()
+        .get(reqwest::header::CONTENT_ENCODING)
+        .is_some_and(|encoding| encoding != "identity")
+    {
+        bail!("scoped HTTPS response must not use compression");
+    }
+    if response.content_length().is_some_and(|bytes| bytes > limit) {
+        bail!("network body exceeds its reserved byte limit");
+    }
+    let status = response.status().as_u16();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("network response interrupted")?
+    {
+        if bytes.len() as u64 + chunk.len() as u64 > limit {
+            bail!("network body exceeds its reserved byte limit");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok((bytes, status))
+}
+
 pub(crate) fn fetch(store: &mut Store, operation: &Operation) -> Result<Value> {
     let run = store.run(&operation.run_id)?;
     let scopes =
@@ -180,41 +228,13 @@ pub(crate) fn fetch(store: &mut Store, operation: &Operation) -> Result<Value> {
             .resolve_to_addrs(&host, &addresses)
             .timeout(timeout)
             .build()?;
-        let mut response = client
+        let response = client
             .get(url)
             .header(reqwest::header::ACCEPT_ENCODING, "identity")
             .send()
             .await
             .context("scoped HTTPS request failed")?;
-        if !response.status().is_success() {
-            bail!(
-                "scoped HTTPS returned HTTP {}; response body omitted",
-                response.status().as_u16()
-            );
-        }
-        if response
-            .headers()
-            .get(reqwest::header::CONTENT_ENCODING)
-            .is_some_and(|encoding| encoding != "identity")
-        {
-            bail!("scoped HTTPS response must not use compression");
-        }
-        if response.content_length().is_some_and(|bytes| bytes > limit) {
-            bail!("network body exceeds its reserved byte limit");
-        }
-        let status = response.status().as_u16();
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .context("network response interrupted")?
-        {
-            if bytes.len() as u64 + chunk.len() as u64 > limit {
-                bail!("network body exceeds its reserved byte limit");
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        Ok::<_, anyhow::Error>((bytes, status))
+        read_body(response, limit).await
     })?;
     store.finish_network_receipt(operation, attempt, bytes.len() as u64)?;
     let hash = store.put_artifact(&bytes)?;
@@ -304,6 +324,59 @@ impl Store {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn body_reader_enforces_declared_chunked_and_compression_limits_without_following_redirects()
+    -> Result<()> {
+        use std::io::Write;
+        let responses = [
+            (
+                "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+                true,
+            ),
+            (
+                "HTTP/1.1 200 OK\r\nContent-Length: 128\r\nConnection: close\r\n\r\n",
+                false,
+            ),
+            (
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n8\r\n12345678\r\n8\r\n12345678\r\n0\r\n\r\n",
+                false,
+            ),
+            (
+                "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndata",
+                false,
+            ),
+            (
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                false,
+            ),
+        ];
+        for (response, success) in responses {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let address = listener.local_addr()?;
+            let server = std::thread::spawn(move || -> std::io::Result<()> {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                let mut request = [0; 4096];
+                stream.read(&mut request)?;
+                stream.write_all(response.as_bytes())?;
+                Ok(())
+            });
+            let result = bounded(Duration::from_secs(2), async {
+                let client = reqwest::Client::builder()
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()?;
+                read_body(client.get(format!("http://{address}/")).send().await?, 8).await
+            });
+            assert_eq!(result.is_ok(), success);
+            if success {
+                assert_eq!(result?.0, b"hello");
+            }
+            server.join().unwrap()?;
+        }
+        Ok(())
+    }
 
     #[test]
     fn request_deadlines_are_constructed_inside_the_runtime_and_actually_expire() -> Result<()> {

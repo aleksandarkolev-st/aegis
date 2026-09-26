@@ -27,7 +27,7 @@ IMPLEMENTED
 - Installed Windows package updated from source ab1607c. Vendor and user-global native SHA256 both match ff262059f77c9542205047cf4fbe19ea9c5e53a753eed4eca315ecf6a1ab2b03. The separate endurance prefix was not changed.
 
 IN PROGRESS / NOT YET COMPLETE
-- Network-domain scopes, durable conservative body-byte reservations and a worker HTTPS adapter are in progress. The adapter rejects redirects, proxies, compression, credentials and private/special-use DNS answers; public DNS answers are pinned. Guided/advanced grant controls and positive HTTPS verification remain pending. No network grant is enabled by default; container networking stays disabled.
+- Network-domain scopes, durable conservative body-byte reservations and a worker HTTPS adapter are implemented, with optional inline F7 controls and advanced reviewed JSON. Negative scope/claim, timeout, receipt persistence and guided preservation checks passed. Body/positive HTTPS checks are in progress. No network grant is enabled by default; container networking stays disabled. The byte metric excludes TLS/header/DNS/native-provider traffic and is not an OS wire-bandwidth quota.
 - Coding usability audit: safe parent-directory scaffolding passed focused checks, with and without file scopes. Directory creation follows grant/scope/path validation, not a manual user step. Broken-link and resolved metadata-alias rejection have also been tightened; Unix-only link checks still need execution on that platform.
 - Remaining tool-result token and network-byte budget enforcement; exact schema-token measurement.
 - Full completion audit against plan.txt and functional regression checks after remaining changes.
@@ -83,6 +83,8 @@ LATEST LOCAL COMMITS
 - ab1607c: configure optional file scopes inline without extending first-run setup; guided preservation/confirmation checks passed.
 - 0b36217: safely scaffold validated parent directories during file writes.
 - b8224a0: keep the actual selected provider label when previewing appearance.
+- 4899ba0: add scoped worker HTTPS reads, pinned DNS and durable conservative body reservations.
+- 0db5944: approve optional domains inline without adding an onboarding step.
 
 LATEST MANUAL UX CHECK
 - Installed ab1607c build opened in the existing terminal with Byte, the correct generic mascot caption and wrapped memory feedback.
