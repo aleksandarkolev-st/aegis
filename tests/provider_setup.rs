@@ -92,7 +92,7 @@ writeFileSync(path.join(prefix, 'consent-install.json'), JSON.stringify(args));
         .stdin
         .take()
         .unwrap()
-        .write_all(b"3\n1\n1\n1\n2\n1\nRead the workspace\n/quit\n")?;
+        .write_all(b"3\n1\n1\n1\n2\n1\n1\nRead the workspace\n/quit\n")?;
     let output = child.wait_with_output()?;
     assert!(
         output.status.success(),

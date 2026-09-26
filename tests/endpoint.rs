@@ -148,7 +148,7 @@ fn custom_endpoint_completes_a_kernel_run_without_persisting_its_key() -> Result
                 "none" => 3,
                 _ => 1,
             };
-            child.stdin.take().unwrap().write_all(format!("4\nhttp://{address}/v1\nfixture-model\n{format_choice}\nlocal-fixture-secret\n2\n1\nRead fixture.txt\nRead that file again\n/new\nRead fixture.txt in a fresh conversation\n/quit\n").as_bytes())?;
+            child.stdin.take().unwrap().write_all(format!("4\nhttp://{address}/v1\nfixture-model\n{format_choice}\nlocal-fixture-secret\n2\n1\n1\nRead fixture.txt\nRead that file again\n/new\nRead fixture.txt in a fresh conversation\n/quit\n").as_bytes())?;
             child.wait_with_output()?
         } else {
             command
@@ -181,6 +181,10 @@ fn custom_endpoint_completes_a_kernel_run_without_persisting_its_key() -> Result
         assert_eq!(runs.len(), if interactive { 3 } else { 1 });
         for run in &runs {
             assert_eq!(run.state, "completed");
+            if interactive {
+                assert_eq!(run.budgets["wall_seconds"], 14_400);
+                assert_eq!(run.budgets["process_seconds"], 600);
+            }
             assert_eq!(store.model_tokens(&run.id)?, 36);
             assert!(!serde_json::to_string(run)?.contains("local-fixture-secret"));
             for event in store.events(&run.id)? {

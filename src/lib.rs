@@ -1,4 +1,5 @@
 pub mod acceptance;
+pub mod budget;
 pub mod capability;
 pub mod endpoint;
 pub mod evaluation;

@@ -25,6 +25,8 @@ struct Profile {
     write: bool,
     image: Option<String>,
     #[serde(default)]
+    limits: crate::budget::Limits,
+    #[serde(default)]
     acceptance_check: Option<crate::acceptance::Check>,
     #[serde(default)]
     previous_run: Option<String>,
@@ -65,6 +67,7 @@ fn configure(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
         endpoint: None,
         write: false,
         image: None,
+        limits: crate::budget::Limits::default(),
         acceptance_check: None,
         previous_run: None,
     };
@@ -184,6 +187,10 @@ fn configure(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
             profile.image = Some(images[index].clone());
         }
     }
+    let Some(limits) = configure_limits(terminal)? else {
+        return Ok(None);
+    };
+    profile.limits = limits;
     let choices = [
         "Successful-operation evidence",
         "Independent container check from a JSON file",
@@ -249,6 +256,57 @@ fn download_image(terminal: &Terminal, docker: &Path) -> Result<Option<String>> 
     }
     terminal.message(Tone::Success, "Container ready", &image)?;
     Ok(Some(image))
+}
+
+fn configure_limits(terminal: &Terminal) -> Result<Option<crate::budget::Limits>> {
+    let choices = [
+        "Standard — 4 hours, 200 turns, 800k tokens, 10-minute commands",
+        "Quick — 1 hour, 80 turns, 800k tokens, 1-minute commands",
+        "Custom limits",
+    ]
+    .map(str::to_owned);
+    let Some(choice) = terminal.select("Task budget", &choices)? else {
+        return Ok(None);
+    };
+    let mut limits = if choice == 1 {
+        crate::budget::Limits::quick()
+    } else {
+        crate::budget::Limits::default()
+    };
+    if choice == 2 {
+        terminal.message(Tone::Warning, "Custom budget", "These are hard task limits, not a price estimate. Provider usage allowances still apply. Press Enter to keep each default.")?;
+        for (label, value) in [
+            ("Action limit", &mut limits.actions),
+            ("Model token limit", &mut limits.model_tokens),
+            ("Task duration in seconds", &mut limits.wall_seconds),
+            ("Command deadline in seconds", &mut limits.process_seconds),
+            ("Model-turn deadline in seconds", &mut limits.model_seconds),
+            ("Context characters", &mut limits.context_chars),
+        ] {
+            let Some(input) = field(terminal, &format!("  {label} [{}] › ", *value), false)?
+            else {
+                return Ok(None);
+            };
+            if !input.trim().is_empty() {
+                match input.trim().parse() {
+                    Ok(parsed) => *value = parsed,
+                    Err(_) => {
+                        terminal.message(
+                            Tone::Warning,
+                            "Invalid budget",
+                            "Use a positive whole number.",
+                        )?;
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    }
+    if let Err(error) = limits.validate() {
+        terminal.message(Tone::Warning, "Invalid budget", &error.to_string())?;
+        return Ok(None);
+    }
+    Ok(Some(limits))
 }
 
 fn valid_image_reference(image: &str) -> bool {
@@ -679,6 +737,7 @@ fn task(
     secret: Option<&str>,
     request: &str,
 ) -> Result<()> {
+    profile.limits.validate()?;
     let mut store = Store::open(root)?;
     let mut grants = vec!["workspace.read".to_owned()];
     if profile.write {
@@ -692,11 +751,31 @@ fn task(
         .as_ref()
         .map(|check| check.name.as_str())
         .unwrap_or("Complete the requested task using successful-operation evidence");
-    let run = store.create_run(request, &std::env::current_dir()?, &profile.provider, json!(grants),
-        json!({"model":profile.model, "endpoint":profile.endpoint, "container_image":profile.image, "previous_run":profile.previous_run,
-            "acceptance_check":profile.acceptance_check,
-            "actions":80,"model_tokens":800_000,"wall_seconds":3600,"context_chars":256_000,"model_seconds":180,"process_seconds":60}),
-        acceptance)?;
+    let mut budgets = serde_json::to_value(profile.limits)?;
+    budgets["model"] = json!(profile.model);
+    budgets["endpoint"] = json!(profile.endpoint);
+    budgets["container_image"] = json!(profile.image);
+    budgets["previous_run"] = json!(profile.previous_run);
+    budgets["acceptance_check"] = json!(profile.acceptance_check);
+    let run = store.create_run(
+        request,
+        &std::env::current_dir()?,
+        &profile.provider,
+        json!(grants),
+        budgets,
+        acceptance,
+    )?;
+    terminal.message(
+        Tone::Quiet,
+        "Budget",
+        &format!(
+            "{} hours · {} turns · {} tokens · commands up to {}s",
+            profile.limits.wall_seconds as f64 / 3600.0,
+            profile.limits.actions,
+            profile.limits.model_tokens,
+            profile.limits.process_seconds
+        ),
+    )?;
     drop(store);
     profile.previous_run = Some(run.id.clone());
     save(root, profile)?;
@@ -935,6 +1014,7 @@ mod tests {
             }),
             write: false,
             image: None,
+            limits: crate::budget::Limits::default(),
             acceptance_check: None,
             previous_run: None,
         };

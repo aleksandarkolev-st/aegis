@@ -17,6 +17,8 @@ The scrollback interface has an animated activity line, elapsed time and token c
 
 Set `NO_COLOR=1` to disable colors or `AEGIS_REDUCED_MOTION=1` to disable animation. Custom keys are held in session memory and passed to the model runner, not saved in the profile or forwarded to tool workers. The profile remembers only the key's environment-variable reference.
 
+Setup offers a **Task budget**: Standard allows four hours, 200 model turns, 800,000 model tokens, and ten-minute commands; Quick allows one hour and one-minute commands. Custom limits support tasks up to 24 hours and individual commands up to two hours, with separate turn/token/context bounds. The chosen limits are saved in the profile and copied into each immutable task contract. Provider usage allowances still apply; these limits are not price estimates. Advanced runs can set `--process-seconds` separately from `--wall-seconds`. A command deadline is always clamped to the task's remaining time.
+
 Follow-up tasks carry bounded summaries of the previous four tasks, including after reopening Aegis or switching providers. Earlier summaries do not grant permissions or count as evidence for a new task. F5 (or optional `/new`) clears that continuation; task history remains available under F3.
 
 Reopening an interactive terminal offers continuing your unfinished task. Interrupted non-idempotent calls remain paused: the recovery menu lets you select the operation and record an externally verified success or failure with a receipt, without entering operation IDs or replaying uncertain side effects. Evidence inspection uses bounded previews or text search, even for large stored logs.

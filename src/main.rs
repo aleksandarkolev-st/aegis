@@ -23,6 +23,7 @@ fn usage() {
         "arun attach|resume|status|cancel|replay|trace <run-id> | resolve <run-id> <op-id> succeeded|failed <note> | list | inspect <artifact-hash> | login|probe <provider>"
     );
     println!("arun interrupt <run-id> operation|model");
+    println!("Long commands: arun run <task> --process-seconds <1..7200> --wall-seconds <task-limit>");
     println!(
         "arun tasks|context|tools|artifacts <run-id> | mcp add <name> --image <local-image> [--allow-write] -- <command> [args...] | mcp add <name> --trusted-host -- <command> [args...]"
     );
@@ -150,6 +151,7 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
     let mut actions = 40_u64;
     let mut model_tokens = 400_000_u64;
     let mut wall_seconds = 3600_u64;
+    let mut process_seconds = 60_u64;
     let mut context_chars = 256_000_u64;
     let mut programs = Vec::new();
     let mut image = None;
@@ -275,6 +277,16 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
                     bail!("context limit must be positive");
                 }
             }
+            "--process-seconds" => {
+                index += 1;
+                process_seconds = args
+                    .get(index)
+                    .context("--process-seconds needs a deadline")?
+                    .parse()?;
+                if !(1..=7200).contains(&process_seconds) {
+                    bail!("command deadline must be 1..7200 seconds");
+                }
+            }
             argument if argument.starts_with('-') => bail!("unknown option: {argument}"),
             argument => task.push(argument),
         }
@@ -341,7 +353,7 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
         provider,
         json!(grants),
         json!({"model": model, "endpoint":endpoint, "mode": mode, "actions": actions, "model_tokens": model_tokens, "wall_seconds": wall_seconds, "context_chars": context_chars,
-            "model_seconds": 180, "process_seconds": 60, "container_image": image, "acceptance_check":acceptance_check}),
+            "model_seconds": 180, "process_seconds": process_seconds, "container_image": image, "acceptance_check":acceptance_check}),
         acceptance,
     )?;
     println!("run: {} provider: {}", run.id, run.provider);
