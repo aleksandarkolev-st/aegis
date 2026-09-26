@@ -84,8 +84,6 @@ fn docker_command(
         "2",
         "--workdir",
         "/workspace",
-        "--mount",
-        &mount,
         "--tmpfs",
         "/tmp:rw,size=256m",
         "--env",
@@ -97,7 +95,29 @@ fn docker_command(
         "--env",
         &format!("ARUN_IDEMPOTENCY_KEY={}", operation.idempotency_key),
     ]);
-    mask_metadata(&mut command, Path::new(&run.workspace))?;
+    if let Some(scopes) = crate::filesystem::FileScopes::from_configuration(&run.budgets)? {
+        let (mounts, masks) = scopes.mounts(run)?;
+        if !mounts.iter().any(|mount| mount.target == "/workspace") {
+            command.args(["--tmpfs", "/workspace:rw,noexec,size=16m"]);
+        }
+        for mount in mounts {
+            command.args([
+                "--mount",
+                &format!(
+                    "type=bind,source={},target={}{}",
+                    mount.source.to_string_lossy(),
+                    mount.target,
+                    if mount.writable { "" } else { ",readonly" }
+                ),
+            ]);
+        }
+        for path in masks {
+            command.args(["--tmpfs", &format!("{path}:rw,noexec,size=1m")]);
+        }
+    } else {
+        command.args(["--mount", &mount]);
+        mask_metadata(&mut command, Path::new(&run.workspace))?;
+    }
     command.args(["--entrypoint", program, image]);
     command.args(arguments);
     Ok(command)
@@ -186,6 +206,7 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
         isolated.grants = json!([]);
         isolated.budgets["container_image"] = json!(check.image);
         isolated.budgets["process_seconds"] = json!(check.seconds);
+        isolated.budgets["filesystem_scopes"] = Value::Null;
         return execute_container(
             &mut store,
             root,
@@ -236,6 +257,18 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
                     }
                     let kind = entry.file_type()?;
                     if kind.is_dir() {
+                        if let Some(scopes) = &file_scopes {
+                            let path = entry
+                                .path()
+                                .strip_prefix(workspace)?
+                                .to_string_lossy()
+                                .into_owned();
+                            if !scopes.may_descend(&path)
+                                || crate::filesystem::linked(&fs::symlink_metadata(entry.path())?)
+                            {
+                                continue;
+                            }
+                        }
                         pending.push(entry.path());
                     } else if kind.is_file() && entry.metadata()?.len() <= MAX_FILE {
                         if let Some(scopes) = &file_scopes {

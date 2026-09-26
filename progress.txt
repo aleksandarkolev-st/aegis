@@ -25,7 +25,7 @@ IMPLEMENTED
 
 IN PROGRESS / NOT YET COMPLETE
 - Habit adaptation implementation added: eight bounded preference categories, repeated user-request observations, current-request precedence and UI confirmation/correction/forget controls. Focused core tests passed; UI integration verification pending. Arbitrary behavioral profiling is not implemented or claimed.
-- Fine-grained filesystem scopes: core file-tool policy and preclaim checks are in progress. Scoped process mounts and guided controls are not yet delivered; narrow policies fail closed for process/MCP calls. Network-domain scopes remain pending.
+- Fine-grained filesystem scopes: file-tool preflight/preclaim checks and bounded scoped container mounts are implemented. A real Docker fixture passed: unapproved host files stayed invisible, read-only writes failed, the approved exact file changed, and nested existing metadata stayed hidden. Guided controls remain pending. Narrowed scopes reject MCP rather than letting it bypass permissions. Network-domain scopes remain pending.
 - Remaining tool-result token and network-byte budget enforcement; exact schema-token measurement.
 - Full completion audit against plan.txt and functional regression checks after remaining changes.
 - Native Codex hard-coding benchmark and ARC-AGI-3: NOT STARTED under the new readiness gate.

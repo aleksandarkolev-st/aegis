@@ -147,7 +147,7 @@ fn context(store: &Store, run: &Run) -> Result<String> {
     if let Some(scopes) = crate::filesystem::FileScopes::from_configuration(&run.budgets)? {
         context["filesystem_scopes"] = json!(scopes);
         context["filesystem_policy"] = json!(
-            "Read and write only the listed exact relative files or directory/** subtrees. Empty lists deny access. Metadata and symlink traversal are forbidden. Narrowed scopes currently disable process and MCP access; they cannot be bypassed with another tool."
+            "Read and write only the listed exact relative files or directory/** subtrees. Empty lists deny host access. Metadata and link traversal are forbidden. Container mounts expose only existing scoped paths; writes also require workspace.write. MCP cannot bypass narrowed scopes."
         );
     }
     let discovery = if mode == "eager" {
@@ -1062,6 +1062,36 @@ mod tests {
         assert_eq!(store.run(&run.id)?.state, "failed");
         assert_eq!(store.event_count(&run.id, "context.over_limit")?, 1);
         assert_eq!(store.event_count(&run.id, "model.started")?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn out_of_scope_files_are_rejected_before_intent_creation() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join("secret.txt"), "secret")?;
+        let mut store = Store::open(&directory.path().join(".arun"))?;
+        let run = store.create_run(
+            "read",
+            directory.path(),
+            "fixture",
+            json!(["workspace.read"]),
+            json!({"mode":"eager","filesystem_scopes":{"read":["allowed.txt"],"write":[]}}),
+            "",
+        )?;
+        assert!(
+            apply(
+                &mut store,
+                directory.path(),
+                &run,
+                Action::Invoke {
+                    capability: "workspace.read".into(),
+                    args: json!({"path":"secret.txt"})
+                }
+            )
+            .is_err()
+        );
+        assert!(store.operations(&run.id)?.is_empty());
+        assert_eq!(store.event_count(&run.id, "operation.pending")?, 0);
         Ok(())
     }
 
