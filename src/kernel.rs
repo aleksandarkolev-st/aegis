@@ -152,8 +152,10 @@ pub(crate) fn inspect(bytes: &[u8], query: &str) -> String {
     }
 }
 
-fn cleanup_container(operation: &Operation) {
-    if operation.capability != "process.run" {
+pub(crate) fn cleanup_container(operation: &Operation) {
+    if operation.capability != "process.run"
+        && operation.capability != crate::acceptance::CAPABILITY
+    {
         return;
     }
     if let Ok(name) = crate::worker::container_name(&operation.id) {
@@ -366,6 +368,10 @@ fn apply(store: &mut Store, root: &Path, run: &Run, action: Action) -> Result<bo
             store.save_checkpoint(&run.id, &checkpoint)?;
         }
         Action::Finish { summary, evidence } => {
+            if crate::acceptance::Check::from_run(run)?.is_some() {
+                crate::acceptance::propose(store, run, &summary, &evidence)?;
+                return crate::acceptance::resume(store, root, run);
+            }
             store.complete_run(&run.id, &summary, &evidence)?;
             return Ok(true);
         }
@@ -409,10 +415,15 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
     let started_at = store
         .run_started_at(run_id)?
         .context("run start event missing")?;
-    for operation in unresolved.iter().filter(|operation| operation.retry_safe) {
+    for operation in unresolved.iter().filter(|operation| {
+        operation.retry_safe && operation.capability != crate::acceptance::CAPABILITY
+    }) {
         if perform(&mut store, root, &run, operation)? {
             return Ok(());
         }
+    }
+    if crate::acceptance::resume(&mut store, root, &run)? {
+        return Ok(());
     }
     let max_actions = run
         .budgets

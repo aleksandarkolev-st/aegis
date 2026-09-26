@@ -177,6 +177,7 @@ impl Store {
             state: "ready".into(),
             created_at: now(),
         };
+        crate::acceptance::Check::from_run(&run)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -528,7 +529,7 @@ impl Store {
         Ok(hash)
     }
 
-    pub fn complete_run(&mut self, run_id: &str, summary: &str, evidence: &[String]) -> Result<()> {
+    pub fn validate_completion(&self, run_id: &str, evidence: &[String]) -> Result<()> {
         if evidence.is_empty() {
             bail!("completion requires evidence");
         }
@@ -537,6 +538,32 @@ impl Store {
                 bail!("completion evidence is not a successful operation artifact: {hash}");
             }
         }
+        let milestones = self.milestones(run_id)?;
+        if self.run(run_id)?.state != "running" {
+            bail!("only a running run can complete");
+        }
+        if !(milestones.len() == 1 && milestones[0].title == "Task request")
+            && milestones
+                .iter()
+                .any(|milestone| milestone.state != "completed")
+        {
+            bail!("all planned milestones must have evidence before completion");
+        }
+        Ok(())
+    }
+
+    pub fn completion_proposal(&self, run_id: &str) -> Result<Option<String>> {
+        Ok(self.connection.query_row(
+            "SELECT json_extract(payload, '$.artifact') FROM events WHERE run_id = ?1 AND kind = 'completion.proposed' AND seq > COALESCE((SELECT MAX(seq) FROM events WHERE run_id = ?1 AND kind = 'completion.resolved'), 0) ORDER BY seq DESC LIMIT 1",
+            [run_id], |row| row.get(0),
+        ).optional()?)
+    }
+
+    pub fn complete_run(&mut self, run_id: &str, summary: &str, evidence: &[String]) -> Result<()> {
+        self.validate_completion(run_id, evidence)?;
+        let acceptance =
+            crate::acceptance::verified_result(self, &self.run(run_id)?, summary, evidence)?;
+        let proposal = self.completion_proposal(run_id)?;
         let milestones = self.milestones(run_id)?;
         let transaction = self
             .connection
@@ -563,11 +590,19 @@ impl Store {
             "UPDATE runs SET state = 'completed' WHERE id = ?1",
             [run_id],
         )?;
+        if acceptance.is_some() {
+            append_event(
+                &transaction,
+                run_id,
+                "completion.resolved",
+                json!({"proposal":proposal,"outcome":"passed","acceptance":acceptance}),
+            )?;
+        }
         append_event(
             &transaction,
             run_id,
             "run.completed",
-            json!({"summary": summary, "evidence": evidence}),
+            json!({"summary": summary, "evidence": evidence, "acceptance":acceptance}),
         )?;
         transaction.commit()?;
         Ok(())

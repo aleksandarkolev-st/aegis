@@ -8,6 +8,12 @@ An operation has a stable ID, capability version, validated arguments, idempoten
 
 On restart, an operation without a terminal outcome is reconciled. A read-only/idempotent operation may be repeated with the original idempotency key. An externally queryable operation checks the external system first. A non-idempotent operation whose outcome cannot be queried becomes `outcome_unknown`, pauses the run, and requires explicit reconciliation; it is never blindly retried. The worker enforces the kernel's grant and deadline, not merely the model-visible manifest.
 
+## Independent acceptance
+
+An optional acceptance check is validated and copied into the immutable task contract. A completion proposal is written to a durable artifact before the kernel dispatches `runtime.acceptance`; this private capability is not model-discoverable or grantable through tool manifests. The worker verifies the proposal, configured check version, and evidence before claiming it. Checks execute with a read-only workspace, no container network, a bounded deadline/output, and hidden runtime metadata. Assertion code embedded in the approved arguments remains frozen even if the workspace's original configuration file changes.
+
+Nonzero check exits reject completion and expose bounded failure evidence for the next model turn. An unavailable environment pauses instead of claiming success. On restart, an unfinished read-only verification may safely retry; a recorded passing result completes its original proposal without another model call. The storage completion gate rejects missing checks, failed results, or a summary/evidence set different from the checked proposal. Its acceptance artifact and resolved proposal commit with the terminal state. Checks that invoke mutable workspace test files must additionally use their own integrity assertions; freezing command arguments does not freeze every file an approved command might read.
+
 ## Crash cases
 
 1. Crash after intent commit and before worker dispatch: restart sees `pending`; a safe action can dispatch once, and an unsafe action requires reconciliation unless non-dispatch is provable.

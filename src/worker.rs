@@ -2,7 +2,7 @@ use std::fs::{self, File};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -139,6 +139,22 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
     if run.state != "running" {
         bail!("run is not active");
     }
+    if operation.capability == crate::acceptance::CAPABILITY {
+        let check = crate::acceptance::authorized_check(&store, &run, &operation)?;
+        store.claim_operation(&operation)?;
+        let mut isolated = run.clone();
+        isolated.grants = json!([]);
+        isolated.budgets["container_image"] = json!(check.image);
+        isolated.budgets["process_seconds"] = json!(check.seconds);
+        return execute_container(
+            &mut store,
+            root,
+            &isolated,
+            &operation,
+            &check.program,
+            &check.args,
+        );
+    }
     let grants: Vec<String> = serde_json::from_value(run.grants.clone())?;
     let manifest = capability::permitted(&store, &operation.capability, &grants)?
         .context("capability not granted")?;
@@ -230,37 +246,7 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
                         .context("process argument must be a string")
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let output_dir = tempfile::tempdir_in(root)?;
-            let path = output_dir.path().join("process-output");
-            let file = File::create(&path)?;
-            let mut child = docker_command(&run, &operation, program, &arguments)?
-                .stdout(Stdio::from(file.try_clone()?))
-                .stderr(Stdio::from(file))
-                .spawn()
-                .context(
-                    "start Docker; ensure the daemon is running and image is available locally",
-                )?;
-            let status = loop {
-                if let Some(status) = child.try_wait()? {
-                    break status;
-                }
-                if fs::metadata(&path)?.len() > MAX_OUTPUT {
-                    child.kill()?;
-                    child.wait()?;
-                    bail!("process output exceeded 32 MiB");
-                }
-                thread::sleep(Duration::from_millis(100));
-            };
-            let bytes = fs::read(&path)?;
-            if bytes.len() as u64 > MAX_OUTPUT {
-                bail!("process output exceeded 32 MiB");
-            }
-            let hash = store.put_artifact(&bytes)?;
-            store.link_artifact(&operation.id, &hash, "process.output")?;
-            Ok(
-                json!({"exit_code": status.code(), "output_artifact": hash, "bytes": bytes.len(),
-                "preview": String::from_utf8_lossy(&bytes).chars().take(300).collect::<String>()}),
-            )
+            execute_container(&mut store, root, &run, &operation, program, &arguments)
         }
         name if name.starts_with("mcp.") => {
             let (server_name, tool_name) = name
@@ -272,6 +258,50 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
         }
         _ => bail!("unknown capability"),
     }
+}
+
+fn execute_container(
+    store: &mut Store,
+    root: &Path,
+    run: &Run,
+    operation: &Operation,
+    program: &str,
+    arguments: &[String],
+) -> Result<Value> {
+    let output_dir = tempfile::tempdir_in(root)?;
+    let path = output_dir.path().join("process-output");
+    let file = File::create(&path)?;
+    let mut command = docker_command(run, operation, program, arguments)?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(file.try_clone()?))
+        .stderr(Stdio::from(file));
+    let mut child = crate::process::spawn(command)
+        .context("start Docker; ensure its daemon and local image are available")?;
+    let started = Instant::now();
+    let deadline = Duration::from_secs(run.budgets["process_seconds"].as_u64().unwrap_or(60));
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        let oversized = fs::metadata(&path)?.len() > MAX_OUTPUT;
+        let cancelled = Store::open(root)?.run(&run.id)?.state != "running";
+        if oversized || cancelled || started.elapsed() >= deadline {
+            child.kill()?;
+            crate::kernel::cleanup_container(operation);
+            bail!("container output limit, cancellation, or deadline reached");
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+    let bytes = fs::read(&path)?;
+    if bytes.len() as u64 > MAX_OUTPUT {
+        bail!("process output exceeded 32 MiB")
+    }
+    let hash = store.put_artifact(&bytes)?;
+    store.link_artifact(&operation.id, &hash, "process.output")?;
+    Ok(
+        json!({"exit_code":status.code(), "output_artifact":hash, "bytes":bytes.len(), "preview":String::from_utf8_lossy(&bytes).chars().take(300).collect::<String>()}),
+    )
 }
 
 #[cfg(test)]
