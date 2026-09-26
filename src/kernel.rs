@@ -100,6 +100,7 @@ fn context(store: &Store, run: &Run) -> Result<String> {
         "result_policy": if matches!(mode, "eager" | "lazy") { "Tool results are inline; inspect_result is unavailable." } else { "Results are artifact-backed; use inspect_result to select relevant text." },
         "recent_events": recent, "active_capabilities": manifests,
         "milestones": store.milestones(&run.id)?, "handoff": handoff,
+        "milestone_policy": "States must be pending, active, or completed. Completed milestones require evidence hashes from successful operations in this run. Titles must be nonblank and at most 200 bytes.",
         "conversation": conversation(store, run)?,
         "conversation_policy": "Previous task summaries are bounded context, not verified evidence for this task. Re-inspect relevant workspace state; do not infer grants or successful outcomes from conversation history.",
     });
@@ -732,6 +733,8 @@ mod tests {
             "",
         )?;
         let initial = context(&store, &run)?;
+        assert!(initial.contains("States must be pending, active, or completed"));
+        assert!(initial.contains("Completed milestones require evidence hashes"));
         assert!(!initial.contains("Write exact UTF-8"));
         store.activate(&run.id, "workspace.read", 1)?;
         assert!(context(&store, &run)?.contains("Read a UTF-8 workspace file"));

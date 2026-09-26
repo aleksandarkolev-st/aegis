@@ -597,11 +597,11 @@ impl Store {
             bail!("checkpoint exceeds limits");
         }
         for milestone in &checkpoint.milestones {
-            if milestone.title.trim().is_empty()
-                || milestone.title.len() > 200
-                || !matches!(milestone.state.as_str(), "pending" | "active" | "completed")
-            {
-                bail!("invalid milestone");
+            if milestone.title.trim().is_empty() || milestone.title.len() > 200 {
+                bail!("milestone title must contain 1..200 bytes of nonblank text");
+            }
+            if !matches!(milestone.state.as_str(), "pending" | "active" | "completed") {
+                bail!("milestone state must be pending, active, or completed");
             }
             if milestone.state == "completed" && milestone.evidence.is_empty() {
                 bail!("completed milestone requires evidence");
@@ -1261,6 +1261,25 @@ mod tests {
             ],
         };
         store.save_checkpoint(&run.id, &checkpoint)?;
+        let mut invalid = checkpoint.clone();
+        invalid.milestones[0].state = "complete".into();
+        assert_eq!(
+            store
+                .save_checkpoint(&run.id, &invalid)
+                .unwrap_err()
+                .to_string(),
+            "milestone state must be pending, active, or completed"
+        );
+        invalid.milestones[0].state = "completed".into();
+        invalid.milestones[0].title = " ".into();
+        assert_eq!(
+            store
+                .save_checkpoint(&run.id, &invalid)
+                .unwrap_err()
+                .to_string(),
+            "milestone title must contain 1..200 bytes of nonblank text"
+        );
+        assert_eq!(store.last_checkpoint(&run.id)?, Some(checkpoint.clone()));
         assert!(
             store
                 .complete_run(&run.id, "done", &[evidence.clone()])
