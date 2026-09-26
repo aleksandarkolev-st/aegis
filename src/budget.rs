@@ -26,6 +26,7 @@ pub fn response_bytes(configuration: &serde_json::Value) -> Result<u64> {
 pub struct Limits {
     pub actions: u64,
     pub model_tokens: u64,
+    pub tool_result_tokens: u64,
     pub wall_seconds: u64,
     pub model_seconds: u64,
     pub process_seconds: u64,
@@ -38,6 +39,7 @@ impl Default for Limits {
         Self {
             actions: 200,
             model_tokens: 800_000,
+            tool_result_tokens: crate::tokenization::DEFAULT_TOOL_TOKENS,
             wall_seconds: 14_400,
             model_seconds: 180,
             process_seconds: 600,
@@ -59,6 +61,9 @@ impl Limits {
 
     pub fn validate(&self) -> Result<()> {
         validate_response_bytes(self.model_response_bytes)?;
+        crate::tokenization::limit(
+            &serde_json::json!({"tool_result_tokens":self.tool_result_tokens}),
+        )?;
         if !(1..=1000).contains(&self.actions) {
             bail!("action limit must be 1..1000");
         }

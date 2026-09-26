@@ -77,6 +77,36 @@ pub(crate) fn append_event(
     payload: Value,
 ) -> Result<()> {
     let timestamp = now();
+    if kind == "model.started" && payload.get("context_tokenizer").is_some() {
+        if payload["context_tokenizer"] != crate::tokenization::ENCODING {
+            bail!("model attempt uses an unsupported context tokenizer");
+        }
+        let charge = payload["tool_result_tokens"]
+            .as_u64()
+            .context("model attempt is missing measured tool-result tokens")?;
+        let configuration: String =
+            transaction.query_row("SELECT budgets FROM runs WHERE id=?1", [run_id], |row| {
+                row.get(0)
+            })?;
+        let configuration: Value = serde_json::from_str(&configuration)?;
+        let used: u64 = transaction.query_row(
+            "SELECT COALESCE((SELECT tokens FROM tool_token_projection WHERE run_id=?1),0)",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        let total = used
+            .checked_add(charge)
+            .context("tool-result token accounting overflow")?;
+        if total > i64::MAX as u64
+            || crate::tokenization::limit(&configuration)?.is_some_and(|limit| total > limit)
+        {
+            bail!("tool-result token budget exhausted before model attempt");
+        }
+        transaction.execute(
+            "INSERT INTO tool_token_projection(run_id,tokens) VALUES (?1,?2) ON CONFLICT(run_id) DO UPDATE SET tokens=excluded.tokens",
+            params![run_id,total],
+        )?;
+    }
     transaction.execute(
         "INSERT OR IGNORE INTO run_projection(run_id) VALUES (?1)",
         [run_id],
@@ -165,6 +195,9 @@ impl Store {
                PRIMARY KEY(operation_id,attempt)
              );
              CREATE INDEX IF NOT EXISTS network_receipts_run ON network_receipts(run_id);
+             CREATE TABLE IF NOT EXISTS tool_token_projection (
+               run_id TEXT PRIMARY KEY REFERENCES runs(id), tokens INTEGER NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS milestones (
                run_id TEXT NOT NULL REFERENCES runs(id), position INTEGER NOT NULL,
                title TEXT NOT NULL, state TEXT NOT NULL, evidence TEXT NOT NULL,
@@ -292,6 +325,13 @@ impl Store {
         if !budgets.is_object() {
             bail!("run configuration must be an object");
         }
+        if budgets.get("tool_result_tokens").is_none() {
+            budgets["tool_result_tokens"] = json!(crate::tokenization::DEFAULT_TOOL_TOKENS);
+        }
+        if budgets.get("context_tokenizer").is_none() {
+            budgets["context_tokenizer"] = json!(crate::tokenization::ENCODING);
+        }
+        crate::tokenization::validate(&budgets)?;
         budgets["project_memory"] = json!(self.project_memory(&workspace)?);
         budgets["learning_enabled"] = json!(self.learning_enabled(&workspace)?);
         budgets["user_habits"] = json!(self.learned_habits(&workspace, task)?);
@@ -543,6 +583,14 @@ impl Store {
             |row| row.get(0),
         )?;
         Ok(total.max(0) as u64)
+    }
+
+    pub fn tool_result_tokens(&self, run_id: &str) -> Result<u64> {
+        Ok(self.connection.query_row(
+            "SELECT COALESCE((SELECT tokens FROM tool_token_projection WHERE run_id=?1),0)",
+            [run_id],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn run_started_at(&self, run_id: &str) -> Result<Option<i64>> {

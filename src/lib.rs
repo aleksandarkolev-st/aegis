@@ -21,6 +21,7 @@ pub mod restart;
 pub mod session;
 pub mod storage;
 pub mod terminal;
+pub mod tokenization;
 pub mod trace;
 pub mod ui;
 pub mod worker;

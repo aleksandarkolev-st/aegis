@@ -947,10 +947,14 @@ fn configure_limits(terminal: &Terminal) -> Result<Option<crate::budget::Limits>
         crate::budget::Limits::default()
     };
     if choice == 2 {
-        terminal.message(Tone::Warning, "Custom budget", "Task and command deadlines are enforced. Token limits are checked after each model turn, not a price estimate. Provider usage allowances still apply. Press Enter to keep each default.")?;
+        terminal.message(Tone::Warning, "Custom budget", "Task and command deadlines are enforced. Model usage is checked between turns; tool-context exposure is reserved before requests in o200k_base units, not provider billing tokens. Provider usage allowances still apply. Press Enter to keep each default.")?;
         for (label, value) in [
             ("Action limit", &mut limits.actions),
             ("Model token limit", &mut limits.model_tokens),
+            (
+                "Tool-context token limit (o200k_base)",
+                &mut limits.tool_result_tokens,
+            ),
             ("Task duration in seconds", &mut limits.wall_seconds),
             ("Command deadline in seconds", &mut limits.process_seconds),
             ("Model-turn deadline in seconds", &mut limits.model_seconds),

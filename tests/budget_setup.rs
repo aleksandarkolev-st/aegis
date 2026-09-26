@@ -12,7 +12,7 @@ fn guided_presets_and_custom_limits_are_saved_without_terminal_commands() -> Res
         ("2", "", 3600, 60),
         (
             "3",
-            "20\n400000\n10800\n7200\n180\n256000\n\n",
+            "20\n400000\n600000\n10800\n7200\n180\n256000\n\n",
             10_800,
             7200,
         ),
@@ -40,6 +40,10 @@ fn guided_presets_and_custom_limits_are_saved_without_terminal_commands() -> Res
             serde_json::from_slice(&fs::read(directory.path().join(".arun/profile.json"))?)?;
         assert_eq!(profile["limits"]["wall_seconds"], seconds);
         assert_eq!(profile["limits"]["process_seconds"], command_seconds);
+        assert_eq!(
+            profile["limits"]["tool_result_tokens"],
+            if choice == "3" { 600_000 } else { 800_000 }
+        );
         assert!(String::from_utf8_lossy(&output.stdout).contains("Task budget"));
     }
     Ok(())

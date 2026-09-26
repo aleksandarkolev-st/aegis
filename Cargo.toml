@@ -13,6 +13,7 @@ hex = "0.4"
 jsonschema = { version = "0.57", default-features = false }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 tempfile = "3"
+tiktoken-rs = "=0.12.1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 rmcp = { version = "3.4", default-features = false, features = ["client", "transport-child-process"] }
 serde = { version = "1", features = ["derive"] }

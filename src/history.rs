@@ -19,6 +19,8 @@ pub struct Snapshot {
     pub state: String,
     counts: BTreeMap<String, i64>,
     model_tokens: u64,
+    #[serde(default)]
+    tool_result_tokens: u64,
     started_at: Option<i64>,
     checkpoint: Option<String>,
     proposal: Option<String>,
@@ -59,6 +61,18 @@ impl Snapshot {
         self.sequence = event.seq;
         *self.counts.entry(event.kind.clone()).or_default() += 1;
         match event.kind.as_str() {
+            "model.started" => {
+                if event.payload["context_tokenizer"] == crate::tokenization::ENCODING {
+                    self.tool_result_tokens = self
+                        .tool_result_tokens
+                        .checked_add(
+                            event.payload["tool_result_tokens"]
+                                .as_u64()
+                                .context("measured tool-result tokens missing")?,
+                        )
+                        .context("tool-result token accounting overflow")?;
+                }
+            }
             "model.response" => {
                 self.model_tokens = self
                     .model_tokens
@@ -348,6 +362,7 @@ impl Store {
             state: run.state,
             counts,
             model_tokens: self.model_tokens(run_id)?,
+            tool_result_tokens: self.tool_result_tokens(run_id)?,
             started_at: self.run_started_at(run_id)?,
             checkpoint,
             proposal,

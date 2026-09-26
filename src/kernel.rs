@@ -651,10 +651,25 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
             )?;
             break;
         }
+        let exposure = crate::tokenization::measure(&prompt)?;
+        let used = store.tool_result_tokens(run_id)?;
+        if crate::tokenization::limit(&run.budgets)?
+            .is_some_and(|limit| used.saturating_add(exposure.tool_result_tokens) > limit)
+        {
+            store.event(run_id, "context.tool_limit", json!({"used":used,"requested":exposure.tool_result_tokens,"limit":run.budgets["tool_result_tokens"],"context_tokenizer":exposure.encoding}))?;
+            store.state(
+                run_id,
+                "waiting_recovery",
+                json!({"reason":"tool-result token budget exhausted before model request"}),
+            )?;
+            break;
+        }
         store.event(
             run_id,
             "model.started",
             json!({"turn": actions + 1, "prompt_chars": prompt_chars,
+                "context_tokenizer":exposure.encoding,"schema_tokens":exposure.schema_tokens,
+                "tool_result_tokens":exposure.tool_result_tokens,"raw_prompt_tokens":exposure.raw_prompt_tokens,
                 "schema_count": manifests.len(), "schema_bytes": serde_json::to_vec(&manifests)?.len()}),
         )?;
         let model_started = Instant::now();
@@ -1073,6 +1088,33 @@ mod tests {
         assert_eq!(store.run(&run.id)?.state, "failed");
         assert_eq!(store.event_count(&run.id, "context.over_limit")?, 1);
         assert_eq!(store.event_count(&run.id, "model.started")?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn tool_token_overflow_pauses_before_provider_or_reservation() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "inspect result",
+            directory.path(),
+            "fixture",
+            json!(["workspace.read"]),
+            json!({"mode":"durable","tool_result_tokens":1}),
+            "",
+        )?;
+        store.event(
+            &run.id,
+            "artifact.inspected",
+            json!({"excerpt":"a useful compiler diagnostic with multiple tokens"}),
+        )?;
+        drop(store);
+        drive(directory.path(), &run.id)?;
+        let store = Store::open(directory.path())?;
+        assert_eq!(store.run(&run.id)?.state, "waiting_recovery");
+        assert_eq!(store.event_count(&run.id, "context.tool_limit")?, 1);
+        assert_eq!(store.event_count(&run.id, "model.started")?, 0);
+        assert_eq!(store.tool_result_tokens(&run.id)?, 0);
         Ok(())
     }
 

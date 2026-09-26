@@ -13,6 +13,12 @@ pub struct Metrics {
     pub schema_bytes_initial: u64,
     pub schema_bytes_peak: u64,
     pub schema_count_peak: u64,
+    pub context_tokenizer: Option<String>,
+    pub schema_tokens_initial: Option<u64>,
+    pub schema_tokens_peak: Option<u64>,
+    pub tool_result_tokens: u64,
+    pub raw_prompt_tokens: u64,
+    pub unaccounted_context_attempts: usize,
     pub prompt_chars_peak: u64,
     pub model_elapsed_ms: u64,
     pub searches: usize,
@@ -41,6 +47,29 @@ pub fn metrics(events: &[Event]) -> Metrics {
         match event.kind.as_str() {
             "model.started" | "context.over_limit" => {
                 summary.model_attempts += usize::from(event.kind == "model.started");
+                if event.kind == "model.started" {
+                    if event.payload["context_tokenizer"] == crate::tokenization::ENCODING
+                        && ["schema_tokens", "tool_result_tokens", "raw_prompt_tokens"]
+                            .iter()
+                            .all(|key| event.payload[*key].as_u64().is_some())
+                    {
+                        summary.context_tokenizer = Some(crate::tokenization::ENCODING.into());
+                        let tokens = number("schema_tokens");
+                        if summary.model_attempts == 1 {
+                            summary.schema_tokens_initial = Some(tokens);
+                        }
+                        summary.schema_tokens_peak =
+                            Some(summary.schema_tokens_peak.unwrap_or(0).max(tokens));
+                        summary.tool_result_tokens = summary
+                            .tool_result_tokens
+                            .saturating_add(number("tool_result_tokens"));
+                        summary.raw_prompt_tokens = summary
+                            .raw_prompt_tokens
+                            .saturating_add(number("raw_prompt_tokens"));
+                    } else {
+                        summary.unaccounted_context_attempts += 1;
+                    }
+                }
                 let schemas = number("schema_bytes");
                 if !first_schema_seen {
                     summary.schema_bytes_initial = schemas;
@@ -185,6 +214,10 @@ mod tests {
         assert_eq!(result.unaccounted_searches, 1);
         assert_eq!(result.model_attempts, 2);
         assert_eq!(result.unaccounted_model_attempts, 1);
+        assert_eq!(result.unaccounted_context_attempts, 2);
+        assert_eq!(result.context_tokenizer, None);
+        assert_eq!(result.schema_tokens_initial, None);
+        assert_eq!(result.schema_tokens_peak, None);
         assert_eq!(result.wall_seconds, 4);
     }
 

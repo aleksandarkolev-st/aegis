@@ -148,6 +148,7 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
     let mut foreground = false;
     let mut actions = 40_u64;
     let mut model_tokens = 400_000_u64;
+    let mut tool_result_tokens = arun::tokenization::DEFAULT_TOOL_TOKENS;
     let mut wall_seconds = 3600_u64;
     let mut process_seconds = 60_u64;
     let mut context_chars = 256_000_u64;
@@ -280,6 +281,14 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
                     bail!("model token limit must be positive");
                 }
             }
+            "--tool-result-tokens" => {
+                index += 1;
+                tool_result_tokens = args
+                    .get(index)
+                    .context("--tool-result-tokens needs a limit")?
+                    .parse()?;
+                arun::tokenization::limit(&json!({"tool_result_tokens":tool_result_tokens}))?;
+            }
             "--wall-seconds" => {
                 index += 1;
                 wall_seconds = args
@@ -399,7 +408,7 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
         &std::env::current_dir()?,
         provider,
         json!(grants),
-        json!({"model": model, "endpoint":endpoint, "mode": mode, "actions": actions, "model_tokens": model_tokens, "wall_seconds": wall_seconds, "context_chars": context_chars,
+        json!({"model": model, "endpoint":endpoint, "mode": mode, "actions": actions, "model_tokens": model_tokens, "tool_result_tokens":tool_result_tokens, "wall_seconds": wall_seconds, "context_chars": context_chars,
             "model_seconds": 180, "model_response_bytes": model_response_bytes, "process_seconds": process_seconds, "container_image": image, "acceptance_check":acceptance_check, "command_scopes":command_scopes, "filesystem_scopes":filesystem_scopes, "network_scopes":network_scopes}),
         acceptance,
     )?;
