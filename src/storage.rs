@@ -146,6 +146,12 @@ impl Store {
              );
              CREATE INDEX IF NOT EXISTS project_memory_workspace ON project_memory(workspace);
              CREATE TABLE IF NOT EXISTS learning_settings (workspace TEXT PRIMARY KEY, enabled INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS user_habits (
+               workspace TEXT NOT NULL, category TEXT NOT NULL, choice TEXT NOT NULL,
+               observations INTEGER NOT NULL, confirmed INTEGER NOT NULL,
+               last_run TEXT REFERENCES runs(id), updated_at INTEGER NOT NULL,
+               PRIMARY KEY(workspace,category)
+             );
              CREATE TABLE IF NOT EXISTS workflow_experience (
                run_id TEXT PRIMARY KEY REFERENCES runs(id), workspace TEXT NOT NULL,
                topics TEXT NOT NULL, steps TEXT NOT NULL, verifier TEXT NOT NULL,
@@ -281,6 +287,7 @@ impl Store {
         }
         budgets["project_memory"] = json!(self.project_memory(&workspace)?);
         budgets["learning_enabled"] = json!(self.learning_enabled(&workspace)?);
+        budgets["user_habits"] = json!(self.learned_habits(&workspace, task)?);
         budgets["workflow_patterns"] =
             json!(self.learned_patterns(&workspace, task, &budgets, &grants)?);
         let run = Run {
@@ -323,6 +330,7 @@ impl Store {
             "INSERT INTO milestones VALUES (?1, 0, 'Task request', 'active', '[]')",
             [&run.id],
         )?;
+        crate::habits::record(&transaction, &run)?;
         transaction.commit()?;
         Ok(run)
     }

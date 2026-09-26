@@ -6,7 +6,7 @@ LATEST USER REQUIREMENTS
 - Keep memory lightweight and structured; no growing Markdown memory files.
 - Finish implementation and functional verification before starting new agent benchmarks.
 - Then measure coding correctness, correction attempts and token efficiency against native Codex.
-- Run the requested "arg agi" evaluation after the same readiness gate. Dataset/version clarification requested; do not silently assume one.
+- Run ARC-AGI-3 after the same readiness gate. The user explicitly confirmed version 3; protocol/dataset/scoring setup remains pending.
 - Record progress here, and preserve raw evaluation records as well as summaries.
 - Work in small atomic local commits. Do not publish or push without authorization.
 
@@ -24,11 +24,11 @@ IMPLEMENTED
   Inspect, pause, enable and reset controls are in Project memory.
 
 IN PROGRESS / NOT YET COMPLETE
-- Habit adaptation: the current verified-path learner does not yet learn arbitrary personal preferences.
+- Habit adaptation implementation added: eight bounded preference categories, repeated user-request observations, current-request precedence and UI confirmation/correction/forget controls. Focused core tests passed; UI integration verification pending. Arbitrary behavioral profiling is not implemented or claimed.
 - Fine-grained filesystem and network-domain capability scopes.
 - Remaining tool-result token and network-byte budget enforcement; exact schema-token measurement.
 - Full completion audit against plan.txt and functional regression checks after remaining changes.
-- Native Codex hard-coding benchmark and requested AGI benchmark: NOT STARTED under the new readiness gate.
+- Native Codex hard-coding benchmark and ARC-AGI-3: NOT STARTED under the new readiness gate.
 - Public npm/release distribution and actual Linux/macOS build verification.
 - Claude live verification: intentionally pending at the user's request; fixtures are not login proof.
 

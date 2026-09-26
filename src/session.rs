@@ -532,7 +532,7 @@ fn memory_menu(root: &Path, terminal: &Terminal) -> Result<()> {
             .iter()
             .map(|note| crate::terminal::fit(&note.text, 100)),
     );
-    choices.push("Workflow learning · inspect / pause / reset".into());
+    choices.push("Habit and workflow learning · inspect / pause / reset".into());
     choices.push("Back".into());
     let Some(choice) = terminal.select("What should Aegis remember?", &choices)? else {
         return Ok(());
@@ -542,7 +542,24 @@ fn memory_menu(root: &Path, terminal: &Terminal) -> Result<()> {
             remember(root, terminal, &text, None)?;
         }
     } else if choice == notes.len() + 1 {
-        terminal.message(Tone::Accent, "Workflow learning", &format!("{} verified experiences saved. Learning is {}. Only independently accepted tasks teach bounded tool paths; no transcripts or command arguments are copied.", store.learning_count(&workspace)?, if store.learning_enabled(&workspace)? {"on"} else {"paused"}))?;
+        terminal.message(Tone::Accent, "Habit and workflow learning", &format!("{} verified experiences saved. Learning is {}. Repeated user preferences teach tentative habits; independently accepted tasks teach tool paths. No extra model calls, transcripts or command arguments.", store.learning_count(&workspace)?, if store.learning_enabled(&workspace)? {"on"} else {"paused"}))?;
+        for habit in store.habits(&workspace)? {
+            terminal.message(
+                Tone::Quiet,
+                &format!(
+                    "{} · {}",
+                    habit.category,
+                    if habit.confirmed {
+                        "confirmed"
+                    } else if habit.observations >= 2 {
+                        "learned"
+                    } else {
+                        "tentative"
+                    }
+                ),
+                &habit.preference,
+            )?;
+        }
         for (steps, count) in store.learning_paths(&workspace)? {
             terminal.message(
                 Tone::Quiet,
@@ -559,6 +576,7 @@ fn memory_menu(root: &Path, terminal: &Terminal) -> Result<()> {
             "Pause learning",
             "Enable learning",
             "Reset learned experiences",
+            "Review or correct a habit",
         ]
         .map(str::to_owned);
         match terminal.select("Learning controls", &actions)? {
@@ -574,6 +592,7 @@ fn memory_menu(root: &Path, terminal: &Terminal) -> Result<()> {
                     store.reset_learning(&workspace)?;
                 }
             }
+            Some(4) => review_habits(&mut store, &workspace, terminal)?,
             _ => {}
         }
     } else if let Some(note) = notes.get(choice - 1) {
@@ -593,6 +612,54 @@ fn memory_menu(root: &Path, terminal: &Terminal) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn review_habits(store: &mut Store, workspace: &Path, terminal: &Terminal) -> Result<()> {
+    let habits = store.habits(workspace)?;
+    if habits.is_empty() {
+        return terminal.message(Tone::Quiet,"Habits","Nothing inferred yet. Repeated preferences in your normal requests can teach Aegis; you do not need to configure them first.");
+    }
+    let mut choices: Vec<_> = habits
+        .iter()
+        .map(|habit| format!("{} · {}", habit.category, habit.choice))
+        .collect();
+    choices.push("Back".into());
+    let Some(selected) = terminal.select("Which habit?", &choices)? else {
+        return Ok(());
+    };
+    let Some(habit) = habits.get(selected) else {
+        return Ok(());
+    };
+    let actions = [
+        "Keep",
+        "Confirm this preference",
+        "Change this preference",
+        "Forget this preference",
+    ]
+    .map(str::to_owned);
+    match terminal.select("You control what Aegis learns", &actions)? {
+        Some(1) => store.confirm_habit(workspace, &habit.category, &habit.choice)?,
+        Some(2) => {
+            let alternatives = crate::habits::choices(&habit.category);
+            let mut labels: Vec<_> = alternatives
+                .iter()
+                .map(|(_, description)| description.clone())
+                .collect();
+            labels.push("Back".into());
+            if let Some(index) = terminal.select("Preferred habit", &labels)? {
+                if let Some((choice, _)) = alternatives.get(index) {
+                    store.confirm_habit(workspace, &habit.category, choice)?;
+                }
+            }
+        }
+        Some(3) => store.forget_habit(workspace, &habit.category)?,
+        _ => {}
+    }
+    terminal.message(
+        Tone::Quiet,
+        "Habit updated",
+        "Applies to future tasks; current instructions always take priority.",
+    )
 }
 
 fn help(terminal: &Terminal) -> Result<()> {

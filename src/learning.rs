@@ -145,10 +145,16 @@ impl Store {
 
     pub fn reset_learning(&mut self, workspace: &Path) -> Result<()> {
         let workspace = dunce::canonicalize(workspace)?;
-        self.connection.execute(
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
             "DELETE FROM workflow_experience WHERE workspace=?1",
             [workspace.to_string_lossy().as_ref()],
         )?;
+        transaction.execute(
+            "DELETE FROM user_habits WHERE workspace=?1",
+            [workspace.to_string_lossy().as_ref()],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
