@@ -230,12 +230,29 @@ fn dispatch(root: &Path, operation: &Operation, timeout: Duration) -> Result<Val
     }
 }
 
+pub(crate) fn remaining_seconds(store: &Store, run: &Run) -> Result<u64> {
+    let budget = run.budgets["wall_seconds"].as_u64().unwrap_or(3600);
+    let started = store
+        .run_started_at(&run.id)?
+        .unwrap_or_else(crate::storage::unix_time);
+    Ok(budget.saturating_sub(crate::storage::unix_time().saturating_sub(started) as u64))
+}
+
 pub(crate) fn perform(
     store: &mut Store,
     root: &Path,
     run: &Run,
     operation: &Operation,
 ) -> Result<bool> {
+    let remaining = remaining_seconds(store, run)?;
+    if remaining == 0 {
+        store.state(
+            &run.id,
+            "waiting_recovery",
+            json!({"reason":"wall-clock budget exhausted before operation"}),
+        )?;
+        return Ok(true);
+    }
     store.operation_state(
         operation,
         "dispatched",
@@ -246,7 +263,8 @@ pub(crate) fn perform(
         run.budgets
             .get("process_seconds")
             .and_then(Value::as_u64)
-            .unwrap_or(60),
+            .unwrap_or(60)
+            .min(remaining),
     );
     match dispatch(root, operation, timeout) {
         Ok(result) => {
@@ -497,7 +515,8 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
             run.budgets
                 .get("model_seconds")
                 .and_then(Value::as_u64)
-                .unwrap_or(180),
+                .unwrap_or(180)
+                .min(remaining_seconds(&store, &run)?),
         );
         let response = match model::call_configured(
             &run.provider,

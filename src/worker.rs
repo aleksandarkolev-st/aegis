@@ -279,7 +279,12 @@ fn execute_container(
     let mut child = crate::process::spawn(command)
         .context("start Docker; ensure its daemon and local image are available")?;
     let started = Instant::now();
-    let deadline = Duration::from_secs(run.budgets["process_seconds"].as_u64().unwrap_or(60));
+    let deadline = Duration::from_secs(
+        run.budgets["process_seconds"]
+            .as_u64()
+            .unwrap_or(60)
+            .min(crate::kernel::remaining_seconds(store, run)?),
+    );
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
