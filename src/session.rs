@@ -152,12 +152,18 @@ fn configure(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
     };
     profile.write = permission != 1;
     if permission == 2 {
-        let output = Command::new("docker")
-            .args(["image", "ls", "--format", "{{.Repository}}:{{.Tag}}"])
-            .stderr(Stdio::null())
-            .output();
+        let docker = provider::system_executable("docker");
+        let output = docker.as_ref().and_then(|program| {
+            Command::new(program)
+                .args(["image", "ls", "--format", "{{.Repository}}:{{.Tag}}"])
+                .stderr(Stdio::null())
+                .output()
+                .ok()
+        });
+        let available = output
+            .as_ref()
+            .is_some_and(|output| output.status.success());
         let images: Vec<String> = output
-            .ok()
             .filter(|output| output.status.success())
             .map(|output| {
                 String::from_utf8_lossy(&output.stdout)
@@ -167,13 +173,65 @@ fn configure(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
                     .collect()
             })
             .unwrap_or_default();
-        if images.is_empty() {
-            terminal.message(Tone::Warning, "Containers", "No local Docker image is available. File edits remain enabled; process tools stay disabled.")?;
+        if !available {
+            terminal.message(Tone::Warning, "Containers", "Docker is missing or its daemon is unavailable. File edits remain enabled; process tools stay disabled.")?;
+        } else if images.is_empty() {
+            profile.image = download_image(terminal, docker.as_ref().unwrap())?;
         } else if let Some(index) = terminal.select("Choose a local container image", &images)? {
             profile.image = Some(images[index].clone());
         }
     }
     Ok(Some((profile, secret)))
+}
+
+fn download_image(terminal: &Terminal, docker: &Path) -> Result<Option<String>> {
+    terminal.message(Tone::Warning, "Container setup", "No local images are available. Downloading an image uses your network and disk space; task commands themselves remain network-disabled.")?;
+    let choices = [
+        "Download node:22-alpine for Node/npm tasks",
+        "Download a different image",
+        "Continue without command execution",
+    ]
+    .map(str::to_owned);
+    let Some(choice) = terminal.select("Prepare an isolated command environment", &choices)? else {
+        return Ok(None);
+    };
+    let image = match choice {
+        0 => "node:22-alpine".to_owned(),
+        1 => {
+            let Some(image) = field(terminal, "  Container image reference › ", false)? else {
+                return Ok(None);
+            };
+            if !valid_image_reference(&image) {
+                terminal.message(Tone::Warning, "!", "Use a nonempty container image reference, not command options or shell syntax.")?;
+                return Ok(None);
+            }
+            image
+        }
+        _ => return Ok(None),
+    };
+    let status = Command::new(docker)
+        .args(["pull", "--"])
+        .arg(&image)
+        .status()?;
+    if !status.success() {
+        terminal.message(
+            Tone::Warning,
+            "Download failed",
+            "File edits remain enabled. Reopen provider setup to try again.",
+        )?;
+        return Ok(None);
+    }
+    terminal.message(Tone::Success, "Container ready", &image)?;
+    Ok(Some(image))
+}
+
+fn valid_image_reference(image: &str) -> bool {
+    !image.is_empty()
+        && image.len() <= 256
+        && !image.starts_with('-')
+        && image
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._/:@-".contains(&byte))
 }
 
 fn ensure_provider(terminal: &Terminal, name: &str) -> Result<bool> {
@@ -756,6 +814,23 @@ pub fn interactive(root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_references_cannot_be_command_options_or_shell_expressions() {
+        assert!(valid_image_reference("node:22-alpine"));
+        assert!(valid_image_reference(
+            "localhost:5000/org/image@sha256:abcdef"
+        ));
+        for invalid in [
+            "",
+            "--all-tags",
+            "node;echo bad",
+            "node\nother",
+            "node image",
+        ] {
+            assert!(!valid_image_reference(invalid));
+        }
+    }
 
     #[test]
     fn profile_persists_only_secret_references() -> Result<()> {

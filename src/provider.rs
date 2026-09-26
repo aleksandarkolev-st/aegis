@@ -74,21 +74,23 @@ fn executable_file(path: &Path) -> bool {
     }
 }
 
-pub fn find(provider: &str) -> Result<Option<PathBuf>> {
-    let info = specification(provider)?;
-    let mut directories: Vec<_> = std::env::var_os("PATH")
+pub fn system_executable(binary: &str) -> Option<PathBuf> {
+    let directories: Vec<_> = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
         .unwrap_or_default();
-    if let Some(path) = search(info.binary, directories.clone()) {
+    search(binary, directories)
+}
+
+pub fn find(provider: &str) -> Result<Option<PathBuf>> {
+    let info = specification(provider)?;
+    if let Some(path) = system_executable(info.binary) {
         return Ok(Some(path));
     }
-    directories.push(
-        managed_home()?
-            .join(info.binary)
-            .join("node_modules")
-            .join(".bin"),
-    );
-    Ok(search(info.binary, directories))
+    let directory = managed_home()?
+        .join(info.binary)
+        .join("node_modules")
+        .join(".bin");
+    Ok(search(info.binary, [directory]))
 }
 
 pub fn executable(provider: &str) -> Result<PathBuf> {

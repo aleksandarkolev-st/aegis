@@ -100,7 +100,7 @@ Read-only workspace search/read are granted by default. Add `--allow-write` to g
 arun run "Run the tests" --allow-process node --image node:22-alpine
 ```
 
-The worker uses a read-only root filesystem, a bind-mounted workspace (read-only unless `--allow-write`), no container network, dropped capabilities, resource limits, and an ephemeral mount hiding `.arun`. Images are never pulled automatically. Process output up to 32 MiB is stored as a separate artifact instead of being dumped into model context. Docker Desktop or an equivalent Docker daemon must be running for this capability.
+The worker uses a read-only root filesystem, a bind-mounted workspace (read-only unless `--allow-write`), no container network, dropped capabilities, resource limits, and an ephemeral mount hiding `.arun`. Task execution never pulls images. Guided setup can download an image only after you explicitly choose it, or continue with commands disabled. Process output up to 32 MiB is stored as a separate artifact instead of being dumped into model context. Docker Desktop or an equivalent Docker daemon must be running for this capability.
 
 Register a trusted local stdio MCP server and grant individual tools:
 
