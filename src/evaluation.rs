@@ -375,6 +375,7 @@ pub fn command(root: &Path, args: &[String]) -> Result<()> {
         .create_new(true)
         .write(true)
         .open(experiment.join("results.jsonl"))?;
+    let mut rows = Vec::new();
     for case in cases {
         let started = Instant::now();
         let error = kernel::drive(&case.root, &case.run_id)
@@ -428,9 +429,11 @@ pub fn command(root: &Path, args: &[String]) -> Result<()> {
             .count();
         let row = json!({"case":case, "state":run.state, "acceptance":acceptance, "metrics":trace::metrics(&events),
             "wrong_tools":wrong_tools, "invalid_arguments":invalid_arguments, "execution_ms":execution_ms,
-            "execution_and_acceptance_ms":started.elapsed().as_millis(), "runtime_error":error});
+            "execution_and_acceptance_ms":started.elapsed().as_millis(), "runtime_error":error,
+            "context_overflow":events.iter().any(|event| event.kind == "context.over_limit")});
         writeln!(report, "{}", serde_json::to_string(&row)?)?;
         report.sync_all()?;
+        rows.push(row);
         println!(
             "{} tools  {}  {}  accepted={}  tokens={}",
             case.size,
@@ -440,6 +443,10 @@ pub fn command(root: &Path, args: &[String]) -> Result<()> {
             store.model_tokens(&run.id)?
         );
     }
+    fs::write(
+        experiment.join("paired-summary.json"),
+        serde_json::to_vec_pretty(&crate::evaluation_report::summarize(&rows)?)?,
+    )?;
     println!(
         "raw results: {}",
         experiment.join("results.jsonl").display()

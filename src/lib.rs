@@ -2,6 +2,7 @@ pub mod acceptance;
 pub mod capability;
 pub mod endpoint;
 pub mod evaluation;
+pub mod evaluation_report;
 pub mod kernel;
 pub mod mcp;
 pub mod model;

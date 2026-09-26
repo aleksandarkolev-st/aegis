@@ -375,6 +375,15 @@ fn main() -> Result<()> {
         None => interactive(&root),
         Some("run") => run(&root, &arguments[1..]),
         Some("eval") => arun::evaluation::command(&root, &arguments[1..]),
+        Some("eval-report") => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&arun::evaluation_report::from_file(Path::new(
+                    required(1)?
+                ))?)?
+            );
+            Ok(())
+        }
         Some("serve") => kernel::drive(Path::new(required(1)?), required(2)?),
         Some("worker") => {
             let value = arun::worker::execute(Path::new(required(1)?), required(2)?)?;

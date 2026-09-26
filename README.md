@@ -154,4 +154,6 @@ Read and large-log fixtures require both the expected final answer and matching 
 
 ## Remaining work
 
-The broader `plan.txt` also calls for forced-restart benchmarks and paired uncertainty reporting. These are not yet claimed as implemented. The Codex CLI adapter disables its built-in tools, but its own system context still incurs substantial token overhead; measured usage is reported rather than presented as a kernel-only schema cost.
+Every completed evaluation writes `paired-summary.json`, matching candidate runs to eager runs by registry size, task, restart condition, and repeat. Acceptance differences include distribution-free 95% bounds; numeric differences use a deterministic paired bootstrap, with no interval for a single pair. Missing pairs and metrics are counted explicitly. Cost differences include failures and context overflow, so they are not automatically improvements. Regenerate a summary from saved observations with `arun eval-report <results.jsonl>`.
+
+The broader `plan.txt` also calls for forced-restart benchmarks; these are not yet claimed as implemented. The Codex CLI adapter disables its built-in tools, but its own system context still incurs substantial token overhead; measured usage is reported rather than presented as a kernel-only schema cost.
