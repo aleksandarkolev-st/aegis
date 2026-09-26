@@ -10,6 +10,7 @@ use arun::storage::Store;
 use serde_json::{Value, json};
 
 fn request(stream: &mut TcpStream) -> Result<(String, Value)> {
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let mut bytes = Vec::new();
     let mut buffer = [0; 4096];
