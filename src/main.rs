@@ -551,6 +551,10 @@ fn execute() -> Result<()> {
                 Ok(())
             }
         }
+        Some("--version" | "-V") => {
+            println!("aegis {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         Some("status") => {
             println!(
                 "{}",
