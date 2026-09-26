@@ -22,12 +22,17 @@ This is a development verification record, not a success-rate or performance-imp
 
 ## Automated checks
 
-- `cargo test --locked`: 35 unit tests and nine integration tests passed; the Docker test is ignored by default.
-- `cargo test --test docker -- --ignored`: passed separately after starting Docker Desktop. It verifies multi-megabyte output virtualization and that the runtime database is hidden from the container.
+- `cargo test --locked`: 45 unit tests and 16 integration tests passed after the acceptance, isolation, and restart changes; three Docker tests are ignored by default.
+- `cargo test --test docker --test docker_acceptance --test docker_mcp -- --ignored`: all three passed separately with Docker running. They verify multi-megabyte output virtualization, hidden runtime state, immutable/read-only acceptance checks, and MCP filesystem/network/credential isolation.
 - `npm test`: four package/platform/checksum/version tests passed.
 - Process-tree tests verify that explicit kill and drop cleanup stop a descendant heartbeat, not merely its launcher.
 - Setup fixtures verify install consent, refusal without installation, private provider paths, and image download consent.
 - Recovery fixtures verify required receipts, no repeated write, and that reconciliation never revives a cancelled task.
+- Forced-restart fixtures terminate actual supervised process trees: durable recovery consumes committed read evidence once; all three non-durable modes fail on interruption; an unsafe executing MCP call pauses with an unknown outcome and is not replayed. The decision provider is mocked in these fixtures.
+- Paired-report tests cover repeat matching, missing/duplicate conditions, deterministic bootstrap intervals, conservative acceptance bounds, and refusal to pair different experiments. They do not constitute measured live comparisons.
+- Guided and advanced acceptance setup fixtures verify frozen configurations and that the private verifier is not exposed as a model tool.
+- A stalled HTTP fixture verifies that an active model request respects the remaining task wall-time budget.
+- A natural-exit regression covers a Windows completion-port double-wait hang discovered during Docker testing and fixed before the successful rerun.
 - `git diff --check`: passed.
 
 ## Not yet verified or delivered
@@ -35,4 +40,5 @@ This is a development verification record, not a success-rate or performance-imp
 - Public npm publication and GitHub release assets.
 - Actual Linux/macOS release builds; the checked-in release matrix still needs to run in CI.
 - Live Claude completion after reauthentication.
-- The remaining broader-plan work listed in the README: forced-restart comparisons, paired uncertainty reporting, full untrusted-MCP isolation, and configurable external acceptance for ordinary tasks.
+- Multi-hour live demonstrations and live paired/restart comparisons with pinned models.
+- Scalable snapshot-based recovery and granular operation/model-turn Ctrl+C semantics.

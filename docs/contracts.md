@@ -16,7 +16,7 @@ Nonzero check exits reject completion and expose bounded failure evidence for th
 
 ## Crash cases
 
-1. Crash after intent commit and before worker dispatch: restart sees `pending`; a safe action can dispatch once, and an unsafe action requires reconciliation unless non-dispatch is provable.
+1. Crash after intent commit and before worker dispatch: restart sees `pending`; the durable dispatch/claim gate proves no adapter executed this intent, so it can dispatch once even when its eventual effect is unsafe. Once the operation is `dispatched` or `executing`, that proof no longer holds.
 2. Crash after external side effect and before result commit: restart sees `dispatched`; it queries external state or pauses. It must not duplicate an unsafe side effect.
 3. Crash after artifact write and before result commit: the artifact may be orphaned. Recovery treats the operation as unresolved and cleanup may remove unreferenced artifacts; no event may reference missing bytes.
 
