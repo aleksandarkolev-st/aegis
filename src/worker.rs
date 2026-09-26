@@ -139,16 +139,26 @@ fn relative(workspace: &Path, path: &str) -> Result<PathBuf> {
         bail!("runtime and Git metadata are not workspace files");
     }
     let target = workspace.join(relative);
-    let existing = if target.exists() {
-        &target
-    } else {
-        target.parent().context("missing parent")?
-    };
-    if !existing
-        .canonicalize()?
-        .starts_with(workspace.canonicalize()?)
-    {
+    let mut existing = target.as_path();
+    loop {
+        match fs::symlink_metadata(existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                existing = existing.parent().context("missing parent")?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let root = workspace.canonicalize()?;
+    let resolved = existing.canonicalize()?;
+    if !resolved.starts_with(&root) {
         bail!("path escapes workspace through symlink");
+    }
+    if resolved.strip_prefix(&root)?.components().any(|component| {
+        let name = component.as_os_str().to_string_lossy();
+        name.eq_ignore_ascii_case(".git") || name.eq_ignore_ascii_case(".arun")
+    }) {
+        bail!("resolved path enters runtime or Git metadata");
     }
     Ok(target)
 }
@@ -310,6 +320,7 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
             if content.len() > MAX_FILE as usize {
                 bail!("write exceeds file limit");
             }
+            fs::create_dir_all(path.parent().context("write parent missing")?)?;
             fs::write(&path, content)?;
             Ok(
                 json!({"path": path.strip_prefix(workspace)?.to_string_lossy(), "bytes": content.len()}),
@@ -448,6 +459,60 @@ mod tests {
         );
         assert_eq!(store.operation(&operation.id)?.state, "dispatched");
         assert!(!directory.path().join("fixture.txt").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn writes_scaffold_validated_directories_with_and_without_file_scopes() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(".arun");
+        let mut store = Store::open(&root)?;
+        for configuration in [
+            json!({}),
+            json!({"filesystem_scopes":{"read":["src/**"],"write":["src/**"]}}),
+        ] {
+            let run = store.create_run(
+                "scaffold",
+                directory.path(),
+                "fixture",
+                json!(["workspace.write"]),
+                configuration,
+                "",
+            )?;
+            store.state(&run.id, "running", json!({}))?;
+            let path = format!("src/{}/nested/file.txt", run.id);
+            let operation = store.begin_operation(
+                &run.id,
+                "workspace.write",
+                json!({"path":path,"content":"hello"}),
+                false,
+            )?;
+            store.operation_state(&operation, "dispatched", None, json!({}))?;
+            let result = execute(&root, &operation.id)?;
+            assert_eq!(result["bytes"], 5);
+            assert_eq!(fs::read_to_string(directory.path().join(path))?, "hello");
+        }
+        assert!(relative(directory.path(), ".git/new/file.txt").is_err());
+        assert!(!directory.path().join(".git").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_links_and_metadata_aliases_cannot_escape_write_validation() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join(".arun"))?;
+        std::os::unix::fs::symlink(
+            outside.path().join("missing"),
+            directory.path().join("broken"),
+        )?;
+        std::os::unix::fs::symlink(
+            directory.path().join(".arun"),
+            directory.path().join("alias"),
+        )?;
+        assert!(relative(directory.path(), "broken").is_err());
+        assert!(relative(directory.path(), "alias/new/file").is_err());
         Ok(())
     }
 

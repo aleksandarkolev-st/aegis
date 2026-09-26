@@ -24,10 +24,11 @@ IMPLEMENTED
   Inspect, pause, enable and reset controls are in Project memory.
 - Habit adaptation: eight bounded preference categories, repeated user-request observations, current-request precedence, and UI confirmation/correction/forget controls. Core and UI integration checks passed. No extra model calls or copied transcripts. Arbitrary behavioral profiling is not claimed.
 - Optional exact-file/subtree permissions for file tools and container mounts, with inline F7 configuration. Five Docker checks passed, including scoped read/write enforcement and hidden nested existing metadata. Restrictions apply to future tasks and require confirmation before removal.
+- Installed Windows package updated from source ab1607c. Vendor and user-global native SHA256 both match ff262059f77c9542205047cf4fbe19ea9c5e53a753eed4eca315ecf6a1ab2b03. The separate endurance prefix was not changed.
 
 IN PROGRESS / NOT YET COMPLETE
 - Network-domain scopes and scoped network-body byte budgets remain pending. Containers still have no network by default; narrowed file scopes reject MCP rather than letting it bypass permissions.
-- Coding usability audit: ensure safe file writes can scaffold missing parent directories instead of making users create folders manually.
+- Coding usability audit: safe parent-directory scaffolding has been added; focused verification is in progress. Directory creation follows grant/scope/path validation, not a manual user step. Broken-link and resolved metadata-alias rejection have also been tightened.
 - Remaining tool-result token and network-byte budget enforcement; exact schema-token measurement.
 - Full completion audit against plan.txt and functional regression checks after remaining changes.
 - Native Codex hard-coding benchmark and ARC-AGI-3: NOT STARTED under the new readiness gate.
