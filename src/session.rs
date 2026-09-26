@@ -300,10 +300,23 @@ fn resume(
 ) -> Result<()> {
     let mut store = Store::open(root)?;
     let run = store.run(id)?;
-    if matches!(run.state.as_str(), "completed" | "cancelled" | "failed")
-        || store.unknown_count(id)? > 0
-    {
-        terminal.message(Tone::Warning, "!", "This task cannot resume without resolving its terminal state or unknown operation outcomes.")?;
+    if matches!(run.state.as_str(), "completed" | "cancelled" | "failed") {
+        terminal.message(
+            Tone::Warning,
+            "!",
+            "This task has ended. Start a new task to continue the conversation.",
+        )?;
+        return Ok(());
+    }
+    if store.unknown_count(id)? > 0 {
+        review_operations(root, id, terminal)?;
+    }
+    if store.unknown_count(id)? > 0 {
+        terminal.message(
+            Tone::Warning,
+            "Paused",
+            "Unverified operation outcomes remain. Aegis will not repeat them automatically.",
+        )?;
         return Ok(());
     }
     if run.state == "waiting_recovery" {
@@ -312,6 +325,156 @@ fn resume(
     drop(store);
     kernel::spawn(root, id, secret)?;
     follow(root, id, terminal)
+}
+
+fn review_operations(root: &Path, id: &str, terminal: &Terminal) -> Result<()> {
+    let mut store = Store::open(root)?;
+    if kernel::is_active(root, id)? {
+        terminal.message(
+            Tone::Warning,
+            "!",
+            "Stop the active runner before reviewing interrupted operations.",
+        )?;
+        return Ok(());
+    }
+    let operations: Vec<_> = store
+        .operations(id)?
+        .into_iter()
+        .filter(|operation| operation.state == "outcome_unknown")
+        .collect();
+    if operations.is_empty() {
+        terminal.message(Tone::Quiet, "Recovery", "No unknown operation outcomes.")?;
+        return Ok(());
+    }
+    let mut choices: Vec<_> = operations
+        .iter()
+        .map(|operation| {
+            format!(
+                "{} · {}",
+                operation.capability,
+                crate::terminal::fit(&operation.arguments.to_string(), 100)
+            )
+        })
+        .collect();
+    choices.push("Back — leave outcomes unresolved".into());
+    let Some(index) = terminal.select("Choose an interrupted operation", &choices)? else {
+        return Ok(());
+    };
+    let Some(operation) = operations.get(index) else {
+        return Ok(());
+    };
+    terminal.message(Tone::Warning, "Unknown outcome", "The call may already have taken effect. Check the actual workspace or external system before recording a result. Aegis will not re-run it here.")?;
+    terminal.message(
+        Tone::Quiet,
+        &operation.capability,
+        &crate::terminal::fit(&operation.arguments.to_string(), 2000),
+    )?;
+    let choices = [
+        "I verified the operation succeeded",
+        "I verified the operation failed",
+        "Leave unresolved",
+    ]
+    .map(str::to_owned);
+    let Some(outcome) = terminal.select("Record an externally verified outcome", &choices)? else {
+        return Ok(());
+    };
+    if outcome > 1 {
+        return Ok(());
+    }
+    let Some(note) = field(
+        terminal,
+        "  Verification note or receipt (no credentials) › ",
+        false,
+    )?
+    else {
+        return Ok(());
+    };
+    if note.trim().is_empty() {
+        terminal.message(
+            Tone::Warning,
+            "!",
+            "A verification note is required; nothing changed.",
+        )?;
+        return Ok(());
+    }
+    store.resolve_unknown(id, &operation.id, outcome == 0, &note)?;
+    terminal.message(
+        Tone::Success,
+        "Recorded",
+        "Verification saved durably. No operation was repeated.",
+    )
+}
+
+fn artifacts(root: &Path, id: &str, terminal: &Terminal) -> Result<()> {
+    let store = Store::open(root)?;
+    let artifacts = store.evidence_artifacts(id)?;
+    if artifacts.is_empty() {
+        return terminal.message(Tone::Quiet, "Artifacts", "No successful tool evidence yet.");
+    }
+    let mut choices: Vec<_> = artifacts
+        .iter()
+        .map(|(label, hash)| format!("{label} · {}", &hash[..12]))
+        .collect();
+    choices.push("Back".into());
+    let Some(index) = terminal.select("Stored evidence", &choices)? else {
+        return Ok(());
+    };
+    let Some((label, hash)) = artifacts.get(index) else {
+        return Ok(());
+    };
+    let Some(query) = field(terminal, "  Find text (Enter for preview) › ", false)? else {
+        return Ok(());
+    };
+    terminal.message(
+        Tone::Quiet,
+        label,
+        &kernel::inspect(&store.artifact(hash)?, &query),
+    )
+}
+
+fn context_view(root: &Path, id: &str, terminal: &Terminal) -> Result<()> {
+    let store = Store::open(root)?;
+    let run = store.run(id)?;
+    terminal.message(Tone::Accent, "Task", &run.task)?;
+    terminal.message(
+        Tone::Quiet,
+        "Context",
+        &format!(
+            "{} · {} · {} tokens · {} active capabilities · {} evidence artifacts",
+            name(&run.provider),
+            run.state,
+            store.model_tokens(id)?,
+            store.active_capabilities(id)?.len(),
+            store.evidence_artifacts(id)?.len()
+        ),
+    )?;
+    terminal.message(Tone::Quiet, "Acceptance", &run.acceptance)?;
+    if let Some(checkpoint) = store.last_checkpoint(id)? {
+        terminal.message(Tone::Accent, "Next action", &checkpoint.next_action)?;
+        for decision in checkpoint.decisions {
+            terminal.message(Tone::Quiet, "Decision", &decision)?;
+        }
+        for unresolved in checkpoint.unresolved {
+            terminal.message(Tone::Warning, "Unresolved", &unresolved)?;
+        }
+    }
+    Ok(())
+}
+
+fn tools_view(root: &Path, id: &str, terminal: &Terminal) -> Result<()> {
+    let store = Store::open(root)?;
+    let active = store.active_capabilities(id)?;
+    if active.is_empty() {
+        terminal.message(
+            Tone::Quiet,
+            "Tools",
+            "No capabilities activated yet. Discovery happens automatically when a task needs it.",
+        )?;
+    }
+    for (capability, version) in active {
+        terminal.message(Tone::Accent, &capability, &format!("version {version}"))?;
+    }
+    Ok(())
 }
 
 fn sessions(
@@ -326,7 +489,7 @@ fn sessions(
         terminal.message(Tone::Quiet, "Sessions", "No tasks yet.")?;
         return Ok(());
     }
-    let selected: Vec<_> = runs.iter().take(8).collect();
+    let selected: Vec<_> = runs.iter().take(100).collect();
     let mut choices: Vec<_> = selected
         .iter()
         .map(|run| {
@@ -351,6 +514,10 @@ fn sessions(
         "Cancel task",
         "View milestones",
         "View trace",
+        "View context and handoff",
+        "View active tools",
+        "Inspect evidence artifacts",
+        "Review interrupted operations",
         "Back",
     ]
     .map(str::to_owned);
@@ -379,6 +546,10 @@ fn sessions(
             }
         }
         Some(4) => trace::display(run, &store.events(&run.id)?),
+        Some(5) => context_view(root, &run.id, terminal)?,
+        Some(6) => tools_view(root, &run.id, terminal)?,
+        Some(7) => artifacts(root, &run.id, terminal)?,
+        Some(8) => review_operations(root, &run.id, terminal)?,
         _ => {}
     }
     Ok(())
@@ -475,6 +646,32 @@ pub fn interactive(root: &Path) -> Result<()> {
         name(&profile.provider),
         &std::env::current_dir()?.display().to_string(),
     )?;
+    if terminal.interactive {
+        if let Some(id) = &profile.previous_run {
+            let store = Store::open(root)?;
+            if let Ok(run) = store.run(id) {
+                if !matches!(run.state.as_str(), "completed" | "cancelled" | "failed") {
+                    let choices = [
+                        "Continue my last task",
+                        "Start a new task",
+                        "Open saved tasks",
+                    ]
+                    .map(str::to_owned);
+                    terminal.message(Tone::Quiet, "Last task", &run.task)?;
+                    match terminal.select("Welcome back", &choices)? {
+                        Some(0) => resume(
+                            root,
+                            id,
+                            &mut terminal,
+                            secret_reference(&profile).zip(secret.as_deref()),
+                        )?,
+                        Some(2) => sessions(root, &mut terminal, &profile, secret.as_deref())?,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
     let mut history: Vec<_> = Store::open(root)?
         .runs()?
         .iter()
@@ -526,6 +723,17 @@ pub fn interactive(root: &Path) -> Result<()> {
                     }
                     "/new" => { new_conversation(root, &terminal, &mut profile)?; history.clear(); }
                     "/sessions" | "/status" => sessions(root, &mut terminal, &profile, secret.as_deref())?,
+                    "/context" | "/tools" | "/artifacts" | "/trace" | "/tasks" => {
+                        if let Some(id) = &profile.previous_run {
+                            match request {
+                                "/context" => context_view(root, id, &terminal)?,
+                                "/tools" => tools_view(root, id, &terminal)?,
+                                "/artifacts" => artifacts(root, id, &terminal)?,
+                                "/trace" => { let store = Store::open(root)?; trace::display(&store.run(id)?, &store.events(id)?); },
+                                _ => { for milestone in Store::open(root)?.milestones(id)? { terminal.message(Tone::Quiet, &milestone.state, &milestone.title)?; } }
+                            }
+                        } else { terminal.message(Tone::Quiet, "", "No current task. Describe one to get started.")?; }
+                    }
                     "/exit" | "/quit" => break,
                     "/help" => terminal.message(Tone::Quiet, "Help", "Write a task in plain language. F2 changes provider, F3 opens tasks, F4 signs in, F5 starts a fresh conversation. Ctrl+C stops an active task; Ctrl+D detaches. Up recalls previous tasks.")?,
                     _ => {

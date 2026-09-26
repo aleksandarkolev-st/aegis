@@ -113,7 +113,7 @@ fn context(store: &Store, run: &Run) -> Result<String> {
     ))
 }
 
-fn inspect(bytes: &[u8], query: &str) -> String {
+pub(crate) fn inspect(bytes: &[u8], query: &str) -> String {
     let raw = String::from_utf8_lossy(bytes);
     let text = serde_json::from_slice::<Value>(bytes)
         .ok()

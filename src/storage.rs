@@ -681,8 +681,8 @@ impl Store {
         Ok(())
     }
 
-    pub fn unresolved(&self, run_id: &str) -> Result<Vec<Operation>> {
-        let mut statement = self.connection.prepare("SELECT id, capability, capability_version, arguments, idempotency_key, retry_safe, state, artifact FROM operations WHERE run_id = ?1 AND state IN ('pending', 'dispatched') ORDER BY rowid")?;
+    pub fn operations(&self, run_id: &str) -> Result<Vec<Operation>> {
+        let mut statement = self.connection.prepare("SELECT id, capability, capability_version, arguments, idempotency_key, retry_safe, state, artifact FROM operations WHERE run_id = ?1 ORDER BY rowid")?;
         let rows = statement.query_map([run_id], |row| {
             let arguments: String = row.get(3)?;
             Ok(Operation {
@@ -715,6 +715,23 @@ impl Store {
         )?)
     }
 
+    pub fn unresolved(&self, run_id: &str) -> Result<Vec<Operation>> {
+        Ok(self
+            .operations(run_id)?
+            .into_iter()
+            .filter(|operation| matches!(operation.state.as_str(), "pending" | "dispatched"))
+            .collect())
+    }
+
+    pub fn evidence_artifacts(&self, run_id: &str) -> Result<Vec<(String, String)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT capability, artifact FROM operations WHERE run_id = ?1 AND state = 'succeeded' AND artifact IS NOT NULL UNION SELECT operation.capability || ' ' || linked.kind, linked.hash FROM operations AS operation JOIN operation_artifacts AS linked ON linked.operation_id = operation.id WHERE operation.run_id = ?1 AND operation.state = 'succeeded' ORDER BY 1, 2"
+        )?;
+        let rows = statement.query_map([run_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn resolve_unknown(
         &mut self,
         run_id: &str,
@@ -736,7 +753,12 @@ impl Store {
             Some(&artifact),
             json!({"reconciled_by": "user", "note_artifact": artifact}),
         )?;
-        if self.unknown_count(run_id)? == 0 {
+        if self.unknown_count(run_id)? == 0
+            && !matches!(
+                self.run(run_id)?.state.as_str(),
+                "completed" | "cancelled" | "failed"
+            )
+        {
             self.state(run_id, "ready", json!({"reconciled": operation_id}))?;
         }
         Ok(())
