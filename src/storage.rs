@@ -69,9 +69,35 @@ fn append_event(
     kind: &str,
     payload: Value,
 ) -> Result<()> {
+    let timestamp = now();
     transaction.execute(
-        "INSERT INTO events(run_id, seq, kind, payload, created_at) VALUES (?1, (SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE run_id = ?1), ?2, ?3, ?4)",
-        params![run_id, kind, payload.to_string(), now()],
+        "INSERT OR IGNORE INTO run_projection(run_id) VALUES (?1)",
+        [run_id],
+    )?;
+    transaction.execute(
+        "INSERT INTO events(run_id, seq, kind, payload, created_at) VALUES (?1, (SELECT last_seq + 1 FROM run_projection WHERE run_id = ?1), ?2, ?3, ?4)",
+        params![run_id, kind, payload.to_string(), timestamp],
+    )?;
+    let tokens = if kind == "model.response" {
+        payload["usage"]["input_tokens"]
+            .as_u64()
+            .unwrap_or(0)
+            .saturating_add(payload["usage"]["output_tokens"].as_u64().unwrap_or(0))
+            .min(i64::MAX as u64) as i64
+    } else {
+        0
+    };
+    transaction.execute("UPDATE run_projection SET last_seq = last_seq + 1,
+        model_tokens = MIN(9223372036854775807, model_tokens + ?2),
+        started_at = CASE WHEN ?3 = 'run.running' THEN COALESCE(started_at, ?4) ELSE started_at END,
+        checkpoint = CASE WHEN ?3 = 'checkpoint.created' THEN ?5 ELSE checkpoint END,
+        proposal = CASE WHEN ?3 = 'completion.proposed' THEN ?5 WHEN ?3 = 'completion.resolved' THEN NULL ELSE proposal END,
+        summary = CASE WHEN ?3 = 'run.completed' THEN ?6 ELSE summary END WHERE run_id = ?1",
+        params![run_id, tokens, kind, timestamp, payload["artifact"].as_str(), payload["summary"].as_str().map(|summary| summary.chars().take(4000).collect::<String>())])?;
+    transaction.execute(
+        "INSERT INTO event_counts(run_id, kind, count) VALUES (?1, ?2, 1)
+        ON CONFLICT(run_id, kind) DO UPDATE SET count = count + 1",
+        params![run_id, kind],
     )?;
     Ok(())
 }
@@ -161,6 +187,31 @@ impl Store {
                 )?;
             }
             connection.execute_batch("PRAGMA user_version=3")?;
+        }
+        if schema_version < 4 {
+            connection.execute_batch("BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS run_projection (
+                    run_id TEXT PRIMARY KEY REFERENCES runs(id), last_seq INTEGER NOT NULL DEFAULT 0,
+                    model_tokens INTEGER NOT NULL DEFAULT 0, started_at INTEGER, checkpoint TEXT,
+                    proposal TEXT, summary TEXT
+                );
+                CREATE TABLE IF NOT EXISTS event_counts (
+                    run_id TEXT NOT NULL REFERENCES runs(id), kind TEXT NOT NULL, count INTEGER NOT NULL,
+                    PRIMARY KEY(run_id, kind)
+                );
+                INSERT OR IGNORE INTO run_projection(run_id, last_seq, model_tokens, started_at, checkpoint, proposal, summary)
+                SELECT id,
+                    COALESCE((SELECT MAX(seq) FROM events WHERE run_id = runs.id), 0),
+                    COALESCE((SELECT SUM(COALESCE(json_extract(payload, '$.usage.input_tokens'), 0) + COALESCE(json_extract(payload, '$.usage.output_tokens'), 0)) FROM events WHERE run_id = runs.id AND kind = 'model.response'), 0),
+                    (SELECT MIN(created_at) FROM events WHERE run_id = runs.id AND kind = 'run.running'),
+                    (SELECT json_extract(payload, '$.artifact') FROM events WHERE run_id = runs.id AND kind = 'checkpoint.created' ORDER BY seq DESC LIMIT 1),
+                    (SELECT json_extract(payload, '$.artifact') FROM events WHERE run_id = runs.id AND kind = 'completion.proposed' AND seq > COALESCE((SELECT MAX(seq) FROM events WHERE run_id = runs.id AND kind = 'completion.resolved'), 0) ORDER BY seq DESC LIMIT 1),
+                    (SELECT substr(json_extract(payload, '$.summary'), 1, 4000) FROM events WHERE run_id = runs.id AND kind = 'run.completed' ORDER BY seq DESC LIMIT 1)
+                FROM runs;
+                INSERT OR IGNORE INTO event_counts SELECT run_id, kind, COUNT(*) FROM events GROUP BY run_id, kind;
+                CREATE INDEX IF NOT EXISTS operations_run_state ON operations(run_id, state);
+                PRAGMA user_version=4;
+                COMMIT;")?;
         }
         Ok(Self {
             connection,
@@ -316,7 +367,7 @@ impl Store {
 
     pub fn event_count(&self, run_id: &str, kind: &str) -> Result<i64> {
         Ok(self.connection.query_row(
-            "SELECT COUNT(*) FROM events WHERE run_id = ?1 AND kind = ?2",
+            "SELECT COALESCE((SELECT count FROM event_counts WHERE run_id = ?1 AND kind = ?2), 0)",
             params![run_id, kind],
             |row| row.get(0),
         )?)
@@ -324,26 +375,31 @@ impl Store {
 
     pub fn model_tokens(&self, run_id: &str) -> Result<u64> {
         let total: i64 = self.connection.query_row(
-            "SELECT COALESCE(SUM(COALESCE(json_extract(payload, '$.usage.input_tokens'), 0) + COALESCE(json_extract(payload, '$.usage.output_tokens'), 0)), 0) FROM events WHERE run_id = ?1 AND kind = 'model.response'",
-            [run_id], |row| row.get(0)
+            "SELECT COALESCE((SELECT model_tokens FROM run_projection WHERE run_id = ?1), 0)",
+            [run_id],
+            |row| row.get(0),
         )?;
         Ok(total.max(0) as u64)
     }
 
     pub fn run_started_at(&self, run_id: &str) -> Result<Option<i64>> {
         Ok(self.connection.query_row(
-            "SELECT MIN(created_at) FROM events WHERE run_id = ?1 AND kind = 'run.running'",
+            "SELECT started_at FROM run_projection WHERE run_id = ?1",
             [run_id],
             |row| row.get(0),
         )?)
     }
 
     pub fn run_summary(&self, run_id: &str) -> Result<Option<String>> {
-        Ok(self.connection.query_row(
-            "SELECT substr(json_extract(payload, '$.summary'), 1, 4000) FROM events WHERE run_id = ?1 AND kind = 'run.completed' ORDER BY seq DESC LIMIT 1",
-            [run_id],
-            |row| row.get(0),
-        ).optional()?)
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT summary FROM run_projection WHERE run_id = ?1",
+                [run_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     pub fn activate(&mut self, run_id: &str, capability: &str, version: u32) -> Result<()> {
@@ -489,10 +545,15 @@ impl Store {
     }
 
     pub fn last_checkpoint(&self, run_id: &str) -> Result<Option<Handoff>> {
-        let hash: Option<String> = self.connection.query_row(
-            "SELECT json_extract(payload, '$.artifact') FROM events WHERE run_id = ?1 AND kind = 'checkpoint.created' ORDER BY seq DESC LIMIT 1",
-            [run_id], |row| row.get(0)
-        ).optional()?;
+        let hash: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT checkpoint FROM run_projection WHERE run_id = ?1",
+                [run_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
         hash.map(|hash| serde_json::from_slice(&self.artifact(&hash)?).map_err(Into::into))
             .transpose()
     }
@@ -574,10 +635,15 @@ impl Store {
     }
 
     pub fn completion_proposal(&self, run_id: &str) -> Result<Option<String>> {
-        Ok(self.connection.query_row(
-            "SELECT json_extract(payload, '$.artifact') FROM events WHERE run_id = ?1 AND kind = 'completion.proposed' AND seq > COALESCE((SELECT MAX(seq) FROM events WHERE run_id = ?1 AND kind = 'completion.resolved'), 0) ORDER BY seq DESC LIMIT 1",
-            [run_id], |row| row.get(0),
-        ).optional()?)
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT proposal FROM run_projection WHERE run_id = ?1",
+                [run_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     pub fn complete_run(&mut self, run_id: &str, summary: &str, evidence: &[String]) -> Result<()> {
@@ -759,7 +825,16 @@ impl Store {
     }
 
     pub fn operations(&self, run_id: &str) -> Result<Vec<Operation>> {
-        let mut statement = self.connection.prepare("SELECT id, capability, capability_version, arguments, idempotency_key, retry_safe, state, artifact FROM operations WHERE run_id = ?1 ORDER BY rowid")?;
+        self.selected_operations(run_id, false)
+    }
+
+    fn selected_operations(&self, run_id: &str, unresolved: bool) -> Result<Vec<Operation>> {
+        let query = if unresolved {
+            "SELECT id, capability, capability_version, arguments, idempotency_key, retry_safe, state, artifact FROM operations WHERE run_id = ?1 AND state IN ('pending', 'dispatched', 'executing') ORDER BY rowid"
+        } else {
+            "SELECT id, capability, capability_version, arguments, idempotency_key, retry_safe, state, artifact FROM operations WHERE run_id = ?1 ORDER BY rowid"
+        };
+        let mut statement = self.connection.prepare(query)?;
         let rows = statement.query_map([run_id], |row| {
             let arguments: String = row.get(3)?;
             Ok(Operation {
@@ -793,16 +868,7 @@ impl Store {
     }
 
     pub fn unresolved(&self, run_id: &str) -> Result<Vec<Operation>> {
-        Ok(self
-            .operations(run_id)?
-            .into_iter()
-            .filter(|operation| {
-                matches!(
-                    operation.state.as_str(),
-                    "pending" | "dispatched" | "executing"
-                )
-            })
-            .collect())
+        self.selected_operations(run_id, true)
     }
 
     pub fn evidence_artifacts(&self, run_id: &str) -> Result<Vec<(String, String)>> {
@@ -949,6 +1015,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn projection_migration_preserves_history_and_updates_atomically() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "history",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        store.event(
+            &run.id,
+            "model.response",
+            json!({"usage":{"input_tokens":123,"output_tokens":7}}),
+        )?;
+        let proposal = store.put_artifact(b"proposal")?;
+        store.event(&run.id, "completion.proposed", json!({"artifact":proposal}))?;
+        let original = store.events(&run.id)?;
+        store.connection.execute_batch(
+            "DROP TABLE run_projection; DROP TABLE event_counts; PRAGMA user_version=3;",
+        )?;
+        drop(store);
+        let mut store = Store::open(directory.path())?;
+        assert_eq!(store.model_tokens(&run.id)?, 130);
+        assert_eq!(store.event_count(&run.id, "model.response")?, 1);
+        assert_eq!(store.completion_proposal(&run.id)?, Some(proposal));
+        assert_eq!(store.run_started_at(&run.id)?, Some(original[1].created_at));
+        {
+            let transaction = store
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            append_event(
+                &transaction,
+                &run.id,
+                "model.response",
+                json!({"usage":{"input_tokens":999}}),
+            )?;
+        }
+        assert_eq!(store.model_tokens(&run.id)?, 130);
+        assert_eq!(store.event_count(&run.id, "model.response")?, 1);
+        store.event(&run.id, "completion.resolved", json!({}))?;
+        assert_eq!(store.completion_proposal(&run.id)?, None);
+        assert_eq!(
+            store.events(&run.id)?.last().unwrap().seq,
+            original.len() as i64 + 1
+        );
+        Ok(())
+    }
+
+    #[test]
     fn execution_clock_starts_at_first_running_event() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let mut store = Store::open(directory.path())?;
@@ -964,6 +1082,10 @@ mod tests {
         store.state(&run.id, "running", json!({}))?;
         store.connection.execute(
             "UPDATE events SET created_at = 100 WHERE run_id = ?1 AND kind = 'run.running'",
+            [&run.id],
+        )?;
+        store.connection.execute(
+            "UPDATE run_projection SET started_at = 100 WHERE run_id = ?1",
             [&run.id],
         )?;
         store.state(&run.id, "waiting_recovery", json!({}))?;
