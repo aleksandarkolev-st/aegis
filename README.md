@@ -129,6 +129,8 @@ MCP annotations and descriptions do not grant permissions or retry safety. Untru
 
 Explicitly trusted local servers can opt out with `arun mcp add fixture --trusted-host -- node tests/fixtures/mcp.mjs`. This executes host code and is not a sandbox. Existing registrations without a stored policy must be registered again; they do not silently inherit trust. The benchmark's bundled fixture explicitly uses this trusted-host path. Isolated MCP currently rejects Git worktrees using a `.git` metadata file rather than exposing that file.
 
+The MCP transport caps each input line at 32 MiB, registry data at 16 MiB/8,192 tools/100 pages, and rejects repeated pagination cursors. Server stderr is not displayed in the terminal. These bounds protect the host-side protocol reader in addition to the server container's resource limits.
+
 ## Validation
 
 ```powershell

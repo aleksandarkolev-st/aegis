@@ -1,16 +1,112 @@
 use std::path::Path;
+use std::pin::Pin;
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use rmcp::{
     ServiceExt,
-    model::CallToolRequestParams,
-    transport::{ConfigureCommandExt, TokioChildProcess},
+    model::{CallToolRequestParams, PaginatedRequestParams},
+    transport::ConfigureCommandExt,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio::process::Command;
+
+struct BoundedRead<Reader> {
+    inner: Reader,
+    line_bytes: usize,
+}
+
+impl<Reader: AsyncRead + Unpin> AsyncRead for BoundedRead<Reader> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let state = self.get_mut();
+        let mut bytes = [0; 8192];
+        let length = output.remaining().min(bytes.len());
+        let mut buffer = ReadBuf::new(&mut bytes[..length]);
+        match Pin::new(&mut state.inner).poll_read(context, &mut buffer) {
+            Poll::Ready(Ok(())) => {
+                for byte in buffer.filled() {
+                    if *byte == b'\n' {
+                        state.line_bytes = 0;
+                    } else {
+                        state.line_bytes += 1;
+                        if state.line_bytes > 32 * 1024 * 1024 {
+                            return Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "MCP message exceeds 32 MiB",
+                            )));
+                        }
+                    }
+                }
+                output.put_slice(buffer.filled());
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
+fn transport(
+    mut command: Command,
+) -> Result<(
+    tokio::process::Child,
+    (
+        BoundedRead<tokio::process::ChildStdout>,
+        tokio::process::ChildStdin,
+    ),
+)> {
+    let mut child = command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let output = child.stdout.take().context("MCP stdout missing")?;
+    let input = child.stdin.take().context("MCP stdin missing")?;
+    Ok((
+        child,
+        (
+            BoundedRead {
+                inner: output,
+                line_bytes: 0,
+            },
+            input,
+        ),
+    ))
+}
+
+async fn tools(peer: &rmcp::service::Peer<rmcp::RoleClient>) -> Result<Vec<rmcp::model::Tool>> {
+    let mut tools = Vec::new();
+    let mut cursor = None;
+    let mut cursors = std::collections::BTreeSet::new();
+    let mut bytes = 0;
+    for _ in 0..100 {
+        let page = peer
+            .list_tools(Some(PaginatedRequestParams::default().with_cursor(cursor)))
+            .await?;
+        bytes += serde_json::to_vec(&page)?.len();
+        if bytes > 16 * 1024 * 1024 || tools.len() + page.tools.len() > 8192 {
+            bail!("MCP registry exceeds limits");
+        }
+        tools.extend(page.tools);
+        cursor = page.next_cursor;
+        match &cursor {
+            None => return Ok(tools),
+            Some(cursor) if !cursors.insert(cursor.clone()) => {
+                bail!("MCP pagination cursor repeated")
+            }
+            _ => {}
+        }
+    }
+    bail!("MCP pagination exceeds 100 pages")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Server {
@@ -182,8 +278,9 @@ pub fn discover(server: &Server, workspace: &Path) -> Result<Vec<Tool>> {
     }
     runtime()?.block_on(async {
         tokio::time::timeout(Duration::from_secs(20), async {
-            let client = ().serve(TokioChildProcess::new(command)?).await?;
-            let tools = client.list_all_tools().await?;
+            let (mut child, transport) = transport(command)?;
+            let client = ().serve(transport).await?;
+            let tools = tools(client.peer()).await?;
             let result = tools
                 .into_iter()
                 .map(|tool| {
@@ -215,6 +312,7 @@ pub fn discover(server: &Server, workspace: &Path) -> Result<Vec<Tool>> {
                 })
                 .collect();
             client.cancel().await?;
+            let _ = child.kill().await;
             Ok(result)
         })
         .await
@@ -225,6 +323,38 @@ pub fn discover(server: &Server, workspace: &Path) -> Result<Vec<Tool>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_reader_rejects_overflow_before_forwarding_bytes() -> Result<()> {
+        use tokio::io::AsyncReadExt;
+        runtime()?.block_on(async {
+            let mut reader = BoundedRead {
+                inner: std::io::Cursor::new(b"abc"),
+                line_bytes: 32 * 1024 * 1024 - 1,
+            };
+            let mut output = [0; 16];
+            let error = reader.read(&mut output).await.unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(output, [0; 16]);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn message_reader_resets_its_limit_at_each_newline() -> Result<()> {
+        use tokio::io::AsyncReadExt;
+        runtime()?.block_on(async {
+            let mut reader = BoundedRead {
+                inner: std::io::Cursor::new(b"a\nb\n"),
+                line_bytes: 32 * 1024 * 1024 - 1,
+            };
+            let mut output = Vec::new();
+            reader.read_to_end(&mut output).await?;
+            assert_eq!(output, b"a\nb\n");
+            assert_eq!(reader.line_bytes, 0);
+            Ok(())
+        })
+    }
 
     #[test]
     fn host_execution_is_not_implicitly_trusted() {
@@ -306,8 +436,9 @@ pub(crate) fn call_with_access(
         .clone();
     runtime()?.block_on(async {
         tokio::time::timeout(Duration::from_secs(30), async {
-            let client = ().serve(TokioChildProcess::new(command)?).await?;
-            let tools = client.list_all_tools().await?;
+            let (mut child, transport) = transport(command)?;
+            let client = ().serve(transport).await?;
+            let tools = tools(client.peer()).await?;
             if !tools.iter().any(|tool| tool.name == name) {
                 bail!("MCP server does not expose this tool");
             }
@@ -315,6 +446,7 @@ pub(crate) fn call_with_access(
                 .call_tool(CallToolRequestParams::new(name.to_owned()).with_arguments(arguments))
                 .await?;
             client.cancel().await?;
+            let _ = child.kill().await;
             serde_json::to_value(result).map_err(Into::into)
         })
         .await
