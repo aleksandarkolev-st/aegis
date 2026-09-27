@@ -26,6 +26,15 @@ pub struct Run {
     pub created_at: i64,
 }
 
+impl Run {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.state.as_str(),
+            "completed" | "answered" | "cancelled" | "failed"
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectMemory {
     pub id: String,
@@ -129,7 +138,7 @@ pub(crate) fn append_event(
         started_at = CASE WHEN ?3 = 'run.running' THEN COALESCE(started_at, ?4) ELSE started_at END,
         checkpoint = CASE WHEN ?3 = 'checkpoint.created' THEN ?5 ELSE checkpoint END,
         proposal = CASE WHEN ?3 = 'completion.proposed' THEN ?5 WHEN ?3 = 'completion.resolved' THEN NULL ELSE proposal END,
-        summary = CASE WHEN ?3 = 'run.completed' THEN ?6 ELSE summary END WHERE run_id = ?1",
+        summary = CASE WHEN ?3 IN ('run.completed', 'run.answered') THEN ?6 ELSE summary END WHERE run_id = ?1",
         params![run_id, tokens, kind, timestamp, payload["artifact"].as_str(), payload["summary"].as_str().map(|summary| summary.chars().take(4000).collect::<String>())])?;
     transaction.execute(
         "INSERT INTO event_counts(run_id, kind, count) VALUES (?1, ?2, 1)
@@ -271,7 +280,7 @@ impl Store {
                     (SELECT MIN(created_at) FROM events WHERE run_id = runs.id AND kind = 'run.running'),
                     (SELECT json_extract(payload, '$.artifact') FROM events WHERE run_id = runs.id AND kind = 'checkpoint.created' ORDER BY seq DESC LIMIT 1),
                     (SELECT json_extract(payload, '$.artifact') FROM events WHERE run_id = runs.id AND kind = 'completion.proposed' AND seq > COALESCE((SELECT MAX(seq) FROM events WHERE run_id = runs.id AND kind = 'completion.resolved'), 0) ORDER BY seq DESC LIMIT 1),
-                    (SELECT substr(json_extract(payload, '$.summary'), 1, 4000) FROM events WHERE run_id = runs.id AND kind = 'run.completed' ORDER BY seq DESC LIMIT 1)
+                    (SELECT substr(json_extract(payload, '$.summary'), 1, 4000) FROM events WHERE run_id = runs.id AND kind IN ('run.completed', 'run.answered') ORDER BY seq DESC LIMIT 1)
                 FROM runs;
                 INSERT OR IGNORE INTO event_counts SELECT run_id, kind, COUNT(*) FROM events GROUP BY run_id, kind;
                 CREATE INDEX IF NOT EXISTS operations_run_state ON operations(run_id, state);
@@ -883,6 +892,47 @@ impl Store {
         Ok(())
     }
 
+    pub fn answer_run(&mut self, run_id: &str, summary: &str) -> Result<()> {
+        if summary.trim().is_empty() || summary.len() > 64 * 1024 {
+            bail!("a conversational reply must contain 1..65536 bytes");
+        }
+        let run = self.run(run_id)?;
+        if crate::acceptance::Check::from_run(&run)?.is_some() {
+            bail!("a reply cannot replace the configured acceptance check");
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state: String =
+            transaction.query_row("SELECT state FROM runs WHERE id = ?1", [run_id], |row| {
+                row.get(0)
+            })?;
+        let operations: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM operations WHERE run_id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        let planned: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM milestones WHERE run_id = ?1 AND title != 'Task request'",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if state != "running" || operations != 0 || planned != 0 {
+            bail!(
+                "a conversational reply cannot replace started or planned tool work; finish with evidence instead"
+            );
+        }
+        transaction.execute("UPDATE runs SET state = 'answered' WHERE id = ?1", [run_id])?;
+        append_event(
+            &transaction,
+            run_id,
+            "run.answered",
+            json!({"summary":summary,"verified":false}),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn completion_proposal(&self, run_id: &str) -> Result<Option<String>> {
         Ok(self
             .connection
@@ -964,7 +1014,10 @@ impl Store {
             transaction.query_row("SELECT state FROM runs WHERE id = ?1", [run_id], |row| {
                 row.get(0)
             })?;
-        if matches!(previous.as_str(), "completed" | "cancelled" | "failed") {
+        if matches!(
+            previous.as_str(),
+            "completed" | "answered" | "cancelled" | "failed"
+        ) {
             bail!("terminal run cannot change state");
         }
         transaction.execute(
@@ -1153,12 +1206,7 @@ impl Store {
             Some(&artifact),
             json!({"reconciled_by": "user", "note_artifact": artifact}),
         )?;
-        if self.unknown_count(run_id)? == 0
-            && !matches!(
-                self.run(run_id)?.state.as_str(),
-                "completed" | "cancelled" | "failed"
-            )
-        {
+        if self.unknown_count(run_id)? == 0 && !self.run(run_id)?.is_terminal() {
             self.state(run_id, "ready", json!({"reconciled": operation_id}))?;
         }
         Ok(())

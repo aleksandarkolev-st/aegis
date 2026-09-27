@@ -536,9 +536,7 @@ fn execute() -> Result<()> {
             let id = required(1)?;
             let mut store = Store::open(&root)?;
             let run = store.run(id)?;
-            if matches!(run.state.as_str(), "completed" | "cancelled" | "failed")
-                || store.unknown_count(id)? > 0
-            {
+            if run.is_terminal() || store.unknown_count(id)? > 0 {
                 bail!("run cannot resume until unknown operations are reconciled");
             }
             if run.state == "waiting_recovery" {

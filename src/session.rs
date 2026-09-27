@@ -879,10 +879,7 @@ fn cancel_task(root: &Path, id: Option<&str>, terminal: &Terminal) -> Result<()>
         return terminal.message(Tone::Quiet, "Cancel", "No current task yet.");
     };
     let mut store = Store::open(root)?;
-    if matches!(
-        store.run(id)?.state.as_str(),
-        "completed" | "cancelled" | "failed"
-    ) {
+    if store.run(id)?.is_terminal() {
         return terminal.message(Tone::Quiet, "Cancel", "This task has already ended.");
     }
     terminal.message(Tone::Warning, "Cancel whole task?", "The worker/model will stop. Completed edits are not undone; uncertain effects still require reconciliation.")?;
@@ -1194,7 +1191,7 @@ fn resume(
 ) -> Result<()> {
     let mut store = Store::open(root)?;
     let run = store.run(id)?;
-    if matches!(run.state.as_str(), "completed" | "cancelled" | "failed") {
+    if run.is_terminal() {
         terminal.message(
             Tone::Warning,
             "!",
@@ -1510,7 +1507,7 @@ fn sessions(
             };
             resume(root, &run.id, terminal, credentials)?;
         }
-        Some(2) if !matches!(run.state.as_str(), "completed" | "cancelled" | "failed") => {
+        Some(2) if !run.is_terminal() => {
             cancel_task(root, Some(&run.id), terminal)?;
         }
         Some(3) => {
@@ -1665,7 +1662,7 @@ pub fn interactive(root: &Path) -> Result<()> {
         if let Some(id) = &profile.previous_run {
             let store = Store::open(root)?;
             if let Ok(run) = store.run(id) {
-                if !matches!(run.state.as_str(), "completed" | "cancelled" | "failed") {
+                if !run.is_terminal() {
                     let choices = [
                         "Continue my last task",
                         "Start a new task",

@@ -92,8 +92,14 @@ impl Snapshot {
             | "run.waiting_recovery"
             | "run.failed"
             | "run.cancelled"
+            | "run.answered"
             | "run.completed" => {
                 self.state = event.kind.trim_start_matches("run.").into();
+                if event.kind == "run.answered" {
+                    self.summary = event.payload["summary"]
+                        .as_str()
+                        .map(|summary| summary.chars().take(4000).collect());
+                }
                 if event.kind == "run.completed" {
                     self.summary = event.payload["summary"]
                         .as_str()

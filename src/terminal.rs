@@ -868,6 +868,11 @@ impl Terminal {
                 let (tone, label, text) = result_summary(payload);
                 self.message(tone, label, &text)
             }
+            "run.answered" => self.message(
+                Tone::Accent,
+                "Aegis",
+                payload["summary"].as_str().unwrap_or_default(),
+            ),
             "run.completed" => {
                 let face = fit(&self.skin.frame(crate::ui::Phase::Ready, 0), 24);
                 let label = if face.is_empty() {
