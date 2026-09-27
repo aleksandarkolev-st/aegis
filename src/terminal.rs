@@ -212,11 +212,13 @@ impl Terminal {
     }
 
     pub fn with_skin(mut self, skin: impl crate::ui::Skin + 'static) -> Self {
+        self.activity_view.replace(None);
         self.skin = Box::new(skin);
         self
     }
 
     pub fn apply_ui(&mut self, options: crate::ui::UiOptions) -> Result<()> {
+        self.activity_view.replace(None);
         options.validate()?;
         if self.activity_rows.get() > 0 {
             self.clear_activity()?;
@@ -1045,6 +1047,23 @@ pub fn fit(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activity_cache_is_invalidated_after_clear_and_style_changes() -> Result<()> {
+        let mut terminal = Terminal::default();
+        terminal.interactive = false;
+        let view = (80, "thinking".to_owned(), Some("context".to_owned()));
+        terminal.activity_view.replace(Some(view.clone()));
+        terminal.clear_activity()?;
+        assert!(terminal.activity_view.borrow().is_none());
+        terminal.activity_view.replace(Some(view.clone()));
+        terminal.apply_ui(crate::ui::UiOptions::preset(1))?;
+        assert!(terminal.activity_view.borrow().is_none());
+        terminal.activity_view.replace(Some(view));
+        let terminal = terminal.with_skin(crate::ui::UiOptions::preset(2));
+        assert!(terminal.activity_view.borrow().is_none());
+        Ok(())
+    }
 
     #[test]
     fn message_wrapping_respects_label_space_wide_text_and_long_paths() {
