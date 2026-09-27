@@ -42,6 +42,7 @@ pub struct Terminal {
     animations: bool,
     activity_rows: std::cell::Cell<u16>,
     activity_view: std::cell::RefCell<Option<(usize, String, Option<String>)>>,
+    input_draft: std::cell::RefCell<Option<(String, Vec<char>, usize)>>,
     skin: Box<dyn crate::ui::Skin>,
 }
 
@@ -194,6 +195,7 @@ impl Default for Terminal {
             animations: interactive && std::env::var_os("AEGIS_REDUCED_MOTION").is_none(),
             activity_rows: std::cell::Cell::new(0),
             activity_view: std::cell::RefCell::new(None),
+            input_draft: std::cell::RefCell::new(None),
             skin: Box::new(crate::ui::UiOptions::default()),
         }
     }
@@ -471,6 +473,16 @@ impl Terminal {
         Ok(())
     }
 
+    fn take_input_draft(&self, label: &str, secret: bool) -> (Vec<char>, usize) {
+        let mut draft = self.input_draft.borrow_mut();
+        if !secret && draft.as_ref().is_some_and(|saved| saved.0 == label) {
+            let (_, text, caret) = draft.take().unwrap();
+            let caret = caret.min(text.len());
+            return (text, caret);
+        }
+        (Vec::new(), 0)
+    }
+
     pub fn input(&self, label: &str, secret: bool, history: &[String]) -> Result<Input> {
         if !self.interactive {
             print!("{label}");
@@ -482,8 +494,8 @@ impl Terminal {
             return Ok(Input::Submit(text.trim_end_matches(['\r', '\n']).into()));
         }
         let _raw = RawMode::enter(true)?;
-        let mut text: Vec<char> = Vec::new();
-        let mut caret = 0_usize;
+        let draft_label = label.to_owned();
+        let (mut text, mut caret) = self.take_input_draft(label, secret);
         let mut history_index = history.len();
         loop {
             let width = terminal::size()
@@ -530,6 +542,10 @@ impl Terminal {
                 }
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     let control = key.modifiers.contains(KeyModifiers::CONTROL);
+                    if !secret && matches!(key.code, KeyCode::F(1..=9)) {
+                        self.input_draft
+                            .replace(Some((draft_label.clone(), text.clone(), caret)));
+                    }
                     match key.code {
                         KeyCode::Enter => {
                             write!(io::stdout(), "\r\n")?;
@@ -1171,6 +1187,23 @@ mod tests {
             assert!(column <= 7);
         }
         assert_eq!(input_view(&['h', 'i'], 2, 20), ("hi".into(), 2));
+    }
+
+    #[test]
+    fn menu_drafts_restore_once_with_caret_and_never_enter_secret_or_other_fields() {
+        let terminal = Terminal::default();
+        let text: Vec<_> = "fix 🦊\nthen test".chars().collect();
+        terminal
+            .input_draft
+            .replace(Some(("task › ".into(), text.clone(), 5)));
+        assert_eq!(terminal.take_input_draft("task › ", true), (vec![], 0));
+        assert_eq!(terminal.take_input_draft("API key › ", false), (vec![], 0));
+        assert_eq!(terminal.take_input_draft("task › ", false), (text, 5));
+        assert_eq!(terminal.take_input_draft("task › ", false), (vec![], 0));
+        terminal
+            .input_draft
+            .replace(Some(("task › ".into(), vec!['🦊'], 99)));
+        assert_eq!(terminal.take_input_draft("task › ", false), (vec!['🦊'], 1));
     }
 
     #[test]

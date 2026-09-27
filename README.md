@@ -15,6 +15,8 @@ The scrollback interface has an animated activity line, elapsed time and token c
 - Ctrl+C once: interrupt the active operation. Press twice within 900 ms to interrupt the model turn. Ctrl+D detaches without stopping the task; cancel the entire task from its F3 menu.
 - Ctrl+D at an empty prompt: exit. Up/Down: recall task input.
 
+Opening a keyboard menu keeps your unfinished prompt and cursor position in this terminal session. Returning to the same prompt restores it, even after entering other settings fields. Drafts are not saved to disk or restored into secret-key fields.
+
 Set `NO_COLOR=1` to disable colors or `AEGIS_REDUCED_MOTION=1` to disable animation. Custom keys are held in session memory and passed to the model runner, not saved in the profile or forwarded to tool workers. The profile remembers only the key's environment-variable reference.
 
 Sensible budgets and evidence checks are enabled by default. Optional F7 **Task budgets** settings offer Standard (four hours, 200 model turns, 800,000 model tokens and ten-minute commands), Quick (one hour and one-minute commands), or custom limits up to 24 hours per task and two hours per command. Limits are saved in the profile and copied into immutable task contracts. Provider usage allowances still apply; these limits are not price estimates. Advanced runs can set `--process-seconds` separately from `--wall-seconds`. A command deadline is always clamped to the task's remaining time.

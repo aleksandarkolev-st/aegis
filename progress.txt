@@ -117,6 +117,7 @@ LATEST MANUAL UX CHECK
 - Both benchmark --run commands refused absent readiness review before API/model calls; raw refusal logs .arun/arc-readiness-refusal-20260927.log and .arun/coding-readiness-refusal-20260927.log. No attestation was invented.
 
 NEXT IMPLEMENTATION / VERIFICATION WORK
+- Menu usability follow-up preserves unfinished prompt text and Unicode cursor position in session memory across keyboard shortcuts, without injecting drafts into other settings or secret fields. Focused regression and installed verification are pending; this is not a completion claim.
 - Safe directory scaffolding and optional scoped HTTPS are implemented and functionally checked.
 - Refresh latest installed same-terminal UX and latest-source Windows/Linux checks. macOS remains pending actual platform execution.
 - ARC-AGI-3 adapter and record/scoring pipeline are implemented and fixture-verified, not live-certified. Continue the full readiness audit, including official service/data-use conditions before actual evaluation. Preserve authoritative scorecards and incomplete records; do not equate completion percentage or tokens with the official score. Anonymous credentials/cookies are private and excluded from shareable logs.
