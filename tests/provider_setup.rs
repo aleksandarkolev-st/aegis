@@ -14,6 +14,97 @@ fn node() -> Result<std::path::PathBuf> {
 }
 
 #[test]
+fn native_login_launchers_forward_input_and_reject_failure_without_creating_tasks() -> Result<()> {
+    let node = node()?;
+    for (provider, binary, expected) in [
+        ("chatgpt", "codex", vec!["login"]),
+        ("codex", "codex", vec!["login"]),
+        ("claude-code", "claude", vec!["auth", "login"]),
+        ("claude", "claude", vec!["auth", "login"]),
+        ("grok", "grok", vec!["login"]),
+    ] {
+        for managed in [false, true] {
+            for success in [false, true] {
+                let directory = tempfile::tempdir()?;
+                let providers = directory.path().join("managed");
+                let receipt = directory.path().join("login-receipt.json");
+                let fixture = directory.path().join("login.mjs");
+                fs::write(
+                    &fixture,
+                    r#"import { readFileSync, writeFileSync } from 'node:fs';
+writeFileSync(process.env.AEGIS_LOGIN_FIXTURE_RECEIPT, JSON.stringify({args:process.argv.slice(2), input:readFileSync(0,'utf8')}));
+console.log('NATIVE_LOGIN_FIXTURE_RETURNED');
+process.exit(Number(process.env.AEGIS_LOGIN_FIXTURE_EXIT));"#,
+                )?;
+                let bin = if managed {
+                    providers.join(binary).join("node_modules/.bin")
+                } else {
+                    directory.path().to_owned()
+                };
+                fs::create_dir_all(&bin)?;
+                let executable = bin.join(if cfg!(windows) {
+                    format!("{binary}.cmd")
+                } else {
+                    binary.to_owned()
+                });
+                let wrapper = if cfg!(windows) {
+                    format!("@\"{}\" \"{}\" %*\r\n", node.display(), fixture.display())
+                } else {
+                    format!(
+                        "#!/bin/sh\nexec \"{}\" \"{}\" \"$@\"\n",
+                        node.display(),
+                        fixture.display()
+                    )
+                };
+                fs::write(&executable, wrapper)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(executable, fs::Permissions::from_mode(0o755))?;
+                }
+                let mut child = Command::new(env!("CARGO_BIN_EXE_arun"))
+                    .args(["login", provider])
+                    .current_dir(directory.path())
+                    .env("PATH", directory.path())
+                    .env("AEGIS_PROVIDER_HOME", &providers)
+                    .env("AEGIS_LOGIN_FIXTURE_RECEIPT", &receipt)
+                    .env("AEGIS_LOGIN_FIXTURE_EXIT", if success { "0" } else { "7" })
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()?;
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(b"fixture input, not credentials\n")?;
+                let output = child.wait_with_output()?;
+                assert_eq!(output.status.success(), success);
+                let recorded: serde_json::Value = serde_json::from_slice(&fs::read(receipt)?)?;
+                assert_eq!(recorded["args"], serde_json::json!(expected));
+                assert_eq!(recorded["input"], "fixture input, not credentials\n");
+                assert!(
+                    String::from_utf8_lossy(&output.stdout)
+                        .contains("NATIVE_LOGIN_FIXTURE_RETURNED")
+                );
+                if !success {
+                    assert!(
+                        String::from_utf8_lossy(&output.stderr)
+                            .contains("provider login did not complete successfully")
+                    );
+                }
+                assert!(
+                    Store::open(&directory.path().join(".arun"))?
+                        .runs()?
+                        .is_empty()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn declining_setup_does_not_install_or_create_a_task() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let providers = directory.path().join("managed");
