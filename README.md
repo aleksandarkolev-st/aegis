@@ -51,7 +51,7 @@ Memory stays deliberately small: at most 16 notes, 512 UTF-8 bytes each, 4 KiB o
 
 ### Pinned project instructions
 
-For coding reads, Aegis can discover `workspace.read_batch`: up to eight selected file ranges in one read-only operation, with 3000 Unicode characters total. Requested ranges appear in the next decision context immediately, eliminating a separate inspection action for them. Larger reads still use bounded artifact inspection. This reduces avoidable action turns, not a claim that native-provider bootstrap cost is fixed or that all tasks use fewer tokens.
+For coding reads, complete `workspace.read` results of at most 1024 Unicode characters appear in the next decision context, with their artifact and available content digest. Larger files stay artifact-backed without an automatic prefix dump. `workspace.read_batch` selects up to eight file ranges in one read-only operation, with 3000 Unicode characters total; those ranges also enter context directly. Both avoid requiring a separate inspection action for already-visible text. This is bounded runtime behavior, not a guarantee that every model chooses fewer actions or every task costs fewer tokens.
 
 F7 → **Project instructions** adds, edits or removes explicit rules for this workspace, an exact relative file, or a `folder/**` subtree. No JSON file or model call is needed. The SQLite ledger keeps at most eight rules / 3 KiB, rejects oversized text instead of truncating it, and gives each edit a revision. New tasks freeze the complete ledger; recovery and checkpoints cannot rewrite it. Saved tasks show their original scoped revisions in Task details → Context.
 

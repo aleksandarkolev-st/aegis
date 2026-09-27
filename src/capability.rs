@@ -29,7 +29,7 @@ pub fn registry() -> Vec<Manifest> {
         Manifest {
             id: "workspace.read".into(),
             version: 1,
-            purpose: "Read a UTF-8 workspace file by relative path".into(),
+            purpose: "Read a UTF-8 workspace file; artifact-backed modes map complete files <=1024 characters directly".into(),
             permission: "workspace.read".into(),
             side_effect: "none".into(),
             cost: 1,
