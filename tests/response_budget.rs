@@ -1,61 +1,34 @@
-use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use arun::storage::Store;
+use serde_json::json;
+
+#[path = "support/http.rs"]
+mod http;
 
 #[test]
-fn native_capture_limits_stop_stdout_stderr_and_reply_before_parsing_actions() -> Result<()> {
-    let node = arun::provider::system_executable("node")
-        .context("Node is required for the provider capture fixture")?;
-    for channel in ["stdout", "stderr", "combined", "reply", "fast"] {
+fn direct_capture_limits_reject_oversized_actions_and_envelopes_before_execution() -> Result<()> {
+    for oversized_action in [false, true] {
         let directory = tempfile::tempdir()?;
-        let fixture = directory.path().join("oversized.cjs");
-        let script = match channel {
-            "stdout" | "fast" => "process.stdout.write('x'.repeat(2048));",
-            "stderr" => "process.stderr.write('x'.repeat(2048));",
-            "combined" => {
-                "process.stdout.write('x'.repeat(700)); process.stderr.write('x'.repeat(700));"
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = std::sync::Arc::clone(&requests);
+        let endpoint = http::Endpoint::start(move |body| {
+            assert_eq!(http::state(body)?["task"], "Capture fixture");
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let action = json!({"kind":"invoke","capability":"workspace.write",
+                "args":{"path":"should-not-exist.txt","text":if oversized_action { "x".repeat(2048) } else { "blocked".into() }}});
+            let mut response = json!({"choices":[{"message":{"content":action.to_string()}}],
+                "usage":{"prompt_tokens":10,"completion_tokens":2}});
+            if !oversized_action {
+                response["padding"] = json!("x".repeat(2048));
             }
-            _ => {
-                "const args = process.argv.slice(2); require('fs').writeFileSync(args[args.indexOf('-o')+1], 'x'.repeat(2048));"
-            }
-        };
-        fs::write(
-            &fixture,
-            if channel == "fast" {
-                script.to_owned()
-            } else {
-                format!("{script}\nsetInterval(() => {{}}, 1000);")
-            },
-        )?;
-        let provider = if channel == "reply" {
-            "codex"
-        } else {
-            "claude"
-        };
-        let wrapper = if cfg!(windows) {
-            format!("@\"{}\" \"{}\" %*\r\n", node.display(), fixture.display())
-        } else {
-            format!(
-                "#!/bin/sh\nexec \"{}\" \"{}\" \"$@\"\n",
-                node.display(),
-                fixture.display()
-            )
-        };
-        let cli = directory.path().join(format!(
-            "{provider}{}",
-            if cfg!(windows) { ".cmd" } else { "" }
-        ));
-        fs::write(&cli, wrapper)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(cli, fs::Permissions::from_mode(0o755))?;
-        }
+            assert!(response.to_string().len() > 1024);
+            Ok((200, response))
+        })?;
         let started = Instant::now();
         let output = Command::new(env!("CARGO_BIN_EXE_arun"))
             .current_dir(directory.path())
@@ -64,12 +37,18 @@ fn native_capture_limits_stop_stdout_stderr_and_reply_before_parsing_actions() -
                 "run",
                 "Capture fixture",
                 "--provider",
-                provider,
+                "custom",
+                "--endpoint",
+                &endpoint.url,
+                "--model",
+                "fixture-model",
                 "--model-response-bytes",
                 "1024",
                 "--foreground",
             ])
             .output()?;
+        endpoint.finish()?;
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(
             output.status.success(),
             "{}",
@@ -77,7 +56,7 @@ fn native_capture_limits_stop_stdout_stderr_and_reply_before_parsing_actions() -
         );
         assert!(
             started.elapsed() < Duration::from_secs(5),
-            "capture did not stop promptly: {channel}"
+            "capture did not stop promptly: oversized_action={oversized_action}"
         );
         let store = Store::open(&directory.path().join(".arun"))?;
         let run = &store.runs()?[0];
@@ -85,11 +64,18 @@ fn native_capture_limits_stop_stdout_stderr_and_reply_before_parsing_actions() -
         assert_eq!(run.state, "waiting_recovery");
         assert_eq!(store.event_count(&run.id, "model.response")?, 0);
         assert!(store.operations(&run.id)?.is_empty());
+        assert!(!directory.path().join("should-not-exist.txt").exists());
+        assert_eq!(store.event_count(&run.id, "model.failed")?, 1);
+        assert_eq!(store.model_tokens(&run.id)?, 0);
+        assert_eq!(
+            arun::trace::metrics(&store.events(&run.id)?).unaccounted_model_attempts,
+            1
+        );
         assert!(store.events(&run.id)?.iter().any(|event| {
             event.kind == "model.failed"
                 && event.payload["error"]
                     .as_str()
-                    .is_some_and(|error| error.contains("response capture limit"))
+                    .is_some_and(|error| error.contains("configured byte limit"))
         }));
     }
     Ok(())
