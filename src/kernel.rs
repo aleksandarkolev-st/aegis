@@ -207,6 +207,40 @@ fn context(store: &Store, run: &Run) -> Result<String> {
     ))
 }
 
+fn search_excerpt(line: &str, folded_query: &str) -> Option<String> {
+    let matched_byte = line.to_lowercase().find(folded_query)?;
+    let matched_character = if line.is_ascii() {
+        matched_byte
+    } else {
+        let mut folded_byte = 0;
+        let mut position = 0;
+        for character in line.chars() {
+            let length = character.to_lowercase().map(char::len_utf8).sum::<usize>();
+            if folded_byte + length > matched_byte {
+                break;
+            }
+            folded_byte += length;
+            position += 1;
+        }
+        position
+    };
+    let start = if matched_character <= 220 {
+        0
+    } else {
+        matched_character.saturating_sub(80)
+    };
+    let mut characters: Vec<_> = line.chars().skip(start).take(301).collect();
+    let more = characters.len() > 300;
+    characters.truncate(300);
+    let excerpt: String = characters.into_iter().collect();
+    let suffix = if more { "…" } else { "" };
+    Some(if start == 0 {
+        format!("{excerpt}{suffix}")
+    } else {
+        format!("…{excerpt}{suffix} [char {start}]")
+    })
+}
+
 pub(crate) fn inspect(bytes: &[u8], query: &str) -> String {
     let raw = String::from_utf8_lossy(bytes);
     let text = serde_json::from_slice::<Value>(bytes)
@@ -270,19 +304,14 @@ pub(crate) fn inspect(bytes: &[u8], query: &str) -> String {
             excerpt
         };
     }
-    let query = query.strip_prefix("@find ").unwrap_or(query);
+    let query = query.strip_prefix("@find ").unwrap_or(query).to_lowercase();
     let lines: Vec<_> = text
         .lines()
         .enumerate()
-        .filter(|(_, line)| line.to_lowercase().contains(&query.to_lowercase()))
-        .take(20)
-        .map(|(index, line)| {
-            format!(
-                "{}: {}",
-                index + 1,
-                line.chars().take(300).collect::<String>()
-            )
+        .filter_map(|(index, line)| {
+            search_excerpt(line, &query).map(|excerpt| format!("{}: {excerpt}", index + 1))
         })
+        .take(20)
         .collect();
     if lines.is_empty() {
         "No matching lines".into()
@@ -1215,6 +1244,18 @@ mod tests {
         assert!(excerpt.contains("70001: error: AEGIS_EVAL_LOG_FAILURE"));
         assert!(!excerpt.contains("warning"));
         assert!(excerpt.len() < 200);
+        Ok(())
+    }
+
+    #[test]
+    fn literal_artifact_search_keeps_matches_beyond_long_line_prefixes() -> Result<()> {
+        let content = format!("{}ERROR_NEEDLE 🦊 suffix", "İ".repeat(5000));
+        let bytes = serde_json::to_vec(&json!({"content":content}))?;
+        let excerpt = inspect(&bytes, "error_needle");
+        assert!(excerpt.contains("ERROR_NEEDLE 🦊"));
+        assert!(excerpt.contains("char 4920"));
+        assert!(excerpt.chars().count() <= 4000);
+        assert!(!excerpt.contains(&"İ".repeat(300)));
         Ok(())
     }
 

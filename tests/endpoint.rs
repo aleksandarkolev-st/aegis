@@ -308,6 +308,17 @@ fn custom_endpoint_completes_a_kernel_run_without_persisting_its_key() -> Result
 
 #[test]
 fn requested_artifact_tail_reaches_the_next_model_request_without_inline_output() -> Result<()> {
+    for query in [
+        "@slice 5000 100",
+        "unique_tail_evidence",
+        "@find UNIQUE_TAIL_EVIDENCE",
+    ] {
+        artifact_tail_scenario(query)?;
+    }
+    Ok(())
+}
+
+fn artifact_tail_scenario(query: &str) -> Result<()> {
     let directory = tempfile::tempdir()?;
     fs::write(
         directory.path().join("long.txt"),
@@ -316,6 +327,7 @@ fn requested_artifact_tail_reaches_the_next_model_request_without_inline_output(
     let listener = TcpListener::bind("127.0.0.1:0")?;
     listener.set_nonblocking(true)?;
     let address = listener.local_addr()?;
+    let query = query.to_owned();
     let server = thread::spawn(move || -> Result<()> {
         for turn in 0..4 {
             let started = Instant::now();
@@ -356,7 +368,7 @@ fn requested_artifact_tail_reaches_the_next_model_request_without_inline_output(
                     json!({"kind":"invoke","capability":"workspace.read","args":{"path":"long.txt"}})
                 }
                 2 => {
-                    json!({"kind":"inspect_result","artifact":artifact()?,"query":"@slice 5000 100"})
+                    json!({"kind":"inspect_result","artifact":artifact()?,"query":query})
                 }
                 _ => {
                     let event = events
@@ -364,7 +376,13 @@ fn requested_artifact_tail_reaches_the_next_model_request_without_inline_output(
                         .find(|event| event["kind"] == "artifact.inspected")
                         .unwrap();
                     let mapped: Value = serde_json::from_str(event["payload"].as_str().unwrap())?;
-                    assert_eq!(mapped["excerpt"], "UNIQUE_TAIL_EVIDENCE");
+                    let excerpt = mapped["excerpt"].as_str().unwrap();
+                    assert!(excerpt.contains("UNIQUE_TAIL_EVIDENCE"));
+                    if query.starts_with("@slice ") {
+                        assert_eq!(excerpt, "UNIQUE_TAIL_EVIDENCE");
+                    } else {
+                        assert!(excerpt.contains("char 4920"));
+                    }
                     assert!(!prompt.contains(&"x".repeat(5000)));
                     json!({"kind":"finish","summary":"tail independently observed","evidence":[artifact()?]})
                 }
