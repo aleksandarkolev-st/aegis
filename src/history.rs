@@ -73,7 +73,7 @@ impl Snapshot {
                         .context("tool-result token accounting overflow")?;
                 }
             }
-            "model.response" => {
+            "model.response" | "model.failed" => {
                 self.model_tokens = self
                     .model_tokens
                     .saturating_add(event.payload["usage"]["input_tokens"].as_u64().unwrap_or(0))
@@ -214,6 +214,126 @@ mod tests {
     use super::*;
 
     #[test]
+    fn failed_usage_migration_rolls_back_all_runs_when_an_archive_is_invalid() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let mut runs = vec![
+            store.create_run("first", directory.path(), "grok", json!([]), json!({}), "")?,
+            store.create_run("second", directory.path(), "grok", json!([]), json!({}), "")?,
+        ];
+        runs.sort_by(|first, second| first.id.cmp(&second.id));
+        let first = &runs[0];
+        let second = &runs[1];
+        store.event(
+            &first.id,
+            "model.failed",
+            json!({"usage":{"input_tokens":1,"output_tokens":1}}),
+        )?;
+        store.connection.execute(
+            "UPDATE run_projection SET model_tokens=0 WHERE run_id=?1",
+            [&first.id],
+        )?;
+        let original_hash = store.save_snapshot(&first.id)?;
+        for _ in 0..180 {
+            store.event(&second.id, "model.failed", json!({"usage":null}))?;
+        }
+        store.save_snapshot(&second.id)?;
+        assert!(store.archive_history(&second.id)? > 0);
+        store.connection.execute(
+            "UPDATE event_archives SET first_seq=first_seq+1 WHERE run_id=?1",
+            [&second.id],
+        )?;
+        store.connection.execute_batch("PRAGMA user_version=6;")?;
+        drop(store);
+        assert!(Store::open(directory.path()).is_err());
+        let connection = rusqlite::Connection::open(directory.path().join("runs.sqlite"))?;
+        let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let tokens: i64 = connection.query_row(
+            "SELECT model_tokens FROM run_projection WHERE run_id=?1",
+            [&first.id],
+            |row| row.get(0),
+        )?;
+        let hash: String = connection.query_row(
+            "SELECT artifact FROM run_snapshots WHERE run_id=?1",
+            [&first.id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(version, 6);
+        assert_eq!(tokens, 0);
+        assert_eq!(hash, original_hash);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_usage_migration_preserves_archives_and_snapshot_tail_without_double_charging()
+    -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "legacy accounting",
+            directory.path(),
+            "grok",
+            json!([]),
+            json!({}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        for _ in 0..180 {
+            store.event(
+                &run.id,
+                "model.failed",
+                json!({"usage":{"input_tokens":10,"output_tokens":2,"source":"provider"}}),
+            )?;
+        }
+        store.event(
+            &run.id,
+            "model.response",
+            json!({"usage":{"input_tokens":100,"output_tokens":30,"source":"provider"}}),
+        )?;
+        let old_hash = store.save_snapshot(&run.id)?;
+        let mut snapshot: Snapshot = serde_json::from_slice(&store.artifact(&old_hash)?)?;
+        snapshot.model_tokens = 130;
+        let legacy_hash = store.put_artifact(&serde_json::to_vec(&snapshot)?)?;
+        store.connection.execute(
+            "UPDATE run_snapshots SET artifact=?2 WHERE run_id=?1",
+            params![run.id, legacy_hash],
+        )?;
+        assert!(store.archive_history(&run.id)? > 0);
+        store.event(
+            &run.id,
+            "model.failed",
+            json!({"usage":{"input_tokens":7,"output_tokens":3,"source":"provider"}}),
+        )?;
+        store.event(&run.id, "model.failed", json!({"usage":null}))?;
+        let original = serde_json::to_value(store.events(&run.id)?)?;
+        let legacy_bytes = store.artifact(&legacy_hash)?;
+        store.connection.execute(
+            "UPDATE run_projection SET model_tokens=130 WHERE run_id=?1",
+            [&run.id],
+        )?;
+        store.connection.execute_batch("PRAGMA user_version=6;")?;
+        drop(store);
+        for _ in 0..2 {
+            let store = Store::open(directory.path())?;
+            assert_eq!(store.model_tokens(&run.id)?, 2300);
+            assert_eq!(
+                store.load_recovery(&run.id)?.unwrap().snapshot.model_tokens,
+                2300
+            );
+            assert_eq!(serde_json::to_value(store.events(&run.id)?)?, original);
+            assert_eq!(store.artifact(&legacy_hash)?, legacy_bytes);
+            assert_eq!(
+                serde_json::to_value(store.run(&run.id)?)?,
+                serde_json::to_value(&run).map(|mut value| {
+                    value["state"] = json!("running");
+                    value
+                })?
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn archived_history_replays_exactly_but_recovery_reads_only_the_snapshot_tail() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let mut store = Store::open(directory.path())?;
@@ -347,6 +467,107 @@ mod tests {
 }
 
 impl Store {
+    pub(crate) fn migrate_failed_model_usage(&self) -> Result<()> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let current: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if current >= 7 {
+            transaction.commit()?;
+            return Ok(());
+        }
+        let mut runs = transaction.prepare("SELECT id FROM runs ORDER BY id")?;
+        let run_ids = runs.query_map([], |row| row.get::<_, String>(0))?;
+        for run_id in run_ids {
+            let run_id = run_id?;
+            let pointer: Option<(i64, String)> = transaction
+                .query_row(
+                    "SELECT sequence, artifact FROM run_snapshots WHERE run_id = ?1",
+                    [&run_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let mut snapshot = pointer
+                .as_ref()
+                .map(|(sequence, hash)| -> Result<Snapshot> {
+                    let snapshot: Snapshot = serde_json::from_slice(&self.artifact(hash)?)?;
+                    if snapshot.version != 1
+                        || snapshot.run_id != run_id
+                        || snapshot.sequence != *sequence
+                        || snapshot.contract != contract(&self.run(&run_id)?)?
+                    {
+                        bail!("snapshot does not match the immutable task contract");
+                    }
+                    Ok(snapshot)
+                })
+                .transpose()?;
+            let mut total = 0_u64;
+            let mut snapshot_total = 0_u64;
+            let mut account = |sequence: i64, kind: &str, payload: &serde_json::Value| {
+                if kind != "model.failed" {
+                    return;
+                }
+                let tokens = payload["usage"]["input_tokens"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .saturating_add(payload["usage"]["output_tokens"].as_u64().unwrap_or(0));
+                total = total.saturating_add(tokens).min(i64::MAX as u64);
+                if pointer.as_ref().is_some_and(|(base, _)| sequence <= *base) {
+                    snapshot_total = snapshot_total.saturating_add(tokens).min(i64::MAX as u64);
+                }
+            };
+            let mut archives = transaction.prepare(
+                "SELECT first_seq, last_seq, artifact FROM event_archives WHERE run_id = ?1 ORDER BY first_seq",
+            )?;
+            let mut rows = archives.query([&run_id])?;
+            let mut archived_through = 0;
+            while let Some(row) = rows.next()? {
+                let first: i64 = row.get(0)?;
+                let last: i64 = row.get(1)?;
+                let hash: String = row.get(2)?;
+                if first <= archived_through {
+                    bail!("event archives overlap during accounting migration");
+                }
+                let archive = self.read_archive(&run_id, first, last, &hash)?;
+                for event in archive.events {
+                    account(event.seq, &event.kind, &event.payload);
+                }
+                archived_through = last;
+            }
+            let mut events = transaction.prepare(
+                "SELECT seq, payload FROM events WHERE run_id = ?1 AND kind = 'model.failed' ORDER BY seq",
+            )?;
+            let mut rows = events.query([&run_id])?;
+            while let Some(row) = rows.next()? {
+                let sequence: i64 = row.get(0)?;
+                if sequence <= archived_through {
+                    bail!("hot and archived failures overlap during accounting migration");
+                }
+                let payload: String = row.get(1)?;
+                account(sequence, "model.failed", &serde_json::from_str(&payload)?);
+            }
+            transaction.execute(
+                "UPDATE run_projection SET model_tokens = MIN(9223372036854775807, model_tokens + ?2) WHERE run_id = ?1",
+                params![run_id, total as i64],
+            )?;
+            if snapshot_total > 0 {
+                let snapshot = snapshot.as_mut().context("accounting snapshot missing")?;
+                snapshot.model_tokens = snapshot
+                    .model_tokens
+                    .saturating_add(snapshot_total)
+                    .min(i64::MAX as u64);
+                let hash = self.put_artifact(&serde_json::to_vec(snapshot)?)?;
+                transaction.execute(
+                    "UPDATE run_snapshots SET artifact = ?2 WHERE run_id = ?1",
+                    params![run_id, hash],
+                )?;
+            }
+        }
+        drop(runs);
+        transaction.execute_batch("PRAGMA user_version=7;")?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn capture(&self, run_id: &str) -> Result<Snapshot> {
         let run = self.run(run_id)?;
         let (sequence, checkpoint, proposal, summary) = self.connection.query_row(
@@ -450,19 +671,7 @@ impl Store {
         let mut events = Vec::new();
         for row in rows {
             let (first, last, hash) = row?;
-            let archive: Archive = serde_json::from_slice(&self.artifact(&hash)?)?;
-            if archive.run_id != run_id
-                || archive.first_seq != first
-                || archive.last_seq != last
-                || archive.events.first().map(|event| event.seq) != Some(first)
-                || archive.events.last().map(|event| event.seq) != Some(last)
-                || archive
-                    .events
-                    .windows(2)
-                    .any(|pair| pair[1].seq != pair[0].seq + 1)
-            {
-                bail!("event archive range failed validation");
-            }
+            let archive = self.read_archive(run_id, first, last, &hash)?;
             events.extend(
                 archive
                     .events
@@ -471,6 +680,23 @@ impl Store {
             );
         }
         Ok(events)
+    }
+
+    fn read_archive(&self, run_id: &str, first: i64, last: i64, hash: &str) -> Result<Archive> {
+        let archive: Archive = serde_json::from_slice(&self.artifact(hash)?)?;
+        if archive.run_id != run_id
+            || archive.first_seq != first
+            || archive.last_seq != last
+            || archive.events.first().map(|event| event.seq) != Some(first)
+            || archive.events.last().map(|event| event.seq) != Some(last)
+            || archive
+                .events
+                .windows(2)
+                .any(|pair| pair[1].seq != pair[0].seq + 1)
+        {
+            bail!("event archive range failed validation");
+        }
+        Ok(archive)
     }
 
     pub fn archive_history(&mut self, run_id: &str) -> Result<usize> {

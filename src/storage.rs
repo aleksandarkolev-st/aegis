@@ -124,7 +124,7 @@ pub(crate) fn append_event(
         "INSERT INTO events(run_id, seq, kind, payload, created_at) VALUES (?1, (SELECT last_seq + 1 FROM run_projection WHERE run_id = ?1), ?2, ?3, ?4)",
         params![run_id, kind, payload.to_string(), timestamp],
     )?;
-    let tokens = if kind == "model.response" {
+    let tokens = if matches!(kind, "model.response" | "model.failed") {
         payload["usage"]["input_tokens"]
             .as_u64()
             .unwrap_or(0)
@@ -325,10 +325,14 @@ impl Store {
                 COMMIT;",
             )?;
         }
-        Ok(Self {
+        let store = Self {
             connection,
             artifacts,
-        })
+        };
+        if schema_version < 7 {
+            store.migrate_failed_model_usage()?;
+        }
+        Ok(store)
     }
 
     pub fn create_run(

@@ -263,34 +263,41 @@ impl Endpoint {
         })?;
         let envelope: Value = serde_json::from_slice(&bytes)
             .map_err(|_| anyhow!("custom endpoint response was not JSON"))?;
+        let reported_usage = envelope.get("usage").and_then(|usage| {
+            Some(Usage {
+                input_tokens: usage.get("prompt_tokens")?.as_u64()?,
+                output_tokens: usage.get("completion_tokens")?.as_u64()?,
+                cached_input_tokens: usage
+                    .pointer("/prompt_tokens_details/cached_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                source: "provider".into(),
+            })
+        });
         let text = envelope
             .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
-            .context("custom endpoint did not return assistant text")?;
+            .ok_or_else(|| {
+                anyhow!(crate::direct::RejectedResponse {
+                    usage: reported_usage.clone(),
+                    shape: json!({"assistant_text":false}),
+                })
+            })?;
         let raw = key
             .as_ref()
             .map_or_else(|| text.to_owned(), |key| text.replace(key, "[redacted]"));
-        let action = model::parse_action(&raw)
-            .map_err(|_| anyhow!("custom endpoint returned invalid action JSON"))?;
-        let usage = envelope
-            .get("usage")
-            .and_then(|usage| {
-                Some(Usage {
-                    input_tokens: usage.get("prompt_tokens")?.as_u64()?,
-                    output_tokens: usage.get("completion_tokens")?.as_u64()?,
-                    cached_input_tokens: usage
-                        .pointer("/prompt_tokens_details/cached_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0),
-                    source: "provider".into(),
-                })
+        let action = model::parse_action(&raw).map_err(|_| {
+            anyhow!(crate::direct::RejectedResponse {
+                usage: reported_usage.clone(),
+                shape: crate::direct::response_shape(&raw),
             })
-            .unwrap_or_else(|| Usage {
-                input_tokens: (prompt.chars().count() as u64).div_ceil(4),
-                output_tokens: (raw.chars().count() as u64).div_ceil(4),
-                cached_input_tokens: 0,
-                source: "estimated".into(),
-            });
+        })?;
+        let usage = reported_usage.unwrap_or_else(|| Usage {
+            input_tokens: (prompt.chars().count() as u64).div_ceil(4),
+            output_tokens: (raw.chars().count() as u64).div_ceil(4),
+            cached_input_tokens: 0,
+            source: "estimated".into(),
+        });
         Ok(Response {
             action,
             raw,
@@ -310,6 +317,50 @@ mod tests {
             response_format: ResponseFormat::Schema,
             allow_insecure: false,
         }
+    }
+
+    #[test]
+    fn rejected_actions_and_missing_assistant_text_preserve_only_reported_usage() -> Result<()> {
+        for content in [Value::Null, json!("private-invalid-action")] {
+            for reported in [true, false] {
+                let mut body = json!({"choices":[{"message":{"content":content}}]});
+                if reported {
+                    body["usage"] = json!({"prompt_tokens":20,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":10}});
+                }
+                let (endpoint, worker) = server("200 OK", "", &body.to_string(), Duration::ZERO)?;
+                let error = endpoint
+                    .call_bounded(
+                        "fixture-model",
+                        "request",
+                        Duration::from_secs(2),
+                        || false,
+                        65536,
+                    )
+                    .err()
+                    .context("Malformed action must be rejected")?;
+                worker.join().unwrap();
+                let rejected = error
+                    .downcast_ref::<crate::direct::RejectedResponse>()
+                    .context("Rejected receipt missing")?;
+                assert!(!error.to_string().contains("private-invalid-action"));
+                assert!(
+                    !rejected
+                        .shape
+                        .to_string()
+                        .contains("private-invalid-action")
+                );
+                if reported {
+                    let usage = rejected.usage.as_ref().context("Reported usage missing")?;
+                    assert_eq!(usage.input_tokens, 20);
+                    assert_eq!(usage.output_tokens, 3);
+                    assert_eq!(usage.cached_input_tokens, 10);
+                    assert_eq!(usage.source, "provider");
+                } else {
+                    assert!(rejected.usage.is_none());
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]

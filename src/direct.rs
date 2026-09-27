@@ -61,7 +61,7 @@ impl std::fmt::Display for RejectedResponse {
 
 impl std::error::Error for RejectedResponse {}
 
-fn response_shape(raw: &str) -> Value {
+pub(crate) fn response_shape(raw: &str) -> Value {
     let Ok(value) = serde_json::from_str::<Value>(raw) else {
         return json!({"json":false,"characters":raw.chars().count()});
     };

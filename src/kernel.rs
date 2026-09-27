@@ -698,6 +698,28 @@ fn apply(store: &mut Store, root: &Path, run: &Run, action: Action) -> Result<bo
     Ok(false)
 }
 
+fn record_model_failure(
+    store: &mut Store,
+    run_id: &str,
+    error: &anyhow::Error,
+    interrupted: bool,
+    elapsed: Duration,
+) -> Result<()> {
+    let rejected = error.downcast_ref::<crate::direct::RejectedResponse>();
+    store.event(
+        run_id,
+        "model.failed",
+        json!({
+            "error": if interrupted { "model turn interrupted by user".into() } else { format!("{error:#}") },
+            "interrupted":interrupted,
+            "elapsed_ms":elapsed.as_millis(),
+            "usage":rejected.and_then(|response| response.usage.as_ref()),
+            "response_shape":rejected.map(|response| &response.shape),
+        }),
+    )?;
+    Ok(())
+}
+
 pub fn drive(root: &Path, run_id: &str) -> Result<()> {
     uuid::Uuid::parse_str(run_id).context("invalid run ID")?;
     let lock = File::options()
@@ -878,10 +900,12 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
                     crate::interrupt::Scope::Model,
                     &model_target,
                 )?;
-                store.event(
+                record_model_failure(
+                    &mut store,
                     run_id,
-                    "model.failed",
-                    json!({"error": if interrupted { "model turn interrupted by user".into() } else { format!("{error:#}") }, "interrupted":interrupted,"elapsed_ms":model_started.elapsed().as_millis()}),
+                    &error,
+                    interrupted,
+                    model_started.elapsed(),
                 )?;
                 store.acknowledge_interrupt(
                     run_id,
@@ -932,6 +956,54 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_provider_receipts_charge_budget_and_survive_recovery_without_applying_actions()
+    -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "request",
+            directory.path(),
+            "grok",
+            json!([]),
+            json!({"model_tokens":12,"actions":2,"wall_seconds":120}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        store.save_snapshot(&run.id)?;
+        let error = anyhow::anyhow!(crate::direct::RejectedResponse {
+            usage: Some(model::Usage {
+                input_tokens: 10,
+                output_tokens: 2,
+                cached_input_tokens: 8,
+                source: "provider".into(),
+            }),
+            shape: json!({"json":true,"field_count":2}),
+        });
+        record_model_failure(
+            &mut store,
+            &run.id,
+            &error,
+            false,
+            Duration::from_millis(25),
+        )?;
+        assert_eq!(store.model_tokens(&run.id)?, 12);
+        assert!(store.load_recovery(&run.id)?.is_some());
+        assert!(store.operations(&run.id)?.is_empty());
+        assert_eq!(store.event_count(&run.id, "model.response")?, 0);
+        let event = store.events(&run.id)?.pop().unwrap();
+        assert_eq!(event.payload["usage"]["source"], "provider");
+        assert_eq!(event.payload["usage"]["cached_input_tokens"], 8);
+        drop(store);
+        drive(directory.path(), &run.id)?;
+        let store = Store::open(directory.path())?;
+        assert_eq!(store.run(&run.id)?.state, "waiting_recovery");
+        assert_eq!(store.event_count(&run.id, "model.started")?, 0);
+        assert_eq!(store.model_tokens(&run.id)?, 12);
+        assert!(store.operations(&run.id)?.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn artifact_ranges_preserve_unicode_and_map_requested_tail_into_bounded_context() -> Result<()>

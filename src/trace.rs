@@ -37,6 +37,7 @@ pub fn metrics(events: &[Event]) -> Metrics {
     let mut dispatched = std::collections::HashSet::new();
     let mut first_schema_seen = false;
     let mut missing_response_usage = 0;
+    let mut accounted_failures = 0;
     for event in events {
         let number = |key: &str| {
             event
@@ -103,6 +104,17 @@ pub fn metrics(events: &[Event]) -> Metrics {
             }
             "model.failed" => {
                 summary.failed_model_turns += 1;
+                let input = event.payload["usage"]["input_tokens"].as_u64();
+                let output = event.payload["usage"]["output_tokens"].as_u64();
+                accounted_failures += usize::from(input.is_some() && output.is_some());
+                summary.model_tokens = summary
+                    .model_tokens
+                    .saturating_add(input.unwrap_or(0))
+                    .saturating_add(output.unwrap_or(0));
+                if input.is_some() || output.is_some() {
+                    summary.estimated_turns +=
+                        usize::from(event.payload["usage"]["source"] != "provider");
+                }
                 summary.model_elapsed_ms = summary
                     .model_elapsed_ms
                     .saturating_add(number("elapsed_ms"));
@@ -128,8 +140,10 @@ pub fn metrics(events: &[Event]) -> Metrics {
             _ => {}
         }
     }
-    summary.unaccounted_model_attempts =
-        summary.model_attempts.saturating_sub(summary.model_turns) + missing_response_usage;
+    summary.unaccounted_model_attempts = summary
+        .model_attempts
+        .saturating_sub(summary.model_turns + accounted_failures)
+        + missing_response_usage;
     if let (Some(first), Some(last)) = (events.first(), events.last()) {
         summary.wall_seconds = (last.created_at - first.created_at).max(0);
     }
@@ -242,6 +256,38 @@ mod tests {
         assert_eq!(measured.tool_result_tokens, 9);
         assert_eq!(measured.raw_prompt_tokens, 300);
         assert_eq!(measured.unaccounted_context_attempts, 0);
+    }
+
+    #[test]
+    fn rejected_receipts_are_charged_while_missing_failure_usage_stays_unknown() {
+        let event = |seq, kind: &str, payload| Event {
+            seq,
+            kind: kind.into(),
+            payload,
+            created_at: seq,
+        };
+        let events = vec![
+            event(1, "model.started", serde_json::json!({})),
+            event(
+                2,
+                "model.failed",
+                serde_json::json!({"usage":{"input_tokens":10,"output_tokens":2,"cached_input_tokens":8,"source":"provider"}}),
+            ),
+            event(3, "model.started", serde_json::json!({})),
+            event(4, "model.failed", serde_json::json!({"usage":null})),
+            event(5, "model.started", serde_json::json!({})),
+            event(
+                6,
+                "model.response",
+                serde_json::json!({"usage":{"input_tokens":4,"output_tokens":1,"source":"provider"}}),
+            ),
+        ];
+        let result = metrics(&events);
+        assert_eq!(result.model_tokens, 17);
+        assert_eq!(result.model_turns, 1);
+        assert_eq!(result.failed_model_turns, 2);
+        assert_eq!(result.unaccounted_model_attempts, 1);
+        assert_eq!(result.estimated_turns, 0);
     }
 
     #[test]
