@@ -16,6 +16,10 @@ fn guided_greeting_and_followup_use_one_request_each_without_file_edits() -> Res
     let directory = tempfile::tempdir()?;
     let root = directory.path().join(".arun");
     fs::create_dir(&root)?;
+    fs::write(
+        directory.path().join("AGENTS.md"),
+        "Keep greeting replies conversational; never manufacture evidence",
+    )?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
     listener.set_nonblocking(true)?;
@@ -62,6 +66,8 @@ fn guided_greeting_and_followup_use_one_request_each_without_file_edits() -> Res
             assert_eq!(body["reasoning_effort"], "low");
             let prompt = body["messages"][0]["content"].as_str().unwrap();
             assert!(prompt.contains("Never create files"));
+            assert!(prompt.contains("REVIEWED REPOSITORY GUIDANCE"));
+            assert!(prompt.contains("Keep greeting replies conversational"));
             if turn == 1 {
                 assert!(prompt.contains("Hello from the saved chat"));
             }
@@ -92,7 +98,7 @@ fn guided_greeting_and_followup_use_one_request_each_without_file_edits() -> Res
         .stdin
         .take()
         .unwrap()
-        .write_all(b"hello\nremember our greeting?\n/model-not-a-command\n/quit\n")?;
+        .write_all(b"hello\n2\nremember our greeting?\n/model-not-a-command\n/quit\n")?;
     let output = child.wait_with_output()?;
     assert!(
         output.status.success(),
@@ -104,6 +110,7 @@ fn guided_greeting_and_followup_use_one_request_each_without_file_edits() -> Res
     assert!(text.contains("Hello from the saved chat"));
     assert!(text.contains("I remember our greeting"));
     assert!(text.contains("Unknown shortcut"));
+    assert_eq!(text.matches("Trust repository guidance?").count(), 1);
     assert!(!text.contains("completion requires evidence"));
     assert!(!directory.path().join("hello.txt").exists());
     let store = Store::open(&root)?;
@@ -113,6 +120,7 @@ fn guided_greeting_and_followup_use_one_request_each_without_file_edits() -> Res
     for run in &runs {
         assert!(store.operations(&run.id)?.is_empty());
         assert_eq!(store.event_count(&run.id, "model.started")?, 1);
+        assert_eq!(run.budgets["repository_rules"][0]["path"], "AGENTS.md");
     }
     assert_eq!(store.model_tokens(&runs[0].id)?, 12);
     Ok(())

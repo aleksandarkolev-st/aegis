@@ -30,6 +30,10 @@ fn validate(scope: &str, text: &str) -> Result<()> {
     if text.is_empty() || text.len() > 512 || crate::text::clean(text) != text {
         bail!("instructions need safe, nonempty text of at most 512 UTF-8 bytes");
     }
+    reject_credentials(text)
+}
+
+pub(crate) fn reject_credentials(text: &str) -> Result<()> {
     let lower = text.to_lowercase();
     if [
         "ghp_",

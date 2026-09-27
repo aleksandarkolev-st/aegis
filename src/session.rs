@@ -805,10 +805,14 @@ fn instruction_menu(root: &Path, terminal: &Terminal) -> Result<()> {
             crate::terminal::fit(&rule.text, 70)
         )
     }));
+    choices.push("Review repository guidance · AGENTS.md / CLAUDE.md".into());
     choices.push("Back".into());
     let Some(selected) = terminal.select("Project instructions", &choices)? else {
         return Ok(());
     };
+    if selected == rules.len() + 1 {
+        return repository_menu(root, terminal);
+    }
     let existing = selected.checked_sub(1).and_then(|index| rules.get(index));
     if selected != 0 && existing.is_none() {
         return Ok(());
@@ -857,6 +861,139 @@ fn instruction_menu(root: &Path, terminal: &Terminal) -> Result<()> {
         ),
         Err(error) => terminal.message(Tone::Warning, "Instruction unchanged", &error.to_string()),
     }
+}
+
+fn review_repository_file(
+    store: &mut Store,
+    workspace: &Path,
+    terminal: &Terminal,
+    path: &str,
+) -> Result<()> {
+    let candidate = match crate::repository_rules::read(workspace, path) {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            return terminal.message(Tone::Warning, "Guidance not imported", &error.to_string());
+        }
+    };
+    terminal.message(
+        Tone::Accent,
+        &format!("{} · scope {}", candidate.path, candidate.scope),
+        &candidate.text,
+    )?;
+    terminal.message(Tone::Quiet, "Review before trusting", "This full file will become task guidance, not a permission grant. Changed content needs another review. Eight files / 16 KiB total; no silent truncation.")?;
+    let choices = [
+        "Ignore this version",
+        "Approve this exact content",
+        "Back without saving",
+    ]
+    .map(str::to_owned);
+    match terminal.select("Trust repository guidance?", &choices)? {
+        Some(choice @ (0 | 1)) => {
+            match store.review_repository_rule(workspace, &candidate, choice == 1) {
+                Ok(()) => terminal.message(Tone::Success, if choice == 1 { "Guidance approved" } else { "Guidance ignored" }, "Saved locally without a model call. Existing tasks keep their original guidance."),
+                Err(error) => terminal.message(Tone::Warning, "Review not saved", &error.to_string()),
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+fn repository_menu(root: &Path, terminal: &Terminal) -> Result<()> {
+    let workspace = std::env::current_dir()?;
+    let mut store = Store::open(root)?;
+    let reviews = store.repository_reviews(&workspace)?;
+    let mut paths: Vec<String> = reviews.iter().map(|rule| rule.path.clone()).collect();
+    for path in ["AGENTS.md", "CLAUDE.md"] {
+        if workspace.join(path).exists() && !paths.iter().any(|existing| existing == path) {
+            paths.push(path.into());
+        }
+    }
+    let mut choices: Vec<_> = paths
+        .iter()
+        .map(|path| {
+            let status =
+                reviews
+                    .iter()
+                    .find(|rule| &rule.path == path)
+                    .map_or("not reviewed", |rule| {
+                        if !rule.approved {
+                            "ignored"
+                        } else if crate::repository_rules::read(&workspace, path)
+                            .is_ok_and(|current| current.sha256 == rule.sha256)
+                        {
+                            "approved"
+                        } else {
+                            "needs review"
+                        }
+                    });
+            format!("{path} · {status}")
+        })
+        .collect();
+    choices.extend(["Choose a nested guidance file".into(), "Back".into()]);
+    let Some(selected) = terminal.select(
+        "Repository guidance · full content, explicit trust",
+        &choices,
+    )?
+    else {
+        return Ok(());
+    };
+    if selected == paths.len() {
+        let Some(path) = field(terminal, "  Relative AGENTS.md / CLAUDE.md path › ", false)?
+        else {
+            return Ok(());
+        };
+        return review_repository_file(&mut store, &workspace, terminal, &path);
+    }
+    let Some(path) = paths.get(selected) else {
+        return Ok(());
+    };
+    if reviews.iter().any(|rule| &rule.path == path) {
+        let actions = ["Review current content", "Remove saved review", "Back"].map(str::to_owned);
+        match terminal.select(path, &actions)? {
+            Some(0) => {}
+            Some(1) => {
+                store.remove_repository_review(&workspace, path)?;
+                return terminal.message(Tone::Quiet, "Review removed", "Saved tasks are unchanged; this source is no longer approved for future tasks.");
+            }
+            _ => return Ok(()),
+        }
+    }
+    review_repository_file(&mut store, &workspace, terminal, path)
+}
+
+fn review_new_root_guidance(
+    root: &Path,
+    terminal: &Terminal,
+    scopes: Option<&crate::filesystem::FileScopes>,
+) -> Result<()> {
+    let workspace = std::env::current_dir()?;
+    let mut store = Store::open(root)?;
+    let reviews = store.repository_reviews(&workspace)?;
+    for path in ["AGENTS.md", "CLAUDE.md"] {
+        if scopes.is_some_and(|scopes| !scopes.permits(path, false)) {
+            continue;
+        }
+        let candidate = match crate::repository_rules::read(&workspace, path) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                if workspace.join(path).exists() {
+                    terminal.message(
+                        Tone::Warning,
+                        "Guidance not imported",
+                        &format!("{path}: {error}"),
+                    )?;
+                }
+                continue;
+            }
+        };
+        if !reviews
+            .iter()
+            .any(|rule| rule.path == path && rule.sha256 == candidate.sha256)
+        {
+            review_repository_file(&mut store, &workspace, terminal, path)?;
+        }
+    }
+    Ok(())
 }
 
 fn memory_menu(root: &Path, terminal: &Terminal) -> Result<()> {
@@ -1588,6 +1725,19 @@ fn context_view(root: &Path, id: &str, terminal: &Terminal) -> Result<()> {
             &rule.text,
         )?;
     }
+    for rule in crate::repository_rules::frozen(&run.budgets)? {
+        terminal.message(
+            Tone::Accent,
+            &format!(
+                "Repository · {} · {} · v{} · {}",
+                rule.path,
+                rule.scope,
+                rule.revision,
+                &rule.sha256[..12]
+            ),
+            &rule.text,
+        )?;
+    }
     if let Some(checkpoint) = store.last_checkpoint(id)? {
         terminal.message(Tone::Accent, "Next action", &checkpoint.next_action)?;
         for decision in checkpoint.decisions {
@@ -1844,6 +1994,7 @@ fn task(
     request: &str,
 ) -> Result<()> {
     profile.limits.validate()?;
+    review_new_root_guidance(root, terminal, profile.filesystem_scopes.as_ref())?;
     let mut store = Store::open(root)?;
     let mut grants = vec!["workspace.read".to_owned()];
     if profile.write {

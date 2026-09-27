@@ -20,6 +20,7 @@ pub mod policy;
 pub mod process;
 pub mod provider;
 pub mod recall;
+pub mod repository_rules;
 pub mod restart;
 pub mod session;
 pub mod storage;

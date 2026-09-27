@@ -189,6 +189,11 @@ impl Store {
                text TEXT NOT NULL, revision INTEGER NOT NULL, updated_at INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS project_instructions_workspace ON project_instructions(workspace);
+             CREATE TABLE IF NOT EXISTS repository_reviews (
+               workspace TEXT NOT NULL, path TEXT NOT NULL, scope TEXT NOT NULL,
+               sha256 TEXT NOT NULL, text TEXT NOT NULL, revision INTEGER NOT NULL,
+               approved INTEGER NOT NULL, PRIMARY KEY(workspace,path)
+             );
              CREATE TABLE IF NOT EXISTS learning_settings (workspace TEXT PRIMARY KEY, enabled INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS user_habits (
                workspace TEXT NOT NULL, category TEXT NOT NULL, choice TEXT NOT NULL,
@@ -349,6 +354,8 @@ impl Store {
         budgets["project_memory"] = json!(self.project_memory(&workspace)?);
         budgets["project_instructions"] = json!(self.project_instructions(&workspace)?);
         crate::instructions::frozen(&budgets)?;
+        budgets["repository_rules"] =
+            json!(self.repository_snapshot(&workspace, &grants, &budgets)?);
         budgets["learning_enabled"] = json!(self.learning_enabled(&workspace)?);
         budgets["user_habits"] = json!(self.learned_habits(&workspace, task)?);
         budgets["workflow_patterns"] =
