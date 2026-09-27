@@ -11,7 +11,8 @@ if (!state.handoff) {
 } else if (!result) {
   action = {kind:'invoke', capability:'workspace.read', args:{path:'greeting.txt'}};
 } else {
-  action = {kind:'finish', summary:'AEGIS_ACCOUNTING_UI_OK', evidence:[JSON.parse(result.payload).artifact]};
+  const payload = typeof result.payload === 'string' ? JSON.parse(result.payload) : result.payload;
+  action = {kind:'finish', summary:'AEGIS_ACCOUNTING_UI_OK', evidence:[payload.artifact]};
 }
 const delay = Number(process.env.AEGIS_TERMINAL_FIXTURE_DELAY_MS || 10);
 setTimeout(() => console.log(JSON.stringify({structured_output:action, usage:{input_tokens:12, output_tokens:2}})), delay);

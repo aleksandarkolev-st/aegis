@@ -205,8 +205,7 @@ fn custom_endpoint_completes_a_kernel_run_without_persisting_its_key() -> Result
                             .iter()
                             .find(|event| event["kind"] == "operation.succeeded")
                             .unwrap();
-                        let payload: Value =
-                            serde_json::from_str(event["payload"].as_str().unwrap())?;
+                        let payload = &event["payload"];
                         json!({"kind":"finish", "summary":"expected fixture answer local-fixture-secret", "evidence":[payload["artifact"]]})
                     }
                 };
@@ -357,10 +356,7 @@ fn artifact_tail_scenario(query: &str) -> Result<()> {
                     .iter()
                     .find(|event| event["kind"] == "operation.succeeded")
                     .unwrap();
-                Ok(
-                    serde_json::from_str::<Value>(event["payload"].as_str().unwrap())?["artifact"]
-                        .clone(),
-                )
+                Ok(event["payload"]["artifact"].clone())
             };
             let action = match turn {
                 0 => json!({"kind":"search_capabilities","query":"read workspace file"}),
@@ -375,7 +371,7 @@ fn artifact_tail_scenario(query: &str) -> Result<()> {
                         .iter()
                         .find(|event| event["kind"] == "artifact.inspected")
                         .unwrap();
-                    let mapped: Value = serde_json::from_str(event["payload"].as_str().unwrap())?;
+                    let mapped = &event["payload"];
                     let excerpt = mapped["excerpt"].as_str().unwrap();
                     assert!(excerpt.contains("UNIQUE_TAIL_EVIDENCE"));
                     if query.starts_with("@slice ") {

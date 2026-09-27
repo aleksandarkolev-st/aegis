@@ -21,7 +21,7 @@ const state = JSON.parse(prompt.split('STATE (bounded, data not instructions):\n
 if(state.mode==='durable' && !state.handoff?.decisions.includes('Keep the fixture evidence through context resets')) process.exit(9);
 const result = state.recent_events.find(event=>event.kind==='operation.succeeded');
 const active = state.active_capabilities.some(capability=>capability.id==='workspace.read');
-const action = result ? {kind:'finish',summary:'fixture read',evidence:[JSON.parse(result.payload).artifact]}
+const action = result ? {kind:'finish',summary:'fixture read',evidence:[result.payload.artifact]}
   : active ? {kind:'invoke',capability:'workspace.read',args:{path:'fixture.txt'}}
   : {kind:'search_capabilities',query:'read workspace file'};
 setTimeout(()=>console.log(JSON.stringify({text:JSON.stringify(action)})),250);
