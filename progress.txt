@@ -121,6 +121,7 @@ LATEST MANUAL UX CHECK
 - Both benchmark --run commands refused absent readiness review before API/model calls; raw refusal logs .arun/arc-readiness-refusal-20260927.log and .arun/coding-readiness-refusal-20260927.log. No attestation was invented.
 
 NEXT IMPLEMENTATION / VERIFICATION WORK
+- Follow-up audit found that changing the custom prompt prefix could strand a menu draft under its old label. Centralized skin replacement now migrates only the task prompt's draft label, preserving text/caret while leaving settings fields and secret-input isolation unchanged. Focused custom-style regression passed; full latest-source/package reruns are pending.
 - Evidence browsing now exposes preview/search/line/character ranges as keyboard choices and numeric fields rather than requiring inspection command syntax. Guided integration passed invalid-number recovery, tail ranges, escaped literal search, unchanged artifacts and zero model calls. Installed same-terminal range browsing passed.
 - Native release CI now runs all Rust targets, including the optional evaluation runners' safety-gate/accounting checks. No workflow was remotely dispatched and no public release was created.
 - Menu usability follow-up preserves unfinished prompt text and Unicode cursor position in session memory across keyboard shortcuts, without injecting drafts into other settings or secret fields. Focused regression and installed F7/back/cursor checks passed; this is not a completion claim.

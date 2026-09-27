@@ -213,9 +213,20 @@ impl Terminal {
         Color::Rgb { r, g, b }
     }
 
-    pub fn with_skin(mut self, skin: impl crate::ui::Skin + 'static) -> Self {
+    fn set_skin(&mut self, skin: Box<dyn crate::ui::Skin>) {
+        let previous_prefix = self.input_prefix();
         self.activity_view.replace(None);
-        self.skin = Box::new(skin);
+        self.skin = skin;
+        let next_prefix = self.input_prefix();
+        if let Some((label, _, _)) = self.input_draft.borrow_mut().as_mut() {
+            if *label == previous_prefix {
+                *label = next_prefix;
+            }
+        }
+    }
+
+    pub fn with_skin(mut self, skin: impl crate::ui::Skin + 'static) -> Self {
+        self.set_skin(Box::new(skin));
         self
     }
 
@@ -230,7 +241,7 @@ impl Terminal {
             && std::env::var_os("AEGIS_REDUCED_MOTION").is_none();
         self.colors =
             io::stdout().is_terminal() && options.colors && std::env::var_os("NO_COLOR").is_none();
-        self.skin = Box::new(options);
+        self.set_skin(Box::new(options));
         Ok(())
     }
 
@@ -1204,6 +1215,38 @@ mod tests {
             .input_draft
             .replace(Some(("task › ".into(), vec!['🦊'], 99)));
         assert_eq!(terminal.take_input_draft("task › ", false), (vec!['🦊'], 1));
+    }
+
+    #[test]
+    fn custom_prompt_styles_preserve_task_drafts_without_relabeling_other_fields() -> Result<()> {
+        let mut terminal = Terminal::default();
+        let text: Vec<_> = "keep this 🦊 task".chars().collect();
+        terminal
+            .input_draft
+            .replace(Some((terminal.input_prefix(), text.clone(), 5)));
+        terminal.apply_ui(crate::ui::UiOptions {
+            input_prefix: "  build › ".into(),
+            ..Default::default()
+        })?;
+        terminal = terminal.with_skin(crate::ui::UiOptions {
+            input_prefix: "  next › ".into(),
+            ..Default::default()
+        });
+        assert_eq!(terminal.take_input_draft("  next › ", true), (vec![], 0));
+        assert_eq!(terminal.take_input_draft("  next › ", false), (text, 5));
+        terminal
+            .input_draft
+            .replace(Some(("  First line › ".into(), vec!['2'], 1)));
+        terminal.apply_ui(crate::ui::UiOptions::default())?;
+        assert_eq!(
+            terminal.take_input_draft(&terminal.input_prefix(), false),
+            (vec![], 0)
+        );
+        assert_eq!(
+            terminal.take_input_draft("  First line › ", false),
+            (vec!['2'], 1)
+        );
+        Ok(())
     }
 
     #[test]
