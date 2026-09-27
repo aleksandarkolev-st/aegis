@@ -343,6 +343,26 @@ pub(crate) fn remaining_seconds(store: &Store, run: &Run) -> Result<u64> {
     Ok(budget.saturating_sub(crate::storage::unix_time().saturating_sub(started) as u64))
 }
 
+fn commit_result(
+    store: &mut Store,
+    operation: &Operation,
+    result: Value,
+    elapsed_ms: u128,
+) -> Result<()> {
+    let bytes = serde_json::to_vec(&result)?;
+    let hash = store.put_artifact(&bytes)?;
+    let mut detail = result_detail(operation, &result, bytes.len(), elapsed_ms);
+    let state = if operation.capability.starts_with("mcp.") && result["isError"] == true {
+        detail["error"] = json!(
+            "MCP tool reported an error; inspect its result artifact. It is not successful completion evidence."
+        );
+        "failed"
+    } else {
+        "succeeded"
+    };
+    store.operation_state(operation, state, Some(&hash), detail)
+}
+
 pub(crate) fn perform(
     store: &mut Store,
     root: &Path,
@@ -384,15 +404,7 @@ pub(crate) fn perform(
     let started = Instant::now();
     match dispatch(root, operation, timeout) {
         Ok(result) => {
-            let bytes = serde_json::to_vec(&result)?;
-            let hash = store.put_artifact(&bytes)?;
-            let detail = result_detail(
-                operation,
-                &result,
-                bytes.len(),
-                started.elapsed().as_millis(),
-            );
-            store.operation_state(operation, "succeeded", Some(&hash), detail)?;
+            commit_result(store, operation, result, started.elapsed().as_millis())?;
         }
         Err(error) => {
             let interrupted = store.interrupt_requested(
@@ -796,6 +808,42 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_reported_errors_keep_artifacts_but_cannot_prove_completion() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "fixture",
+            directory.path(),
+            "fixture",
+            json!([]),
+            json!({}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let operation = store.begin_operation(&run.id, "mcp.fixture.act", json!({}), false)?;
+        store.operation_state(&operation, "dispatched", None, json!({}))?;
+        let result = json!({"isError":true,"content":[{"type":"text","text":"move unavailable"}]});
+        commit_result(&mut store, &operation, result.clone(), 10)?;
+        let saved = store.operation(&operation.id)?;
+        assert_eq!(saved.state, "failed");
+        let artifact = saved.artifact.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&store.artifact(&artifact)?)?,
+            result
+        );
+        assert_eq!(store.event_count(&run.id, "operation.failed")?, 1);
+        assert_eq!(store.event_count(&run.id, "operation.succeeded")?, 0);
+        assert!(store.evidence_artifacts(&run.id)?.is_empty());
+        assert!(
+            store
+                .complete_run(&run.id, "claimed success", &[artifact])
+                .is_err()
+        );
+        assert_eq!(store.run(&run.id)?.state, "running");
+        Ok(())
+    }
 
     #[test]
     fn result_metadata_keeps_real_tool_counts_exit_status_and_timing() -> Result<()> {
