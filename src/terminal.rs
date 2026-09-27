@@ -549,6 +549,14 @@ impl Terminal {
     }
 
     pub fn authentication_activity(&self, label: &str, elapsed: Duration) -> Result<()> {
+        self.loading_activity(
+            label,
+            elapsed,
+            "Esc / Ctrl+C cancel · sign-in codes never enter chat",
+        )
+    }
+
+    pub fn loading_activity(&self, label: &str, elapsed: Duration, hint: &str) -> Result<()> {
         if !self.interactive {
             return Ok(());
         }
@@ -564,10 +572,7 @@ impl Terminal {
         self.paint_activity(
             width,
             fit(&format!("  {frame} {label}"), width.saturating_sub(1)),
-            Some(fit(
-                "  Esc / Ctrl+C cancel · sign-in codes never enter chat",
-                width.saturating_sub(1),
-            )),
+            Some(fit(&format!("  {hint}"), width.saturating_sub(1))),
         )
     }
 

@@ -12,6 +12,185 @@ fn profile() -> Value {
 }
 
 #[test]
+fn owned_models_and_reasoning_work_without_native_metadata_or_clis() -> Result<()> {
+    for provider in [
+        arun::direct::Provider::ChatGpt,
+        arun::direct::Provider::Grok,
+    ] {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(".arun");
+        fs::create_dir(&root)?;
+        let mut original = profile();
+        original["provider"] = json!(if provider == arun::direct::Provider::ChatGpt {
+            "codex"
+        } else {
+            "grok"
+        });
+        original["model"] = json!("owned-first");
+        original["reasoning_effort"] = json!("low");
+        fs::write(root.join("profile.json"), serde_json::to_vec(&original)?)?;
+        let vault = arun::auth_store::Vault::new(directory.path().join(".aegis/auth"));
+        let session = arun::auth_store::Session {
+            provider: if provider == arun::direct::Provider::ChatGpt {
+                "chatgpt"
+            } else {
+                "grok"
+            }
+            .into(),
+            access_token: "owned-fixture-private-access".into(),
+            refresh_token: None,
+            account_id: (provider == arun::direct::Provider::ChatGpt)
+                .then(|| "owned-private-account".into()),
+            expires_at: 2000000000,
+        };
+        vault.save(&session)?;
+        arun::provider_catalog::save(
+            &vault,
+            provider,
+            &session.credentials()?,
+            ["owned-first", "owned-second"]
+                .into_iter()
+                .map(|id| arun::catalog::RemoteModel {
+                    id: id.into(),
+                    label: "Same friendly label".into(),
+                    reasoning_levels: vec!["low".into(), "high".into()],
+                    default_reasoning: Some("low".into()),
+                })
+                .collect(),
+            || false,
+        )?;
+        let original_session = fs::read(
+            directory
+                .path()
+                .join(format!(".aegis/auth/{}.session", session.provider)),
+        )?;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_arun"))
+            .current_dir(directory.path())
+            .env("HOME", directory.path())
+            .env("USERPROFILE", directory.path())
+            .env("CODEX_HOME", directory.path().join("missing-native-cache"))
+            .env("PATH", directory.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"/model\n2\n/reasoning\n3\n/quit\n")?;
+        let output = child.wait_with_output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains("Same friendly label [owned-first]")
+                && text.contains("Same friendly label [owned-second]")
+        );
+        assert!(text.contains("Aegis account-bound catalog"));
+        assert!(text.contains("Provider default · low · no override"));
+        assert!(!text.contains("owned-fixture-private-access"));
+        assert!(!text.contains("owned-private-account"));
+        let saved: Value = serde_json::from_slice(&fs::read(root.join("profile.json"))?)?;
+        assert_eq!(saved["model"], "owned-second");
+        assert_eq!(saved["reasoning_effort"], "high");
+        for key in ["provider", "limits", "write", "image", "previous_run"] {
+            assert_eq!(saved[key], original[key]);
+        }
+        assert_eq!(
+            fs::read(
+                directory
+                    .path()
+                    .join(format!(".aegis/auth/{}.session", session.provider))
+            )?,
+            original_session
+        );
+        assert!(!directory.path().join(".grok").exists());
+        assert!(!directory.path().join("missing-native-cache").exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn expired_owned_accounts_do_not_offer_external_or_old_account_catalogs() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join(".arun");
+    fs::create_dir(&root)?;
+    let mut original = profile();
+    original["reasoning_effort"] = json!("high");
+    fs::write(root.join("profile.json"), serde_json::to_vec(&original)?)?;
+    let home = directory.path().join("native-cache");
+    fs::create_dir(&home)?;
+    fs::write(
+        home.join("models_cache.json"),
+        serde_json::to_vec(&json!({"models":[{"slug":"external-model","visibility":"list"}]}))?,
+    )?;
+    let vault = arun::auth_store::Vault::new(directory.path().join(".aegis/auth"));
+    let mut session = arun::auth_store::Session {
+        provider: "chatgpt".into(),
+        access_token: "expired-fixture-access".into(),
+        refresh_token: None,
+        account_id: Some("expired-private-account".into()),
+        expires_at: 2000000000,
+    };
+    vault.save(&session)?;
+    arun::provider_catalog::save(
+        &vault,
+        arun::direct::Provider::ChatGpt,
+        &session.credentials()?,
+        vec![arun::catalog::RemoteModel {
+            id: "old-account-model".into(),
+            label: "Old private catalog".into(),
+            reasoning_levels: vec!["low".into()],
+            default_reasoning: Some("low".into()),
+        }],
+        || false,
+    )?;
+    session.expires_at = 1;
+    vault.save(&session)?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_arun"))
+        .current_dir(directory.path())
+        .env("HOME", directory.path())
+        .env("USERPROFILE", directory.path())
+        .env("CODEX_HOME", home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"/model\n1\n/reasoning\n/quit\n")?;
+    let output = child.wait_with_output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(!text.contains("external-model"));
+    assert!(!text.contains("old-account-model"));
+    assert!(!text.contains("expired-fixture-access"));
+    let saved: Value = serde_json::from_slice(&fs::read(root.join("profile.json"))?)?;
+    for key in [
+        "provider",
+        "model",
+        "reasoning_effort",
+        "limits",
+        "write",
+        "image",
+        "previous_run",
+    ] {
+        assert_eq!(saved[key], original[key]);
+    }
+    Ok(())
+}
+
+#[test]
 fn explicit_reasoning_selection_persists_without_changing_saved_contracts() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let root = directory.path().join(".arun");
@@ -29,6 +208,8 @@ fn explicit_reasoning_selection_persists_without_changing_saved_contracts() -> R
     let mut child = Command::new(env!("CARGO_BIN_EXE_arun"))
         .current_dir(directory.path())
         .env("CODEX_HOME", home)
+        .env("HOME", directory.path())
+        .env("USERPROFILE", directory.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -82,6 +263,8 @@ fn reselecting_current_model_preserves_reasoning_and_new_model_resets_it() -> Re
         let mut child = Command::new(env!("CARGO_BIN_EXE_arun"))
             .current_dir(directory.path())
             .env("CODEX_HOME", home)
+            .env("HOME", directory.path())
+            .env("USERPROFILE", directory.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -123,6 +306,8 @@ fn settings_change_only_the_selected_section_and_remove_unapproved_commands() ->
         fs::write(root.join("profile.json"), serde_json::to_vec(&original)?)?;
         let mut child = Command::new(env!("CARGO_BIN_EXE_arun"))
             .current_dir(directory.path())
+            .env("HOME", directory.path())
+            .env("USERPROFILE", directory.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -168,14 +353,26 @@ fn model_and_provider_switches_keep_permissions_budgets_and_task_history() -> Re
             )?,
         )?;
         let home = directory.path().join("home");
-        arun::auth_store::Vault::new(home.join(".aegis/auth")).save(
-            &arun::auth_store::Session {
-                provider: "grok".into(),
-                access_token: "fixture-private-access".into(),
-                refresh_token: None,
-                account_id: None,
-                expires_at: 2000000000,
-            },
+        let vault = arun::auth_store::Vault::new(home.join(".aegis/auth"));
+        let session = arun::auth_store::Session {
+            provider: "grok".into(),
+            access_token: "fixture-private-access".into(),
+            refresh_token: None,
+            account_id: None,
+            expires_at: 2000000000,
+        };
+        vault.save(&session)?;
+        arun::provider_catalog::save(
+            &vault,
+            arun::direct::Provider::Grok,
+            &session.credentials()?,
+            vec![arun::catalog::RemoteModel {
+                id: "grok-example".into(),
+                label: "Friendly Grok".into(),
+                reasoning_levels: Vec::new(),
+                default_reasoning: None,
+            }],
+            || false,
         )?;
         fs::create_dir_all(home.join(".grok"))?;
         fs::write(

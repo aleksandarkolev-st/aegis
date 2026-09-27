@@ -65,34 +65,46 @@ fn field(terminal: &Terminal, label: &str, secret: bool) -> Result<Option<String
     }
 }
 
+fn load_catalog(
+    terminal: &Terminal,
+    profile: &Profile,
+    secret: Option<&str>,
+) -> Result<Option<Result<crate::catalog::Catalog>>> {
+    let provider = profile.provider.clone();
+    let endpoint = profile.endpoint.clone();
+    let secret = secret.map(str::to_owned);
+    crate::background::run(
+        terminal,
+        "Discovering your available models",
+        move |cancelled| {
+            let interrupted = || cancelled.load(std::sync::atomic::Ordering::Acquire);
+            Ok(if let Some(endpoint) = endpoint {
+                endpoint
+                    .models_with_cancel(secret.as_deref(), interrupted)
+                    .map(|models| crate::catalog::Catalog {
+                        models,
+                        source: "Your endpoint's /models catalog".into(),
+                    })
+            } else {
+                crate::catalog::available(&provider, interrupted)
+            })
+        },
+    )
+}
+
 fn choose_model(
     terminal: &Terminal,
     profile: &Profile,
     secret: Option<&str>,
 ) -> Result<Option<Option<String>>> {
     terminal.message(Tone::Quiet, "Models", "Loading the provider catalog…")?;
-    let catalog = if let Some(endpoint) = &profile.endpoint {
-        endpoint
-            .models(secret)
-            .map(|models| crate::catalog::Catalog {
-                models,
-                source: "Your endpoint's /models catalog".into(),
-            })
-    } else {
-        crate::catalog::native(&profile.provider)
+    let Some(catalog) = load_catalog(terminal, profile, secret)? else {
+        return Ok(None);
     };
     let models = match catalog {
         Ok(catalog) => {
             if terminal.interactive {
-                terminal.message(
-                    Tone::Quiet,
-                    "",
-                    if profile.provider == "custom" {
-                        "Models advertised by your endpoint"
-                    } else {
-                        "Provider catalog · account availability may change"
-                    },
-                )?;
+                terminal.message(Tone::Quiet, "", &catalog.source)?;
             } else {
                 terminal.message(Tone::Quiet, "Catalog", &catalog.source)?;
             }
@@ -102,7 +114,10 @@ fn choose_model(
             terminal.message(
                 Tone::Quiet,
                 "Catalog",
-                &format!("Model list unavailable · {}. You can enter an advertised model ID; F4 manages sign-in.", if error.to_string().to_lowercase().contains("timed out") { "provider didn't respond in time" } else { "listing is unsupported or not ready" }),
+                &format!(
+                    "{} You can enter an advertised model ID.",
+                    crate::catalog::discovery_error(&error.to_string())
+                ),
             )?;
             Vec::new()
         }
@@ -115,7 +130,11 @@ fn choose_model(
         } else {
             ""
         };
-        choices.push(format!("{}{current}", model.label));
+        choices.push(if model.label.is_empty() || model.label == model.id {
+            format!("{}{current}", model.id)
+        } else {
+            format!("{} [{}]{current}", model.label, model.id)
+        });
         values.push(Some(model.id));
     }
     if let Some(current) = &profile.model {
@@ -222,6 +241,24 @@ fn switch_model(
 }
 
 fn choose_reasoning(terminal: &Terminal, profile: &Profile) -> Result<Option<Option<String>>> {
+    if let Ok(provider) = crate::direct::provider(&profile.provider) {
+        if crate::auth_store::Vault::user()?
+            .load(provider.session_name())?
+            .is_some()
+        {
+            let Some(result) = load_catalog(terminal, profile, None)? else {
+                return Ok(None);
+            };
+            if let Err(error) = result {
+                terminal.message(
+                    Tone::Warning,
+                    "Reasoning",
+                    crate::catalog::discovery_error(&error.to_string()),
+                )?;
+                return Ok(None);
+            }
+        }
+    }
     let levels = profile
         .model
         .as_deref()
@@ -238,7 +275,15 @@ fn choose_reasoning(terminal: &Terminal, profile: &Profile) -> Result<Option<Opt
     if profile.provider == "custom" {
         terminal.message(Tone::Quiet, "Endpoint option", "Explicitly sends reasoning_effort; your endpoint/model must support it. Default omits the field.")?;
     }
-    let mut choices = vec!["Provider default · no override".into()];
+    let default = profile.model.as_deref().and_then(|id| {
+        crate::catalog::advertised_reasoning_default(&profile.provider, id)
+            .ok()
+            .flatten()
+    });
+    let mut choices = vec![match default {
+        Some(effort) => format!("Provider default · {effort} · no override"),
+        None => "Provider default · no override".into(),
+    }];
     choices.extend(levels.iter().map(|effort| {
         format!(
             "{effort} · {}{}",

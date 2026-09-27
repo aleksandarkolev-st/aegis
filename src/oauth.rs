@@ -268,6 +268,7 @@ impl AuthClient {
         if cancelled() {
             bail!("Sign-in cancelled before saving credentials");
         }
+        vault.remove_catalog(self.name())?;
         vault.save(session)
     }
 

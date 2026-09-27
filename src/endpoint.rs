@@ -28,6 +28,17 @@ pub struct Endpoint {
 
 impl Endpoint {
     pub fn models(&self, session_key: Option<&str>) -> Result<Vec<crate::catalog::Model>> {
+        self.models_with_cancel(session_key, || false)
+    }
+
+    pub fn models_with_cancel(
+        &self,
+        session_key: Option<&str>,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Vec<crate::catalog::Model>> {
+        if cancelled() {
+            bail!("Model catalog request cancelled before dispatch");
+        }
         let mut url = self.url()?;
         let path = url.path().trim_end_matches("/chat/completions");
         url.set_path(&format!("{path}/models"));
@@ -48,6 +59,7 @@ impl Endpoint {
             if let Some(key) = &key {
                 request = request.bearer_auth(key);
             }
+            let fetch = async {
             let mut response = request
                 .send()
                 .await
@@ -58,6 +70,9 @@ impl Endpoint {
                     response.status().as_u16()
                 );
             }
+            if response.content_length().is_some_and(|length| length > 1024 * 1024) {
+                bail!("Endpoint model catalog exceeds 1 MiB");
+            }
             let mut bytes = Vec::new();
             while let Some(chunk) = response.chunk().await? {
                 if bytes.len() + chunk.len() > 1024 * 1024 {
@@ -66,10 +81,36 @@ impl Endpoint {
                 bytes.extend_from_slice(&chunk);
             }
             Ok::<_, anyhow::Error>(bytes)
+            };
+            tokio::pin!(fetch);
+            loop {
+                tokio::select! {
+                    result = &mut fetch => break result,
+                    _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                        if cancelled() { bail!("Model catalog request cancelled during endpoint discovery"); }
+                    }
+                }
+            }
         })?;
-        crate::catalog::endpoint_value(
-            &serde_json::from_slice(&bytes).context("Endpoint model catalog was not JSON")?,
-        )
+        if cancelled() {
+            bail!("Model catalog request cancelled before accepting metadata");
+        }
+        let mut value: Value =
+            serde_json::from_slice(&bytes).context("Endpoint model catalog was not JSON")?;
+        if let Some(key) = key.filter(|key| !key.is_empty()) {
+            if let Some(entries) = value.get_mut("data").and_then(Value::as_array_mut) {
+                for entry in entries {
+                    if entry
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| id.contains(&key))
+                    {
+                        entry["id"] = Value::Null;
+                    }
+                }
+            }
+        }
+        crate::catalog::endpoint_value(&value)
     }
 
     pub fn url(&self) -> Result<Url> {
@@ -349,6 +390,36 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(450));
         assert!(error.to_string().contains("cancelled"));
         thread.join().unwrap();
+        Ok(())
+    }
+
+    #[test]
+    fn model_discovery_is_cancellable_and_cannot_echo_a_session_key_as_an_id() -> Result<()> {
+        let (endpoint, thread) = server("200 OK", "", "{}", Duration::from_millis(500))?;
+        let started = std::time::Instant::now();
+        let error = endpoint
+            .models_with_cancel(None, || started.elapsed() >= Duration::from_millis(100))
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(450));
+        assert!(error.to_string().contains("cancelled"));
+        thread.join().unwrap();
+        let (endpoint, thread) = server(
+            "200 OK",
+            "",
+            "{\"data\":[{\"id\":\"fixture-session-key\"},{\"id\":\"public-model\"}]}",
+            Duration::ZERO,
+        )?;
+        let models = endpoint.models(Some("fixture-session-key"))?;
+        thread.join().unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "public-model");
+        assert!(
+            endpoint
+                .models_with_cancel(None, || true)
+                .unwrap_err()
+                .to_string()
+                .contains("before dispatch")
+        );
         Ok(())
     }
 }

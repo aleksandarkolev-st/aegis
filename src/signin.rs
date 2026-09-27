@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event};
 
 use crate::auth_store::Vault;
 use crate::oauth::{AuthClient, Poll};
@@ -206,10 +206,7 @@ fn present(
 }
 
 fn cancel_key(key: crossterm::event::KeyEvent) -> bool {
-    key.kind == KeyEventKind::Press
-        && (key.code == KeyCode::Esc
-            || key.modifiers.contains(KeyModifiers::CONTROL)
-                && matches!(key.code, KeyCode::Char('c' | 'd')))
+    crate::background::cancel_key(key)
 }
 
 #[cfg(windows)]
@@ -253,7 +250,7 @@ fn open_browser(_url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyEvent;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     #[test]
     fn sign_in_cancellation_is_explicit_and_never_consumes_model_commands() {

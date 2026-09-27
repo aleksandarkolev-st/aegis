@@ -130,7 +130,9 @@ pub fn call_with_cancel(
     cancelled: impl Fn() -> bool,
 ) -> Result<Response> {
     crate::direct::provider(provider)?;
-    let model = crate::catalog::native(provider)?
+    let started = std::time::Instant::now();
+    let interrupted = || cancelled() || started.elapsed() >= timeout;
+    let model = crate::catalog::available(provider, interrupted)?
         .models
         .into_iter()
         .next()
@@ -141,8 +143,8 @@ pub fn call_with_cancel(
         &serde_json::json!({"provider_transport":"aegis-direct-v1", "model":model}),
         prompt,
         directory,
-        timeout,
-        cancelled,
+        timeout.saturating_sub(started.elapsed()),
+        interrupted,
     )
 }
 

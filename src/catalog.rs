@@ -130,7 +130,14 @@ pub fn remote_value(provider: crate::direct::Provider, value: &Value) -> Result<
         }
     }
     if models.is_empty() {
-        bail!("Provider advertised no selectable models for this account");
+        let incoming = match provider {
+            Provider::ChatGpt => value["models"].as_array(),
+            Provider::Grok => value["data"].as_array(),
+        }
+        .map_or(0, Vec::len);
+        bail!(
+            "Provider advertised no selectable models for this account ({incoming} incoming entries)"
+        );
     }
     Ok(models)
 }
@@ -158,6 +165,36 @@ pub fn valid_effort(effort: &str) -> bool {
         effort,
         "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
     )
+}
+
+pub fn discovery_error(error: &str) -> &'static str {
+    let lower = error.to_lowercase();
+    if ["401", "expired", "not signed in"]
+        .iter()
+        .any(|part| lower.contains(part))
+    {
+        "Sign in with F4 to load models for your account."
+    } else if lower.contains("403") {
+        "Your account doesn't permit model discovery for this provider."
+    } else if ["429", "usage limit"]
+        .iter()
+        .any(|part| lower.contains(part))
+    {
+        "The provider's usage limit was reached; try again later."
+    } else if ["timeout", "timed out", "connection failed"]
+        .iter()
+        .any(|part| lower.contains(part))
+    {
+        "The provider didn't respond. Check your connection and retry."
+    } else if lower.contains("private model catalog") || lower.contains("storage") {
+        "Aegis couldn't read its private model cache. F4 can reconnect this account."
+    } else if lower.contains("no selectable models") {
+        "This account advertised no selectable models."
+    } else if lower.contains("sign-in changed") {
+        "Your account changed during discovery. Refresh the model list."
+    } else {
+        "No model list is available yet. Sign in with F4 or enter a model ID."
+    }
 }
 
 pub fn reasoning_from_value(provider: &str, id: &str, catalog: &Value) -> Vec<String> {
@@ -210,7 +247,8 @@ pub fn reasoning_levels(provider: &str, id: &str) -> Result<Vec<String>> {
         let vault = crate::auth_store::Vault::user()?;
         if vault.load(selected.session_name())?.is_some() {
             return Ok(crate::provider_catalog::cached(&vault, selected, || false)?
-                .into_iter().flatten()
+                .into_iter()
+                .flatten()
                 .find(|model| model.id == id)
                 .map(|model| model.reasoning_levels)
                 .unwrap_or_default());
@@ -238,6 +276,21 @@ pub fn reasoning_levels(provider: &str, id: &str) -> Result<Vec<String>> {
         id,
         &serde_json::from_slice(&bytes)?,
     ))
+}
+
+pub fn advertised_reasoning_default(provider: &str, id: &str) -> Result<Option<String>> {
+    let Ok(selected) = crate::direct::provider(provider) else {
+        return Ok(None);
+    };
+    let vault = crate::auth_store::Vault::user()?;
+    if vault.load(selected.session_name())?.is_none() {
+        return Ok(None);
+    }
+    Ok(crate::provider_catalog::cached(&vault, selected, || false)?
+        .into_iter()
+        .flatten()
+        .find(|model| model.id == id)
+        .and_then(|model| model.default_reasoning))
 }
 
 fn insert(models: &mut Vec<Model>, id: &str, label: &str) {
@@ -377,12 +430,21 @@ pub fn available(provider: &str, cancelled: impl Fn() -> bool) -> Result<Catalog
     let selected = crate::direct::provider(provider)?;
     let vault = crate::auth_store::Vault::user()?;
     if vault.load(selected.session_name())?.is_none() {
-        return native(provider);
+        let mut catalog = native(provider)?;
+        catalog.source.push_str(" · not an Aegis sign-in");
+        return Ok(catalog);
     }
     let models = crate::provider_catalog::get(&vault, selected, cancelled)?;
     Ok(Catalog {
-        models: models.into_iter().map(|model| Model { id: model.id, label: model.label }).collect(),
-        source: "Aegis account-bound catalog · cached up to 15 minutes · availability can change".into(),
+        models: models
+            .into_iter()
+            .map(|model| Model {
+                id: model.id,
+                label: model.label,
+            })
+            .collect(),
+        source: "Aegis account-bound catalog · cached up to 15 minutes · availability can change"
+            .into(),
     })
 }
 
@@ -413,6 +475,26 @@ mod tests {
         assert!(std::str::from_utf8(label.as_bytes()).is_ok());
         assert_eq!(display_label("🦊 日本語\u{1b}\u{202e}"), "🦊 日本語");
         assert!(!valid_id("model\u{202e}"));
+    }
+
+    #[test]
+    fn discovery_errors_are_actionable_without_raw_json_or_false_saved_task_claims() {
+        for error in [
+            "HTTP 401 fixture-secret",
+            "HTTP 403 fixture-secret",
+            "HTTP 429 fixture-secret",
+            "Provider connection failed",
+            "Aegis's private model catalog is invalid",
+            "Sign-in changed during discovery",
+            "{\"secret\":\"fixture-secret\"}",
+        ] {
+            let message = discovery_error(error);
+            assert!(!message.contains("fixture-secret"));
+            assert!(!message.contains('{'));
+            assert!(!message.contains("task is saved"));
+        }
+        assert!(discovery_error("Saved sign-in expired").contains("F4"));
+        assert!(discovery_error("HTTP 403").contains("doesn't permit"));
     }
 
     #[test]

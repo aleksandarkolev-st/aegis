@@ -414,6 +414,32 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn fresh_owned_sign_in_clears_a_corrupt_cache_without_touching_another_provider() -> Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("auth");
+        let vault = Vault::new(root.clone());
+        for provider in [Provider::ChatGpt, Provider::Grok] {
+            let session = session(provider);
+            vault.save(&session)?;
+            save(&vault, provider, &session.credentials()?, models(), || {
+                false
+            })?;
+        }
+        fs::write(root.join("chatgpt.catalog"), b"invalid-disposable-catalog")?;
+        assert!(cached(&vault, Provider::ChatGpt, || false).is_err());
+        crate::oauth::AuthClient::new(Provider::ChatGpt)?.save(
+            &vault,
+            &session(Provider::ChatGpt),
+            || false,
+        )?;
+        assert!(vault.load_catalog("chatgpt")?.is_none());
+        assert!(vault.load("chatgpt")?.is_some());
+        assert_eq!(cached(&vault, Provider::Grok, || false)?, Some(models()));
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn catalog_owner_permissions_and_links_are_enforced() -> Result<()> {
