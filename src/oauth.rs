@@ -276,7 +276,9 @@ impl AuthClient {
         if cancelled() {
             bail!("Sign-out cancelled before removing credentials");
         }
-        vault.remove(self.name())
+        let removed = vault.remove(self.name())?;
+        vault.remove_catalog(self.name())?;
+        Ok(removed)
     }
 
     pub fn credentials(&self, vault: &Vault, cancelled: impl Fn() -> bool) -> Result<Credentials> {

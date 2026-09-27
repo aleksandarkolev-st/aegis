@@ -27,6 +27,13 @@ pub enum Provider {
 }
 
 impl Provider {
+    pub(crate) fn session_name(self) -> &'static str {
+        match self {
+            Self::ChatGpt => "chatgpt",
+            Self::Grok => "grok",
+        }
+    }
+
     fn url(self) -> &'static str {
         match self {
             Self::ChatGpt => "https://chatgpt.com/backend-api/codex/responses",
@@ -99,6 +106,22 @@ fn response_shape(raw: &str) -> Value {
 }
 
 impl Credentials {
+    pub(crate) fn catalog_binding(&self, provider: Provider) -> String {
+        use sha2::{Digest, Sha256};
+
+        let mut hash = Sha256::new();
+        hash.update(b"aegis/catalog-binding/v1");
+        for field in [
+            provider.session_name(),
+            self.account_id.as_deref().unwrap_or(""),
+            &self.access_token,
+        ] {
+            hash.update((field.len() as u64).to_le_bytes());
+            hash.update(field.as_bytes());
+        }
+        hex::encode(hash.finalize())
+    }
+
     pub fn from_saved_session(provider: Provider, path: &Path) -> Result<Self> {
         let metadata = std::fs::symlink_metadata(path)
             .map_err(|_| anyhow!("Saved provider sign-in is unavailable"))?;
@@ -174,7 +197,7 @@ impl Credentials {
         })
     }
 
-    fn redact(&self, text: &str) -> String {
+    pub(crate) fn redact(&self, text: &str) -> String {
         let text = text.replace(&self.access_token, "[redacted]");
         self.account_id.as_ref().map_or_else(
             || text.clone(),

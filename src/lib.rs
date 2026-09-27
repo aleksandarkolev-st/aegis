@@ -22,6 +22,7 @@ pub mod patch;
 pub mod policy;
 pub mod process;
 pub mod provider;
+pub mod provider_catalog;
 pub mod read_batch;
 pub mod recall;
 pub mod repository_rules;

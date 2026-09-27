@@ -8,6 +8,42 @@ use serde::{Deserialize, Serialize};
 const MAX_PLAIN_BYTES: usize = 128 * 1024;
 const MAX_STORED_BYTES: usize = 256 * 1024;
 
+#[derive(Clone, Copy)]
+enum PrivateFile {
+    Session,
+    Catalog,
+}
+
+impl PrivateFile {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Catalog => "catalog",
+        }
+    }
+
+    fn plain_limit(self) -> usize {
+        match self {
+            Self::Session => MAX_PLAIN_BYTES,
+            Self::Catalog => 256 * 1024,
+        }
+    }
+
+    fn stored_limit(self) -> usize {
+        match self {
+            Self::Session => MAX_STORED_BYTES,
+            Self::Catalog => 512 * 1024,
+        }
+    }
+
+    fn entropy(self, provider: &str) -> String {
+        match self {
+            Self::Session => provider.to_owned(),
+            Self::Catalog => format!("{provider}/catalog-v1"),
+        }
+    }
+}
+
 #[cfg(windows)]
 const HEADER: &[u8] = b"AEGIS-AUTH-DPAPI-1\n";
 #[cfg(not(windows))]
@@ -153,9 +189,13 @@ impl Vault {
     }
 
     fn path(&self, provider: &str) -> Result<PathBuf> {
+        self.file_path(provider, PrivateFile::Session)
+    }
+
+    fn file_path(&self, provider: &str, kind: PrivateFile) -> Result<PathBuf> {
         Ok(self
             .root
-            .join(format!("{}.session", provider_name(provider)?)))
+            .join(format!("{}.{}", provider_name(provider)?, kind.suffix())))
     }
 
     fn check_ancestors(&self) -> Result<()> {
@@ -206,20 +246,62 @@ impl Vault {
 
     pub fn save(&self, session: &Session) -> Result<()> {
         session.validate(&session.provider)?;
-        let path = self.path(&session.provider)?;
+        self.write_private(
+            &session.provider,
+            PrivateFile::Session,
+            serde_json::to_vec(session)?,
+        )
+    }
+
+    pub fn load(&self, provider: &str) -> Result<Option<Session>> {
+        let Some(mut plain) = self.read_private(provider, PrivateFile::Session)? else {
+            return Ok(None);
+        };
+        let session = serde_json::from_slice::<Session>(&plain);
+        plain.fill(0);
+        let session =
+            session.map_err(|_| anyhow!("Saved Aegis sign-in is invalid; sign in again"))?;
+        session.validate(provider)?;
+        Ok(Some(session))
+    }
+
+    pub(crate) fn save_catalog(&self, provider: &str, bytes: Vec<u8>) -> Result<()> {
+        self.write_private(provider, PrivateFile::Catalog, bytes)
+    }
+
+    pub(crate) fn load_catalog(&self, provider: &str) -> Result<Option<Vec<u8>>> {
+        self.read_private(provider, PrivateFile::Catalog)
+    }
+
+    pub(crate) fn remove_catalog(&self, provider: &str) -> Result<()> {
+        let path = self.file_path(provider, PrivateFile::Catalog)?;
+        self.check_ancestors()?;
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => bail!("Aegis catalog storage is unavailable"),
+            Ok(_) => {
+                checked_metadata(&self.root, true)?;
+                checked_metadata(&path, false)?;
+                fs::remove_file(path)
+                    .map_err(|_| anyhow!("Could not remove Aegis's private model catalog"))
+            }
+        }
+    }
+
+    fn write_private(&self, provider: &str, kind: PrivateFile, mut plain: Vec<u8>) -> Result<()> {
+        let path = self.file_path(provider, kind)?;
         self.prepare()?;
         if fs::symlink_metadata(&path).is_ok() {
             checked_metadata(&path, false)?;
         }
-        let mut plain = serde_json::to_vec(session)?;
-        if plain.len() > MAX_PLAIN_BYTES {
+        if plain.len() > kind.plain_limit() {
             plain.fill(0);
             bail!("Sign-in credential exceeds the storage bound");
         }
-        let sealed = protect(&session.provider, &plain);
+        let sealed = protect(&kind.entropy(provider), &plain);
         plain.fill(0);
         let sealed = sealed?;
-        if sealed.len() + HEADER.len() > MAX_STORED_BYTES {
+        if sealed.len() + HEADER.len() > kind.stored_limit() {
             bail!("Protected sign-in credential exceeds the storage bound");
         }
         let mut temporary = tempfile::NamedTempFile::new_in(&self.root)
@@ -241,8 +323,8 @@ impl Vault {
         Ok(())
     }
 
-    pub fn load(&self, provider: &str) -> Result<Option<Session>> {
-        let path = self.path(provider)?;
+    fn read_private(&self, provider: &str, kind: PrivateFile) -> Result<Option<Vec<u8>>> {
+        let path = self.file_path(provider, kind)?;
         self.check_ancestors()?;
         match fs::symlink_metadata(&self.root) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -256,28 +338,23 @@ impl Vault {
             Err(_) => bail!("Saved Aegis sign-in is unavailable"),
             Ok(_) => checked_metadata(&path, false)?,
         };
-        if metadata.len() > MAX_STORED_BYTES as u64 {
+        if metadata.len() > kind.stored_limit() as u64 {
             bail!("Saved sign-in exceeds the storage bound");
         }
         let file = File::open(&path).map_err(|_| anyhow!("Could not open saved Aegis sign-in"))?;
         let mut bytes = Vec::new();
-        file.take(MAX_STORED_BYTES as u64 + 1)
+        file.take(kind.stored_limit() as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| anyhow!("Could not read saved Aegis sign-in"))?;
-        if bytes.len() > MAX_STORED_BYTES || !bytes.starts_with(HEADER) {
+        if bytes.len() > kind.stored_limit() || !bytes.starts_with(HEADER) {
             bail!("Saved sign-in has an invalid protection format; sign in again");
         }
-        let mut plain = unprotect(provider, &bytes[HEADER.len()..])?;
-        if plain.len() > MAX_PLAIN_BYTES {
+        let mut plain = unprotect(&kind.entropy(provider), &bytes[HEADER.len()..])?;
+        if plain.len() > kind.plain_limit() {
             plain.fill(0);
             bail!("Saved sign-in exceeds its plaintext bound");
         }
-        let session = serde_json::from_slice::<Session>(&plain);
-        plain.fill(0);
-        let session =
-            session.map_err(|_| anyhow!("Saved Aegis sign-in is invalid; sign in again"))?;
-        session.validate(provider)?;
-        Ok(Some(session))
+        Ok(Some(plain))
     }
 
     pub fn remove(&self, provider: &str) -> Result<bool> {

@@ -121,7 +121,7 @@ pub fn remote_value(provider: crate::direct::Provider, value: &Value) -> Result<
             .map(str::to_owned);
         models.push(RemoteModel {
             id: id.to_owned(),
-            label: crate::terminal::fit(label.unwrap_or(id), 100),
+            label: display_label(label.unwrap_or(id)),
             reasoning_levels,
             default_reasoning,
         });
@@ -141,6 +141,16 @@ pub fn valid_id(id: &str) -> bool {
         && !id
             .chars()
             .any(|character| character.is_whitespace() || character.is_control())
+        && crate::text::clean(id) == id
+}
+
+pub(crate) fn display_label(label: &str) -> String {
+    let label = crate::terminal::fit(label, 100);
+    let mut end = label.len().min(400);
+    while !label.is_char_boundary(end) {
+        end -= 1;
+    }
+    label[..end].to_owned()
 }
 
 pub fn valid_effort(effort: &str) -> bool {
@@ -195,6 +205,16 @@ pub fn reasoning_levels(provider: &str, id: &str) -> Result<Vec<String>> {
         return Ok(["none", "minimal", "low", "medium", "high", "xhigh"]
             .map(str::to_owned)
             .to_vec());
+    }
+    if let Ok(selected) = crate::direct::provider(provider) {
+        let vault = crate::auth_store::Vault::user()?;
+        if vault.load(selected.session_name())?.is_some() {
+            return Ok(crate::provider_catalog::cached(&vault, selected, || false)?
+                .into_iter().flatten()
+                .find(|model| model.id == id)
+                .map(|model| model.reasoning_levels)
+                .unwrap_or_default());
+        }
     }
     let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
         .context("Home directory unavailable")?;
@@ -353,6 +373,19 @@ pub fn native(provider: &str) -> Result<Catalog> {
     }
 }
 
+pub fn available(provider: &str, cancelled: impl Fn() -> bool) -> Result<Catalog> {
+    let selected = crate::direct::provider(provider)?;
+    let vault = crate::auth_store::Vault::user()?;
+    if vault.load(selected.session_name())?.is_none() {
+        return native(provider);
+    }
+    let models = crate::provider_catalog::get(&vault, selected, cancelled)?;
+    Ok(Catalog {
+        models: models.into_iter().map(|model| Model { id: model.id, label: model.label }).collect(),
+        source: "Aegis account-bound catalog · cached up to 15 minutes · availability can change".into(),
+    })
+}
+
 pub fn endpoint_value(value: &Value) -> Result<Vec<Model>> {
     let mut models = Vec::new();
     for model in value["data"]
@@ -372,6 +405,15 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::fs;
+
+    #[test]
+    fn remote_display_labels_have_byte_and_column_bounds_even_for_combining_marks() {
+        let label = display_label(&format!("Example{}", "\u{301}".repeat(8192)));
+        assert!(label.len() <= 400);
+        assert!(std::str::from_utf8(label.as_bytes()).is_ok());
+        assert_eq!(display_label("🦊 日本語\u{1b}\u{202e}"), "🦊 日本語");
+        assert!(!valid_id("model\u{202e}"));
+    }
 
     #[test]
     fn remote_chatgpt_catalog_preserves_advertised_priority_and_reasoning_only() -> Result<()> {
