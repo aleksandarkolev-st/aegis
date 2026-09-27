@@ -23,7 +23,7 @@ Sensible budgets and evidence checks are enabled by default. Optional F7 **Task 
 
 Follow-up tasks carry bounded summaries of the previous four tasks, including after reopening Aegis or switching providers. Earlier summaries do not grant permissions or count as evidence for a new task. F5 (or optional `/new`) clears that continuation; task history remains available under F3.
 
-Reopening an interactive terminal offers continuing your unfinished task. Interrupted non-idempotent calls remain paused: the recovery menu lets you select the operation and record an externally verified success or failure with a receipt, without entering operation IDs or replaying uncertain side effects. Evidence inspection uses bounded previews or text search, even for large stored logs.
+Reopening an interactive terminal offers continuing your unfinished task. Interrupted non-idempotent calls remain paused: the recovery menu lets you select the operation and record an externally verified success or failure with a receipt, without entering operation IDs or replaying uncertain side effects. Evidence inspection offers bounded previews, literal text search, line ranges and character ranges through menus, even for large stored logs. Browsing evidence makes no model or tool calls.
 
 ### Model selection and terminal feedback
 

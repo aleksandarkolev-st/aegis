@@ -117,6 +117,7 @@ LATEST MANUAL UX CHECK
 - Both benchmark --run commands refused absent readiness review before API/model calls; raw refusal logs .arun/arc-readiness-refusal-20260927.log and .arun/coding-readiness-refusal-20260927.log. No attestation was invented.
 
 NEXT IMPLEMENTATION / VERIFICATION WORK
+- Evidence browsing now exposes preview/search/line/character ranges as keyboard choices and numeric fields rather than requiring inspection command syntax. Read-only guided integration verification is pending.
 - Native release CI now runs all Rust targets, including the optional evaluation runners' safety-gate/accounting checks. No workflow was remotely dispatched and no public release was created.
 - Menu usability follow-up preserves unfinished prompt text and Unicode cursor position in session memory across keyboard shortcuts, without injecting drafts into other settings or secret fields. Focused regression and installed verification are pending; this is not a completion claim.
 - Safe directory scaffolding and optional scoped HTTPS are implemented and functionally checked.

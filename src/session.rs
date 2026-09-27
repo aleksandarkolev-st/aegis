@@ -1299,6 +1299,33 @@ fn review_operations(root: &Path, id: &str, terminal: &Terminal) -> Result<()> {
     )
 }
 
+fn inspection_number(
+    terminal: &Terminal,
+    label: &str,
+    default: usize,
+    minimum: usize,
+    maximum: usize,
+) -> Result<Option<usize>> {
+    loop {
+        let Some(value) = field(terminal, label, false)? else {
+            return Ok(None);
+        };
+        let parsed = if value.trim().is_empty() {
+            Some(default)
+        } else {
+            value.trim().parse::<usize>().ok()
+        };
+        if let Some(number) = parsed.filter(|number| (minimum..=maximum).contains(number)) {
+            return Ok(Some(number));
+        }
+        terminal.message(
+            Tone::Warning,
+            "Choose a number",
+            &format!("Enter a whole number from {minimum} to {maximum}, or Enter for {default}."),
+        )?;
+    }
+}
+
 fn artifacts(root: &Path, id: &str, terminal: &Terminal) -> Result<()> {
     let store = Store::open(root)?;
     let artifacts = store.evidence_artifacts(id)?;
@@ -1316,14 +1343,66 @@ fn artifacts(root: &Path, id: &str, terminal: &Terminal) -> Result<()> {
     let Some((label, hash)) = artifacts.get(index) else {
         return Ok(());
     };
-    let Some(query) = field(terminal, "  Find text (Enter for preview) › ", false)? else {
-        return Ok(());
-    };
-    terminal.message(
-        Tone::Quiet,
-        label,
-        &kernel::inspect(&store.artifact(hash)?, &query),
-    )
+    let bytes = store.artifact(hash)?;
+    let modes = [
+        "Preview · first 4,000 characters",
+        "Find text · literal search",
+        "Read lines · choose start and count",
+        "Read characters · choose offset and count",
+        "Back",
+    ]
+    .map(str::to_owned);
+    loop {
+        let query = match terminal.select("Inspect evidence · no tools or model calls", &modes)? {
+            Some(0) => String::new(),
+            Some(1) => {
+                let Some(text) = field(terminal, "  Find text › ", false)? else {
+                    continue;
+                };
+                if text.trim().is_empty() {
+                    continue;
+                }
+                format!("@find {text}")
+            }
+            Some(mode @ (2 | 3)) => {
+                let lines = mode == 2;
+                let Some(start) = inspection_number(
+                    terminal,
+                    if lines {
+                        "  First line (Enter: 1) › "
+                    } else {
+                        "  Character offset (Enter: 0) › "
+                    },
+                    usize::from(lines),
+                    usize::from(lines),
+                    usize::MAX,
+                )?
+                else {
+                    continue;
+                };
+                let Some(count) = inspection_number(
+                    terminal,
+                    if lines {
+                        "  Line count (Enter: 40, max: 100) › "
+                    } else {
+                        "  Character count (Enter: 2,000, max: 4,000) › "
+                    },
+                    if lines { 40 } else { 2000 },
+                    1,
+                    if lines { 100 } else { 4000 },
+                )?
+                else {
+                    continue;
+                };
+                format!(
+                    "{} {start} {count}",
+                    if lines { "@lines" } else { "@slice" }
+                )
+            }
+            _ => return Ok(()),
+        };
+        terminal.message(Tone::Quiet, label, &kernel::inspect(&bytes, &query))?;
+    }
 }
 
 fn context_view(root: &Path, id: &str, terminal: &Terminal) -> Result<()> {
