@@ -1,5 +1,5 @@
 AEGIS IMPLEMENTATION PROGRESS
-Updated: 2026-09-27 09:49 UTC (UTC; workspace timezone Europe/Kyiv)
+Updated: 2026-09-27 09:51 UTC (UTC; workspace timezone Europe/Kyiv)
 
 LATEST USER REQUIREMENTS
 - Adapt to the user's habits, not just remember explicit notes.
@@ -139,3 +139,11 @@ NEXT IMPLEMENTATION / VERIFICATION WORK
 - ARC-AGI-3 adapter and record/scoring pipeline are implemented and fixture-verified, not live-certified. Continue the full readiness audit, including official service/data-use conditions before actual evaluation. Preserve authoritative scorecards and incomplete records; do not equate completion percentage or tokens with the official score. Anonymous credentials/cookies are private and excluded from shareable logs.
 - Resource accounting, bounded result mapping and runtime mechanisms have functional evidence. Remaining full-goal gates are live Claude verification explicitly user-deferred, actual macOS/multi-architecture release verification/public distribution, fully finalized multi-hour agent evidence, and later agent measurements under the readiness gate. No new readiness attestation or agent evaluation was started; no owned UI/worker/build session remains active.
 - Only after readiness: native Codex coding comparisons and ARC-AGI-3, preserving every attempt and correction outcome.
+
+FULL-GOAL IMPASSE AUDIT (2026-09-27 09:51 UTC)
+- Previous goal turn was progress: committed UI-independent text validation, reproduced/fixed long-line inspection and completed Windows/Linux/package/installed verification. Current recheck finds a clean worktree and the installed 038b2ac native hash unchanged.
+- The same completion boundary has remained across at least three consecutive goal turns: live Claude verification is explicitly user-deferred, yet the full objective requires verified operation with Claude login. Isolated launcher/model fixtures are not authentication proof. Do not open sign-in, silently reauthenticate or substitute fixture success.
+- Platform preflight still provides Windows/Linux x86 only, not actual macOS/ARM verification. Remote release/publication has not been authorized or performed. Do not install privileged host emulators or claim cross-compilation as native execution to close that gap.
+- Existing multi-hour worker/external-check success is not original agent completion. Do not mutate its frozen contract, rerun its effectful work or retrofit acceptance/completion events to manufacture a successful demonstration.
+- The requested new native-Codex coding/ARC-AGI-3 evaluations remain behind the full readiness boundary. No review attestation or new agent evaluation was created. Further cosmetic edits cannot prove these remaining requirements.
+- No owned goal verification/UI/job handle remains live to wait on. The full goal is not complete; meaningful progress past this boundary now needs the user-deferred verification to resume and the relevant external platform/distribution prerequisites, then honest evaluation records after readiness.
