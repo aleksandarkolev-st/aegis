@@ -4,6 +4,8 @@ Scope: `plan.txt`, native ChatGPT/Grok login operation, custom OpenAI-compatible
 
 ## Runtime requirements
 
+New architecture gate: the user explicitly rejected starting native provider CLIs and prioritized direct ChatGPT/Grok login, leaving Claude pending. `src/direct.rs` is a tested HTTP/credential-binding core, not yet the normal dispatch/login/catalog path. Historical native-CLI evidence below remains historical and does not prove the revised requirement. See `docs/direct-providers.md`; readiness and new agent evaluations remain deferred.
+
 | Requirement | Authoritative implementation/evidence | Status or remaining gate |
 | --- | --- | --- |
 | Tiny stable model interface; deterministic kernel owns execution | `src/model.rs` six action variants; `src/kernel.rs` action validation/context/dispatch; native adapters disable their own tools | Implemented; real read/repair observations and mocked action tests cover the interface |

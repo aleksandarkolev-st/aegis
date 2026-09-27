@@ -25,6 +25,8 @@ No competitor source is copied into Aegis. Potential issues above are opportunit
 
 ## Implemented follow-up
 
+- The user rejected nested native CLIs after the greeting investigation. Aegis now has a tested independent direct HTTP transport core for the source-visible ChatGPT/Grok protocols, bounded saved-session reads and unchanged six-action output. Runtime routing, owned sign-in/refresh, catalog/setup replacement and installed verification are still pending; the core alone does not satisfy the architecture gate. See `docs/direct-providers.md`. Existing native installation/measurement evidence is retained, not reused as proof of direct access.
+
 - `d3aa163`: explicit scoped/revisioned SQLite instructions, immutable per-run capture, separate instruction-priority section and keyboard add/edit/remove. No automatic repository-guidance import yet. Focused bounds/recovery/permission/UI checks passed.
 - Bounded older-chat lexical recall and explicit same-chain full-message inspection now preserve access beyond the previous four-turn window. The fixed horizon, clipped previews and search coverage are disclosed. Retrieval cannot provide completion evidence or cross branches/workspaces; its mapped text is accounted before provider calls. Focused model-free, guided-chat and recovery checks passed. Latest installed release still needs rebuilding after these changes.
 - Native provider bootstrap cost, unnecessary action turns and repository-guidance compatibility remain open optimization targets. No superiority claim or new agent benchmark is made.
