@@ -146,7 +146,7 @@ fn present(
                 terminal.message(
                     Tone::Accent,
                     "Your code",
-                    &format!("{code} · expires in {} minutes", seconds.div_ceil(60)),
+                    &format!("{code} · approve within {} minutes", seconds.div_ceil(60)),
                 )?;
                 terminal.message(
                     Tone::Quiet,

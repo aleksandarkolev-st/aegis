@@ -13,6 +13,7 @@ const GROK_CLIENT: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 const GROK_SCOPES: &str = "openid profile email offline_access grok-cli:access api:access";
 const MAX_BYTES: usize = 128 * 1024;
 const MAX_EXPIRY: u64 = 366 * 24 * 60 * 60;
+const LOGIN_WINDOW_SECONDS: u64 = 15 * 60;
 
 pub struct DeviceLogin {
     provider: Provider,
@@ -130,16 +131,19 @@ impl AuthClient {
             Some(value) => number(value).context("Sign-in service returned an invalid interval")?,
         };
         let expiry = match self.provider {
-            Provider::ChatGpt => 15 * 60,
+            Provider::ChatGpt => LOGIN_WINDOW_SECONDS,
             Provider::Grok => value["expires_in"]
                 .as_u64()
                 .context("Sign-in service returned no code expiration")?,
         };
-        if !(1..=60).contains(&interval) || !(1..=15 * 60).contains(&expiry) {
-            bail!("Sign-in timing exceeds the supported bounds");
+        if !(1..=LOGIN_WINDOW_SECONDS).contains(&interval) {
+            bail!("Sign-in polling interval exceeds the local waiting window");
+        }
+        if expiry == 0 {
+            bail!("Sign-in service returned an expired code");
         }
         let interval = Duration::from_secs(interval);
-        let deadline = started + Duration::from_secs(expiry);
+        let deadline = started + Duration::from_secs(expiry.min(LOGIN_WINDOW_SECONDS));
         if Instant::now() >= deadline || cancelled() {
             bail!("Sign-in code expired or was cancelled before presentation");
         }
@@ -780,9 +784,11 @@ mod tests {
             ("user_code", json!("\u{1b}[2J")),
             ("user_code", json!("")),
             ("interval", json!(0)),
-            ("interval", json!(61)),
+            ("interval", json!(LOGIN_WINDOW_SECONDS + 1)),
+            ("interval", json!(u64::MAX)),
             ("expires_in", json!(0)),
-            ("expires_in", json!(901)),
+            ("expires_in", json!(-1)),
+            ("expires_in", json!("3600")),
             ("device_code", json!("private secret")),
             ("verification_uri", json!("https://evil.test/")),
         ] {
@@ -791,6 +797,28 @@ mod tests {
             let (client, worker) = fixture(Provider::Grok, vec![reply("200 OK", response)])?;
             assert!(client.begin(|| false).is_err());
             assert_eq!(worker.join().unwrap()?.len(), 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn server_code_lifetime_is_independent_of_the_bounded_local_wait() -> Result<()> {
+        for expiry in [30, LOGIN_WINDOW_SECONDS, 3600, u64::MAX] {
+            for interval in [1, 61, LOGIN_WINDOW_SECONDS] {
+                let mut response = code(Provider::Grok);
+                response["expires_in"] = json!(expiry);
+                response["interval"] = json!(interval);
+                let (client, worker) = fixture(Provider::Grok, vec![reply("200 OK", response)])?;
+                let mut login = client.begin(|| false)?;
+                assert_eq!(login.interval, Duration::from_secs(interval));
+                assert!(login.expires_in() > Duration::ZERO);
+                assert!(
+                    login.expires_in() <= Duration::from_secs(expiry.min(LOGIN_WINDOW_SECONDS))
+                );
+                assert!(client.poll(&mut login, || true).is_err());
+                assert!(login.finished);
+                assert_eq!(worker.join().unwrap()?.len(), 1);
+            }
         }
         Ok(())
     }
