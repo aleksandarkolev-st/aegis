@@ -1,6 +1,6 @@
 # Plan implementation audit — 2026-09-27
 
-Scope: the full `plan.txt`, native ChatGPT/Claude/Grok login operation, custom OpenAI-compatible endpoints, installable `aegis-arun`, and the user's same-terminal autonomous UX. This is a requirement audit, not a completion claim. Previous UI work is verified progress; it does not prove the whole goal.
+Scope: `plan.txt`, native ChatGPT/Grok login operation, custom OpenAI-compatible endpoints, installable `aegis-arun`, and the user's same-terminal autonomous UX. On 2026-09-27 the user excluded Claude live verification and macOS/ARM verification from the required current scope. Their adapters/release definitions remain, with historical limitations preserved rather than claimed verified. The user subsequently requested a redesigned saved-chat/model/reasoning interface and approved established Rust terminal frameworks; that work must be functionally and installation-verified before the new agent benchmarks. This is a requirement audit, not a completion claim.
 
 ## Runtime requirements
 
@@ -48,10 +48,10 @@ Scope: the full `plan.txt`, native ChatGPT/Claude/Grok login operation, custom O
 | Tool output / verified result / warning distinction, large-output metadata | Semantic operation labels, measured result metadata and separate warning/success tones, including nonzero/unknown exit status | Implemented and tested; no JSON previews dumped in normal completion feedback |
 | Native ChatGPT login works | Verified read pilot, matrix and UI tasks using Codex login, including a fresh bounded `gpt-5.5` read with response capture guards | Proven for observed calls; historical subscription usage limits are recorded, not bypassed |
 | Native Grok login works | Independently accepted native Grok read task and current model picker | Proven for observed read; no broad reliability estimate |
-| Native Claude login works | Adapter and native login flow; expired saved session | Live completion pending at the user's explicit request; do not silently reauthenticate |
+| Native Claude login works | Adapter and native login flow; expired saved session | Excluded from current required verification at the user's request; support retained, live completion not claimed |
 | Custom OpenAI-compatible endpoint | Authenticated local HTTP tests across schema/json/prompt formats and `/models` | Local compatible protocol verified; unspecified production endpoint not certified |
 | Installable Node package, `aegis` / `arun` commands | Bundled Windows user-global install and Linux source-only container npm install/launcher smoke | Windows/Linux x86_64 local installs verified; public publication and all-platform release assets not authorized/verified |
-| Cross-platform release distribution | Five-platform checksum/version workflow, npm verification tests and local Windows install; Linux source tests and release/version smoke | Actual Windows/Linux builds exist. macOS execution, multi-architecture release assets and public publication remain pending |
+| Cross-platform release distribution | Five-platform checksum/version workflow, npm verification tests and local Windows install; Linux source tests and release/version smoke | Actual Windows/Linux x86_64 builds exist. macOS/ARM verification is excluded from current scope. Public publication remains unauthorized |
 
 ## Additional user requirements and evaluation gate
 

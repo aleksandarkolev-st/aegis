@@ -212,8 +212,8 @@ impl Skin for UiOptions {
             return self.portrait.clone();
         }
         let rows = match self.mascot {
-            Mascot::Pip => ["   .-----.", "   | o o |", "   \\  ^  /", "    '---'"],
-            Mascot::Byte => ["    .-.-.", "   [ o o ]", "   |  =  |", "    '-.-'"],
+            Mascot::Pip => ["  /\\_/\\", " ( o.o )", "  / >_\\", "   / \\"],
+            Mascot::Byte => ["   ╭───╮", "   │• •│", "   ╰─┬─╯", "    ╱ ╲"],
             Mascot::Orbit => ["     . + .", "   --(o)--", "     ' + '", "      *"],
             Mascot::Off => unreachable!(),
         };

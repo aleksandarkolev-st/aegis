@@ -6,7 +6,7 @@ use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     queue,
-    style::{Color, ResetColor, SetForegroundColor},
+    style::{Attribute, Color, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
     terminal::{self, Clear, ClearType},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -44,6 +44,7 @@ pub struct Terminal {
     activity_rows: std::cell::Cell<u16>,
     activity_view: std::cell::RefCell<Option<(usize, String, Option<String>)>>,
     input_draft: std::cell::RefCell<Option<(String, Vec<char>, usize)>>,
+    input_status: std::cell::RefCell<String>,
     skin: Box<dyn crate::ui::Skin>,
 }
 
@@ -188,6 +189,7 @@ impl Default for Terminal {
             activity_rows: std::cell::Cell::new(0),
             activity_view: std::cell::RefCell::new(None),
             input_draft: std::cell::RefCell::new(None),
+            input_status: std::cell::RefCell::new(String::new()),
             skin: Box::new(crate::ui::UiOptions::default()),
         }
     }
@@ -299,64 +301,169 @@ impl Terminal {
     }
 
     pub fn welcome(&self, provider: &str, workspace: &str) -> Result<()> {
-        println!();
+        self.home(provider, workspace, "", &[])
+    }
+
+    pub fn home(
+        &self,
+        provider: &str,
+        workspace: &str,
+        selection: &str,
+        recent: &[String],
+    ) -> Result<()> {
         let width = terminal::size()
             .map(|(width, _)| width as usize)
             .unwrap_or(80)
-            .saturating_sub(4);
-        for block in self.skin.blocks().into_iter().take(5) {
+            .saturating_sub(4)
+            .min(96)
+            .max(12);
+        let mut output = io::stdout();
+        write!(output, "\r\n")?;
+        let buffer = self.home_buffer(provider, workspace, selection, recent, width);
+        for row in 0..buffer.area.height {
+            if self.interactive {
+                self.paint_widget_row(&buffer, row, 2)?;
+            } else {
+                write!(output, "  {}", crate::widgets::row_text(&buffer, row))?;
+            }
+            write!(output, "\r\n")?;
+        }
+        if self.colors {
+            queue!(output, ResetColor)?;
+        }
+        write!(output, "\r\n")?;
+        if self
+            .skin
+            .blocks()
+            .contains(&crate::ui::WelcomeBlock::Shortcuts)
+        {
+            self.message(
+                Tone::Quiet,
+                "",
+                "F3 chats   F6 model + reasoning   F7 style / settings   F1 help",
+            )?;
+            write!(output, "\r\n")?;
+        }
+        output.flush()?;
+        Ok(())
+    }
+
+    fn home_buffer(
+        &self,
+        provider: &str,
+        workspace: &str,
+        selection: &str,
+        recent: &[String],
+        width: usize,
+    ) -> ratatui::buffer::Buffer {
+        let width = width.max(12);
+        let blocks = self.skin.blocks();
+        let mut content = Vec::new();
+        for block in &blocks {
             match block {
                 crate::ui::WelcomeBlock::Mascot => {
                     let portrait = self.skin.portrait();
                     if portrait.is_empty() {
-                        self.message(Tone::Accent, "A E G I S", "Your terminal sidekick.")?;
-                    } else {
-                        for (index, row) in portrait.iter().take(8).enumerate() {
-                            let caption = [
-                                "A E G I S",
-                                "Your terminal sidekick.",
-                                "Big ideas. Tiny footprint.",
-                            ]
-                            .get(index)
-                            .copied()
-                            .unwrap_or("");
-                            self.message(
-                                Tone::Accent,
-                                "",
-                                &fit(&format!("{row:<15} {caption}"), width),
-                            )?;
-                        }
+                        content.push("Aegis · ready when you are".into());
+                    }
+                    for (index, row) in portrait.into_iter().enumerate() {
+                        content.push(if row.width() > 10 {
+                            row
+                        } else {
+                            format!(
+                                "{}  {}",
+                                pad_line(&row, 10),
+                                ["Ready when you are.", "Let's build it.", "", ""]
+                                    .get(index)
+                                    .copied()
+                                    .unwrap_or("")
+                            )
+                        });
+                    }
+                    content.push(String::new());
+                }
+                crate::ui::WelcomeBlock::Provider => {
+                    content.push(provider.to_owned());
+                    if !selection.is_empty() {
+                        content.push(selection.to_owned());
                     }
                 }
-                crate::ui::WelcomeBlock::Provider => self.message(
-                    Tone::Accent,
-                    "Provider",
-                    &fit(provider, width.saturating_sub(10)),
-                )?,
-                crate::ui::WelcomeBlock::Workspace => self.message(
-                    Tone::Quiet,
-                    "Workspace",
-                    &fit(workspace, width.saturating_sub(11)),
-                )?,
-                crate::ui::WelcomeBlock::Hint => {
-                    self.message(Tone::Quiet, "", "What would you like to build? Just ask.")?
-                }
-                crate::ui::WelcomeBlock::Shortcuts => {
-                    self.message(
-                        Tone::Quiet,
-                        "",
-                        &fit("F2 provider · F6 models · F7 personalize · F3 tasks", width),
-                    )?;
-                    self.message(
-                        Tone::Quiet,
-                        "",
-                        &fit("F1 help · F4 sign in · F5 fresh start · Ctrl+D exit", width),
-                    )?;
-                }
+                crate::ui::WelcomeBlock::Hint => content.push("Ask, explore, build.".into()),
+                _ => {}
             }
         }
-        println!();
+        let mut history = vec!["Recent chats  /  F3".into(), String::new()];
+        if recent.is_empty() {
+            history.extend([
+                "A fresh canvas.".into(),
+                "Your chats save automatically.".into(),
+            ]);
+        } else {
+            history.extend(recent.iter().take(6).cloned());
+        }
+        crate::widgets::home(
+            &content,
+            &history,
+            blocks
+                .contains(&crate::ui::WelcomeBlock::Workspace)
+                .then_some(workspace),
+            width.min(u16::MAX as usize) as u16,
+            &self.skin.palette(),
+        )
+    }
+
+    fn paint_widget_row(
+        &self,
+        buffer: &ratatui::buffer::Buffer,
+        row: u16,
+        margin: u16,
+    ) -> Result<()> {
+        use ratatui::style::{Color as WidgetColor, Modifier};
+        let mut output = io::stdout();
+        queue!(
+            output,
+            cursor::MoveToColumn(0),
+            Clear(ClearType::CurrentLine)
+        )?;
+        write!(output, "{}", " ".repeat(margin as usize))?;
+        let mut previous = None;
+        let mut column = 0;
+        while column < buffer.area.width {
+            let cell = &buffer[(column, row)];
+            let style = (cell.fg, cell.bg, cell.modifier);
+            if self.colors && previous != Some(style) {
+                let convert = |color| match color {
+                    WidgetColor::Rgb(r, g, b) => Color::Rgb { r, g, b },
+                    _ => Color::Reset,
+                };
+                queue!(
+                    output,
+                    SetAttribute(Attribute::Reset),
+                    SetForegroundColor(convert(cell.fg)),
+                    SetBackgroundColor(convert(cell.bg))
+                )?;
+                for (modifier, attribute) in [
+                    (Modifier::BOLD, Attribute::Bold),
+                    (Modifier::DIM, Attribute::Dim),
+                    (Modifier::REVERSED, Attribute::Reverse),
+                ] {
+                    if cell.modifier.contains(modifier) {
+                        queue!(output, SetAttribute(attribute))?;
+                    }
+                }
+                previous = Some(style);
+            }
+            write!(output, "{}", cell.symbol())?;
+            column += cell.symbol().width().max(1) as u16;
+        }
+        if self.colors {
+            queue!(output, SetAttribute(Attribute::Reset), ResetColor)?;
+        }
         Ok(())
+    }
+
+    pub fn set_input_status(&self, status: &str) {
+        self.input_status.replace(clean(status));
     }
 
     pub fn clear_activity(&self) -> Result<()> {
@@ -497,6 +604,12 @@ impl Terminal {
             return Ok(Input::Submit(text.trim_end_matches(['\r', '\n']).into()));
         }
         let _raw = RawMode::enter(true)?;
+        let composer =
+            !secret && label == self.input_prefix() && !self.input_status.borrow().is_empty();
+        if composer {
+            write!(io::stdout(), "\r\n\r\n")?;
+            queue!(io::stdout(), cursor::MoveUp(1))?;
+        }
         let draft_label = label.to_owned();
         let (mut text, mut caret) = self.take_input_draft(label, secret);
         let mut history_index = history.len();
@@ -504,8 +617,18 @@ impl Terminal {
             let width = terminal::size()
                 .map(|(width, _)| width as usize)
                 .unwrap_or(80);
-            let label = fit(label, width.saturating_sub(2));
-            let available = width.saturating_sub(label.width() + 1).max(1);
+            let width = if composer { width.min(100) } else { width };
+            let label = fit(
+                &if composer {
+                    format!("  │ {}", label.trim_start())
+                } else {
+                    label.into()
+                },
+                width.saturating_sub(4),
+            );
+            let available = width
+                .saturating_sub(label.width() + if composer { 5 } else { 1 })
+                .max(1);
             let displayed: Vec<_> = text
                 .iter()
                 .map(|character| {
@@ -521,17 +644,35 @@ impl Terminal {
                 })
                 .collect();
             let (visible, caret_width) = input_view(&displayed, caret, available);
-            queue!(
-                io::stdout(),
-                cursor::MoveToColumn(0),
-                Clear(ClearType::CurrentLine)
-            )?;
-            if self.colors {
-                queue!(io::stdout(), SetForegroundColor(self.color(Tone::Accent)))?;
+            if composer {
+                let buffer = crate::widgets::composer(
+                    &draft_label,
+                    &visible,
+                    &self.input_status.borrow(),
+                    width.saturating_sub(4).max(4) as u16,
+                    &self.skin.palette(),
+                );
+                queue!(io::stdout(), cursor::MoveUp(1))?;
+                for row in 0..3 {
+                    self.paint_widget_row(&buffer, row, 2)?;
+                    if row < 2 {
+                        write!(io::stdout(), "\r\n")?;
+                    }
+                }
+                queue!(io::stdout(), cursor::MoveUp(1), ResetColor)?;
+            } else {
+                queue!(
+                    io::stdout(),
+                    cursor::MoveToColumn(0),
+                    Clear(ClearType::CurrentLine)
+                )?;
+                if self.colors {
+                    queue!(io::stdout(), SetForegroundColor(self.color(Tone::Accent)))?;
+                }
+                write!(io::stdout(), "{label}")?;
+                queue!(io::stdout(), ResetColor)?;
+                write!(io::stdout(), "{visible}")?;
             }
-            write!(io::stdout(), "{label}")?;
-            queue!(io::stdout(), ResetColor)?;
-            write!(io::stdout(), "{visible}")?;
             queue!(
                 io::stdout(),
                 cursor::MoveToColumn((label.width() + caret_width) as u16)
@@ -551,11 +692,16 @@ impl Terminal {
                     }
                     match key.code {
                         KeyCode::Enter => {
-                            write!(io::stdout(), "\r\n")?;
-                            return Ok(Input::Submit(text.iter().collect()));
+                            let submitted: String = text.iter().collect();
+                            self.finish_input(
+                                composer,
+                                (!secret && !submitted.starts_with('/'))
+                                    .then_some(submitted.as_str()),
+                            )?;
+                            return Ok(Input::Submit(submitted));
                         }
                         KeyCode::Char('d') if control && text.is_empty() => {
-                            write!(io::stdout(), "\r\n")?;
+                            self.finish_input(composer, None)?;
                             return Ok(Input::Exit);
                         }
                         KeyCode::Char('c') if control => {
@@ -567,39 +713,39 @@ impl Terminal {
                             caret = 0;
                         }
                         KeyCode::F(2) if !secret => {
-                            write!(io::stdout(), "\r\n")?;
+                            self.finish_input(composer, None)?;
                             return Ok(Input::Providers);
                         }
                         KeyCode::F(3) if !secret => {
-                            write!(io::stdout(), "\r\n")?;
+                            self.finish_input(composer, None)?;
                             return Ok(Input::Sessions);
                         }
                         KeyCode::F(4) if !secret => {
-                            write!(io::stdout(), "\r\n")?;
+                            self.finish_input(composer, None)?;
                             return Ok(Input::Login);
                         }
                         KeyCode::F(5) if !secret => {
-                            write!(io::stdout(), "\r\n")?;
+                            self.finish_input(composer, None)?;
                             return Ok(Input::NewConversation);
                         }
                         KeyCode::F(6) if !secret => {
-                            write!(io::stdout(), "\r\n")?;
+                            self.finish_input(composer, None)?;
                             return Ok(Input::Models);
                         }
                         KeyCode::F(7) if !secret => {
-                            write!(io::stdout(), "\r\n")?;
+                            self.finish_input(composer, None)?;
                             return Ok(Input::Settings);
                         }
                         KeyCode::F(1) if !secret => {
-                            write!(io::stdout(), "\r\n")?;
+                            self.finish_input(composer, None)?;
                             return Ok(Input::Help);
                         }
                         KeyCode::F(8) if !secret => {
-                            write!(io::stdout(), "\r\n")?;
+                            self.finish_input(composer, None)?;
                             return Ok(Input::Checkpoint);
                         }
                         KeyCode::F(9) if !secret => {
-                            write!(io::stdout(), "\r\n")?;
+                            self.finish_input(composer, None)?;
                             return Ok(Input::CancelTask);
                         }
                         KeyCode::Left => caret = caret.saturating_sub(1),
@@ -638,14 +784,49 @@ impl Terminal {
         }
     }
 
+    fn finish_input(&self, composer: bool, submitted: Option<&str>) -> Result<()> {
+        if !composer {
+            write!(io::stdout(), "\r\n")?;
+            return Ok(());
+        }
+        queue!(
+            io::stdout(),
+            cursor::MoveUp(1),
+            cursor::MoveToColumn(0),
+            ResetColor
+        )?;
+        for row in 0..3 {
+            queue!(io::stdout(), Clear(ClearType::CurrentLine))?;
+            if row < 2 {
+                queue!(io::stdout(), cursor::MoveDown(1), cursor::MoveToColumn(0))?;
+            }
+        }
+        queue!(io::stdout(), cursor::MoveUp(2), cursor::Show)?;
+        if let Some(text) = submitted.filter(|text| !text.is_empty()) {
+            self.message(Tone::Accent, "You", text)?;
+            write!(io::stdout(), "\r\n")?;
+        }
+        io::stdout().flush()?;
+        Ok(())
+    }
+
     pub fn select(&self, title: &str, choices: &[String]) -> Result<Option<usize>> {
+        self.select_at(title, choices, 0)
+    }
+
+    pub fn select_at(
+        &self,
+        title: &str,
+        choices: &[String],
+        initial: usize,
+    ) -> Result<Option<usize>> {
         if choices.is_empty() {
             return Ok(None);
         }
-        self.message(Tone::Accent, "◇", title)?;
         if self.interactive {
-            return self.menu(choices);
+            return self.menu(title, choices, initial);
         }
+        self.message(Tone::Accent, "◇", title)?;
         for (index, choice) in choices.iter().enumerate() {
             self.message(Tone::Quiet, &format!("{}", index + 1), choice)?;
         }
@@ -667,13 +848,14 @@ impl Terminal {
         }
     }
 
-    fn menu(&self, choices: &[String]) -> Result<Option<usize>> {
+    fn menu(&self, title: &str, choices: &[String], initial: usize) -> Result<Option<usize>> {
         let _raw = RawMode::enter(true)?;
         let rows = terminal::size()
             .map(|(_, height)| height.saturating_sub(5).max(1) as usize)
             .unwrap_or(8)
-            .min(choices.len());
-        let mut selected = 0_usize;
+            .min(choices.len())
+            .min(7);
+        let mut selected = initial.min(choices.len() - 1);
         let mut digits = String::new();
         let mut query = String::new();
         let mut rendered = false;
@@ -682,71 +864,31 @@ impl Terminal {
                 .map(|(width, _)| width as usize)
                 .unwrap_or(80);
             if rendered {
-                queue!(io::stdout(), cursor::MoveUp(rows as u16))?;
+                queue!(io::stdout(), cursor::MoveUp(rows as u16 + 1))?;
             }
             let matches = menu_matches(choices, &query);
             selected = selected.min(matches.len().saturating_sub(1));
-            let start = selected
-                .saturating_sub(rows / 2)
-                .min(matches.len().saturating_sub(rows));
-            for row in 0..rows {
-                let position = start + row;
-                let index = matches.get(position).copied();
-                let choice = index
-                    .map(|index| choices[index].as_str())
-                    .unwrap_or(if row == 0 {
-                        "No matching options · Backspace clears the filter"
-                    } else {
-                        ""
-                    });
-                queue!(
-                    io::stdout(),
-                    cursor::MoveToColumn(0),
-                    Clear(ClearType::CurrentLine)
-                )?;
-                if self.colors {
-                    queue!(
-                        io::stdout(),
-                        SetForegroundColor(self.color(
-                            if index.is_some() && position == selected {
-                                Tone::Accent
-                            } else {
-                                Tone::Quiet
-                            }
-                        ))
-                    )?;
+            let buffer = crate::widgets::menu(
+                title,
+                choices,
+                &matches,
+                selected,
+                rows as u16,
+                &query,
+                width.saturating_sub(1).min(120) as u16,
+                &self.skin.palette(),
+            );
+            for row in 0..buffer.area.height {
+                self.paint_widget_row(&buffer, row, 0)?;
+                if row + 1 < buffer.area.height {
+                    write!(io::stdout(), "\r\n")?;
                 }
-                let marker = if index.is_some() && position == selected {
-                    "›"
-                } else {
-                    " "
-                };
-                let number = index
-                    .map(|index| (index + 1).to_string())
-                    .unwrap_or_default();
-                write!(
-                    io::stdout(),
-                    "{}\r\n",
-                    fit(
-                        &format!("  {marker} {number}  {choice}"),
-                        width.saturating_sub(1)
-                    )
-                )?;
             }
             queue!(
                 io::stdout(),
                 cursor::MoveToColumn(0),
-                Clear(ClearType::CurrentLine),
                 ResetColor,
                 cursor::Hide
-            )?;
-            write!(
-                io::stdout(),
-                "{}",
-                fit(
-                    &format!("  ↑ ↓ choose · Enter confirm · Esc back · Filter: {query}"),
-                    width.saturating_sub(1)
-                )
             )?;
             io::stdout().flush()?;
             rendered = true;
@@ -757,16 +899,16 @@ impl Terminal {
                 match key.code {
                     KeyCode::Enter => {
                         if let Some(index) = matches.get(selected) {
-                            write!(io::stdout(), "\r\n")?;
+                            self.clear_menu(rows)?;
                             return Ok(Some(*index));
                         }
                     }
                     KeyCode::Esc => {
-                        write!(io::stdout(), "\r\n")?;
+                        self.clear_menu(rows)?;
                         return Ok(None);
                     }
                     KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        write!(io::stdout(), "\r\n")?;
+                        self.clear_menu(rows)?;
                         return Ok(None);
                     }
                     KeyCode::Char(digit) if digit.is_ascii_digit() && query.is_empty() => {
@@ -800,6 +942,24 @@ impl Terminal {
                 }
             }
         }
+    }
+
+    fn clear_menu(&self, rows: usize) -> Result<()> {
+        queue!(
+            io::stdout(),
+            cursor::MoveUp(rows as u16 + 1),
+            cursor::MoveToColumn(0),
+            ResetColor
+        )?;
+        for row in 0..rows + 2 {
+            queue!(io::stdout(), Clear(ClearType::CurrentLine))?;
+            if row < rows + 1 {
+                queue!(io::stdout(), cursor::MoveDown(1), cursor::MoveToColumn(0))?;
+            }
+        }
+        queue!(io::stdout(), cursor::MoveUp(rows as u16 + 1), cursor::Show)?;
+        io::stdout().flush()?;
+        Ok(())
     }
 
     pub fn render_event(&self, event: &RunEvent) -> Result<()> {
@@ -919,6 +1079,11 @@ impl Terminal {
             _ => Ok(()),
         }
     }
+}
+
+fn pad_line(text: &str, width: usize) -> String {
+    let text = fit(&clean(text).replace('\n', " "), width);
+    format!("{text}{}", " ".repeat(width.saturating_sub(text.width())))
 }
 
 fn menu_matches(choices: &[String], query: &str) -> Vec<usize> {
@@ -1071,6 +1236,43 @@ pub fn fit(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn home_panels_align_at_narrow_and_wide_unicode_widths() {
+        let terminal = Terminal::default();
+        for width in [16, 32, 60, 72, 76, 96] {
+            let buffer = terminal.home_buffer(
+                "ChatGPT / Codex",
+                "C:\\long\\workspace\\日本語",
+                "example-model · high",
+                &["• Fix parser 🦊".into(), "  paused · 4m ago".into()],
+                width,
+            );
+            let rows: Vec<_> = (0..buffer.area.height)
+                .map(|row| crate::widgets::row_text(&buffer, row))
+                .collect();
+            assert!(rows.iter().all(|row| row.width() == width), "{rows:?}");
+            assert!(rows[0].starts_with('╭'));
+            assert!(rows.last().unwrap().ends_with('╯'));
+        }
+        let style = crate::ui::UiOptions {
+            blocks: vec![crate::ui::WelcomeBlock::Hint],
+            ..Default::default()
+        };
+        let buffer = Terminal::default().with_skin(style).home_buffer(
+            "hidden-provider",
+            "hidden-path",
+            "hidden-model",
+            &[],
+            76,
+        );
+        let rows = (0..buffer.area.height)
+            .map(|row| crate::widgets::row_text(&buffer, row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rows.contains("hidden-"));
+        assert!(rows.contains("Ask, explore, build."));
+    }
 
     #[test]
     fn activity_cache_is_invalidated_after_clear_and_style_changes() -> Result<()> {

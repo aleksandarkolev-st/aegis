@@ -137,6 +137,7 @@ fn context(store: &Store, run: &Run) -> Result<String> {
     let handoff = store.last_checkpoint(&run.id)?;
     let mut context = json!({
         "task": run.task, "acceptance": run.acceptance, "workspace": run.workspace, "mode": mode,
+        "acceptance_check_configured": crate::acceptance::Check::from_run(run)?.is_some(),
         "permission_policy": "Discovery returns only granted capabilities; invoke only supplied schemas. Non-eager modes retain at most eight recently discovered capability schemas. Search again to reactivate an evicted schema; discovery never removes recorded operations or evidence.",
         "process_programs": grants(run)?.into_iter().filter_map(|grant| grant.strip_prefix("process:").map(str::to_owned)).collect::<Vec<_>>(),
         "command_scopes": crate::policy::CommandScopes::from_configuration(&run.budgets)?,

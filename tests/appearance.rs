@@ -46,8 +46,8 @@ fn optional_appearance_settings_preserve_runtime_profile_and_reload_without_setu
         let text = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success());
         assert!(!text.contains("Choose your provider") && !text.contains("Make Aegis yours"));
-        assert_eq!(text.contains("| o o |"), preset == 1);
-        assert_eq!(text.contains("[ o o ]"), preset == 2);
+        assert_eq!(text.contains("( o.o )"), preset == 1);
+        assert_eq!(text.contains("│• •│"), preset == 2);
     }
     Ok(())
 }
@@ -76,7 +76,7 @@ fn invalid_optional_style_falls_back_without_blocking_or_running_code() -> Resul
     let output = child.wait_with_output()?;
     assert!(output.status.success());
     let text = String::from_utf8_lossy(&output.stdout);
-    assert!(text.contains("Style fallback") && text.contains("| o o |"));
+    assert!(text.contains("Style fallback") && text.contains("( o.o )"));
     assert!(!text.contains('\u{1b}'));
     assert_eq!(fs::read_dir(directory.path())?.count(), 1);
     Ok(())

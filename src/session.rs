@@ -83,7 +83,19 @@ fn choose_model(
     };
     let models = match catalog {
         Ok(catalog) => {
-            terminal.message(Tone::Quiet, "Catalog", &catalog.source)?;
+            if terminal.interactive {
+                terminal.message(
+                    Tone::Quiet,
+                    "",
+                    if profile.provider == "custom" {
+                        "Models advertised by your endpoint"
+                    } else {
+                        "Provider catalog · account availability may change"
+                    },
+                )?;
+            } else {
+                terminal.message(Tone::Quiet, "Catalog", &catalog.source)?;
+            }
             catalog.models
         }
         Err(error) => {
@@ -108,7 +120,7 @@ fn choose_model(
         } else {
             ""
         };
-        choices.push(format!("{}  [{}]{current}", model.label, model.id));
+        choices.push(format!("{}{current}", model.label));
         values.push(Some(model.id));
     }
     if let Some(current) = &profile.model {
@@ -122,9 +134,13 @@ fn choose_model(
     let selected = if choices.len() == 1 {
         Some(0)
     } else {
-        terminal.select(
+        terminal.select_at(
             &format!("{} · choose a model", name(&profile.provider)),
             &choices,
+            values
+                .iter()
+                .position(|model| model == &profile.model)
+                .unwrap_or(0),
         )?
     };
     let Some(selected) = selected else {
@@ -151,7 +167,7 @@ fn choose_model(
 fn show_selection(terminal: &Terminal, profile: &Profile) -> Result<()> {
     terminal.message(
         Tone::Accent,
-        "Connected",
+        "Model",
         &format!(
             "{} · {} · reasoning {}",
             name(&profile.provider),
@@ -1178,9 +1194,9 @@ fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
                 Tone::Quiet,
                 "",
                 &format!(
-                    "{} model tokens · state {}",
+                    "{} model tokens · {}",
                     store.model_tokens(id)?,
-                    run.state
+                    chat_state(&run.state)
                 ),
             )?;
             return Ok(());
@@ -1741,7 +1757,7 @@ fn task(
         .acceptance_check
         .as_ref()
         .map(|check| check.name.as_str())
-        .unwrap_or("Complete the requested task using successful-operation evidence");
+        .unwrap_or("Reply directly to conversation; verify requested tool work with successful-operation evidence");
     let mut budgets = serde_json::to_value(profile.limits)?;
     budgets["model"] = json!(profile.model);
     budgets["reasoning_effort"] = json!(profile.reasoning_effort);
@@ -1759,17 +1775,6 @@ fn task(
         json!(grants),
         budgets,
         acceptance,
-    )?;
-    terminal.message(
-        Tone::Quiet,
-        "Budget",
-        &format!(
-            "{} hours · {} turns · {} tokens · commands up to {}s",
-            profile.limits.wall_seconds as f64 / 3600.0,
-            profile.limits.actions,
-            profile.limits.model_tokens,
-            profile.limits.process_seconds
-        ),
     )?;
     drop(store);
     profile.previous_run = Some(run.id.clone());
@@ -1842,12 +1847,34 @@ pub fn interactive(root: &Path) -> Result<()> {
         secret = field(&terminal, "  API key for this session (hidden) › ", true)?;
     }
     if returning {
-        terminal.welcome(
+        let recent: Vec<_> = chat_heads(Store::open(root)?.runs()?)
+            .iter()
+            .take(3)
+            .flat_map(|run| {
+                [
+                    format!("• {}", crate::terminal::fit(&run.task, 60)),
+                    format!(
+                        "  {} · {}",
+                        chat_state(&run.state),
+                        relative_age(run.created_at)
+                    ),
+                ]
+            })
+            .collect();
+        terminal.home(
             name(&profile.provider),
             &std::env::current_dir()?.display().to_string(),
+            &format!(
+                "{} · {}",
+                profile.model.as_deref().unwrap_or("provider default"),
+                profile
+                    .reasoning_effort
+                    .as_deref()
+                    .unwrap_or("default effort")
+            ),
+            &recent,
         )?;
     }
-    show_selection(&terminal, &profile)?;
     let mut history: Vec<_> = Store::open(root)?
         .runs()?
         .iter()
@@ -1856,6 +1883,19 @@ pub fn interactive(root: &Path) -> Result<()> {
         .collect();
     history.reverse();
     loop {
+        terminal.set_input_status(&format!(
+            "{} · {} · {}",
+            profile.model.as_deref().unwrap_or(name(&profile.provider)),
+            profile
+                .reasoning_effort
+                .as_deref()
+                .unwrap_or("default effort"),
+            if profile.write {
+                "edit files"
+            } else {
+                "review only"
+            }
+        ));
         match terminal.input(&terminal.input_prefix(), false, &history)? {
             Input::Exit => break,
             Input::Providers => {
@@ -1914,7 +1954,7 @@ pub fn interactive(root: &Path) -> Result<()> {
                         new_conversation(root, &terminal, &mut profile)?;
                         history.clear();
                     }
-                    "/sessions" | "/status" => {
+                    "/sessions" | "/chats" | "/resume" | "/status" => {
                         sessions(root, &mut terminal, &mut profile, secret.as_deref())?
                     }
                     "/context" | "/tools" | "/artifacts" | "/trace" | "/tasks" => {
@@ -1951,6 +1991,7 @@ pub fn interactive(root: &Path) -> Result<()> {
                     }
                     "/cancel" => cancel_task(root, profile.previous_run.as_deref(), &terminal)?,
                     "/help" => help(&terminal)?,
+                    _ if request.starts_with('/') => terminal.message(Tone::Quiet, "Unknown shortcut", "Press F1 for help, F3 for chats, F6 for model/reasoning, or describe your task without a slash.")?,
                     _ => {
                         history.push(request.to_owned());
                         if profile.provider != "custom"

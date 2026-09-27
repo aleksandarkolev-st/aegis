@@ -258,3 +258,8 @@ Codex's override uses [`model_reasoning_effort`](https://developers.openai.com/c
 ### Saved chats
 
 F3 opens searchable saved conversations. Linked follow-up turns appear as one recent chat. Continue a chat to restore its conversation context without restarting old tools, or read its saved user/assistant messages (including earlier pages). Unfinished task recovery remains a separate explicit action. F5 starts a separate conversation; no startup modal blocks the composer.
+### Terminal interface
+
+The home, composer and searchable selection lists use [Ratatui](https://ratatui.rs/)'s Rust widgets and responsive layout. Recent chats sit beside the mascot on wide terminals and stack on narrow ones. The composer shows the selected model, reasoning effort and file-access mode. Menus clean up their own rows instead of dumping complete option lists into scrollback. No alternate-screen takeover or separate application window is required; ordinary output and task history remain in your terminal.
+
+`src/widgets.rs` exposes reusable home/composer/list building blocks. Existing data-only themes and Rust `Skin` customizations still supply palettes, mascot art/animation frames, block order and the prompt prefix. Reduced motion and `NO_COLOR` remain available.
