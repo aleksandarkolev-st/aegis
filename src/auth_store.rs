@@ -318,7 +318,12 @@ impl Vault {
         temporary.as_file().sync_all()?;
         temporary
             .persist(&path)
-            .map_err(|_| anyhow!("Could not atomically save Aegis sign-in"))?;
+            .map_err(|failure| {
+                anyhow!(
+                    "Could not atomically save Aegis sign-in (OS error {})",
+                    failure.error.raw_os_error().unwrap_or(0)
+                )
+            })?;
         checked_metadata(&path, false)?;
         Ok(())
     }

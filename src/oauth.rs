@@ -301,6 +301,9 @@ impl AuthClient {
             .refresh_token
             .take()
             .context("Saved sign-in expired; choose Sign in again")?;
+        if cancelled() {
+            bail!("Refresh cancelled before dispatch; saved credentials are unchanged");
+        }
         vault.save(&session)?;
         let (status, tokens) = self.post(
             match self.provider {
@@ -319,7 +322,7 @@ impl AuthClient {
                 ]),
             },
             Duration::from_secs(30),
-            &cancelled,
+            &|| false,
         )?;
         if !status.is_success() {
             return Err(status_error(status));
@@ -328,10 +331,10 @@ impl AuthClient {
         if updated.refresh_token.is_none() {
             updated.refresh_token = Some(refresh);
         }
-        if cancelled() {
-            bail!("Refresh cancelled; sign in again if the saved session expires");
-        }
         vault.save(&updated)?;
+        if cancelled() {
+            bail!("Request cancelled; refreshed sign-in was safely saved");
+        }
         updated.credentials()
     }
 
@@ -895,6 +898,86 @@ mod tests {
             assert!(client.logout(&vault, || false)?);
             assert!(vault.load(client.name())?.is_none());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_refresh_retains_rotated_credentials_without_accepting_the_request() -> Result<()> {
+        for provider in [Provider::ChatGpt, Provider::Grok] {
+            let directory = tempfile::tempdir()?;
+            let root = directory.path().join("auth");
+            let vault = Vault::new(root.clone());
+            let mut initial =
+                AuthClient::new(provider)?.session(&tokens(provider, "selected-account")?, None)?;
+            initial.expires_at = now()? - 1;
+            vault.save(&initial)?;
+            let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let observer_cancelled = cancelled.clone();
+            let observer = std::thread::spawn(move || -> Result<()> {
+                wait_for_refresh_claim(&Vault::new(root), provider)?;
+                observer_cancelled.store(true, std::sync::atomic::Ordering::Release);
+                Ok(())
+            });
+            let mut response = reply("200 OK", tokens(provider, "selected-account")?);
+            response.delay = Duration::from_millis(300);
+            let (client, worker) = fixture(provider, vec![response])?;
+            let error = client
+                .credentials(&vault, || {
+                    cancelled.load(std::sync::atomic::Ordering::Acquire)
+                })
+                .err()
+                .context("Cancelled refresh must not accept the foreground request")?;
+            observer.join().unwrap()?;
+            assert!(error.to_string().contains("safely saved"));
+            assert!(!error.to_string().contains("rotated-private-refresh"));
+            assert_eq!(
+                vault.load(client.name())?.unwrap().refresh_token.as_deref(),
+                Some("rotated-private-refresh")
+            );
+            client.credentials(&vault, || false)?;
+            assert_eq!(worker.join().unwrap()?.len(), 1);
+        }
+        Ok(())
+    }
+
+    fn wait_for_refresh_claim(vault: &Vault, provider: Provider) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let client = AuthClient::new(provider)?;
+        while Instant::now() < deadline {
+            if vault
+                .load(client.name())?
+                .is_some_and(|session| session.refresh_token.is_none())
+            {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        bail!("Refresh claim was not observed within the test bound")
+    }
+
+    #[test]
+    fn sign_out_waits_for_refresh_and_cannot_be_resurrected_by_its_completion() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("auth");
+        let vault = Vault::new(root.clone());
+        let mut initial =
+            AuthClient::new(Provider::Grok)?.session(&tokens(Provider::Grok, "")?, None)?;
+        initial.expires_at = now()? - 1;
+        vault.save(&initial)?;
+        let logout = std::thread::spawn(move || -> Result<()> {
+            let vault = Vault::new(root);
+            wait_for_refresh_claim(&vault, Provider::Grok)?;
+            assert!(AuthClient::new(Provider::Grok)?.logout(&vault, || false)?);
+            Ok(())
+        });
+        let mut response = reply("200 OK", tokens(Provider::Grok, "")?);
+        response.delay = Duration::from_millis(300);
+        let (client, worker) = fixture(Provider::Grok, vec![response])?;
+        client.credentials(&vault, || false)?;
+        logout.join().unwrap()?;
+        assert!(vault.load("grok")?.is_none());
+        assert!(client.credentials(&vault, || false).is_err());
+        assert_eq!(worker.join().unwrap()?.len(), 1);
         Ok(())
     }
 
