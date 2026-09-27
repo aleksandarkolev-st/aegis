@@ -26,6 +26,14 @@ Only completed responses are accepted. Truncated/failed/refused responses, dupli
 
 ## Reviewed protocols
 
+## Owned sign-in storage foundation
+
+`src/auth_store.rs` adds bounded, provider-bound atomic storage at the user's `.aegis/auth` directory. Windows uses current-user DPAPI with provider-specific entropy, no machine-wide protection and no crypto prompt. Unix currently uses owner-only 0700 directories / 0600 files: **the Unix file contents are plaintext, not encrypted or keyring-backed**. Linked/reparse ancestors and credential files, malformed protection headers, oversized files and cross-provider copies are rejected. Expired sessions may be loaded for future refresh, but cannot produce request credentials. Errors do not include credential values; session structures have no Debug implementation.
+
+This foundation has not yet been connected to fresh OAuth, refresh, F4 or normal model dispatch. No real credential was stored or native credential changed during these checks. Windows library checks passed 131 with the explicit live diagnostic ignored: `.arun/auth-store-library-20260927-final.log`. Three real Docker isolation checks passed in `.arun/auth-store-docker-isolation-20260927.log`. Workspace file tools reject `.aegis` components; root Docker mounts mask root `.aegis`, and scoped mounts mask nested `.aegis`. Broad unscoped mounts do not yet mask all nested metadata, so this is not universal credential isolation for arbitrary home-directory workspaces. Linux-only storage paths still require verification.
+
+The first library attempt exposed an `OsString`/`str` integration error; the corrected code converts names before the shared metadata check, without relaxing it. Original `.arun/auth-store-library-20260927.log` and the initial unused-mut warning in `.arun/auth-store-functional-20260927.log` are retained. The corrected final library run has no such warning.
+
 Latest follow-up Windows library checks passed 128 with the one live diagnostic ignored by default: `.arun/direct-sse-library-20260927-final.log`. Completed output items and any populated final output must agree; neither incomplete output nor an unexpected native tool can be hidden by a valid-looking final message. Latest follow-up Linux/all-target/package/installed verification remains pending.
 
 Codex source revision `41f9084b30812db321a0b592def4f500d1e79cf4`: [Responses request shape](https://github.com/openai/codex/blob/41f9084b30812db321a0b592def4f500d1e79cf4/codex-rs/codex-api/src/common.rs), [provider destination](https://github.com/openai/codex/blob/41f9084b30812db321a0b592def4f500d1e79cf4/codex-rs/model-provider-info/src/lib.rs), [login token structure](https://github.com/openai/codex/blob/41f9084b30812db321a0b592def4f500d1e79cf4/codex-rs/login/src/token_data.rs). [Official authentication documentation](https://learn.chatgpt.com/docs/auth) describes cached login storage and security, but is not a blanket certification of this independent client.

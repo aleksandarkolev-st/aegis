@@ -20,9 +20,9 @@ pub fn container_name(operation_id: &str) -> Result<String> {
 }
 
 pub(crate) fn mask_metadata(command: &mut Command, workspace: &Path) -> Result<()> {
-    for name in [".arun", ".git"] {
+    for name in crate::filesystem::METADATA_DIRECTORIES {
         match fs::symlink_metadata(workspace.join(name)) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            Ok(metadata) if metadata.is_dir() && !crate::filesystem::linked(&metadata) => {
                 command.args(["--tmpfs", &format!("/workspace/{name}:rw,noexec,size=1m")]);
             }
             Ok(_) => bail!(
@@ -136,7 +136,7 @@ fn relative(workspace: &Path, path: &str) -> Result<PathBuf> {
     }
     if relative.components().any(|component| {
         let name = component.as_os_str().to_string_lossy();
-        name.eq_ignore_ascii_case(".git") || name.eq_ignore_ascii_case(".arun")
+        crate::filesystem::metadata_name(&name)
     }) {
         bail!("runtime and Git metadata are not workspace files");
     }
@@ -158,7 +158,7 @@ fn relative(workspace: &Path, path: &str) -> Result<PathBuf> {
     }
     if resolved.strip_prefix(&root)?.components().any(|component| {
         let name = component.as_os_str().to_string_lossy();
-        name.eq_ignore_ascii_case(".git") || name.eq_ignore_ascii_case(".arun")
+        crate::filesystem::metadata_name(&name)
     }) {
         bail!("resolved path enters runtime or Git metadata");
     }
@@ -298,7 +298,8 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
                 for entry in fs::read_dir(directory)? {
                     let entry = entry?;
                     let name = entry.file_name();
-                    if name == ".git" || name == ".arun" || name == "target" {
+                    if crate::filesystem::metadata_name(&name.to_string_lossy()) || name == "target"
+                    {
                         continue;
                     }
                     let kind = entry.file_type()?;
@@ -645,6 +646,8 @@ mod tests {
         let directory = tempfile::tempdir()?;
         assert!(relative(directory.path(), "../outside").is_err());
         assert!(relative(directory.path(), ".git/config").is_err());
+        assert!(relative(directory.path(), ".aegis/auth/chatgpt.session").is_err());
+        assert!(relative(directory.path(), "src/.AEGIS/auth/grok.session").is_err());
         assert!(relative(directory.path(), "C:/outside").is_err());
         assert!(relative(directory.path(), "..\\outside").is_err());
         assert!(relative(directory.path(), "file.txt:stream").is_err());
@@ -806,6 +809,14 @@ mod tests {
         let mut command = Command::new("docker");
         mask_metadata(&mut command, directory.path())?;
         assert_eq!(command.get_args().count(), 0);
+        fs::create_dir(directory.path().join(".aegis"))?;
+        let mut masked = Command::new("docker");
+        mask_metadata(&mut masked, directory.path())?;
+        assert!(
+            masked
+                .get_args()
+                .any(|argument| argument == "/workspace/.aegis:rw,noexec,size=1m")
+        );
         fs::write(directory.path().join(".git"), "gitdir: ../private")?;
         assert!(mask_metadata(&mut command, directory.path()).is_err());
         fs::remove_file(directory.path().join(".git"))?;

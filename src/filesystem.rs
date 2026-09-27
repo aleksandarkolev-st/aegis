@@ -8,6 +8,14 @@ use serde_json::Value;
 
 use crate::storage::Run;
 
+pub(crate) const METADATA_DIRECTORIES: [&str; 3] = [".arun", ".git", ".aegis"];
+
+pub(crate) fn metadata_name(name: &str) -> bool {
+    METADATA_DIRECTORIES
+        .iter()
+        .any(|directory| name.eq_ignore_ascii_case(directory))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileScopes {
@@ -73,8 +81,7 @@ pub(crate) fn path_name(path: &str) -> Result<String> {
                         | "LPT8"
                         | "LPT9"
                 )
-                || part.eq_ignore_ascii_case(".git")
-                || part.eq_ignore_ascii_case(".arun")
+                || metadata_name(part)
         })
     {
         bail!(
@@ -234,7 +241,7 @@ impl FileScopes {
                             .to_string_lossy()
                             .replace('\\', "/");
                         let name = entry.file_name().to_string_lossy().into_owned();
-                        if name.eq_ignore_ascii_case(".git") || name.eq_ignore_ascii_case(".arun") {
+                        if metadata_name(&name) {
                             if !metadata.is_dir() {
                                 bail!("scoped command metadata must be a directory to mask it");
                             }
@@ -320,6 +327,8 @@ mod tests {
         assert!(!scopes.permits("src-other/read.rs", false));
         assert!(!scopes.permits("src/../secret", false));
         assert!(!scopes.permits("src/.git/config", false));
+        assert!(!scopes.permits("src/.aegis/auth/chatgpt.session", false));
+        assert!(!scopes.permits("src/.AEGIS/auth/grok.session", true));
         assert!(!scopes.permits("C:/secret", false));
         assert!(!scopes.permits("src/.git./config", false));
         assert!(!scopes.permits("src/NUL.txt", false));

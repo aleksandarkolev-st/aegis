@@ -1,4 +1,5 @@
 pub mod acceptance;
+pub mod auth_store;
 pub mod budget;
 pub mod capability;
 pub mod catalog;

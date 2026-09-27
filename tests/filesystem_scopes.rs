@@ -58,6 +58,11 @@ fn scoped_container_cannot_read_other_files_or_write_read_only_scopes() -> Resul
     std::fs::create_dir(directory.path().join("src"))?;
     std::fs::create_dir(directory.path().join("src/.git"))?;
     std::fs::write(directory.path().join("src/.git/config"), "SECRET_METADATA")?;
+    std::fs::create_dir_all(directory.path().join("src/.aegis/auth"))?;
+    std::fs::write(
+        directory.path().join("src/.aegis/auth/chatgpt.session"),
+        "SECRET_AEGIS_LOGIN",
+    )?;
     std::fs::write(directory.path().join("src/read.txt"), "approved")?;
     std::fs::write(directory.path().join("src/edit.txt"), "original")?;
     std::fs::write(directory.path().join("secret.txt"), "SECRET_OTHER_FILE")?;
@@ -65,7 +70,7 @@ fn scoped_container_cannot_read_other_files_or_write_read_only_scopes() -> Resul
     let mut store = Store::open(&root)?;
     let run = store.create_run("scoped container",directory.path(),"fixture",json!(["workspace.read","workspace.write","process.run","process:node"]),json!({"filesystem_scopes":{"read":["src/**"],"write":["src/edit.txt"]},"container_image":"node:22-alpine"}),"")?;
     store.state(&run.id, "running", json!({}))?;
-    let script = "const fs=require('fs'),assert=require('assert/strict');assert.equal(fs.existsSync('secret.txt'),false);assert.equal(fs.existsSync('src/.git/config'),false);assert.equal(fs.readFileSync('src/read.txt','utf8'),'approved');assert.throws(()=>fs.writeFileSync('src/read.txt','forbidden'));fs.writeFileSync('src/edit.txt','updated');console.log('SCOPED_ACCESS_OK');";
+    let script = "const fs=require('fs'),assert=require('assert/strict');assert.equal(fs.existsSync('secret.txt'),false);assert.equal(fs.existsSync('src/.git/config'),false);assert.equal(fs.existsSync('src/.aegis/auth/chatgpt.session'),false);assert.equal(fs.readFileSync('src/read.txt','utf8'),'approved');assert.throws(()=>fs.writeFileSync('src/read.txt','forbidden'));fs.writeFileSync('src/edit.txt','updated');console.log('SCOPED_ACCESS_OK');";
     let operation = store.begin_operation(
         &run.id,
         "process.run",

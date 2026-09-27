@@ -10,7 +10,12 @@ fn process_output_is_virtualized_and_state_is_masked() -> Result<()> {
     let mut store = Store::open(&root)?;
     std::fs::create_dir(directory.path().join(".git"))?;
     std::fs::write(directory.path().join(".git/config"), "HOST_GIT_SECRET")?;
-    let script = "const fs=require('fs');const assert=require('assert');assert.equal(fs.existsSync('/workspace/.git/config'),false);fs.writeFileSync('/workspace/.git/config','only ephemeral overlay');console.log(fs.existsSync('/workspace/.arun/runs.sqlite'));console.log(JSON.stringify({operation:process.env.ARUN_OPERATION_ID,key:process.env.ARUN_IDEMPOTENCY_KEY}));process.stdout.write('X'.repeat(2000000))";
+    std::fs::create_dir_all(directory.path().join(".aegis/auth"))?;
+    std::fs::write(
+        directory.path().join(".aegis/auth/grok.session"),
+        "HOST_AEGIS_SECRET",
+    )?;
+    let script = "const fs=require('fs');const assert=require('assert');assert.equal(fs.existsSync('/workspace/.aegis/auth/grok.session'),false);fs.writeFileSync('/workspace/.aegis/overlay','only ephemeral overlay');assert.equal(fs.existsSync('/workspace/.git/config'),false);fs.writeFileSync('/workspace/.git/config','only ephemeral overlay');console.log(fs.existsSync('/workspace/.arun/runs.sqlite'));console.log(JSON.stringify({operation:process.env.ARUN_OPERATION_ID,key:process.env.ARUN_IDEMPOTENCY_KEY}));process.stdout.write('X'.repeat(2000000))";
     let run = store.create_run(
         "test",
         directory.path(),
@@ -54,6 +59,11 @@ fn process_output_is_virtualized_and_state_is_masked() -> Result<()> {
         std::fs::read_to_string(directory.path().join(".git/config"))?,
         "HOST_GIT_SECRET"
     );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join(".aegis/auth/grok.session"))?,
+        "HOST_AEGIS_SECRET"
+    );
+    assert!(!directory.path().join(".aegis/overlay").exists());
     let summary = store.put_artifact(&serde_json::to_vec(&result)?)?;
     store.operation_state(&operation, "succeeded", Some(&summary), json!({}))?;
     assert!(store.has_evidence(&run.id, hash)?);
