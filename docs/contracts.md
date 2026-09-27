@@ -12,6 +12,12 @@ An operation has a stable ID, capability version, validated arguments, idempoten
 
 On restart, an operation without a terminal outcome is reconciled. A read-only/idempotent operation may be repeated with the original idempotency key. An externally queryable operation checks the external system first. A non-idempotent operation whose outcome cannot be queried becomes `outcome_unknown`, pauses the run, and requires explicit reconciliation; it is never blindly retried. The worker enforces the kernel's grant and deadline, not merely the model-visible manifest.
 
+## Evidence and result mapping
+
+Artifact inspection maps explicitly requested text into the next bounded inference context rather than applying ordinary tiny event-summary truncation. An empty query returns the first 4,000 Unicode characters; `@slice offset length` selects zero-based characters with length 1–4,000, and `@lines first count` selects one-based lines with count 1–100 and at most 4,000 output characters. Other queries perform literal line matches; `@find text` escapes reserved prefixes. Structured file/MCP text is decoded before indexing. At most twelve recent events are assembled; repeated mapped excerpts are measured and reserved against the frozen normalized tool-context budget before another provider request. Whole files, transcripts and raw large outputs are not implicitly mapped.
+
+An MCP result with `isError: true` is a reported failed operation, with its result artifact preserved for inspection. It cannot be used as successful milestone/completion evidence. A transport crash after unsafe dispatch remains outcome-unknown rather than being confused with an acknowledged tool error. Observers drain committed final events after seeing terminal state, preventing a concurrent completion commit from disappearing from the normal terminal feedback.
+
 ## Independent acceptance
 
 An optional acceptance check is validated and copied into the immutable task contract. A completion proposal is written to a durable artifact before the kernel dispatches `runtime.acceptance`; this private capability is not model-discoverable or grantable through tool manifests. The worker verifies the proposal, configured check version, and evidence before claiming it. Checks execute with a read-only workspace, no container network, a bounded deadline/output, and hidden runtime metadata. Assertion code embedded in the approved arguments remains frozen even if the workspace's original configuration file changes.

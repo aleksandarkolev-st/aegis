@@ -19,6 +19,12 @@ Live evaluation requires `--run --ready reviewed.json --aegis /path/to/verified/
 
 The transport tests use synthetic frames and injected replies only. They do not establish a live ARC score or service compatibility. Native protocol discovery/cached observation is tested without network. No new ARC agent evaluation has been started.
 
+## Service and submission boundaries
+
+The [official toolkit software license](https://github.com/arcprize/ARC-AGI/blob/main/LICENSE) is MIT; this runner implements the documented REST protocol and does not bundle toolkit code or game sources. That software license is not proof of unrestricted game-data redistribution or blanket service permission. Freeze the current service/data-use conditions and any account/submission limits before a live evaluation; share no private credentials or hidden game assets. No legal certification is claimed.
+
+The [online competition mode](https://docs.arcprize.org/toolkit/competition_mode) is a separate, explicit choice: it is required for the unverified leaderboard and can make results publicly visible. The default sample mode does not opt into it. This runner is not a [Kaggle ARC Prize 2026 hidden-set submission](https://docs.arcprize.org/arc-prize-2026), which has separate account/rules acceptance and offline code-submission constraints. Native cloud logins through a local harness are not automatically compatible with that offline competition. Do not publish or spend a competition submission silently.
+
 ## Primary protocol references
 
 - [Official toolkit source and anonymous-key acquisition](https://github.com/arcprize/ARC-AGI/blob/main/arc_agi/base.py)
