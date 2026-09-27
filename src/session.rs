@@ -204,8 +204,10 @@ fn switch_model(
 ) -> Result<()> {
     if let Some(model) = choose_model(terminal, profile, secret)? {
         let mut candidate = profile.clone();
+        if candidate.model != model {
+            candidate.reasoning_effort = None;
+        }
         candidate.model = model;
-        candidate.reasoning_effort = None;
         if terminal.interactive {
             let Some(effort) = choose_reasoning(terminal, &candidate)? else {
                 return Ok(());
@@ -258,13 +260,21 @@ fn choose_reasoning(terminal: &Terminal, profile: &Profile) -> Result<Option<Opt
             }
         )
     }));
-    Ok(terminal.select("Reasoning effort", &choices)?.map(|index| {
-        if index == 0 {
-            None
-        } else {
-            Some(levels[index - 1].clone())
-        }
-    }))
+    let current = profile
+        .reasoning_effort
+        .as_ref()
+        .and_then(|effort| levels.iter().position(|level| level == effort))
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    Ok(terminal
+        .select_at("Reasoning effort", &choices, current)?
+        .map(|index| {
+            if index == 0 {
+                None
+            } else {
+                Some(levels[index - 1].clone())
+            }
+        }))
 }
 
 fn switch_reasoning(root: &Path, terminal: &Terminal, profile: &mut Profile) -> Result<()> {
@@ -1570,29 +1580,29 @@ fn sessions(
     } else {
         terminal.message(Tone::Quiet, "Saved", chat_state(&run.state))?;
     }
-    let choices = [
+    let mut choices = [
         "Continue this chat · return to typing",
-        "Follow task",
-        "Resume task",
-        "Cancel task",
-        "View milestones",
-        "View trace",
-        "View context and handoff",
-        "View active tools",
-        "Inspect evidence artifacts",
-        "Review interrupted operations",
         "Read saved messages",
-        "Back",
+        "Inspect evidence artifacts",
+        "Task details and recovery",
     ]
-    .map(str::to_owned);
+    .map(str::to_owned)
+    .to_vec();
+    if !run.is_terminal() {
+        choices.extend(["Follow task", "Resume task", "Cancel task"].map(str::to_owned));
+    }
+    choices.push("Back".into());
     match terminal.select("Chat actions", &choices)? {
         Some(0) => {
             profile.previous_run = Some(run.id.clone());
             save(root, profile)?;
             terminal.message(Tone::Accent, "Chat restored", "Your next message continues this conversation. Unfinished tool work is not restarted automatically.")?;
         }
-        Some(1) => follow(root, &run.id, terminal)?,
-        Some(2) if !run.is_terminal() => {
+        Some(1) => saved_messages(&store, &run.id, terminal)?,
+        Some(2) => artifacts(root, &run.id, terminal)?,
+        Some(3) => chat_details(root, run, &store, terminal)?,
+        Some(4) if !run.is_terminal() => follow(root, &run.id, terminal)?,
+        Some(5) if !run.is_terminal() => {
             let matching_endpoint = profile.endpoint.as_ref().is_some_and(|endpoint| {
                 run.budgets
                     .pointer("/endpoint/base_url")
@@ -1606,20 +1616,39 @@ fn sessions(
             };
             resume(root, &run.id, terminal, credentials)?;
         }
-        Some(3) if !run.is_terminal() => {
+        Some(6) if !run.is_terminal() => {
             cancel_task(root, Some(&run.id), terminal)?;
         }
-        Some(4) => {
+        _ => {}
+    }
+    Ok(())
+}
+
+fn chat_details(
+    root: &Path,
+    run: &crate::storage::Run,
+    store: &Store,
+    terminal: &mut Terminal,
+) -> Result<()> {
+    let choices = [
+        "View milestones",
+        "View trace",
+        "View context and handoff",
+        "View active tools",
+        "Review interrupted operations",
+        "Back",
+    ]
+    .map(str::to_owned);
+    match terminal.select("Task details", &choices)? {
+        Some(0) => {
             for milestone in store.milestones(&run.id)? {
                 terminal.message(Tone::Quiet, &milestone.state, &milestone.title)?;
             }
         }
-        Some(5) => trace::display(run, &store.events(&run.id)?),
-        Some(6) => context_view(root, &run.id, terminal)?,
-        Some(7) => tools_view(root, &run.id, terminal)?,
-        Some(8) => artifacts(root, &run.id, terminal)?,
-        Some(9) => review_operations(root, &run.id, terminal)?,
-        Some(10) => saved_messages(&store, &run.id, terminal)?,
+        Some(1) => trace::display(run, &store.events(&run.id)?),
+        Some(2) => context_view(root, &run.id, terminal)?,
+        Some(3) => tools_view(root, &run.id, terminal)?,
+        Some(4) => review_operations(root, &run.id, terminal)?,
         _ => {}
     }
     Ok(())

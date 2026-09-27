@@ -46,7 +46,7 @@ fn saved_chat_can_be_read_and_restored_without_restarting_tools() -> Result<()> 
             .stderr(Stdio::piped())
             .spawn()?;
         child.stdin.take().unwrap().write_all(if messages {
-            b"/sessions\n1\n11\n2\n3\n/quit\n"
+            b"/sessions\n1\n2\n2\n3\n/quit\n"
         } else {
             b"/sessions\n1\n1\n/quit\n"
         })?;
@@ -66,6 +66,8 @@ fn saved_chat_can_be_read_and_restored_without_restarting_tools() -> Result<()> 
             assert!(text.contains("Chat restored"));
         }
         assert!(!text.contains("Welcome back"));
+        assert!(!text.contains("Resume task"));
+        assert!(!text.contains("Cancel task"));
         assert_eq!(
             serde_json::to_value(store.events(&followup.id)?)?,
             serde_json::to_value(&original_events)?

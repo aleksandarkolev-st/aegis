@@ -62,6 +62,58 @@ fn explicit_reasoning_selection_persists_without_changing_saved_contracts() -> R
 }
 
 #[test]
+fn reselecting_current_model_preserves_reasoning_and_new_model_resets_it() -> Result<()> {
+    for (choice, expected) in [(2, Some("high")), (3, None)] {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(".arun");
+        fs::create_dir(&root)?;
+        let mut original = profile();
+        original["reasoning_effort"] = json!("high");
+        fs::write(root.join("profile.json"), serde_json::to_vec(&original)?)?;
+        let home = directory.path().join("codex-home");
+        fs::create_dir(&home)?;
+        fs::write(
+            home.join("models_cache.json"),
+            serde_json::to_vec(&json!({"models":[
+                {"slug":"old-model","visibility":"list"},
+                {"slug":"new-model","visibility":"list"}
+            ]}))?,
+        )?;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_arun"))
+            .current_dir(directory.path())
+            .env("CODEX_HOME", home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(format!("/model\n{choice}\n/quit\n").as_bytes())?;
+        let output = child.wait_with_output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let saved: Value = serde_json::from_slice(&fs::read(root.join("profile.json"))?)?;
+        assert_eq!(saved["reasoning_effort"].as_str(), expected);
+        assert_eq!(
+            saved["model"],
+            if choice == 2 {
+                "old-model"
+            } else {
+                "new-model"
+            }
+        );
+        assert_eq!(saved["limits"], original["limits"]);
+        assert_eq!(saved["previous_run"], original["previous_run"]);
+    }
+    Ok(())
+}
+
+#[test]
 fn settings_change_only_the_selected_section_and_remove_unapproved_commands() -> Result<()> {
     for environment in [false, true] {
         let directory = tempfile::tempdir()?;
