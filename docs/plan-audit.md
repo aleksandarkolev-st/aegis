@@ -21,6 +21,7 @@ Scope: the full `plan.txt`, native ChatGPT/Claude/Grok login operation, custom O
 | Structured evidence-backed handoffs across contexts | Checkpoints with decisions/unresolved/next action/milestones; completion evidence and independent acceptance gate | Implemented; successful multi-hour live completion is still missing |
 | MCP at edge, untrusted annotations do not grant permission | `src/mcp.rs`, capability mapping, Docker isolation tests, direct adapter authorization tests | Implemented synchronous tool edge. Optional protocol Tasks extension is not a kernel requirement and is not claimed |
 | Trace of model → lookup → execution → result, tokens/timing/cost | `src/trace.rs`, normalized schema/tool/prompt units, provider usage and paired reports | Declared-encoding tokens/timing implemented; historical unmeasured attempts remain unknown. Actual billed prices and vendor-specific schema billing are unavailable, not fabricated |
+| Core state does not depend on terminal rendering | `src/text.rs` pure validation; storage, kernel, history and capability source audit; compatibility re-export remains at the terminal edge | Implemented after removing a storage-to-terminal sanitization dependency. Existing memory/style checks and full Windows/Linux regressions passed |
 
 ## Evaluation and build-order gates
 
