@@ -16,6 +16,7 @@ pub struct Metrics {
     pub context_tokenizer: Option<String>,
     pub schema_tokens_initial: Option<u64>,
     pub schema_tokens_peak: Option<u64>,
+    pub schema_tokens_total: Option<u64>,
     pub tool_result_tokens: u64,
     pub raw_prompt_tokens: u64,
     pub unaccounted_context_attempts: usize,
@@ -60,6 +61,12 @@ pub fn metrics(events: &[Event]) -> Metrics {
                         }
                         summary.schema_tokens_peak =
                             Some(summary.schema_tokens_peak.unwrap_or(0).max(tokens));
+                        summary.schema_tokens_total = Some(
+                            summary
+                                .schema_tokens_total
+                                .unwrap_or(0)
+                                .saturating_add(tokens),
+                        );
                         summary.tool_result_tokens = summary
                             .tool_result_tokens
                             .saturating_add(number("tool_result_tokens"));
@@ -218,7 +225,23 @@ mod tests {
         assert_eq!(result.context_tokenizer, None);
         assert_eq!(result.schema_tokens_initial, None);
         assert_eq!(result.schema_tokens_peak, None);
+        assert_eq!(result.schema_tokens_total, None);
         assert_eq!(result.wall_seconds, 4);
+    }
+
+    #[test]
+    fn repeated_normalized_schema_exposure_is_cumulative_not_just_peak() {
+        let events = [10_u64,20,10].into_iter().enumerate().map(|(index,tokens)| Event {
+            seq:index as i64+1, kind:"model.started".into(),created_at:10,
+            payload:json!({"context_tokenizer":crate::tokenization::ENCODING,"schema_tokens":tokens,"tool_result_tokens":3,"raw_prompt_tokens":100}),
+        }).collect::<Vec<_>>();
+        let measured = metrics(&events);
+        assert_eq!(measured.schema_tokens_initial, Some(10));
+        assert_eq!(measured.schema_tokens_peak, Some(20));
+        assert_eq!(measured.schema_tokens_total, Some(40));
+        assert_eq!(measured.tool_result_tokens, 9);
+        assert_eq!(measured.raw_prompt_tokens, 300);
+        assert_eq!(measured.unaccounted_context_attempts, 0);
     }
 
     #[test]

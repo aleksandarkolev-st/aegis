@@ -91,6 +91,10 @@ pub fn summarize(rows: &[Value]) -> Result<Value> {
                 ("discovery_elapsed_ms", "/metrics/discovery_elapsed_ms"),
                 ("execution_ms", "/execution_ms"),
                 ("schema_bytes_peak", "/metrics/schema_bytes_peak"),
+                ("schema_tokens_peak", "/metrics/schema_tokens_peak"),
+                ("schema_tokens_total", "/metrics/schema_tokens_total"),
+                ("tool_result_tokens", "/metrics/tool_result_tokens"),
+                ("raw_prompt_tokens", "/metrics/raw_prompt_tokens"),
                 ("wrong_tools", "/wrong_tools"),
                 ("invalid_arguments", "/invalid_arguments"),
                 ("repeated_dispatches", "/metrics/repeated_dispatches"),
@@ -99,6 +103,23 @@ pub fn summarize(rows: &[Value]) -> Result<Value> {
                 let deltas: Vec<_> = pairs
                     .iter()
                     .filter_map(|(baseline, candidate)| {
+                        if [
+                            "schema_tokens_peak",
+                            "schema_tokens_total",
+                            "tool_result_tokens",
+                            "raw_prompt_tokens",
+                        ]
+                        .contains(&label)
+                            && [baseline, candidate].iter().any(|row| {
+                                row["metrics"]["context_tokenizer"] != crate::tokenization::ENCODING
+                                    || row["metrics"]["unaccounted_context_attempts"] != 0
+                                    || !row["metrics"]["model_attempts"]
+                                        .as_u64()
+                                        .is_some_and(|attempts| attempts > 0)
+                            })
+                        {
+                            return None;
+                        }
                         if label == "discovery_elapsed_ms"
                             && [baseline, candidate].iter().any(|row| {
                                 row["metrics"]["unaccounted_searches"].as_u64() != Some(0)
@@ -171,6 +192,41 @@ pub fn from_file(path: &Path) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalized_context_pairs_require_complete_matching_encoding_receipts() -> Result<()> {
+        let mut baseline = row("eager", 0, true, 100);
+        let mut candidate = row("durable", 0, true, 80);
+        for record in [&mut baseline, &mut candidate] {
+            record["metrics"]["context_tokenizer"] = json!(crate::tokenization::ENCODING);
+            record["metrics"]["unaccounted_context_attempts"] = json!(0);
+            record["metrics"]["model_attempts"] = json!(2);
+            record["metrics"]["schema_tokens_total"] = json!(100);
+        }
+        candidate["metrics"]["schema_tokens_total"] = json!(40);
+        let metric = |report: Value| {
+            report["comparisons"][0]["groups"][0]["metrics"]["schema_tokens_total"].clone()
+        };
+        let measured = metric(summarize(&[baseline.clone(), candidate.clone()])?);
+        assert_eq!(measured["pairs"], 1);
+        assert_eq!(measured["mean_delta"], -60.0);
+        candidate["metrics"]["context_tokenizer"] = json!("other-encoding");
+        assert_eq!(
+            metric(summarize(&[baseline.clone(), candidate.clone()])?)["pairs"],
+            0
+        );
+        candidate["metrics"]["context_tokenizer"] = json!(crate::tokenization::ENCODING);
+        candidate["metrics"]["unaccounted_context_attempts"] = json!(1);
+        assert_eq!(
+            metric(summarize(&[baseline.clone(), candidate])?)["excluded_pairs"],
+            1
+        );
+        assert_eq!(
+            metric(summarize(&[baseline, row("durable", 0, true, 80)])?)["pairs"],
+            0
+        );
+        Ok(())
+    }
 
     fn row(mode: &str, repeat: u64, passed: bool, tokens: u64) -> Value {
         json!({"case":{"size":50,"task":"read","repeat":repeat,"mode":mode,"root":"experiment/registry-50"},"acceptance":{"passed":passed},"metrics":{"model_tokens":tokens,"unaccounted_model_attempts":0,"estimated_turns":0},"context_overflow":false})

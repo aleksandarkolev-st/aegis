@@ -373,7 +373,7 @@ pub fn command(root: &Path, args: &[String]) -> Result<()> {
             "options":options, "runtime_version":env!("CARGO_PKG_VERSION"), "provider_cli_version":version,
             "model":options.model.as_deref().unwrap_or("provider default; not pinned"), "model_seed":"unsupported by these CLI adapters",
             "fixture_sha256":hex::encode(Sha256::digest(SERVER_SOURCE.as_bytes())), "created_at":crate::storage::unix_time(),
-            "schema_metric":"UTF-8 bytes, not tokenizer-specific tokens", "cost_metric":"unavailable; no price assumptions"
+            "schema_metric":"UTF-8 bytes and normalized o200k_base units from actual serialized schemas; not universal provider billing tokens", "cost_metric":"unavailable; no price assumptions"
         }))?,
     )?;
     let cases = prepare(&experiment, &options)?;
