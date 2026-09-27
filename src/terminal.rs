@@ -85,6 +85,47 @@ impl ContextStatus {
 
 pub struct RawMode(bool);
 
+struct InputHistory<'a> {
+    entries: &'a [String],
+    index: usize,
+    draft: Option<(Vec<char>, usize)>,
+}
+
+impl<'a> InputHistory<'a> {
+    fn new(entries: &'a [String]) -> Self {
+        Self {
+            entries,
+            index: entries.len(),
+            draft: None,
+        }
+    }
+
+    fn navigate(&mut self, key: KeyCode, text: &mut Vec<char>, caret: &mut usize) {
+        match key {
+            KeyCode::Up if self.index > 0 => {
+                if self.index == self.entries.len() {
+                    self.draft = Some((text.clone(), (*caret).min(text.len())));
+                }
+                self.index -= 1;
+            }
+            KeyCode::Down if self.index < self.entries.len() => self.index += 1,
+            _ => return,
+        }
+        if let Some(entry) = self.entries.get(self.index) {
+            *text = entry.chars().collect();
+            *caret = text.len();
+        } else if let Some((draft, position)) = self.draft.take() {
+            *text = draft;
+            *caret = position;
+        }
+    }
+
+    fn reset(&mut self) {
+        self.index = self.entries.len();
+        self.draft = None;
+    }
+}
+
 impl RawMode {
     pub fn enter(enabled: bool) -> Result<Self> {
         if enabled {
@@ -644,7 +685,7 @@ impl Terminal {
         }
         let draft_label = label.to_owned();
         let (mut text, mut caret) = self.take_input_draft(label, secret);
-        let mut history_index = history.len();
+        let mut input_history = InputHistory::new(history);
         loop {
             let width = terminal::size()
                 .map(|(width, _)| width as usize)
@@ -739,10 +780,12 @@ impl Terminal {
                         KeyCode::Char('c') if control => {
                             text.clear();
                             caret = 0;
+                            input_history.reset();
                         }
                         KeyCode::Char('u') if control => {
                             text.clear();
                             caret = 0;
+                            input_history.reset();
                         }
                         KeyCode::F(2) if !secret => {
                             self.finish_input(composer, None)?;
@@ -791,18 +834,8 @@ impl Terminal {
                         KeyCode::Delete if caret < text.len() => {
                             text.remove(caret);
                         }
-                        KeyCode::Up if !secret && history_index > 0 => {
-                            history_index -= 1;
-                            text = history[history_index].chars().collect();
-                            caret = text.len();
-                        }
-                        KeyCode::Down if !secret && history_index < history.len() => {
-                            history_index += 1;
-                            text = history
-                                .get(history_index)
-                                .map(|text| text.chars().collect())
-                                .unwrap_or_default();
-                            caret = text.len();
+                        KeyCode::Up | KeyCode::Down if !secret => {
+                            input_history.navigate(key.code, &mut text, &mut caret);
                         }
                         KeyCode::Char(character) if !control => {
                             text.insert(caret, character);
@@ -1454,6 +1487,58 @@ mod tests {
             assert!(column <= 7);
         }
         assert_eq!(input_view(&['h', 'i'], 2, 20), ("hi".into(), 2));
+    }
+
+    #[test]
+    fn input_history_restores_unsent_unicode_drafts_and_exact_carets() {
+        let entries = vec!["first request".into(), "last 日本語 request".into()];
+        let mut history = InputHistory::new(&entries);
+        let original: Vec<_> = "unfinished 🦊\nnext step".chars().collect();
+        let mut text = original.clone();
+        let mut caret = 5;
+        history.navigate(KeyCode::Down, &mut text, &mut caret);
+        assert_eq!((&text, caret), (&original, 5));
+        history.navigate(KeyCode::Up, &mut text, &mut caret);
+        assert_eq!(text.iter().collect::<String>(), entries[1]);
+        history.navigate(KeyCode::Up, &mut text, &mut caret);
+        history.navigate(KeyCode::Up, &mut text, &mut caret);
+        assert_eq!(text.iter().collect::<String>(), entries[0]);
+        history.navigate(KeyCode::Down, &mut text, &mut caret);
+        history.navigate(KeyCode::Down, &mut text, &mut caret);
+        assert_eq!((&text, caret), (&original, 5));
+        text.insert(caret, '!');
+        caret += 1;
+        let edited = text.clone();
+        history.navigate(KeyCode::Up, &mut text, &mut caret);
+        history.navigate(KeyCode::Down, &mut text, &mut caret);
+        assert_eq!((text, caret), (edited, 6));
+        assert!(history.draft.is_none());
+    }
+
+    #[test]
+    fn clearing_history_navigation_cannot_resurrect_a_discarded_draft() {
+        let entries = vec!["previous request".into()];
+        let mut history = InputHistory::new(&entries);
+        let mut text: Vec<_> = "discard this".chars().collect();
+        let mut caret = text.len();
+        history.navigate(KeyCode::Up, &mut text, &mut caret);
+        text.clear();
+        caret = 0;
+        history.reset();
+        history.navigate(KeyCode::Down, &mut text, &mut caret);
+        assert!(text.is_empty());
+        assert_eq!(caret, 0);
+        history.navigate(KeyCode::Up, &mut text, &mut caret);
+        history.navigate(KeyCode::Down, &mut text, &mut caret);
+        assert!(text.is_empty());
+        assert_eq!(caret, 0);
+        let mut empty = InputHistory::new(&[]);
+        text = vec!['🦊'];
+        caret = 1;
+        empty.navigate(KeyCode::Up, &mut text, &mut caret);
+        empty.navigate(KeyCode::Down, &mut text, &mut caret);
+        assert_eq!((text, caret), (vec!['🦊'], 1));
+        assert!(empty.draft.is_none());
     }
 
     #[test]

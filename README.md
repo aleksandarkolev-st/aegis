@@ -17,7 +17,7 @@ The scrollback interface has an animated activity line, elapsed time and token c
 - F4: manage Aegis-owned account sign-in/sign-out or enter a custom endpoint key privately.
 - F5: start a fresh conversation without deleting previous tasks.
 - Ctrl+C once: interrupt the active operation. Press twice within 900 ms to interrupt the model turn. Ctrl+D detaches without stopping the task; cancel the entire task from its F3 menu.
-- Ctrl+D at an empty prompt: exit. Up/Down: recall task input.
+- Ctrl+D at an empty prompt: exit. Up/Down: recall task input; Down past the latest request restores your unsent draft and cursor. Ctrl+U clears it.
 
 Opening a keyboard menu keeps your unfinished prompt and cursor position in this terminal session. Returning to the same prompt restores it, even after entering other settings fields. Drafts are not saved to disk or restored into secret-key fields.
 
