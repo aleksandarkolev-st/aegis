@@ -60,6 +60,16 @@ Initial compilation exposed ShellExecuteW's additional WindowsAndMessaging featu
 
 ## Reviewed protocols
 
+### Independent catalog transport groundwork
+
+The direct adapter now has authenticated, bounded GET requests for ChatGPT's `/backend-api/codex/models` and Grok's `/v1/models`. These share the model transport's account binding, Aegis identity, redirect refusal, cancellation, timeout and credential-safe error handling. ChatGPT's catalog query uses the actual Aegis package version; hosted acceptance of that version is not yet verified. Grok retains the explicitly separate pinned transport-compatibility header. There is no native CLI or alternate-origin fallback.
+
+Normalization retains only inference ID, sanitized display label, advertised reasoning levels and a default only when it is one of those levels. ChatGPT priority ordering and visibility are honored; Grok model/modelId/id and metadata reasoning formats are handled. Unknown levels, hidden/invalid/duplicate entries, upstream instructions, tools, permissions, API keys and routing configuration are not imported. Responses are limited to 8 MiB, at most 4096 incoming entries and 256 selectable models. Credential echoes are removed from recognized metadata fields before display truncation, including JSON-escaped tokens.
+
+Windows functional checks: 149 library tests passed, one opt-in live greeting diagnostic ignored (`.arun/direct-catalog-library-20260927-final.log`). Loopback GET fixtures verify headers/account selection, empty request bodies, denials, malformed JSON, fixed production destinations, redirect credential isolation, declared/chunked byte bounds, cancellation, timeout and redaction. Existing direct model-call fixtures still pass through the shared transport. These are protocol checks, not successful hosted discovery or model calls, installed UX verification or benchmarks.
+
+This is a deliberately atomic transport/parser change. Normal F6 and reasoning selection are still cache-based until the owned account-bound catalog cache and cancellable UI worker are connected. No live user authentication, native credential mutation, installed binary update, historical contract change or benchmark run was performed.
+
 Historical follow-up Windows library checks passed 128 with the one live diagnostic ignored by default: `.arun/direct-sse-library-20260927-final.log`. Completed output items and any populated final output must agree; neither incomplete output nor an unexpected native tool can be hidden by a valid-looking final message. Full all-target/package/installed verification remains pending.
 
 Codex source revision `41f9084b30812db321a0b592def4f500d1e79cf4`: [Responses request shape](https://github.com/openai/codex/blob/41f9084b30812db321a0b592def4f500d1e79cf4/codex-rs/codex-api/src/common.rs), [provider destination](https://github.com/openai/codex/blob/41f9084b30812db321a0b592def4f500d1e79cf4/codex-rs/model-provider-info/src/lib.rs), [login token structure](https://github.com/openai/codex/blob/41f9084b30812db321a0b592def4f500d1e79cf4/codex-rs/login/src/token_data.rs). [Official authentication documentation](https://learn.chatgpt.com/docs/auth) describes cached login storage and security, but is not a blanket certification of this independent client.

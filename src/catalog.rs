@@ -16,6 +16,125 @@ pub struct Catalog {
     pub source: String,
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteModel {
+    pub id: String,
+    pub label: String,
+    pub reasoning_levels: Vec<String>,
+    pub default_reasoning: Option<String>,
+}
+
+pub fn remote_value(provider: crate::direct::Provider, value: &Value) -> Result<Vec<RemoteModel>> {
+    use crate::direct::Provider;
+
+    let entries = value[match provider {
+        Provider::ChatGpt => "models",
+        Provider::Grok => "data",
+    }]
+    .as_array()
+    .context("Provider returned an invalid model catalog")?;
+    if entries.len() > 4096 {
+        bail!("Provider catalog exceeds its model bound");
+    }
+    let mut entries = entries.iter().collect::<Vec<_>>();
+    if provider == Provider::ChatGpt {
+        entries.sort_by_key(|model| model["priority"].as_i64().unwrap_or(i64::MAX));
+    }
+    let mut models = Vec::<RemoteModel>::new();
+    for entry in entries {
+        let meta = &entry["_meta"];
+        let (id, label, levels, default) = match provider {
+            Provider::ChatGpt => {
+                if entry["visibility"] != "list" {
+                    continue;
+                }
+                (
+                    entry["slug"].as_str(),
+                    entry["display_name"].as_str(),
+                    &entry["supported_reasoning_levels"],
+                    entry["default_reasoning_level"].as_str(),
+                )
+            }
+            Provider::Grok => {
+                if entry.get("hidden").unwrap_or(&meta["hidden"]) == &Value::Bool(true) {
+                    continue;
+                }
+                let supports = entry
+                    .get("supportsReasoningEffort")
+                    .or_else(|| entry.get("supports_reasoning_effort"))
+                    .unwrap_or(&meta["supportsReasoningEffort"])
+                    .as_bool()
+                    == Some(true);
+                let advertised = entry
+                    .get("reasoningEfforts")
+                    .or_else(|| entry.get("reasoning_efforts"))
+                    .unwrap_or(&meta["reasoningEfforts"]);
+                let levels = if !supports {
+                    &Value::Null
+                } else if advertised
+                    .as_array()
+                    .is_some_and(|levels| !levels.is_empty())
+                {
+                    advertised
+                } else {
+                    &entry["capabilities"]["reasoning_effort"]
+                };
+                (
+                    entry["model"]
+                        .as_str()
+                        .or_else(|| entry["modelId"].as_str())
+                        .or_else(|| entry["id"].as_str())
+                        .or_else(|| meta["model"].as_str())
+                        .or_else(|| meta["modelId"].as_str()),
+                    entry["name"].as_str(),
+                    levels,
+                    entry["capabilities"]["default_reasoning_effort"].as_str(),
+                )
+            }
+        };
+        let Some(id) = id.filter(|id| valid_id(id)) else {
+            continue;
+        };
+        if models.iter().any(|model| model.id == id) {
+            continue;
+        }
+        let mut reasoning_levels = Vec::<String>::new();
+        let mut marked_default = None;
+        for level in levels.as_array().into_iter().flatten() {
+            let effort = match provider {
+                Provider::ChatGpt => level["effort"].as_str(),
+                Provider::Grok => level.as_str().or_else(|| level["value"].as_str()),
+            };
+            if let Some(effort) = effort.filter(|effort| valid_effort(effort)) {
+                if !reasoning_levels.iter().any(|value| value == effort) {
+                    reasoning_levels.push(effort.to_owned());
+                }
+                if level["default"] == true && marked_default.is_none() {
+                    marked_default = Some(effort);
+                }
+            }
+        }
+        let default_reasoning = default
+            .or(marked_default)
+            .filter(|effort| reasoning_levels.iter().any(|value| value == effort))
+            .map(str::to_owned);
+        models.push(RemoteModel {
+            id: id.to_owned(),
+            label: crate::terminal::fit(label.unwrap_or(id), 100),
+            reasoning_levels,
+            default_reasoning,
+        });
+        if models.len() == 256 {
+            break;
+        }
+    }
+    if models.is_empty() {
+        bail!("Provider advertised no selectable models for this account");
+    }
+    Ok(models)
+}
+
 pub fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 160
@@ -253,6 +372,87 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::fs;
+
+    #[test]
+    fn remote_chatgpt_catalog_preserves_advertised_priority_and_reasoning_only() -> Result<()> {
+        let models = remote_value(
+            crate::direct::Provider::ChatGpt,
+            &json!({"models":[
+                {"slug":"later","display_name":"Later","visibility":"list","priority":20,"default_reasoning_level":"ultra","supported_reasoning_levels":[{"effort":"low"},{"effort":"low"},{"effort":"new-effort"}],"base_instructions":"do not copy","tools":["shell"],"guardian":{"permissions":"approve"}},
+                {"slug":"first","display_name":"First","visibility":"list","priority":1,"default_reasoning_level":"high","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}]},
+                {"slug":"hidden","visibility":"hide","priority":0},
+                {"slug":"first","visibility":"list","priority":30},
+                {"slug":"bad model","visibility":"list"}
+            ]}),
+        )?;
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "later"]
+        );
+        assert_eq!(models[0].reasoning_levels, ["low", "high"]);
+        assert_eq!(models[0].default_reasoning.as_deref(), Some("high"));
+        assert_eq!(models[1].reasoning_levels, ["low"]);
+        assert_eq!(models[1].default_reasoning, None);
+        let serialized = serde_json::to_value(models)?;
+        for model in serialized.as_array().unwrap() {
+            assert_eq!(model.as_object().unwrap().len(), 4);
+        }
+        assert!(!serialized.to_string().contains("instructions"));
+        assert!(!serialized.to_string().contains("guardian"));
+        Ok(())
+    }
+
+    #[test]
+    fn remote_grok_catalog_uses_inference_ids_and_advertised_reasoning_not_routing() -> Result<()> {
+        let models = remote_value(
+            crate::direct::Provider::Grok,
+            &json!({"data":[
+                {"id":"picker-id","model":"inference-id","name":"Example","supportsReasoningEffort":true,"reasoningEfforts":["low",{"value":"high","default":true},{"value":"spoof"}],"baseUrl":"https://untrusted.invalid","apiKey":"never-copy","extraHeaders":{"authorization":"never-copy"}},
+                {"id":"meta-model","_meta":{"supportsReasoningEffort":true,"reasoningEfforts":[{"value":"xhigh"}]}},
+                {"modelId":"capability-model","supports_reasoning_effort":true,"capabilities":{"reasoning_effort":["low","medium"],"default_reasoning_effort":"medium"}},
+                {"id":"no-reasoning","supportsReasoningEffort":false,"reasoningEfforts":["high"]},
+                {"id":"hidden","_meta":{"hidden":true}},
+                {"id":"inference-id"}
+            ]}),
+        )?;
+        assert_eq!(models.len(), 4);
+        assert_eq!(models[0].id, "inference-id");
+        assert_eq!(models[0].reasoning_levels, ["low", "high"]);
+        assert_eq!(models[0].default_reasoning.as_deref(), Some("high"));
+        assert_eq!(models[1].reasoning_levels, ["xhigh"]);
+        assert_eq!(models[2].default_reasoning.as_deref(), Some("medium"));
+        assert!(models[3].reasoning_levels.is_empty());
+        let serialized = serde_json::to_string(&models)?;
+        assert!(!serialized.contains("never-copy"));
+        assert!(!serialized.contains("untrusted.invalid"));
+        assert!(!serialized.contains("picker-id"));
+        Ok(())
+    }
+
+    #[test]
+    fn remote_catalog_limits_and_no_available_models_are_explicit() -> Result<()> {
+        for value in [
+            json!({}),
+            json!({"data":[]}),
+            json!({"data":[{"id":"hidden","hidden":true}]}),
+        ] {
+            assert!(remote_value(crate::direct::Provider::Grok, &value).is_err());
+        }
+        let entries = (0..4097)
+            .map(|index| json!({"id":format!("model-{index}")}))
+            .collect::<Vec<_>>();
+        assert!(remote_value(crate::direct::Provider::Grok, &json!({"data":entries})).is_err());
+        let models = remote_value(
+            crate::direct::Provider::Grok,
+            &json!({"data":entries[..4096]}),
+        )?;
+        assert_eq!(models.len(), 256);
+        assert_eq!(models[255].id, "model-255");
+        Ok(())
+    }
 
     #[test]
     fn reasoning_levels_follow_visible_model_metadata_without_inventing_support() {

@@ -261,6 +261,139 @@ fn call_url(
         bail!("ChatGPT account selection is missing; sign in again");
     }
     let body = body(provider, request.model, request.prompt, request.reasoning)?;
+    let bytes = request_bytes(
+        provider,
+        credentials,
+        &HttpRequest {
+            method: reqwest::Method::POST,
+            url,
+            body: Some(&body),
+            timeout: request.timeout,
+            response_bytes: request.response_bytes,
+            accept: if provider == Provider::ChatGpt {
+                "text/event-stream"
+            } else {
+                "application/json"
+            },
+        },
+        cancelled,
+    )?;
+    parse(provider, credentials, &bytes)
+}
+
+pub fn models(
+    provider: Provider,
+    credentials: &Credentials,
+    timeout: Duration,
+    cancelled: impl Fn() -> bool,
+) -> Result<Vec<crate::catalog::RemoteModel>> {
+    models_url(
+        provider,
+        credentials,
+        timeout,
+        models_url_for(provider)?,
+        cancelled,
+    )
+}
+
+fn models_url_for(provider: Provider) -> Result<Url> {
+    let mut url = Url::parse(match provider {
+        Provider::ChatGpt => "https://chatgpt.com/backend-api/codex/models",
+        Provider::Grok => "https://cli-chat-proxy.grok.com/v1/models",
+    })?;
+    if provider == Provider::ChatGpt {
+        url.query_pairs_mut()
+            .append_pair("client_version", env!("CARGO_PKG_VERSION"));
+    }
+    Ok(url)
+}
+
+fn models_url(
+    provider: Provider,
+    credentials: &Credentials,
+    timeout: Duration,
+    url: Url,
+    cancelled: impl Fn() -> bool,
+) -> Result<Vec<crate::catalog::RemoteModel>> {
+    let bytes = request_bytes(
+        provider,
+        credentials,
+        &HttpRequest {
+            method: reqwest::Method::GET,
+            url,
+            body: None,
+            timeout,
+            response_bytes: 8 * 1024 * 1024,
+            accept: "application/json",
+        },
+        &cancelled,
+    )?;
+    let text =
+        std::str::from_utf8(&bytes).map_err(|_| anyhow!("Provider catalog was not UTF-8"))?;
+    let mut value: Value = serde_json::from_str(text)
+        .map_err(|_| anyhow!("Provider returned an invalid model catalog"))?;
+    if let Some(entries) = value[if provider == Provider::ChatGpt {
+        "models"
+    } else {
+        "data"
+    }]
+    .as_array_mut()
+    {
+        for entry in entries {
+            redact_catalog_fields(credentials, entry);
+            if let Some(meta) = entry.get_mut("_meta") {
+                redact_catalog_fields(credentials, meta);
+            }
+        }
+    }
+    let models = crate::catalog::remote_value(provider, &value)?;
+    if cancelled() {
+        bail!("Model catalog request interrupted before accepting its response");
+    }
+    Ok(models)
+}
+
+fn redact_catalog_fields(credentials: &Credentials, value: &mut Value) {
+    let Some(fields) = value.as_object_mut() else {
+        return;
+    };
+    for name in ["slug", "model", "modelId", "id", "display_name", "name"] {
+        if let Some(value) = fields.get_mut(name) {
+            if let Some(text) = value.as_str() {
+                let redacted = credentials.redact(text);
+                if redacted != text {
+                    *value = if matches!(name, "display_name" | "name") {
+                        Value::String(redacted)
+                    } else {
+                        Value::Null
+                    };
+                }
+            }
+        }
+    }
+}
+
+struct HttpRequest<'request> {
+    method: reqwest::Method,
+    url: Url,
+    body: Option<&'request Value>,
+    timeout: Duration,
+    response_bytes: u64,
+    accept: &'static str,
+}
+
+fn request_bytes(
+    provider: Provider,
+    credentials: &Credentials,
+    request: &HttpRequest<'_>,
+    cancelled: impl Fn() -> bool,
+) -> Result<Vec<u8>> {
+    if request.timeout.is_zero() || cancelled() {
+        bail!("Model request interrupted before dispatch");
+    }
+    if provider == Provider::ChatGpt && credentials.account_id.is_none() {
+        bail!("ChatGPT account selection is missing; sign in again");
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -271,19 +404,23 @@ fn call_url(
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("aegis/", env!("CARGO_PKG_VERSION")))
             .build()?;
-        let mut http = client.post(url).bearer_auth(&credentials.access_token).json(&body);
+        let mut http = client.request(request.method.clone(), request.url.clone())
+            .bearer_auth(&credentials.access_token);
+        if let Some(body) = request.body {
+            http = http.json(body);
+        }
         match provider {
             Provider::ChatGpt => {
                 http = http.header("originator", "aegis")
                     .header("ChatGPT-Account-ID", credentials.account_id.as_ref().unwrap())
-                    .header("Accept", "text/event-stream");
+                    .header("Accept", request.accept);
             }
             Provider::Grok => {
                 http = http.header("X-XAI-Token-Auth", "xai-grok-cli")
                     .header("x-grok-client-identifier", "aegis")
                     .header("x-grok-client-version", GROK_REFERENCE_TRANSPORT_VERSION)
                     .header("x-aegis-client-version", env!("CARGO_PKG_VERSION"))
-                    .header("Accept", "application/json");
+                    .header("Accept", request.accept);
             }
         }
         let fetch = async {
@@ -323,7 +460,7 @@ fn call_url(
     if cancelled() {
         bail!("Model request interrupted before accepting its response");
     }
-    parse(provider, credentials, &bytes)
+    Ok(bytes)
 }
 
 fn usage(value: &Value, input: &str, output: &str, details: &str) -> Result<Option<Usage>> {
@@ -553,7 +690,7 @@ mod tests {
                                 .then(|| value.trim().parse::<usize>().ok())
                                 .flatten()
                         })
-                        .context("Fixture request omitted content length")?;
+                        .unwrap_or(0);
                     if bytes.len() >= end + 4 + length {
                         break;
                     }
@@ -577,6 +714,238 @@ mod tests {
             timeout: Duration::from_secs(3),
             response_bytes: 8192,
         }
+    }
+
+    #[test]
+    fn model_catalog_get_uses_selected_account_and_own_identity_without_native_config() -> Result<()>
+    {
+        for provider in [Provider::ChatGpt, Provider::Grok] {
+            let response = match provider {
+                Provider::ChatGpt => json!({"models":[{"slug":"advertised-model","display_name":"fixture-secret-token","visibility":"list","supported_reasoning_levels":[{"effort":"low"}]}]}),
+                Provider::Grok => json!({"data":[{"id":"advertised-model","name":"fixture-secret-token","supportsReasoningEffort":true,"reasoningEfforts":["low"]}]}),
+            }.to_string();
+            let (url, handle) = server(
+                "200 OK",
+                &format!("Content-Length: {}\r\n", response.len()),
+                response,
+                Duration::ZERO,
+            )?;
+            let models = models_url(
+                provider,
+                &credentials(),
+                Duration::from_secs(3),
+                url,
+                || false,
+            )?;
+            assert_eq!(models.len(), 1);
+            assert_eq!(models[0].id, "advertised-model");
+            assert_eq!(models[0].label, "[redacted]");
+            assert_eq!(models[0].reasoning_levels, ["low"]);
+            let captured = String::from_utf8(handle.join().unwrap()?)?;
+            let (headers, body) = captured.split_once("\r\n\r\n").unwrap();
+            assert!(headers.starts_with("GET /model HTTP/1.1\r\n"));
+            let headers = headers.to_ascii_lowercase();
+            assert!(headers.contains("authorization: bearer fixture-secret-token"));
+            assert!(headers.contains(concat!("user-agent: aegis/", env!("CARGO_PKG_VERSION"))));
+            assert!(headers.contains("accept: application/json"));
+            assert!(body.is_empty());
+            match provider {
+                Provider::ChatGpt => {
+                    assert!(headers.contains("chatgpt-account-id: fixture-account"));
+                    assert!(headers.contains("originator: aegis"));
+                }
+                Provider::Grok => {
+                    assert!(headers.contains("x-xai-token-auth: xai-grok-cli"));
+                    assert!(headers.contains("x-grok-client-identifier: aegis"));
+                    assert!(!headers.contains("chatgpt-account-id:"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_rejections_and_bad_json_do_not_print_remote_bodies_or_retry() -> Result<()> {
+        for (status, body) in [
+            ("401 Unauthorized", "fixture-secret-token"),
+            ("403 Forbidden", "fixture-secret-token"),
+            ("200 OK", "fixture-secret-token"),
+            ("200 OK", "{}"),
+        ] {
+            let (url, handle) = server(
+                status,
+                &format!("Content-Length: {}\r\n", body.len()),
+                body.to_owned(),
+                Duration::ZERO,
+            )?;
+            let error = models_url(
+                Provider::Grok,
+                &credentials(),
+                Duration::from_secs(3),
+                url,
+                || false,
+            )
+            .unwrap_err();
+            assert!(!format!("{error:#}").contains("fixture-secret-token"));
+            handle.join().unwrap()?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_destinations_are_fixed_and_redirects_cannot_receive_credentials() -> Result<()> {
+        assert_eq!(
+            models_url_for(Provider::ChatGpt)?.as_str(),
+            concat!(
+                "https://chatgpt.com/backend-api/codex/models?client_version=",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+        assert_eq!(
+            models_url_for(Provider::Grok)?.as_str(),
+            "https://cli-chat-proxy.grok.com/v1/models"
+        );
+        let redirect = TcpListener::bind("127.0.0.1:0")?;
+        redirect.set_nonblocking(true)?;
+        let (url, handle) = server(
+            "302 Found",
+            &format!(
+                "Location: http://{}/steal-token\r\nContent-Length: 0\r\n",
+                redirect.local_addr()?
+            ),
+            String::new(),
+            Duration::ZERO,
+        )?;
+        let error = models_url(
+            Provider::Grok,
+            &credentials(),
+            Duration::from_secs(3),
+            url,
+            || false,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("HTTP 302"));
+        handle.join().unwrap()?;
+        assert_eq!(
+            redirect.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let unselected = Credentials::new("fixture-secret-token".into(), None)?;
+        assert!(
+            models_url(
+                Provider::ChatGpt,
+                &unselected,
+                Duration::from_secs(3),
+                Url::parse("http://127.0.0.1:9")?,
+                || false
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("account selection")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_redaction_precedes_truncation_and_handles_json_escaped_credentials() -> Result<()> {
+        let access = format!("escaped-\"-{}", "x".repeat(120));
+        let credentials = Credentials::new(access.clone(), Some("account-fixture".into()))?;
+        let response = json!({"data":[null, false, "not-a-model", {"model":access,"id":"public-model","name":format!("{access} account-fixture"),"_meta":{"modelId":access}}]}).to_string();
+        let (url, handle) = server(
+            "200 OK",
+            &format!("Content-Length: {}\r\n", response.len()),
+            response,
+            Duration::ZERO,
+        )?;
+        let models = models_url(
+            Provider::Grok,
+            &credentials,
+            Duration::from_secs(3),
+            url,
+            || false,
+        )?;
+        handle.join().unwrap()?;
+        assert_eq!(models[0].id, "public-model");
+        assert_eq!(models[0].label, "[redacted] [redacted]");
+        assert!(!serde_json::to_string(&models)?.contains("escaped"));
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_byte_limits_timeout_and_cancellation_apply_before_acceptance() -> Result<()> {
+        for (headers, body) in [
+            ("Content-Length: 8388609\r\n".to_owned(), String::new()),
+            (
+                "Transfer-Encoding: chunked\r\n".to_owned(),
+                format!("{:x}\r\n{}\r\n0\r\n\r\n", 8388609, "x".repeat(8388609)),
+            ),
+        ] {
+            let (url, handle) = server("200 OK", &headers, body, Duration::ZERO)?;
+            assert!(
+                models_url(
+                    Provider::Grok,
+                    &credentials(),
+                    Duration::from_secs(3),
+                    url,
+                    || false
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("byte limit")
+            );
+            handle.join().unwrap()?;
+        }
+        let (url, handle) = server(
+            "200 OK",
+            "Content-Length: 0\r\n",
+            String::new(),
+            Duration::from_millis(300),
+        )?;
+        assert!(
+            models_url(
+                Provider::Grok,
+                &credentials(),
+                Duration::from_millis(75),
+                url,
+                || false
+            )
+            .is_err()
+        );
+        handle.join().unwrap()?;
+        let (url, handle) = server(
+            "200 OK",
+            "Content-Length: 0\r\n",
+            String::new(),
+            Duration::from_millis(300),
+        )?;
+        let started = Instant::now();
+        assert!(
+            models_url(
+                Provider::Grok,
+                &credentials(),
+                Duration::from_secs(3),
+                url,
+                || started.elapsed() > Duration::from_millis(75)
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("interrupted")
+        );
+        assert!(started.elapsed() < Duration::from_millis(275));
+        handle.join().unwrap()?;
+        assert!(
+            models_url(
+                Provider::Grok,
+                &credentials(),
+                Duration::from_secs(3),
+                Url::parse("http://127.0.0.1:9")?,
+                || true
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("before dispatch")
+        );
+        Ok(())
     }
 
     #[test]
