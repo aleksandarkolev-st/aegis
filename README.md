@@ -4,13 +4,15 @@
 
 ## Open Aegis
 
-Launch `aegis` (or `arun`) with no arguments. Pick a provider and workspace access, then describe what you want to build. Native providers use your existing login and their default model—no authentication, model, budget or acceptance wizard to get through first. F4 signs in when needed, F6 changes models, and F7 opens optional settings. Custom endpoints need a URL/key/model and offer compatible response modes. The terminal handles task creation, execution, progress, and evidence automatically; you do not need to enter `run`, `attach`, or task IDs.
+Launch `aegis` (or `arun`) with no arguments. Pick ChatGPT, Grok or a custom endpoint, sign in if needed, choose a model and workspace access, then describe what you want to build. Current source uses Aegis-owned direct HTTP, not native agent CLIs. F4 manages sign-in, F6 changes models/reasoning, and F7 opens optional settings. Custom endpoints need a URL/key/model and offer compatible response modes. The terminal handles task creation, execution, progress and evidence automatically; you do not need to enter `run`, `attach` or task IDs.
+
+**Direct-provider transition:** fresh OAuth approval, independent remote model catalogs, remaining legacy fixture migration and current packaging/installed self-use are not yet fully verified. Cache-based models remain available; without a catalog, an advertised manual model ID is currently required. Older installed binaries still use their previous adapters until updated. Claude subscription sign-in is pending, not silently delegated to Claude Code. See [current evidence and remaining work](docs/direct-providers.md).
 
 The scrollback interface has an animated activity line, elapsed time and token counts, editable input with history, and these shortcuts:
 
 - F2: choose a provider without resetting workspace access.
 - F3: select saved tasks, follow or resume them, cancel, inspect context/tools/evidence, or review interrupted outcomes.
-- F4: open native sign-in or enter a custom endpoint key privately.
+- F4: manage Aegis-owned account sign-in/sign-out or enter a custom endpoint key privately.
 - F5: start a fresh conversation without deleting previous tasks.
 - Ctrl+C once: interrupt the active operation. Press twice within 900 ms to interrupt the model turn. Ctrl+D detaches without stopping the task; cancel the entire task from its F3 menu.
 - Ctrl+D at an empty prompt: exit. Up/Down: recall task input.
@@ -29,9 +31,9 @@ Reopening an interactive terminal offers continuing your unfinished task. Interr
 
 F6 opens a searchable model picker; F2 switches providers without resetting workspace permissions, budgets or saved tasks. The current provider and model are shown after startup and selection. Saved tasks retain their original provider/model; selections apply to new tasks. F7 opens focused settings for permissions, budgets or completion checks without signing in again. F8 shows the saved checkpoint and F9 asks before cancelling the entire task, including while following a live task. F1 explains the keyboard controls; slash commands are optional. Menus stay in terminal scrollback, with arrow navigation and text filtering. Animated task activity respects `AEGIS_REDUCED_MOTION`; `NO_COLOR` disables colors.
 
-ChatGPT models come from the official Codex CLI's model metadata cache under `CODEX_HOME` (or `~/.codex`), excluding hidden entries. Claude choices use documented [Claude Code model aliases](https://code.claude.com/docs/en/model-config), resolved by the installed CLI rather than guessing versioned IDs. Grok uses only public ID/name/visibility fields from its model cache, falling back to a bounded native `grok models` command when no usable cache exists; unauthenticated fallback catalogs are labeled explicitly. Cache timestamps are displayed and do not guarantee current account access. Credentials and other cache fields are never copied into the picker or profile. Custom endpoints use an authenticated, five-second bounded `GET /models` request, without following redirects; manual IDs remain available when listing is unsupported.
+Current ChatGPT model metadata comes from `CODEX_HOME` (or `~/.codex`), excluding hidden entries. Grok reads only public ID/name/visibility fields from its model cache. Neither path starts a CLI or invents model availability; cache timestamps do not guarantee current account access. Independent authenticated remote catalogs/reasoning metadata are the next integration step. Claude currently reports pending rather than offering native CLI aliases. Credentials and other cache fields are not copied into the picker or profile. Custom endpoints use an authenticated, five-second bounded `GET /models` request, without following redirects; manual IDs remain available when listing is unsupported.
 
-Normal task feedback shows readable operations, saved evidence and short recovery hints instead of dumping provider JSON. Tool completion shows its path/program, measured bytes, exit code, elapsed time and evidence handle when available. A nonzero command exit is a warning, not a verified success. The live two-line activity area includes last-model context characters/schema count, durable operation/evidence counts and the last observed checkpoint age; characters are not mislabeled as tokens, and unknown measurements stay unknown. Raw events remain available in explicit replay/diagnostic views. Windows workers, model calls, MCP helpers and discovery probes do not allocate separate console windows; native login stays attached to the calling terminal (the provider may open a browser for authentication).
+Normal task feedback shows readable operations, saved evidence and short recovery hints instead of dumping provider JSON. Tool completion shows its path/program, measured bytes, exit code, elapsed time and evidence handle when available. A nonzero command exit is a warning, not a verified success. The live two-line activity area includes last-model context characters/schema count, durable operation/evidence counts and the last observed checkpoint age; characters are not mislabeled as tokens, and unknown measurements stay unknown. Raw events remain available in explicit replay/diagnostic views. Windows workers and MCP helpers do not allocate separate console windows; direct model calls launch no provider process. Owned sign-in remains in this terminal with a cancellable animated status. Windows opens the validated browser authorization link; other platforms currently display a copyable link. Sign-in activity does not pretend to consume model tokens.
 
 ### Persistent project memory
 
@@ -95,22 +97,21 @@ The native release workflow builds and tests Windows x64, Linux x64/arm64, and m
 ```powershell
 cargo build --release
 target/release/arun login chatgpt
-target/release/arun login claude
 target/release/arun login grok
 target/release/arun probe chatgpt
 ```
 
-Each provider adapter launches its installed CLI (Codex for a ChatGPT login, Claude Code for a Claude login, Grok Build for a Grok login). Missing CLIs have an in-terminal installation confirmation: Aegis uses the official npm package in `~/.aegis/providers/`, without changing your global npm installation or workspace. `AEGIS_PROVIDER_HOME` overrides this location. Existing PATH installations take priority. This distribution uses the official [Codex package](https://github.com/openai/codex), [Claude Code npm installation](https://code.claude.com/docs/en/setup#install-with-npm), and [Grok npm distribution](https://docs.x.ai/build/enterprise#additional); provider requirements can exceed Aegis's Node 20 minimum, so Node 22+ is recommended for guided installation.
+ChatGPT/Grok execution and login use direct, fixed provider endpoints. No provider CLI is installed or started and no native-CLI fallback is available. Hosted-service compatibility and account entitlement are not guaranteed by source-visible protocols; refusals are reported rather than bypassed. Claude subscription login reports pending at the user's request.
 
-Credentials stay with those CLIs; arun does not read or copy their token stores. F4 opens native sign-in, and expired-login failures offer signing in and resuming inside the terminal. A provider may also refuse work when its account has no remaining usage balance.
+Aegis-owned credentials live in the user's `.aegis/auth` directory, separately from native caches: current-user DPAPI on Windows, owner-only plaintext 0600 files / 0700 directories on Unix. Refresh/save/sign-out use provider-specific locks. Uncertain rotating-token exchanges are not blindly replayed and can require fresh sign-in. F4 shows a verification link/code, waits for browser approval and supports Esc/Ctrl+C/Ctrl+D cancellation. Codes do not enter chat history or model context. The explicit read-only saved-native-session connection UI is still pending; native credential files are not automatically copied or modified.
 
 Model and tool-worker subprocesses run in a Windows Job Object or POSIX process group. Cancellation, timeout, and runner cleanup terminate their descendants as well as the launcher; detached task runners are intentionally separate from the interactive terminal's lifetime.
 
-`--model <id>` pins the model for a run or evaluation and persists its ID with the task contract. CLI prompts are supplied through stdin (Codex/Claude Code) or a prompt file (Grok), rather than large command-line arguments.
+`--model <id>` pins the model for a run or evaluation and persists its ID with the task contract. Direct prompts use bounded HTTP bodies, not subprocess arguments. New guided/advanced runs freeze `provider_transport: aegis-direct-v1`; legacy ChatGPT/Grok runs without that marker pause instead of silently changing immutable execution semantics. Saved chats remain inspectable; reviewed continuation into a new direct task still needs implementation.
 
 ### Custom endpoints
 
-OpenAI-compatible Chat Completions endpoints are a separate provider; they do not replace native ChatGPT, Claude Code, or Grok sign-in. Advanced CLI usage:
+OpenAI-compatible Chat Completions endpoints are a separate provider; they do not substitute an API key for ChatGPT/Grok account sign-in. Advanced CLI usage:
 
 ```powershell
 arun run "Inspect this repository" --provider custom --endpoint http://127.0.0.1:1234/v1 --model local-model
@@ -261,12 +262,12 @@ Every completed evaluation writes `paired-summary.json`, matching candidate runs
 
 Optional developer runners for [native-Codex coding comparisons](benchmarks/coding/README.md) and [ARC-AGI-3 recordings](benchmarks/arc/README.md) default to preparation only. Their live modes require reviewed matching source/build hashes and completed implementation/functional/installed-UX verification. Independent graders and ARC protocol fixtures run without agents; no live ARC score or superiority over Codex is claimed. Current readiness gaps are recorded in `progress.txt`.
 
-The broader `plan.txt` still needs multi-hour live demonstrations. Forced-restart integration fixtures exercise a committed read across all four modes, checkpoint continuity through an archived history, and an unsafe in-flight MCP call; these are mock-provider correctness checks, not live comparative performance results. Live Claude completion remains pending reauthentication. The Codex CLI adapter disables its built-in tools, but its own system context still incurs substantial token overhead; measured usage is reported rather than presented as a kernel-only schema cost.
+The broader `plan.txt` still needs a finalized multi-hour live demonstration. Historical forced-restart fixtures exercised committed reads/checkpoints/unsafe MCP outcomes; nested-CLI fixtures now need migration to independent transport before renewed full readiness. They are not live comparative performance results. Claude remains pending. Native bootstrap overhead motivated removing CLI execution rather than hiding/subtracting token counts. Direct saved-login protocol diagnostics returned genuine replies, but installed self-use and fresh owned login are still pending; no superiority claim is made.
 ### Reasoning controls
 
-F6 selects a model and then its advertised reasoning effort in the same terminal. ChatGPT/Codex and Grok options come from their installed model catalogs, not a hard-coded claim of availability. Provider default leaves the setting untouched. Custom endpoints can explicitly opt into `reasoning_effort`; compatibility is endpoint-dependent. The selection applies only to new turns, with saved task contracts unchanged. Advanced commands also accept `--reasoning <level>`; `/reasoning` opens just the effort picker.
+F6 selects a model and then its advertised reasoning effort in the same terminal. ChatGPT/Grok options currently come from cached provider metadata, not a hard-coded claim of availability. No misleading CLI-default model option remains. Default reasoning leaves the setting unspecified. Custom endpoints can explicitly opt into `reasoning_effort`; compatibility is endpoint-dependent. The selection applies only to new turns, with saved task contracts unchanged. Advanced commands also accept `--reasoning <level>`; `/reasoning` opens just the effort picker.
 
-Codex's override uses [`model_reasoning_effort`](https://developers.openai.com/codex/config-reference). Grok's installed CLI uses `--reasoning-effort`.
+Direct ChatGPT requests use `reasoning.effort`; direct Grok requests use `reasoning_effort`. They do not pass native CLI configuration flags. Provider support remains model/account dependent.
 ### Saved chats
 
 F3 opens searchable saved conversations. Linked follow-up turns appear as one recent chat. Continue a chat to restore its conversation context without restarting old tools, or read its saved user/assistant messages (including earlier pages). Unfinished task recovery remains a separate explicit action. F5 starts a separate conversation; no startup modal blocks the composer.
