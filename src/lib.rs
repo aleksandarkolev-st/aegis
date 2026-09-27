@@ -26,4 +26,5 @@ pub mod text;
 pub mod tokenization;
 pub mod trace;
 pub mod ui;
+pub mod widgets;
 pub mod worker;
