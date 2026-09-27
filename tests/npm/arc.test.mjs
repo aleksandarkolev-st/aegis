@@ -89,3 +89,17 @@ test('ARC stale process locks and body budgets fail closed before transport', as
   await assert.rejects(() => arcade.initialize(), /budget/);
   assert.equal(JSON.parse(fs.readFileSync(path.join(directory, 'state.json'))).calls, 0);
 }));
+
+test('ARC malformed replies retain redacted failure evidence and do not clear intent', async () => fixture(async (directory) => {
+  const current = JSON.parse(fs.readFileSync(path.join(directory, 'state.json')));
+  Object.assign(current, { game_id: frame().game_id, guid: frame().guid, frame: frame(), card_id: 'card' });
+  save(path.join(directory, 'state.json'), current);
+  save(path.join(directory, 'credentials.json'), { key: 'fixture-"private-key', cookies: ['AWSALB=private-cookie'] });
+  const transport = async () => ({ data: { diagnostic: 'fixture-"private-key private-cookie', frame: [] }, bytes: 100, cookies: [] });
+  await assert.rejects(() => new Arcade(directory, transport).act({ action: 'ACTION1' }));
+  const evidence = fs.readFileSync(path.join(directory, 'response-1.json'), 'utf8');
+  assert.ok(!evidence.includes('private-key'));
+  assert.ok(!evidence.includes('private-cookie'));
+  assert.ok(JSON.parse(evidence).diagnostic.includes('[redacted]'));
+  assert.equal(JSON.parse(fs.readFileSync(path.join(directory, 'state.json'))).pending.route, '/api/cmd/ACTION1');
+}));

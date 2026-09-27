@@ -90,6 +90,20 @@ export function mergeCookies(previous, incoming) {
   return [...cookies].map(([name, value]) => `${name}=${value}`);
 }
 
+function redacted(value, credentials) {
+  const secrets = [credentials.key, ...credentials.cookies.map((cookie) => cookie.slice(cookie.indexOf('=') + 1))].filter(Boolean);
+  const clean = (value_) => {
+    if (typeof value_ === 'string') {
+      for (const secret of secrets) value_ = value_.replaceAll(secret, '[redacted]');
+      return value_;
+    }
+    if (Array.isArray(value_)) return value_.map(clean);
+    if (value_ && typeof value_ === 'object') return Object.fromEntries(Object.entries(value_).map(([name, content]) => [clean(name), clean(content)]));
+    return value_;
+  };
+  return clean(value);
+}
+
 export function validateFrame(frame, expectedGame, expectedGuid) {
   if (!frame || frame.game_id !== expectedGame || !identifier(frame.guid) || (expectedGuid && frame.guid !== expectedGuid)
     || !states.has(frame.state) || !Number.isInteger(frame.levels_completed) || frame.levels_completed < 0
@@ -149,17 +163,17 @@ export class Arcade {
     }
     const reply = await this.transport(route, body, credentials);
     if (!Number.isInteger(reply.bytes) || reply.bytes < 0 || reply.bytes > maximumReply) throw new Error('ARC reply exceeds limit');
-    const data = validator(reply.data);
     credentials.cookies = mergeCookies(credentials.cookies, reply.cookies);
+    let data;
     if (route === '/api/games/anonkey') {
+      data = validator(reply.data);
       credentials.key = data.api_key;
       save(path.join(this.directory, 'credentials.json'), credentials);
     } else {
       save(path.join(this.directory, 'credentials.json'), credentials);
-      const secrets = [credentials.key, ...credentials.cookies.map((cookie) => cookie.slice(cookie.indexOf('=') + 1))].filter(Boolean);
-      let serialized = JSON.stringify(data);
-      for (const secret of secrets) serialized = serialized.replaceAll(secret, '[redacted]');
-      save(path.join(this.directory, `response-${state.calls}.json`), JSON.parse(serialized));
+      const sanitized = redacted(reply.data, credentials);
+      save(path.join(this.directory, `response-${state.calls}.json`), sanitized);
+      data = validator(sanitized);
     }
     apply(data);
     state.bytes += reply.bytes;
