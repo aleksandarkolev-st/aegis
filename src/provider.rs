@@ -9,6 +9,14 @@ pub struct Provider {
     pub login: &'static [&'static str],
 }
 
+pub fn canonical(provider: &str) -> &str {
+    match provider {
+        "chatgpt" => "codex",
+        "claude-code" => "claude",
+        other => other,
+    }
+}
+
 pub fn specification(provider: &str) -> Result<Provider> {
     match provider {
         "codex" | "chatgpt" => Ok(Provider {
@@ -134,6 +142,9 @@ mod tests {
 
     #[test]
     fn official_packages_and_aliases_are_fixed() -> Result<()> {
+        assert_eq!(canonical("chatgpt"), "codex");
+        assert_eq!(canonical("claude-code"), "claude");
+        assert_eq!(canonical("fixture"), "fixture");
         assert_eq!(specification("chatgpt")?.package, "@openai/codex");
         assert_eq!(specification("claude-code")?.login, &["auth", "login"]);
         assert_eq!(specification("grok")?.package, "@xai-official/grok");

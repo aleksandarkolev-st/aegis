@@ -191,6 +191,7 @@ pub fn call_configured(
     timeout: Duration,
     cancelled: impl Fn() -> bool,
 ) -> Result<Response> {
+    let provider = crate::provider::canonical(provider);
     let response_bytes = crate::budget::response_bytes(configuration)?;
     if provider == "custom" {
         let endpoint: crate::endpoint::Endpoint = serde_json::from_value(

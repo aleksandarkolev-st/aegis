@@ -137,7 +137,7 @@ pub fn grok_cache(path: &Path) -> Result<Catalog> {
 }
 
 pub fn native(provider: &str) -> Result<Catalog> {
-    match provider {
+    match crate::provider::canonical(provider) {
         "codex" => {
             let home = std::env::var_os("CODEX_HOME").map(std::path::PathBuf::from).or_else(|| {
                 std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(|home| std::path::PathBuf::from(home).join(".codex"))

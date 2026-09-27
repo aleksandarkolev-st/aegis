@@ -19,6 +19,7 @@ use crate::{
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Profile {
+    #[serde(deserialize_with = "profile_provider")]
     provider: String,
     model: Option<String>,
     endpoint: Option<Endpoint>,
@@ -38,8 +39,15 @@ struct Profile {
     previous_run: Option<String>,
 }
 
+fn profile_provider<'de, Decoder: serde::Deserializer<'de>>(
+    decoder: Decoder,
+) -> std::result::Result<String, Decoder::Error> {
+    let provider = String::deserialize(decoder)?;
+    Ok(crate::provider::canonical(&provider).to_owned())
+}
+
 fn name(provider: &str) -> &str {
-    match provider {
+    match crate::provider::canonical(provider) {
         "codex" => "ChatGPT / Codex",
         "claude" => "Claude Code",
         "grok" => "Grok",
@@ -1803,6 +1811,17 @@ mod tests {
         assert_eq!(fs::read_dir(directory.path())?.count(), 1);
         assert!(is_auth_error("OAuth access token has expired. HTTP 401"));
         assert!(!is_auth_error("usage balance exhausted"));
+        let mut aliased = serde_json::to_value(&saved)?;
+        aliased["provider"] = json!("chatgpt");
+        assert_eq!(
+            serde_json::from_value::<Profile>(aliased.clone())?.provider,
+            "codex"
+        );
+        aliased["provider"] = json!("claude-code");
+        assert_eq!(
+            serde_json::from_value::<Profile>(aliased)?.provider,
+            "claude"
+        );
         Ok(())
     }
 }

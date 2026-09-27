@@ -341,7 +341,7 @@ impl Store {
             id: Uuid::new_v4().to_string(),
             task: task.to_owned(),
             workspace: workspace.to_string_lossy().into_owned(),
-            provider: provider.to_owned(),
+            provider: crate::provider::canonical(provider).to_owned(),
             grants,
             budgets,
             acceptance: acceptance.to_owned(),
