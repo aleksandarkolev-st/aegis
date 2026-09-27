@@ -1,7 +1,6 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -174,6 +173,16 @@ impl Options {
         {
             bail!("duplicate evaluation conditions are not allowed");
         }
+        if !options.prepare_only {
+            crate::direct::provider(&options.provider)?;
+            if !options
+                .model
+                .as_deref()
+                .is_some_and(crate::catalog::valid_id)
+            {
+                bail!("live evaluations require an explicit valid --model ID");
+            }
+        }
         Ok(options)
     }
 }
@@ -263,7 +272,7 @@ fn prepare(root: &Path, options: &Options) -> Result<Vec<Case>> {
                         "export function sum(left, right) { return left - right; }\n",
                     )?;
                     let run = store.create_run(prompt(task), &workspace, &options.provider, json!(grants),
-                        json!({"model":options.model, "mode": mode, "actions": options.actions, "model_tokens":options.model_tokens,
+                        json!({"provider_transport":"aegis-direct-v1", "model":options.model, "mode": mode, "actions": options.actions, "model_tokens":options.model_tokens,
                             "context_chars":options.context_chars, "wall_seconds":options.wall_seconds,
                             "model_seconds":180, "process_seconds":60}),
                         "Independent fixture evidence checks; repair uses containerized Node assertions")?;
@@ -364,14 +373,12 @@ pub fn command(root: &Path, args: &[String]) -> Result<()> {
         .join("evaluations")
         .join(uuid::Uuid::new_v4().to_string());
     fs::create_dir_all(&experiment)?;
-    let version = crate::provider::find(&options.provider)?
-        .and_then(|program| Command::new(program).arg("--version").output().ok())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
     fs::write(
         experiment.join("experiment.json"),
         serde_json::to_vec_pretty(&json!({
-            "options":options, "runtime_version":env!("CARGO_PKG_VERSION"), "provider_cli_version":version,
-            "model":options.model.as_deref().unwrap_or("provider default; not pinned"), "model_seed":"unsupported by these CLI adapters",
+            "options":options, "runtime_version":env!("CARGO_PKG_VERSION"), "provider_cli_version":null,
+            "provider_transport":"aegis-direct-v1", "native_provider_cli_started":false,
+            "model":options.model.as_deref().unwrap_or("not selected; preparation only"), "model_seed":"not requested by the direct transport configuration",
             "fixture_sha256":hex::encode(Sha256::digest(SERVER_SOURCE.as_bytes())), "created_at":crate::storage::unix_time(),
             "schema_metric":"UTF-8 bytes and normalized o200k_base units from actual serialized schemas; not universal provider billing tokens", "cost_metric":"unavailable; no price assumptions"
         }))?,
@@ -493,6 +500,31 @@ mod tests {
         ] {
             assert!(Options::parse(&args.map(str::to_owned)).is_err());
         }
+    }
+
+    #[test]
+    fn live_evaluations_require_a_direct_provider_and_pinned_model() -> Result<()> {
+        assert!(Options::parse(&[]).is_err());
+        assert!(Options::parse(&["--model".into(), "invalid model".into()]).is_err());
+        assert!(
+            Options::parse(&[
+                "--provider".into(),
+                "claude".into(),
+                "--model".into(),
+                "fixture-model".into()
+            ])
+            .is_err()
+        );
+        let live = Options::parse(&[
+            "--provider".into(),
+            "grok".into(),
+            "--model".into(),
+            "fixture-model".into(),
+        ])?;
+        assert_eq!(live.model.as_deref(), Some("fixture-model"));
+        let prepared = Options::parse(&["--prepare-only".into()])?;
+        assert!(prepared.model.is_none());
+        Ok(())
     }
 
     #[test]

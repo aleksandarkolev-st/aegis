@@ -1,5 +1,7 @@
 # Live development observations
 
+The measurements below are historical native-adapter observations, not current direct-provider results. Current evaluation preparation never probes or installs a provider CLI, and new cases freeze Aegis's direct transport. Live evaluations require an explicit model ID and a supported direct provider; Claude remains pending. These functional changes do not authorize running the deferred coding or ARC-AGI-3 comparisons before readiness.
+
 These are small local experiments, not reliability, billed-cost, or production-performance claims. Native calls used an existing ChatGPT login, `codex-cli 0.156.0`, and the explicitly selected `gpt-5.5` model. A model name pin does not guarantee a frozen provider backend or independent sessions.
 
 ## Read pilot: 50 tools, two paired repeats
