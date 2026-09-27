@@ -40,8 +40,8 @@ pub struct Terminal {
     pub interactive: bool,
     colors: bool,
     animations: bool,
-    frame: usize,
     activity_rows: std::cell::Cell<u16>,
+    activity_view: std::cell::RefCell<Option<(usize, String, Option<String>)>>,
     skin: Box<dyn crate::ui::Skin>,
 }
 
@@ -192,8 +192,8 @@ impl Default for Terminal {
             interactive,
             colors: io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
             animations: interactive && std::env::var_os("AEGIS_REDUCED_MOTION").is_none(),
-            frame: 0,
             activity_rows: std::cell::Cell::new(0),
+            activity_view: std::cell::RefCell::new(None),
             skin: Box::new(crate::ui::UiOptions::default()),
         }
     }
@@ -353,6 +353,7 @@ impl Terminal {
     }
 
     pub fn clear_activity(&self) -> Result<()> {
+        self.activity_view.replace(None);
         if self.interactive {
             let rows = self.activity_rows.replace(0);
             if rows > 1 {
@@ -410,11 +411,10 @@ impl Terminal {
         let frame = if !mascot.is_empty() {
             mascot.as_str()
         } else if self.animations {
-            frames[self.frame % frames.len()]
+            frames[tick as usize % frames.len()]
         } else {
             "◆"
         };
-        self.frame += 1;
         let width = terminal::size()
             .map(|(width, _)| width as usize)
             .unwrap_or(80);
@@ -424,6 +424,17 @@ impl Terminal {
             elapsed.as_secs(),
             tokens
         );
+        let text = fit(&text, width.saturating_sub(1));
+        let footer = self.skin.show_context().then(|| {
+            fit(
+                &format!("  {}", context.text(crate::storage::unix_time())),
+                width.saturating_sub(1),
+            )
+        });
+        let view = (width, text, footer);
+        if self.activity_view.borrow().as_ref() == Some(&view) {
+            return Ok(());
+        }
         let rows = self.activity_rows.get();
         if rows > 1 {
             queue!(io::stdout(), cursor::MoveUp(rows - 1))?;
@@ -437,11 +448,12 @@ impl Terminal {
         if self.colors {
             queue!(io::stdout(), SetForegroundColor(self.color(Tone::Accent)))?;
         }
-        write!(io::stdout(), "{}", fit(&text, width.saturating_sub(1)))?;
+        write!(io::stdout(), "{}", view.1)?;
         queue!(io::stdout(), ResetColor)?;
         if !self.skin.show_context() {
             self.activity_rows.set(1);
             io::stdout().flush()?;
+            self.activity_view.replace(Some(view));
             return Ok(());
         }
         write!(io::stdout(), "\r\n")?;
@@ -450,16 +462,10 @@ impl Terminal {
             cursor::MoveToColumn(0),
             Clear(ClearType::CurrentLine)
         )?;
-        write!(
-            io::stdout(),
-            "{}",
-            fit(
-                &format!("  {}", context.text(crate::storage::unix_time())),
-                width.saturating_sub(1)
-            )
-        )?;
+        write!(io::stdout(), "{}", view.2.as_deref().unwrap_or_default())?;
         self.activity_rows.set(2);
         io::stdout().flush()?;
+        self.activity_view.replace(Some(view));
         Ok(())
     }
 

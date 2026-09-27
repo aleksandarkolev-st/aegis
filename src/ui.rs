@@ -228,7 +228,13 @@ impl Skin for UiOptions {
             return self.frames[tick as usize % self.frames.len()].clone();
         }
         if phase == Phase::Ready {
-            return "<^.^>".into();
+            return match self.mascot {
+                Mascot::Pip => "<^.^>",
+                Mascot::Byte => "[^.^]",
+                Mascot::Orbit => "\\*/",
+                Mascot::Off => unreachable!(),
+            }
+            .into();
         }
         let frames = match (self.mascot, phase) {
             (Mascot::Pip, Phase::Thinking) => ["<o.o>", "<o.o>", "<o.->", "<o.o>"],
@@ -265,6 +271,8 @@ mod tests {
             style.frame(Phase::Thinking, 2)
         );
         assert_eq!(style.frame(Phase::Ready, 0), "<^.^>");
+        assert_eq!(UiOptions::preset(1).frame(Phase::Ready, 0), "[^.^]");
+        assert_eq!(UiOptions::preset(2).frame(Phase::Ready, 0), "\\*/");
         assert!(!style.portrait().is_empty());
         let calm = UiOptions {
             motion: false,
