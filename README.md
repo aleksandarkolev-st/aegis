@@ -6,6 +6,8 @@
 
 Launch `aegis` (or `arun`) with no arguments. Pick ChatGPT, Grok or a custom endpoint, sign in if needed, choose a model and workspace access, then describe what you want to build. Current source uses Aegis-owned direct HTTP, not native agent CLIs. F4 manages sign-in, F6 changes models/reasoning, and F7 opens optional settings. Custom endpoints need a URL/key/model and offer compatible response modes. The terminal handles task creation, execution, progress and evidence automatically; you do not need to enter `run`, `attach` or task IDs.
 
+ChatGPT/Grok sign-in now offers browser approval with a protected local callback as the recommended desktop flow, plus an explicit device-code choice for remote/headless terminals. Both return to the same terminal without a provider CLI. Existing sign-ins are retained. Protocol, menu and package checks pass; fresh hosted approval of this browser flow is not yet claimed. See [browser sign-in boundaries](docs/browser-signin.md).
+
 **Direct-provider transition:** own remote model/reasoning discovery and reviewed saved-task continuation are implemented in source. A rebuilt Windows package passes offline private installation, command-shim and setup-decline checks. Fresh owned-account inference, remaining legacy fixture conversion and full interactive installed self-use are not all verified. Without a catalog, an advertised manual model ID is required. Older global installations still use their previous adapters until updated. Claude subscription sign-in is pending, not silently delegated to Claude Code. See [current evidence and remaining work](docs/direct-providers.md).
 
 The scrollback interface has an animated activity line, elapsed time and token counts, editable input with history, and these shortcuts:
