@@ -26,6 +26,83 @@ pub fn valid_id(id: &str) -> bool {
             .any(|character| character.is_whitespace() || character.is_control())
 }
 
+pub fn valid_effort(effort: &str) -> bool {
+    matches!(
+        effort,
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+    )
+}
+
+pub fn reasoning_from_value(provider: &str, id: &str, catalog: &Value) -> Vec<String> {
+    let levels = match crate::provider::canonical(provider) {
+        "codex" => catalog["models"]
+            .as_array()
+            .and_then(|models| {
+                models
+                    .iter()
+                    .find(|model| model["slug"] == id && model["visibility"] == "list")
+            })
+            .map(|model| &model["supported_reasoning_levels"]),
+        "grok" => catalog["models"]
+            .as_object()
+            .and_then(|models| {
+                models.values().find(|model| {
+                    model["info"]["id"] == id
+                        && model["info"]["hidden"] != true
+                        && model["info"]["supports_reasoning_effort"] == true
+                })
+            })
+            .map(|model| &model["info"]["reasoning_efforts"]),
+        _ => None,
+    };
+    let mut result = Vec::new();
+    for level in levels.and_then(Value::as_array).into_iter().flatten() {
+        if let Some(effort) = level[if crate::provider::canonical(provider) == "codex" {
+            "effort"
+        } else {
+            "value"
+        }]
+        .as_str()
+        {
+            if valid_effort(effort) && !result.iter().any(|value| value == effort) {
+                result.push(effort.to_owned());
+            }
+        }
+    }
+    result
+}
+
+pub fn reasoning_levels(provider: &str, id: &str) -> Result<Vec<String>> {
+    let provider = crate::provider::canonical(provider);
+    if provider == "custom" {
+        return Ok(["none", "minimal", "low", "medium", "high", "xhigh"]
+            .map(str::to_owned)
+            .to_vec());
+    }
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .context("Home directory unavailable")?;
+    let path = match provider {
+        "codex" => std::env::var_os("CODEX_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(&home).join(".codex")),
+        "grok" => std::path::PathBuf::from(home).join(".grok"),
+        _ => return Ok(Vec::new()),
+    }
+    .join("models_cache.json");
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(8 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        bail!("Model metadata exceeds 8 MiB");
+    }
+    Ok(reasoning_from_value(
+        provider,
+        id,
+        &serde_json::from_slice(&bytes)?,
+    ))
+}
+
 fn insert(models: &mut Vec<Model>, id: &str, label: &str) {
     if models.len() < 256 && valid_id(id) && !models.iter().any(|model| model.id == id) {
         models.push(Model {
@@ -193,6 +270,23 @@ pub fn endpoint_value(value: &Value) -> Result<Vec<Model>> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn reasoning_levels_follow_visible_model_metadata_without_inventing_support() {
+        let codex = json!({"models":[{"slug":"example","visibility":"list","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"},{"effort":"high"},{"effort":"spoof"}]},{"slug":"hidden","visibility":"hide","supported_reasoning_levels":[{"effort":"high"}]}]});
+        assert_eq!(
+            reasoning_from_value("chatgpt", "example", &codex),
+            ["low", "high"]
+        );
+        assert!(reasoning_from_value("codex", "hidden", &codex).is_empty());
+        assert!(reasoning_from_value("codex", "unknown", &codex).is_empty());
+        let grok = json!({"models":{"example":{"info":{"id":"example","supports_reasoning_effort":true,"reasoning_efforts":[{"value":"xhigh"},{"value":"low"}]}}}});
+        assert_eq!(
+            reasoning_from_value("grok", "example", &grok),
+            ["xhigh", "low"]
+        );
+        assert!(reasoning_from_value("claude", "sonnet", &grok).is_empty());
+    }
 
     #[test]
     fn codex_catalog_hides_internal_models_and_deduplicates() -> Result<()> {

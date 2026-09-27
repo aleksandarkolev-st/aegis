@@ -193,6 +193,19 @@ pub fn call_configured(
 ) -> Result<Response> {
     let provider = crate::provider::canonical(provider);
     let response_bytes = crate::budget::response_bytes(configuration)?;
+    let reasoning = configuration
+        .get("reasoning_effort")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            let effort = value
+                .as_str()
+                .context("reasoning effort must be a string")?;
+            if !crate::catalog::valid_effort(effort) {
+                bail!("invalid reasoning effort");
+            }
+            Ok(effort)
+        })
+        .transpose()?;
     if provider == "custom" {
         let endpoint: crate::endpoint::Endpoint = serde_json::from_value(
             configuration
@@ -204,7 +217,14 @@ pub fn call_configured(
             .get("model")
             .and_then(Value::as_str)
             .context("custom endpoints require a model ID")?;
-        return endpoint.call_bounded(model, prompt, timeout, cancelled, response_bytes);
+        return endpoint.call_reasoned(
+            model,
+            prompt,
+            timeout,
+            cancelled,
+            response_bytes,
+            reasoning,
+        );
     }
     let output = tempfile::tempdir_in(directory)?;
     let prompt_path = output.path().join("prompt.txt");
@@ -286,6 +306,7 @@ pub fn call_configured(
     if let Some(model) = configuration.get("model").and_then(Value::as_str) {
         command.args(["--model", model]);
     }
+    command.args(reasoning_arguments(provider, reasoning)?);
     command
         .current_dir(directory)
         .stdin(if matches!(provider, "codex" | "claude") {
@@ -362,6 +383,23 @@ pub fn call_configured(
     Ok(Response { action, raw, usage })
 }
 
+fn reasoning_arguments(provider: &str, effort: Option<&str>) -> Result<Vec<String>> {
+    let Some(effort) = effort else {
+        return Ok(Vec::new());
+    };
+    if !crate::catalog::valid_effort(effort) {
+        bail!("invalid reasoning effort");
+    }
+    Ok(match provider {
+        "codex" => vec![
+            "-c".into(),
+            format!("model_reasoning_effort={}", serde_json::to_string(effort)?),
+        ],
+        "grok" => vec!["--reasoning-effort".into(), effort.into()],
+        _ => bail!("reasoning selection is not supported by this native adapter"),
+    })
+}
+
 fn capture_bytes(paths: &[&Path]) -> Result<u64> {
     let mut bytes = 0_u64;
     for path in paths {
@@ -386,6 +424,22 @@ fn read_captured(path: &Path, limit: u64) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_overrides_are_explicit_provider_arguments() -> Result<()> {
+        assert!(reasoning_arguments("codex", None)?.is_empty());
+        assert_eq!(
+            reasoning_arguments("codex", Some("high"))?,
+            ["-c", "model_reasoning_effort=\"high\""]
+        );
+        assert_eq!(
+            reasoning_arguments("grok", Some("medium"))?,
+            ["--reasoning-effort", "medium"]
+        );
+        assert!(reasoning_arguments("claude", Some("high")).is_err());
+        assert!(reasoning_arguments("codex", Some("high\";bad")).is_err());
+        Ok(())
+    }
 
     #[test]
     fn parses_direct_and_wrapped_actions() -> Result<()> {

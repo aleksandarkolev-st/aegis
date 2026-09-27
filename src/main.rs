@@ -142,6 +142,7 @@ fn spawn(root: &Path, id: &str) -> Result<()> {
 fn run(root: &Path, args: &[String]) -> Result<()> {
     let mut provider = "codex";
     let mut model = None;
+    let mut reasoning_effort = None;
     let mut endpoint_url = None;
     let mut api_key_env = None;
     let mut response_format = arun::endpoint::ResponseFormat::Schema;
@@ -182,6 +183,16 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
             "--endpoint" => {
                 index += 1;
                 endpoint_url = Some(args.get(index).context("--endpoint needs a URL")?.clone());
+            }
+            "--reasoning" => {
+                index += 1;
+                let effort = args
+                    .get(index)
+                    .context("--reasoning needs an effort level")?;
+                if !arun::catalog::valid_effort(effort) {
+                    bail!("invalid reasoning effort");
+                }
+                reasoning_effort = Some(effort.clone());
             }
             "--api-key-env" => {
                 index += 1;
@@ -411,7 +422,7 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
         &std::env::current_dir()?,
         provider,
         json!(grants),
-        json!({"model": model, "endpoint":endpoint, "mode": mode, "actions": actions, "model_tokens": model_tokens, "tool_result_tokens":tool_result_tokens, "wall_seconds": wall_seconds, "context_chars": context_chars,
+        json!({"model": model, "reasoning_effort":reasoning_effort, "endpoint":endpoint, "mode": mode, "actions": actions, "model_tokens": model_tokens, "tool_result_tokens":tool_result_tokens, "wall_seconds": wall_seconds, "context_chars": context_chars,
             "model_seconds": 180, "model_response_bytes": model_response_bytes, "process_seconds": process_seconds, "container_image": image, "acceptance_check":acceptance_check, "command_scopes":command_scopes, "filesystem_scopes":filesystem_scopes, "network_scopes":network_scopes}),
         acceptance,
     )?;

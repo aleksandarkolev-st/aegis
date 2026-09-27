@@ -22,6 +22,8 @@ struct Profile {
     #[serde(deserialize_with = "profile_provider")]
     provider: String,
     model: Option<String>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
     endpoint: Option<Endpoint>,
     write: bool,
     image: Option<String>,
@@ -151,9 +153,10 @@ fn show_selection(terminal: &Terminal, profile: &Profile) -> Result<()> {
         Tone::Accent,
         "Connected",
         &format!(
-            "{} · {}",
+            "{} · {} · reasoning {}",
             name(&profile.provider),
-            profile.model.as_deref().unwrap_or("provider default")
+            profile.model.as_deref().unwrap_or("provider default"),
+            profile.reasoning_effort.as_deref().unwrap_or("default")
         ),
     )
 }
@@ -167,6 +170,7 @@ fn switch_provider(
     if let Some((selected, key)) = configure_provider(terminal)? {
         profile.provider = selected.provider;
         profile.model = selected.model;
+        profile.reasoning_effort = None;
         profile.endpoint = selected.endpoint;
         *secret = key;
         save(root, profile)?;
@@ -183,7 +187,16 @@ fn switch_model(
     secret: Option<&str>,
 ) -> Result<()> {
     if let Some(model) = choose_model(terminal, profile, secret)? {
-        profile.model = model;
+        let mut candidate = profile.clone();
+        candidate.model = model;
+        candidate.reasoning_effort = None;
+        if terminal.interactive {
+            let Some(effort) = choose_reasoning(terminal, &candidate)? else {
+                return Ok(());
+            };
+            candidate.reasoning_effort = effort;
+        }
+        *profile = candidate;
         save(root, profile)?;
         show_selection(terminal, profile)?;
         terminal.message(
@@ -191,6 +204,58 @@ fn switch_model(
             "",
             "New tasks use this model; saved tasks keep their original selection.",
         )?;
+    }
+    Ok(())
+}
+
+fn choose_reasoning(terminal: &Terminal, profile: &Profile) -> Result<Option<Option<String>>> {
+    let levels = profile
+        .model
+        .as_deref()
+        .map(|model| crate::catalog::reasoning_levels(&profile.provider, model).unwrap_or_default())
+        .unwrap_or_default();
+    if levels.is_empty() {
+        terminal.message(
+            Tone::Quiet,
+            "Reasoning",
+            "Provider-managed · choose a catalog model to see its supported levels.",
+        )?;
+        return Ok(Some(None));
+    }
+    if profile.provider == "custom" {
+        terminal.message(Tone::Quiet, "Endpoint option", "Explicitly sends reasoning_effort; your endpoint/model must support it. Default omits the field.")?;
+    }
+    let mut choices = vec!["Provider default · no override".into()];
+    choices.extend(levels.iter().map(|effort| {
+        format!(
+            "{effort} · {}{}",
+            match effort.as_str() {
+                "none" | "minimal" | "low" => "quicker responses",
+                "medium" => "balanced depth",
+                "high" => "deeper problem solving",
+                _ => "highest depth · may consume more usage",
+            },
+            if profile.reasoning_effort.as_ref() == Some(effort) {
+                " · current"
+            } else {
+                ""
+            }
+        )
+    }));
+    Ok(terminal.select("Reasoning effort", &choices)?.map(|index| {
+        if index == 0 {
+            None
+        } else {
+            Some(levels[index - 1].clone())
+        }
+    }))
+}
+
+fn switch_reasoning(root: &Path, terminal: &Terminal, profile: &mut Profile) -> Result<()> {
+    if let Some(effort) = choose_reasoning(terminal, profile)? {
+        profile.reasoning_effort = effort;
+        save(root, profile)?;
+        show_selection(terminal, profile)?;
     }
     Ok(())
 }
@@ -210,6 +275,7 @@ fn configure_provider(terminal: &Terminal) -> Result<Option<(Profile, Option<Str
     let mut profile = Profile {
         provider,
         model: None,
+        reasoning_effort: None,
         endpoint: None,
         write: false,
         image: None,
@@ -1555,6 +1621,7 @@ fn task(
         .unwrap_or("Complete the requested task using successful-operation evidence");
     let mut budgets = serde_json::to_value(profile.limits)?;
     budgets["model"] = json!(profile.model);
+    budgets["reasoning_effort"] = json!(profile.reasoning_effort);
     budgets["endpoint"] = json!(profile.endpoint);
     budgets["container_image"] = json!(profile.image);
     budgets["previous_run"] = json!(profile.previous_run);
@@ -1741,6 +1808,7 @@ pub fn interactive(root: &Path) -> Result<()> {
                     "/model" | "/models" => {
                         switch_model(root, &terminal, &mut profile, secret.as_deref())?
                     }
+                    "/reasoning" => switch_reasoning(root, &terminal, &mut profile)?,
                     "/settings" => {
                         settings(root, &mut terminal, &mut profile)?;
                     }
@@ -1862,6 +1930,7 @@ mod tests {
         let mut profile = Profile {
             provider: "custom".into(),
             model: Some("model".into()),
+            reasoning_effort: None,
             endpoint: Some(Endpoint {
                 base_url: "https://example.test/v1".into(),
                 api_key_env: Some("ARUN_SESSION_API_KEY".into()),

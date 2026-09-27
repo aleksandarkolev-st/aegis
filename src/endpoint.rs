@@ -142,6 +142,18 @@ impl Endpoint {
         cancelled: impl Fn() -> bool,
         max_response: u64,
     ) -> Result<Response> {
+        self.call_reasoned(model_id, prompt, timeout, cancelled, max_response, None)
+    }
+
+    pub fn call_reasoned(
+        &self,
+        model_id: &str,
+        prompt: &str,
+        timeout: Duration,
+        cancelled: impl Fn() -> bool,
+        max_response: u64,
+        reasoning: Option<&str>,
+    ) -> Result<Response> {
         crate::budget::validate_response_bytes(max_response)?;
         let url = self.url()?;
         if model_id.trim().is_empty() {
@@ -162,6 +174,12 @@ impl Endpoint {
             bail!("API key environment variable is empty");
         }
         let mut body = json!({"model":model_id, "messages":[{"role":"user","content":prompt}], "stream":false});
+        if let Some(effort) = reasoning {
+            if !crate::catalog::valid_effort(effort) {
+                bail!("invalid reasoning effort");
+            }
+            body["reasoning_effort"] = json!(effort);
+        }
         match self.response_format {
             ResponseFormat::Schema => {
                 body["response_format"] = json!({"type":"json_schema","json_schema":{"name":"runtime_action","strict":true,"schema":model::schema()?}})
