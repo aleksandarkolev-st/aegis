@@ -92,6 +92,7 @@ fn ready(record: &Value, binary: &str, plan: &str, bridge: &str, runtime: &str) 
 fn main() -> Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let mut run = false;
+    let mut preparation = false;
     let mut competition = false;
     let mut reviewed = None;
     let mut runtime = None;
@@ -104,7 +105,7 @@ fn main() -> Result<()> {
     while index < arguments.len() {
         let flag = arguments[index].as_str();
         match flag {
-            "--prepare-only" => {}
+            "--prepare-only" => preparation = true,
             "--run" => run = true,
             "--competition" => competition = true,
             _ => {
@@ -124,7 +125,8 @@ fn main() -> Result<()> {
         }
         index += 1;
     }
-    if !["chatgpt", "claude", "grok"].contains(&backend.as_str())
+    if (run && preparation)
+        || !["chatgpt", "claude", "grok"].contains(&backend.as_str())
         || !(1..=500).contains(&moves)
         || !(60..=7200).contains(&seconds)
         || model.is_empty()

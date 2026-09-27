@@ -260,6 +260,7 @@ fn verify(workspace: &Path, state: &Path, task: &str, image: &str) -> Result<Val
 fn main() -> Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let mut run_agents = false;
+    let mut preparation = false;
     let mut ready = None;
     let mut aegis = None;
     let mut model = "gpt-5.5".to_owned();
@@ -270,6 +271,7 @@ fn main() -> Result<()> {
     while index < arguments.len() {
         let flag = arguments[index].as_str();
         if flag == "--prepare-only" {
+            preparation = true;
             index += 1;
             continue;
         }
@@ -293,7 +295,8 @@ fn main() -> Result<()> {
         }
         index += 1;
     }
-    if !(1..=3).contains(&repeats)
+    if (run_agents && preparation)
+        || !(1..=3).contains(&repeats)
         || !(30..=1800).contains(&seconds)
         || model.is_empty()
         || model.len() > 128

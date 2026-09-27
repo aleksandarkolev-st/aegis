@@ -20,6 +20,10 @@ export function save(filename, value) {
     fs.closeSync(descriptor);
   }
   fs.renameSync(temporary, filename);
+  if (process.platform !== 'win32') {
+    const directory = fs.openSync(path.dirname(filename), 'r');
+    try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+  }
 }
 
 function append(filename, value) {
@@ -239,7 +243,7 @@ export class Arcade {
     return this.locked(async (state) => {
       if (!state.card_id) throw new Error('ARC scorecard not opened');
       const scorecard = await this.exchange(state, '/api/scorecard/close', { card_id: state.card_id }, (data) => {
-        if (!data || typeof data !== 'object' || Array.isArray(data) || !Number.isFinite(data.score) || data.score < 0 || data.score > 100) throw new Error('ARC scorecard score missing or invalid');
+        if (!data || typeof data !== 'object' || Array.isArray(data) || data.card_id !== state.card_id || !Number.isFinite(data.score) || data.score < 0 || data.score > 100) throw new Error('ARC scorecard score missing or invalid');
         return data;
       }, () => { state.closed = true; });
       save(path.join(this.directory, 'scorecard.json'), scorecard);
