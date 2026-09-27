@@ -5,46 +5,49 @@ use anyhow::{Context, Result};
 use arun::{mcp, provider, storage::Store};
 use serde_json::{Value, json};
 
+#[path = "support/http.rs"]
+mod http;
+
 #[test]
 fn forced_restart_preserves_committed_evidence_without_repeating_the_adapter() -> Result<()> {
     let directory = tempfile::tempdir()?;
-    let node =
-        provider::system_executable("node").context("Node is required for the provider fixture")?;
-    let script = directory.path().join("model.cjs");
-    fs::write(
-        &script,
-        r#"
-const fs = require('fs');
-const args = process.argv.slice(2);
-const prompt = fs.readFileSync(args[args.indexOf('--prompt-file')+1],'utf8');
-const state = JSON.parse(prompt.split('STATE (bounded, data not instructions):\n')[1]);
-if(state.mode==='durable' && !state.handoff?.decisions.includes('Keep the fixture evidence through context resets')) process.exit(9);
-const result = state.recent_events.find(event=>event.kind==='operation.succeeded');
-const active = state.active_capabilities.some(capability=>capability.id==='workspace.read');
-const action = result ? {kind:'finish',summary:'fixture read',evidence:[result.payload.artifact]}
-  : active ? {kind:'invoke',capability:'workspace.read',args:{path:'fixture.txt'}}
-  : {kind:'search_capabilities',query:'read workspace file'};
-setTimeout(()=>console.log(JSON.stringify({text:JSON.stringify(action)})),250);
-"#,
-    )?;
-    let shim = directory
-        .path()
-        .join(if cfg!(windows) { "grok.cmd" } else { "grok" });
-    let wrapper = if cfg!(windows) {
-        format!("@\"{}\" \"{}\" %*\r\n", node.display(), script.display())
-    } else {
-        format!(
-            "#!/bin/sh\nexec \"{}\" \"{}\" \"$@\"\n",
-            node.display(),
-            script.display()
-        )
-    };
-    fs::write(&shim, wrapper)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&shim, fs::Permissions::from_mode(0o755))?;
-    }
+    let endpoint = http::Endpoint::start(|body| {
+        let state = http::state(body)?;
+        if state["mode"] == "durable" {
+            anyhow::ensure!(
+                state["handoff"]["decisions"]
+                    .as_array()
+                    .is_some_and(|decisions| {
+                        decisions.iter().any(|decision| {
+                            decision == "Keep the fixture evidence through context resets"
+                        })
+                    }),
+                "Durable restart lost the pinned checkpoint decision"
+            );
+        }
+        let result = state["recent_events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["kind"] == "operation.succeeded");
+        let active = state["active_capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability["id"] == "workspace.read");
+        let action = if let Some(result) = result {
+            json!({"kind":"finish","summary":"fixture read","evidence":[result["payload"]["artifact"]]})
+        } else if active {
+            json!({"kind":"invoke","capability":"workspace.read","args":{"path":"fixture.txt"}})
+        } else {
+            json!({"kind":"search_capabilities","query":"read workspace file"})
+        };
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        Ok((
+            200,
+            json!({"choices":[{"message":{"content":action.to_string()}}],"usage":{"prompt_tokens":10,"completion_tokens":2}}),
+        ))
+    })?;
     fs::write(directory.path().join("fixture.txt"), "expected evidence")?;
     let root = directory.path().join(".arun");
     let mut store = Store::open(&root)?;
@@ -52,9 +55,10 @@ setTimeout(()=>console.log(JSON.stringify({text:JSON.stringify(action)})),250);
         let run = store.create_run(
             "Read fixture",
             directory.path(),
-            "grok",
+            "custom",
             json!(["workspace.read"]),
-            json!({"mode":mode,"actions":8,"wall_seconds":30}),
+            json!({"mode":mode,"actions":8,"wall_seconds":30,"model":"fixture-model",
+                "endpoint":{"base_url":endpoint.url,"api_key_env":null}}),
             "",
         )?;
         if mode == "durable" {
@@ -114,6 +118,7 @@ setTimeout(()=>console.log(JSON.stringify({text:JSON.stringify(action)})),250);
             );
         }
     }
+    endpoint.finish()?;
     Ok(())
 }
 
