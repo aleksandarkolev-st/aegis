@@ -47,7 +47,7 @@ jobs:
         run: node scripts/release.mjs verify "$GITHUB_REF_NAME"
       - name: Test
         run: |
-          cargo test --locked
+          cargo test --locked --all-targets
           npm test
       - name: Build native runtime
         run: cargo build --release --locked --target ${{ matrix.target }}
