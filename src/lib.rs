@@ -8,6 +8,7 @@ pub mod evaluation_report;
 pub mod filesystem;
 pub mod habits;
 pub mod history;
+pub mod instructions;
 pub mod interrupt;
 pub mod kernel;
 pub mod learning;

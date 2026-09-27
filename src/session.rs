@@ -456,6 +456,7 @@ fn settings(root: &Path, terminal: &mut Terminal, profile: &mut Profile) -> Resu
         "Project memory · remember what matters",
         "File access scopes · optional exact files / folders",
         "Web access · optional approved HTTPS domains",
+        "Project instructions · pinned, scoped rules",
         "Back",
     ]
     .map(str::to_owned);
@@ -476,6 +477,7 @@ fn settings(root: &Path, terminal: &mut Terminal, profile: &mut Profile) -> Resu
         Some(5) => return memory_menu(root, terminal),
         Some(6) => configure_file_scopes(terminal, &mut selected)?,
         Some(7) => configure_network_scopes(terminal, &mut selected)?,
+        Some(8) => return instruction_menu(root, terminal),
         _ => false,
     };
     if changed {
@@ -786,6 +788,74 @@ fn remember(root: &Path, terminal: &Terminal, text: &str, replace: Option<&str>)
     match Store::open(root)?.remember(&std::env::current_dir()?, text, replace) {
         Ok(_) => terminal.message(Tone::Success, "Remembered", "Saved for future tasks in this workspace. No model call needed; existing tasks keep their original memory snapshot."),
         Err(error) => terminal.message(Tone::Quiet, "Memory unchanged", &error.to_string()),
+    }
+}
+
+fn instruction_menu(root: &Path, terminal: &Terminal) -> Result<()> {
+    let workspace = std::env::current_dir()?;
+    let mut store = Store::open(root)?;
+    let rules = store.project_instructions(&workspace)?;
+    terminal.message(Tone::Quiet, "Pinned instructions", "Explicit project rules, not inferred memories. Frozen into new tasks and retained across recovery. Eight rules / 3 KiB. Current requests and permissions take precedence; no rule can grant access.")?;
+    let mut choices = vec!["Add an instruction".to_owned()];
+    choices.extend(rules.iter().map(|rule| {
+        format!(
+            "{} · v{} · {}",
+            rule.scope,
+            rule.revision,
+            crate::terminal::fit(&rule.text, 70)
+        )
+    }));
+    choices.push("Back".into());
+    let Some(selected) = terminal.select("Project instructions", &choices)? else {
+        return Ok(());
+    };
+    let existing = selected.checked_sub(1).and_then(|index| rules.get(index));
+    if selected != 0 && existing.is_none() {
+        return Ok(());
+    }
+    if let Some(rule) = existing {
+        terminal.message(
+            Tone::Accent,
+            &format!("{} · v{}", rule.scope, rule.revision),
+            &rule.text,
+        )?;
+        let actions = ["Keep", "Edit instruction", "Remove instruction"].map(str::to_owned);
+        match terminal.select("Explicit user rule", &actions)? {
+            Some(1) => {}
+            Some(2) => {
+                store.unpin_instruction(&workspace, &rule.id)?;
+                return terminal.message(Tone::Quiet, "Instruction removed", "Future tasks use the updated ledger; saved tasks retain their frozen instructions.");
+            }
+            _ => return Ok(()),
+        }
+    }
+    let Some(text) = field(terminal, "  Instruction › ", false)? else {
+        return Ok(());
+    };
+    let scopes = ["Whole workspace", "Choose relative file or folder"].map(str::to_owned);
+    let scope = match terminal.select("Where does it apply?", &scopes)? {
+        Some(0) => "**".to_owned(),
+        Some(1) => {
+            terminal.message(Tone::Quiet, "Scope", "Use an exact relative file or folder/**. This is guidance, not a permission grant.")?;
+            let Some(scope) = field(terminal, "  Scope › ", false)? else {
+                return Ok(());
+            };
+            scope
+        }
+        _ => return Ok(()),
+    };
+    match store.pin_instruction(
+        &workspace,
+        &scope,
+        &text,
+        existing.map(|rule| rule.id.as_str()),
+    ) {
+        Ok(_) => terminal.message(
+            Tone::Success,
+            "Instruction pinned",
+            "Saved without a model call. Existing tasks retain their original revisions.",
+        ),
+        Err(error) => terminal.message(Tone::Warning, "Instruction unchanged", &error.to_string()),
     }
 }
 
@@ -1511,6 +1581,13 @@ fn context_view(root: &Path, id: &str, terminal: &Terminal) -> Result<()> {
         ),
     )?;
     terminal.message(Tone::Quiet, "Acceptance", &run.acceptance)?;
+    for rule in crate::instructions::frozen(&run.budgets)? {
+        terminal.message(
+            Tone::Accent,
+            &format!("Rule · {} · v{}", rule.scope, rule.revision),
+            &rule.text,
+        )?;
+    }
     if let Some(checkpoint) = store.last_checkpoint(id)? {
         terminal.message(Tone::Accent, "Next action", &checkpoint.next_action)?;
         for decision in checkpoint.decisions {
@@ -1979,6 +2056,7 @@ pub fn interactive(root: &Path) -> Result<()> {
                         settings(root, &mut terminal, &mut profile)?;
                     }
                     "/memory" => memory_menu(root, &terminal)?,
+                    "/instructions" => instruction_menu(root, &terminal)?,
                     "/new" => {
                         new_conversation(root, &terminal, &mut profile)?;
                         history.clear();

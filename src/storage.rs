@@ -184,6 +184,11 @@ impl Store {
                updated_at INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS project_memory_workspace ON project_memory(workspace);
+             CREATE TABLE IF NOT EXISTS project_instructions (
+               id TEXT PRIMARY KEY, workspace TEXT NOT NULL, scope TEXT NOT NULL,
+               text TEXT NOT NULL, revision INTEGER NOT NULL, updated_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS project_instructions_workspace ON project_instructions(workspace);
              CREATE TABLE IF NOT EXISTS learning_settings (workspace TEXT PRIMARY KEY, enabled INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS user_habits (
                workspace TEXT NOT NULL, category TEXT NOT NULL, choice TEXT NOT NULL,
@@ -342,6 +347,8 @@ impl Store {
         }
         crate::tokenization::validate(&budgets)?;
         budgets["project_memory"] = json!(self.project_memory(&workspace)?);
+        budgets["project_instructions"] = json!(self.project_instructions(&workspace)?);
+        crate::instructions::frozen(&budgets)?;
         budgets["learning_enabled"] = json!(self.learning_enabled(&workspace)?);
         budgets["user_habits"] = json!(self.learned_habits(&workspace, task)?);
         budgets["workflow_patterns"] =
