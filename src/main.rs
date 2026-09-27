@@ -120,6 +120,9 @@ fn attach(root: &Path, id: &str) -> Result<()> {
         }
         let run = store.run(id)?;
         if run.state != "running" && run.state != "ready" {
+            for event in store.events_since(id, last)? {
+                terminal.render_event(&event)?;
+            }
             println!("run {}: {}", id, run.state);
             break;
         }

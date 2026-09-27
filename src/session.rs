@@ -1100,6 +1100,9 @@ fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
         let run = store.run(id)?;
         if !matches!(run.state.as_str(), "ready" | "running") {
             terminal.clear_activity()?;
+            for event in store.events_since(id, sequence)? {
+                terminal.render_event(&event)?;
+            }
             terminal.message(
                 Tone::Quiet,
                 "",

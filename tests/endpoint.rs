@@ -293,7 +293,12 @@ fn custom_endpoint_completes_a_kernel_run_without_persisting_its_key() -> Result
         if interactive {
             let profile = fs::read_to_string(directory.path().join(".arun/profile.json"))?;
             assert!(!profile.contains("local-fixture-secret"));
-            assert!(String::from_utf8_lossy(&output.stdout).contains("Done"));
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).matches("Done").count(),
+                3,
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
         }
     }
     Ok(())
