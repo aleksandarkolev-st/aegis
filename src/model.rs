@@ -118,8 +118,7 @@ pub fn call(
 }
 
 pub fn login(provider: &str) -> Result<()> {
-    crate::signin::run(provider, &crate::terminal::Terminal::default())?;
-    Ok(())
+    crate::signin::command(provider, &crate::terminal::Terminal::default())
 }
 
 pub fn call_with_cancel(

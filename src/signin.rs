@@ -60,6 +60,14 @@ pub fn ensure(provider: &str, terminal: &Terminal) -> Result<bool> {
 }
 
 pub fn run(provider: &str, terminal: &Terminal) -> Result<bool> {
+    run_with_status(provider, terminal, false)
+}
+
+pub fn command(provider: &str, terminal: &Terminal) -> Result<()> {
+    run_with_status(provider, terminal, true).map(|_| ())
+}
+
+fn run_with_status(provider: &str, terminal: &Terminal, propagate_failure: bool) -> Result<bool> {
     let selected = crate::direct::provider(provider)?;
     let vault = Vault::user()?;
     let existing = vault.load(provider_name(selected))?.is_some();
@@ -127,7 +135,25 @@ pub fn run(provider: &str, terminal: &Terminal) -> Result<bool> {
         cancelled,
         thread: Some(thread),
     };
-    present(terminal, &receiver, &_worker.cancelled)
+    report_outcome(
+        terminal,
+        present(terminal, &receiver, &_worker.cancelled),
+        propagate_failure,
+    )
+}
+
+fn report_outcome(
+    terminal: &Terminal,
+    result: Result<bool>,
+    propagate_failure: bool,
+) -> Result<bool> {
+    match result {
+        Err(error) if !propagate_failure => {
+            terminal.message(Tone::Warning, "Sign-in", &error.to_string())?;
+            Ok(false)
+        }
+        outcome => outcome,
+    }
 }
 
 fn present(
@@ -181,10 +207,7 @@ fn present(
                         )?;
                         return Ok(true);
                     }
-                    Err(error) => {
-                        terminal.message(Tone::Warning, "Sign-in", &error.to_string())?;
-                        return Ok(false);
-                    }
+                    Err(error) => return Err(error),
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -280,7 +303,15 @@ mod tests {
         }
         let (sender, receiver) = mpsc::channel();
         sender.send(Update::Done(Err(anyhow!("Fixture connection failed"))))?;
-        assert!(!present(&terminal, &receiver, &AtomicBool::new(false))?);
+        let failed = present(&terminal, &receiver, &AtomicBool::new(false));
+        assert!(failed.is_err());
+        assert!(report_outcome(&terminal, failed, true).is_err());
+        assert!(!report_outcome(
+            &terminal,
+            Err(anyhow!("Fixture connection failed")),
+            false
+        )?);
+        assert!(!report_outcome(&terminal, Ok(false), true)?);
         sender.send(Update::Done(Ok(())))?;
         assert!(!present(&terminal, &receiver, &AtomicBool::new(true))?);
         drop(sender);
