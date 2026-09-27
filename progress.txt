@@ -1,5 +1,5 @@
 AEGIS IMPLEMENTATION PROGRESS
-Updated: 2026-09-27 08:58 UTC (UTC; workspace timezone Europe/Kyiv)
+Updated: 2026-09-27 09:18 UTC (UTC; workspace timezone Europe/Kyiv)
 
 LATEST USER REQUIREMENTS
 - Adapt to the user's habits, not just remember explicit notes.
@@ -108,6 +108,10 @@ LATEST LOCAL COMMITS
 - dcef64b: positive reference solutions, ordinary and isolated grader verification.
 
 LATEST MANUAL UX CHECK
+- Source 2ba69cb is now user-global installed, native SHA256 3bca1755ff5e1dacdb9b0297218886f91830a35bcc7afc91d65b5a1628019da8. Installed aegis --version passed. The prior draft build 03fd5ac (6f12352a9586cab0860edb70a6e7da56b51db10be7c3e51601cd018654abebe5) preserved an unfinished prompt across F7/back with its cursor inside the text; insertion verified that position, then Ctrl+U/Ctrl+D exited without a model call.
+- Latest installed Byte fixture d27b7013-40d8-4ad6-a559-e056e2fd242c in .arun/ui-artifact-range-20260927 used the checked-in decision stub: four synthetic decisions, 56 fixture-reported tokens, readable 5.9 KiB result metadata and Byte Done. F3 evidence menus displayed line 2 and the character slice at offset 6001, both TAIL_RANGE_VISIBLE, without inspection commands. One filter also selected the bounded preview as expected; no extra model/tool calls are attributed to browsing. Esc/back and Ctrl+D returned to the same shell. This is not Claude sign-in evidence or an agent benchmark.
+- Full source 2ba69cb Windows checks: 154 Rust passed, seven optional checks ignored, ten Node passed; all five Docker isolation/acceptance checks passed separately. Logs .arun/functional-20260927-artifact-browser.log, .arun/npm-functional-20260927-artifact-browser.log and .arun/docker-functional-20260927-artifact-browser.log. Formatting and diff checks passed. Latest-source Linux full suite/package rerun is active, not yet claimed.
+- Prior UI repaint source 2a3283b full Windows 152/Linux 151 Rust checks and ten Node checks per platform passed; Linux release/version passed. Prompt-draft source 03fd5ac full Windows 153/Linux 152 Rust checks and ten Node checks per platform passed; Linux release/version passed. Logs are .arun/functional-20260927-render-cache.log, .arun/linux-functional-render-cache.log, .arun/functional-20260927-prompt-drafts.log and .arun/linux-functional-prompt-drafts.log. Counts differ by platform-specific tests; ignored checks were not silently counted as passed.
 - Installed ab1607c build opened in the existing terminal with Byte, the correct generic mascot caption and wrapped memory feedback.
 - Reviewed learning controls and F7 optional file scopes without starting a task or making a model call.
 - Calm preset applied in place, then Ctrl+D returned to the original shell; no extra window.
@@ -117,9 +121,9 @@ LATEST MANUAL UX CHECK
 - Both benchmark --run commands refused absent readiness review before API/model calls; raw refusal logs .arun/arc-readiness-refusal-20260927.log and .arun/coding-readiness-refusal-20260927.log. No attestation was invented.
 
 NEXT IMPLEMENTATION / VERIFICATION WORK
-- Evidence browsing now exposes preview/search/line/character ranges as keyboard choices and numeric fields rather than requiring inspection command syntax. Read-only guided integration verification is pending.
+- Evidence browsing now exposes preview/search/line/character ranges as keyboard choices and numeric fields rather than requiring inspection command syntax. Guided integration passed invalid-number recovery, tail ranges, escaped literal search, unchanged artifacts and zero model calls. Installed same-terminal range browsing passed.
 - Native release CI now runs all Rust targets, including the optional evaluation runners' safety-gate/accounting checks. No workflow was remotely dispatched and no public release was created.
-- Menu usability follow-up preserves unfinished prompt text and Unicode cursor position in session memory across keyboard shortcuts, without injecting drafts into other settings or secret fields. Focused regression and installed verification are pending; this is not a completion claim.
+- Menu usability follow-up preserves unfinished prompt text and Unicode cursor position in session memory across keyboard shortcuts, without injecting drafts into other settings or secret fields. Focused regression and installed F7/back/cursor checks passed; this is not a completion claim.
 - Safe directory scaffolding and optional scoped HTTPS are implemented and functionally checked.
 - Refresh latest installed same-terminal UX and latest-source Windows/Linux checks. macOS remains pending actual platform execution.
 - ARC-AGI-3 adapter and record/scoring pipeline are implemented and fixture-verified, not live-certified. Continue the full readiness audit, including official service/data-use conditions before actual evaluation. Preserve authoritative scorecards and incomplete records; do not equate completion percentage or tokens with the official score. Anonymous credentials/cookies are private and excluded from shareable logs.
