@@ -105,6 +105,53 @@ impl Vault {
         Ok(Self::new(PathBuf::from(home).join(".aegis").join("auth")))
     }
 
+    pub(crate) fn lock(
+        &self,
+        provider: &str,
+        timeout: std::time::Duration,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<File> {
+        provider_name(provider)?;
+        if timeout.is_zero() || cancelled() {
+            bail!("Sign-in storage operation was cancelled");
+        }
+        self.prepare()?;
+        let path = self.root.join(format!("{provider}.lock"));
+        if fs::symlink_metadata(&path).is_ok() {
+            checked_metadata(&path, false)?;
+        }
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(&path)
+            .map_err(|_| anyhow!("Could not open the private sign-in lock"))?;
+        checked_metadata(&path, false)?;
+        let started = std::time::Instant::now();
+        loop {
+            if cancelled() {
+                bail!("Sign-in storage operation was cancelled");
+            }
+            match fs2::FileExt::try_lock_exclusive(&file) {
+                Ok(()) => return Ok(file),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+                {
+                    if started.elapsed() >= timeout {
+                        bail!("Another Aegis sign-in is busy; try again shortly");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(_) => bail!("Could not acquire the private sign-in lock"),
+            }
+        }
+    }
+
     fn path(&self, provider: &str) -> Result<PathBuf> {
         Ok(self
             .root
