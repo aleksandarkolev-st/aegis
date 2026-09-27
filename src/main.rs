@@ -388,7 +388,7 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
             || response_format != arun::endpoint::ResponseFormat::Schema
         {
             bail!(
-                "endpoint options require the custom provider; native providers use their CLI login"
+                "endpoint options require the custom provider; ChatGPT and Grok use Aegis sign-in"
             );
         }
         None
@@ -422,7 +422,7 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
         &std::env::current_dir()?,
         provider,
         json!(grants),
-        json!({"model": model, "reasoning_effort":reasoning_effort, "endpoint":endpoint, "mode": mode, "actions": actions, "model_tokens": model_tokens, "tool_result_tokens":tool_result_tokens, "wall_seconds": wall_seconds, "context_chars": context_chars,
+        json!({"provider_transport":"aegis-direct-v1", "model": model, "reasoning_effort":reasoning_effort, "endpoint":endpoint, "mode": mode, "actions": actions, "model_tokens": model_tokens, "tool_result_tokens":tool_result_tokens, "wall_seconds": wall_seconds, "context_chars": context_chars,
             "model_seconds": 180, "model_response_bytes": model_response_bytes, "process_seconds": process_seconds, "container_image": image, "acceptance_check":acceptance_check, "command_scopes":command_scopes, "filesystem_scopes":filesystem_scopes, "network_scopes":network_scopes}),
         acceptance,
     )?;

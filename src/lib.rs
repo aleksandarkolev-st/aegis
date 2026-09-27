@@ -27,6 +27,7 @@ pub mod recall;
 pub mod repository_rules;
 pub mod restart;
 pub mod session;
+pub mod signin;
 pub mod storage;
 pub mod terminal;
 pub mod text;

@@ -9,6 +9,17 @@ use serde_json::{Value, json};
 
 use crate::model::{self, Response, Usage};
 
+pub fn provider(name: &str) -> Result<Provider> {
+    match crate::provider::canonical(name) {
+        "codex" => Ok(Provider::ChatGpt),
+        "grok" => Ok(Provider::Grok),
+        "claude" => bail!(
+            "Claude subscription sign-in is pending; choose ChatGPT, Grok or a custom API endpoint. No native CLI was started"
+        ),
+        _ => bail!("Unsupported direct provider"),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provider {
     ChatGpt,

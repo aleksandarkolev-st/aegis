@@ -11,7 +11,7 @@ use serde_json::json;
 
 use crate::{
     endpoint::{Endpoint, ResponseFormat},
-    kernel, model, provider,
+    kernel, provider,
     storage::Store,
     terminal::{Input, RawMode, Terminal, Tone},
     trace,
@@ -50,8 +50,8 @@ fn profile_provider<'de, Decoder: serde::Deserializer<'de>>(
 
 fn name(provider: &str) -> &str {
     match crate::provider::canonical(provider) {
-        "codex" => "ChatGPT / Codex",
-        "claude" => "Claude Code",
+        "codex" => "ChatGPT",
+        "claude" => "Claude · pending",
         "grok" => "Grok",
         "custom" => "Custom endpoint",
         other => other,
@@ -102,18 +102,13 @@ fn choose_model(
             terminal.message(
                 Tone::Quiet,
                 "Catalog",
-                &format!("Model list unavailable · {}. Default/manual selection is still available; F4 refreshes sign-in.", if error.to_string().to_lowercase().contains("timed out") { "provider didn't respond in time" } else { "listing is unsupported or not ready" }),
+                &format!("Model list unavailable · {}. You can enter an advertised model ID; F4 manages sign-in.", if error.to_string().to_lowercase().contains("timed out") { "provider didn't respond in time" } else { "listing is unsupported or not ready" }),
             )?;
             Vec::new()
         }
     };
-    let native = profile.provider != "custom";
     let mut choices = Vec::new();
     let mut values = Vec::new();
-    if native {
-        choices.push("Provider default · let your CLI choose".into());
-        values.push(None);
-    }
     for model in models {
         let current = if profile.model.as_deref() == Some(model.id.as_str()) {
             " · current"
@@ -288,9 +283,9 @@ fn switch_reasoning(root: &Path, terminal: &Terminal, profile: &mut Profile) -> 
 
 fn configure_provider(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
     let choices = [
-        "ChatGPT — use your Codex login",
-        "Claude Code — use your Claude login",
-        "Grok — use your Grok login",
+        "ChatGPT — direct account sign-in",
+        "Claude — subscription sign-in pending",
+        "Grok — direct account sign-in",
         "Custom OpenAI-compatible endpoint",
     ]
     .map(str::to_owned);
@@ -351,9 +346,9 @@ fn configure_provider(terminal: &Terminal) -> Result<Option<(Profile, Option<Str
         if !ensure_provider(terminal, &profile.provider)? {
             return Ok(None);
         }
-        terminal.message(Tone::Quiet, "Ready", "Using your existing provider login and default model. F4 signs in if needed; F6 lets you pick another model.")?;
+        terminal.message(Tone::Quiet, "Ready", "Using Aegis's saved account sign-in. F4 manages sign-in; F6 chooses the model and reasoning.")?;
     }
-    if profile.provider == "custom" {
+    {
         let Some(model) = choose_model(terminal, &profile, secret.as_deref())? else {
             return Ok(None);
         };
@@ -1304,22 +1299,8 @@ fn valid_image_reference(image: &str) -> bool {
 }
 
 fn ensure_provider(terminal: &Terminal, name: &str) -> Result<bool> {
-    if provider::find(name)?.is_some() {
-        return Ok(true);
-    }
-    let package = provider::specification(name)?.package;
-    terminal.message(Tone::Warning, "Provider setup", &format!("This provider is not installed. Aegis can download {package} into your private provider directory; it will not modify this workspace or your global npm installation."))?;
-    let choices = [format!("Install {package} and continue"), "Back".into()];
-    if terminal.select("Install the official provider CLI?", &choices)? != Some(0) {
-        return Ok(false);
-    }
-    if let Err(error) = provider::install(name) {
-        terminal.message(Tone::Warning, "Installation failed", &format!("{error:#}"))?;
-        return Ok(false);
-    }
-    Ok(true)
+    crate::signin::ensure(name, terminal)
 }
-
 fn save(root: &Path, profile: &Profile) -> Result<()> {
     let path = root.join("profile.json");
     let mut temporary = tempfile::NamedTempFile::new_in(root)?;
@@ -1994,6 +1975,13 @@ fn task(
     request: &str,
 ) -> Result<()> {
     profile.limits.validate()?;
+    if profile.model.is_none() {
+        let Some(model) = choose_model(terminal, profile, secret)? else {
+            return Ok(());
+        };
+        profile.model = model;
+        save(root, profile)?;
+    }
     review_new_root_guidance(root, terminal, profile.filesystem_scopes.as_ref())?;
     let mut store = Store::open(root)?;
     let mut grants = vec!["workspace.read".to_owned()];
@@ -2016,6 +2004,7 @@ fn task(
         .map(|check| check.name.as_str())
         .unwrap_or("Reply directly to conversation; verify requested tool work with successful-operation evidence");
     let mut budgets = serde_json::to_value(profile.limits)?;
+    budgets["provider_transport"] = json!("aegis-direct-v1");
     budgets["model"] = json!(profile.model);
     budgets["reasoning_effort"] = json!(profile.reasoning_effort);
     budgets["endpoint"] = json!(profile.endpoint);
@@ -2048,8 +2037,9 @@ fn task(
     if authentication_failed && profile.provider != "custom" {
         let choices = ["Sign in and continue this task", "Leave task paused"].map(str::to_owned);
         if terminal.select("Your provider sign-in needs refreshing", &choices)? == Some(0) {
-            model::login(&profile.provider)?;
-            resume(root, &run.id, terminal, None)?;
+            if crate::signin::run(&profile.provider, terminal)? {
+                resume(root, &run.id, terminal, None)?;
+            }
         }
     }
     Ok(())
@@ -2072,6 +2062,10 @@ fn is_auth_error(error: &str) -> bool {
         "oauth access token has expired",
         "not logged in",
         "not authenticated",
+        "not signed in",
+        "sign-in expired",
+        "sign-in was rejected",
+        "choose sign in",
         "please log in",
     ]
     .iter()
@@ -2178,8 +2172,8 @@ pub fn interactive(root: &Path) -> Result<()> {
                             .map(|_| "ARUN_SESSION_API_KEY".into());
                     }
                     save(root, &profile)?;
-                } else if ensure_provider(&terminal, &profile.provider)? {
-                    if let Err(error) = model::login(&profile.provider) {
+                } else {
+                    if let Err(error) = crate::signin::run(&profile.provider, &terminal) {
                         terminal.message(Tone::Warning, "!", &error.to_string())?;
                     }
                 }

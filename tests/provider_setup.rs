@@ -2,104 +2,91 @@ use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use arun::auth_store::{Session, Vault};
 use arun::storage::Store;
+use serde_json::json;
 
-fn node() -> Result<std::path::PathBuf> {
-    let directories = std::env::var_os("PATH").context("PATH missing")?;
-    std::env::split_paths(&directories)
-        .map(|directory| directory.join(if cfg!(windows) { "node.exe" } else { "node" }))
-        .find(|path| path.is_file())
-        .context("Node is required for the provider setup fixture")
+fn command(directory: &std::path::Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_arun"));
+    command
+        .current_dir(directory)
+        .env("HOME", directory.join("home"))
+        .env("USERPROFILE", directory.join("home"))
+        .env("CODEX_HOME", directory.join("home/.codex"))
+        .env("PATH", directory)
+        .env("AEGIS_PROVIDER_HOME", directory.join("managed"));
+    command
+}
+
+fn trap(directory: &std::path::Path) -> Result<()> {
+    for name in ["codex", "grok", "claude", "npm"] {
+        let path = directory.join(if cfg!(windows) {
+            format!("{name}.cmd")
+        } else {
+            name.into()
+        });
+        let script = if cfg!(windows) {
+            "@echo NATIVE_PROVIDER_WAS_STARTED\r\n@echo bad > native-started.txt\r\n"
+        } else {
+            "#!/bin/sh\nprintf NATIVE_PROVIDER_WAS_STARTED\nprintf bad > native-started.txt\n"
+        };
+        fs::write(&path, script)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        }
+    }
+    Ok(())
+}
+
+fn input(mut command: Command, text: &str) -> Result<std::process::Output> {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child.stdin.take().unwrap().write_all(text.as_bytes())?;
+    Ok(child.wait_with_output()?)
 }
 
 #[test]
-fn native_login_launchers_forward_input_and_reject_failure_without_creating_tasks() -> Result<()> {
-    let node = node()?;
-    for (provider, binary, expected) in [
-        ("chatgpt", "codex", vec!["login"]),
-        ("codex", "codex", vec!["login"]),
-        ("claude-code", "claude", vec!["auth", "login"]),
-        ("claude", "claude", vec!["auth", "login"]),
-        ("grok", "grok", vec!["login"]),
-    ] {
-        for managed in [false, true] {
-            for success in [false, true] {
-                let directory = tempfile::tempdir()?;
-                let providers = directory.path().join("managed");
-                let receipt = directory.path().join("login-receipt.json");
-                let fixture = directory.path().join("login.mjs");
-                fs::write(
-                    &fixture,
-                    r#"import { readFileSync, writeFileSync } from 'node:fs';
-writeFileSync(process.env.AEGIS_LOGIN_FIXTURE_RECEIPT, JSON.stringify({args:process.argv.slice(2), input:readFileSync(0,'utf8')}));
-console.log('NATIVE_LOGIN_FIXTURE_RETURNED');
-process.exit(Number(process.env.AEGIS_LOGIN_FIXTURE_EXIT));"#,
-                )?;
-                let bin = if managed {
-                    providers.join(binary).join("node_modules/.bin")
-                } else {
-                    directory.path().to_owned()
-                };
-                fs::create_dir_all(&bin)?;
-                let executable = bin.join(if cfg!(windows) {
-                    format!("{binary}.cmd")
-                } else {
-                    binary.to_owned()
-                });
-                let wrapper = if cfg!(windows) {
-                    format!("@\"{}\" \"{}\" %*\r\n", node.display(), fixture.display())
-                } else {
-                    format!(
-                        "#!/bin/sh\nexec \"{}\" \"{}\" \"$@\"\n",
-                        node.display(),
-                        fixture.display()
-                    )
-                };
-                fs::write(&executable, wrapper)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    fs::set_permissions(executable, fs::Permissions::from_mode(0o755))?;
-                }
-                let mut child = Command::new(env!("CARGO_BIN_EXE_arun"))
-                    .args(["login", provider])
-                    .current_dir(directory.path())
-                    .env("PATH", directory.path())
-                    .env("AEGIS_PROVIDER_HOME", &providers)
-                    .env("AEGIS_LOGIN_FIXTURE_RECEIPT", &receipt)
-                    .env("AEGIS_LOGIN_FIXTURE_EXIT", if success { "0" } else { "7" })
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()?;
-                child
-                    .stdin
-                    .take()
-                    .unwrap()
-                    .write_all(b"fixture input, not credentials\n")?;
-                let output = child.wait_with_output()?;
-                assert_eq!(output.status.success(), success);
-                let recorded: serde_json::Value = serde_json::from_slice(&fs::read(receipt)?)?;
-                assert_eq!(recorded["args"], serde_json::json!(expected));
-                assert_eq!(recorded["input"], "fixture input, not credentials\n");
-                assert!(
-                    String::from_utf8_lossy(&output.stdout)
-                        .contains("NATIVE_LOGIN_FIXTURE_RETURNED")
-                );
-                if !success {
-                    assert!(
-                        String::from_utf8_lossy(&output.stderr)
-                            .contains("provider login did not complete successfully")
-                    );
-                }
-                assert!(
-                    Store::open(&directory.path().join(".arun"))?
-                        .runs()?
-                        .is_empty()
-                );
-            }
-        }
+fn login_back_never_launches_native_agents_or_creates_a_task() -> Result<()> {
+    for provider in ["chatgpt", "codex", "grok"] {
+        let directory = tempfile::tempdir()?;
+        trap(directory.path())?;
+        let mut command = command(directory.path());
+        command.args(["login", provider]);
+        let output = input(command, "2\n")?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("no provider CLI required"));
+        assert!(!directory.path().join("native-started.txt").exists());
+        assert!(!directory.path().join("home/.aegis").exists());
+        assert!(
+            Store::open(&directory.path().join(".arun"))?
+                .runs()?
+                .is_empty()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn claude_pending_is_explicit_instead_of_a_native_cli_fallback() -> Result<()> {
+    for provider in ["claude", "claude-code"] {
+        let directory = tempfile::tempdir()?;
+        trap(directory.path())?;
+        let mut command = command(directory.path());
+        command.args(["login", provider]);
+        let output = command.output()?;
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("pending"));
+        assert!(!directory.path().join("native-started.txt").exists());
     }
     Ok(())
 }
@@ -107,19 +94,15 @@ process.exit(Number(process.env.AEGIS_LOGIN_FIXTURE_EXIT));"#,
 #[test]
 fn declining_setup_does_not_install_or_create_a_task() -> Result<()> {
     let directory = tempfile::tempdir()?;
-    let providers = directory.path().join("managed");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_arun"))
-        .current_dir(directory.path())
-        .env("PATH", directory.path())
-        .env("AEGIS_PROVIDER_HOME", &providers)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    child.stdin.take().unwrap().write_all(b"3\n2\n")?;
-    let output = child.wait_with_output()?;
-    assert!(output.status.success());
-    assert!(!providers.exists());
+    trap(directory.path())?;
+    let output = input(command(directory.path()), "3\n2\n")?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!directory.path().join("managed").exists());
+    assert!(!directory.path().join("native-started.txt").exists());
     assert!(
         Store::open(&directory.path().join(".arun"))?
             .runs()?
@@ -129,79 +112,104 @@ fn declining_setup_does_not_install_or_create_a_task() -> Result<()> {
 }
 
 #[test]
-fn missing_provider_installs_with_consent_without_manual_commands() -> Result<()> {
+fn sign_out_removes_only_owned_credentials_without_modifying_native_accounts() -> Result<()> {
     let directory = tempfile::tempdir()?;
-    let node = node()?;
-    let fixture = directory.path().join("installer.mjs");
-    fs::write(
-        &fixture,
-        r#"
-import { mkdirSync, writeFileSync } from 'node:fs';
-import path from 'node:path';
-const args = process.argv.slice(2);
-if (args[0] !== 'install' || args.at(-1) !== '@xai-official/grok') process.exit(9);
-const prefix = args[args.indexOf('--prefix') + 1];
-const bin = path.join(prefix, 'node_modules', '.bin');
-mkdirSync(bin, { recursive: true });
-const model = path.join(prefix, 'model.mjs');
-writeFileSync(model, 'console.log(JSON.stringify({text:JSON.stringify({kind:"blocked",reason:"fixture provider ready"})}));');
-const wrapper = process.platform === 'win32'
-  ? '@"' + process.execPath + '" "' + model + '" %*\r\n'
-  : '#!/bin/sh\nexec "' + process.execPath + '" "' + model + '" "$@"\n';
-writeFileSync(path.join(bin, process.platform === 'win32' ? 'grok.cmd' : 'grok'), wrapper, {mode:0o755});
-writeFileSync(path.join(prefix, 'consent-install.json'), JSON.stringify(args));
-"#,
-    )?;
-    let wrapper = if cfg!(windows) {
-        format!("@\"{}\" \"{}\" %*\r\n", node.display(), fixture.display())
-    } else {
-        format!(
-            "#!/bin/sh\nexec \"{}\" \"{}\" \"$@\"\n",
-            node.display(),
-            fixture.display()
-        )
-    };
-    let npm = directory
-        .path()
-        .join(if cfg!(windows) { "npm.cmd" } else { "npm" });
-    fs::write(&npm, wrapper)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(npm, fs::Permissions::from_mode(0o755))?;
-    }
-    let providers = directory.path().join("managed");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_arun"))
-        .current_dir(directory.path())
-        .env("PATH", directory.path())
-        .env("AEGIS_PROVIDER_HOME", &providers)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"3\n1\n2\nRead the workspace\n/quit\n")?;
-    let output = child.wait_with_output()?;
+    trap(directory.path())?;
+    let vault = Vault::new(directory.path().join("home/.aegis/auth"));
+    vault.save(&Session {
+        provider: "grok".into(),
+        access_token: "fixture-private-access".into(),
+        refresh_token: Some("fixture-private-refresh".into()),
+        account_id: None,
+        expires_at: 2000000000,
+    })?;
+    fs::create_dir_all(directory.path().join("home/.grok"))?;
+    let native = directory.path().join("home/.grok/auth.json");
+    fs::write(&native, b"native credentials are not modified")?;
+    let mut command = command(directory.path());
+    command.args(["login", "grok"]);
+    let output = input(command, "2\n")?;
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Install the official provider CLI?"));
-    assert!(stdout.contains("fixture provider ready"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Signed out"));
+    assert!(vault.load("grok")?.is_none());
+    assert_eq!(fs::read(&native)?, b"native credentials are not modified");
+    assert!(!directory.path().join("native-started.txt").exists());
+    Ok(())
+}
+
+#[test]
+fn normal_model_dispatch_fails_readably_without_launching_installed_clis() -> Result<()> {
+    for provider in ["chatgpt", "grok", "claude"] {
+        let directory = tempfile::tempdir()?;
+        trap(directory.path())?;
+        let mut command = command(directory.path());
+        command.args([
+            "run",
+            "hello",
+            "--provider",
+            provider,
+            "--model",
+            "fixture-model",
+            "--foreground",
+        ]);
+        let output = command.output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!directory.path().join("native-started.txt").exists());
+        let store = Store::open(&directory.path().join(".arun"))?;
+        let runs = store.runs()?;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].budgets["provider_transport"], "aegis-direct-v1");
+        assert_eq!(runs[0].state, "waiting_recovery");
+        assert!(
+            store
+                .events(&runs[0].id)?
+                .iter()
+                .any(|event| event.kind == "model.failed")
+        );
+        assert_eq!(store.event_count(&runs[0].id, "operation.pending")?, 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn legacy_contracts_are_not_silently_reinterpreted_as_direct_provider_tasks() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    trap(directory.path())?;
+    let root = directory.path().join(".arun");
+    let mut store = Store::open(&root)?;
+    let run = store.create_run(
+        "old task",
+        directory.path(),
+        "codex",
+        json!([]),
+        json!({"model":"fixture-model", "mode":"durable", "actions":2, "wall_seconds":120}),
+        "",
+    )?;
+    drop(store);
+    let mut command = command(directory.path());
+    command.args(["resume", &run.id, "--foreground"]);
+    let output = command.output()?;
     assert!(
-        !stdout.contains("Authentication")
-            && !stdout.contains("Task budget")
-            && !stdout.contains("Completion checks")
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert!(providers.join("grok/consent-install.json").is_file());
-    assert!(!directory.path().join("node_modules").exists());
-    let store = Store::open(&directory.path().join(".arun"))?;
-    assert_eq!(store.runs()?.len(), 1);
-    assert_eq!(store.runs()?[0].state, "waiting_recovery");
+    let store = Store::open(&root)?;
+    assert!(store.events(&run.id)?.iter().any(|event| {
+        event.kind == "model.failed"
+            && event.payload["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("predates direct providers"))
+    }));
+    assert!(!directory.path().join("native-started.txt").exists());
+    assert_eq!(store.run(&run.id)?.budgets, run.budgets);
     Ok(())
 }

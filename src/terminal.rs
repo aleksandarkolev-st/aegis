@@ -545,6 +545,33 @@ impl Terminal {
                 width.saturating_sub(1),
             )
         });
+        self.paint_activity(width, text, footer)
+    }
+
+    pub fn authentication_activity(&self, label: &str, elapsed: Duration) -> Result<()> {
+        if !self.interactive {
+            return Ok(());
+        }
+        let width = terminal::size()
+            .map(|(width, _)| width as usize)
+            .unwrap_or(80);
+        let tick = if self.animations {
+            (elapsed.as_millis() / self.skin.frame_interval().as_millis().max(1)) as u64
+        } else {
+            0
+        };
+        let frame = fit(&self.skin.frame(crate::ui::Phase::Working, tick), 24);
+        self.paint_activity(
+            width,
+            fit(&format!("  {frame} {label}"), width.saturating_sub(1)),
+            Some(fit(
+                "  Esc / Ctrl+C cancel · sign-in codes never enter chat",
+                width.saturating_sub(1),
+            )),
+        )
+    }
+
+    fn paint_activity(&self, width: usize, text: String, footer: Option<String>) -> Result<()> {
         let view = (width, text, footer);
         if self.activity_view.borrow().as_ref() == Some(&view) {
             return Ok(());
@@ -564,7 +591,7 @@ impl Terminal {
         }
         write!(io::stdout(), "{}", view.1)?;
         queue!(io::stdout(), ResetColor)?;
-        if !self.skin.show_context() {
+        if view.2.is_none() {
             self.activity_rows.set(1);
             io::stdout().flush()?;
             self.activity_view.replace(Some(view));

@@ -1,8 +1,6 @@
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -216,37 +214,21 @@ pub fn grok_cache(path: &Path) -> Result<Catalog> {
 pub fn native(provider: &str) -> Result<Catalog> {
     match crate::provider::canonical(provider) {
         "codex" => {
-            let home = std::env::var_os("CODEX_HOME").map(std::path::PathBuf::from).or_else(|| {
-                std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(|home| std::path::PathBuf::from(home).join(".codex"))
-            }).context("Codex home is unavailable")?;
+            let home = std::env::var_os("CODEX_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+                        .map(|home| std::path::PathBuf::from(home).join(".codex"))
+                })
+                .context("Codex home is unavailable")?;
             codex_cache(&home.join("models_cache.json"))
         }
-        "claude" => Ok(Catalog {
-            models: [ ("sonnet", "Sonnet · balanced coding"), ("opus", "Opus · complex reasoning"), ("haiku", "Haiku · lightweight tasks") ].into_iter().map(|(id, label)| Model { id: id.into(), label: label.into() }).collect(),
-            source: "Claude Code model aliases · resolved by your CLI; account access depends on your plan".into(),
-        }),
+        "claude" => bail!("Claude sign-in is pending; use another provider"),
         "grok" => {
-            if let Some(home) = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }) {
-                if let Ok(catalog) = grok_cache(&std::path::PathBuf::from(home).join(".grok/models_cache.json")) {
-                    if !catalog.models.is_empty() { return Ok(catalog); }
-                }
-            }
-            let directory = tempfile::tempdir()?;
-            let stdout = directory.path().join("models");
-            let mut command = Command::new(crate::provider::executable(provider)?);
-            command.arg("models").stdin(Stdio::null()).stdout(Stdio::from(File::create(&stdout)?)).stderr(Stdio::null());
-            let mut child = crate::process::spawn(command)?;
-            let started = Instant::now();
-            loop {
-                if let Some(status) = child.try_wait()? {
-                    if !status.success() { bail!("Grok couldn't list models. Sign in with F4 or use its default model."); }
-                    break;
-                }
-                if started.elapsed() > Duration::from_secs(10) { bail!("Grok model discovery timed out"); }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            if fs::metadata(&stdout)?.len() > 256 * 1024 { bail!("Grok model catalog is too large"); }
-            Ok(grok_output(&fs::read_to_string(stdout)?))
+            let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+                .context("Home directory unavailable")?;
+            grok_cache(&std::path::PathBuf::from(home).join(".grok/models_cache.json"))
+                .context("No cached Grok catalog is available; enter an advertised model ID")
         }
         _ => bail!("Unsupported native provider"),
     }
@@ -270,6 +252,7 @@ pub fn endpoint_value(value: &Value) -> Result<Vec<Model>> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
 
     #[test]
     fn reasoning_levels_follow_visible_model_metadata_without_inventing_support() {

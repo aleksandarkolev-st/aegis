@@ -63,7 +63,7 @@ fn explicit_reasoning_selection_persists_without_changing_saved_contracts() -> R
 
 #[test]
 fn reselecting_current_model_preserves_reasoning_and_new_model_resets_it() -> Result<()> {
-    for (choice, expected) in [(2, Some("high")), (3, None)] {
+    for (choice, expected) in [(1, Some("high")), (2, None)] {
         let directory = tempfile::tempdir()?;
         let root = directory.path().join(".arun");
         fs::create_dir(&root)?;
@@ -101,7 +101,7 @@ fn reselecting_current_model_preserves_reasoning_and_new_model_resets_it() -> Re
         assert_eq!(saved["reasoning_effort"].as_str(), expected);
         assert_eq!(
             saved["model"],
-            if choice == 2 {
+            if choice == 1 {
                 "old-model"
             } else {
                 "new-model"
@@ -167,29 +167,37 @@ fn model_and_provider_switches_keep_permissions_budgets_and_task_history() -> Re
                 &json!({"models":[{"slug":"catalog-model","display_name":"Friendly model","visibility":"list"},{"slug":"internal-hidden","visibility":"hide"}]}),
             )?,
         )?;
-        let claude = directory.path().join(if cfg!(windows) {
-            "claude.cmd"
-        } else {
-            "claude"
-        });
-        fs::write(&claude, "")?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(claude, fs::Permissions::from_mode(0o755))?;
-        }
+        let home = directory.path().join("home");
+        arun::auth_store::Vault::new(home.join(".aegis/auth")).save(
+            &arun::auth_store::Session {
+                provider: "grok".into(),
+                access_token: "fixture-private-access".into(),
+                refresh_token: None,
+                account_id: None,
+                expires_at: 2000000000,
+            },
+        )?;
+        fs::create_dir_all(home.join(".grok"))?;
+        fs::write(
+            home.join(".grok/models_cache.json"),
+            serde_json::to_vec(
+                &json!({"models":{"grok-example":{"info":{"id":"grok-example", "name":"Friendly Grok", "hidden":false}}}}),
+            )?,
+        )?;
         let mut child = Command::new(env!("CARGO_BIN_EXE_arun"))
             .current_dir(directory.path())
             .env("CODEX_HOME", codex_home)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
             .env("PATH", directory.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
         child.stdin.take().unwrap().write_all(if provider_switch {
-            b"/provider\n2\n/models\n2\n/quit\n"
+            b"/provider\n3\n1\n/quit\n"
         } else {
-            b"/models\n2\n/quit\n"
+            b"/models\n1\n/quit\n"
         })?;
         let output = child.wait_with_output()?;
         assert!(
@@ -204,7 +212,7 @@ fn model_and_provider_switches_keep_permissions_budgets_and_task_history() -> Re
         assert_eq!(
             saved["model"],
             if provider_switch {
-                "sonnet"
+                "grok-example"
             } else {
                 "catalog-model"
             }
@@ -213,7 +221,7 @@ fn model_and_provider_switches_keep_permissions_budgets_and_task_history() -> Re
         assert!(!text.contains("Allow workspace edits"));
         assert!(!text.contains("internal-hidden"));
         assert!(text.contains(if provider_switch {
-            "Claude Code model aliases"
+            "Friendly Grok"
         } else {
             "Friendly model"
         }));
@@ -240,6 +248,7 @@ fn custom_setup_lists_authenticated_endpoint_models_without_saving_the_key() -> 
                 Err(error) => return Err(error.into()),
             }
         };
+        stream.set_nonblocking(false)?;
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         let mut request = Vec::new();
         let mut buffer = [0; 1024];
