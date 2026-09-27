@@ -148,6 +148,35 @@ pub(crate) fn append_event(
     Ok(())
 }
 
+pub(crate) fn insert_run(transaction: &Transaction<'_>, run: &Run) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO runs VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            run.id,
+            run.task,
+            run.workspace,
+            run.provider,
+            run.grants.to_string(),
+            run.budgets.to_string(),
+            run.acceptance,
+            run.state,
+            run.created_at
+        ],
+    )?;
+    append_event(
+        transaction,
+        &run.id,
+        "run.created",
+        json!({"task":run.task,"provider":run.provider}),
+    )?;
+    transaction.execute(
+        "INSERT INTO milestones VALUES (?1, 0, 'Task request', 'active', '[]')",
+        [&run.id],
+    )?;
+    crate::habits::record(transaction, run)?;
+    Ok(())
+}
+
 impl Store {
     pub fn open(root: &Path) -> Result<Self> {
         fs::create_dir_all(root)?;
@@ -382,31 +411,7 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "INSERT INTO runs VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                run.id,
-                run.task,
-                run.workspace,
-                run.provider,
-                run.grants.to_string(),
-                run.budgets.to_string(),
-                run.acceptance,
-                run.state,
-                run.created_at
-            ],
-        )?;
-        append_event(
-            &transaction,
-            &run.id,
-            "run.created",
-            json!({"task": run.task, "provider": run.provider}),
-        )?;
-        transaction.execute(
-            "INSERT INTO milestones VALUES (?1, 0, 'Task request', 'active', '[]')",
-            [&run.id],
-        )?;
-        crate::habits::record(&transaction, &run)?;
+        insert_run(&transaction, &run)?;
         transaction.commit()?;
         Ok(run)
     }

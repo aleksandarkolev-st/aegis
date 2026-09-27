@@ -1,0 +1,11 @@
+# Reviewed continuation of older tasks
+
+`src/continuation.rs` prepares an opaque review, then atomically creates a new direct-provider task after confirmation. It does not edit the original task contract or replay its operations. The core is implemented; terminal menu wiring is the next step.
+
+The original request, workspace, grants, command/file/network restrictions, acceptance check, numeric budget limits and frozen guidance are preserved. Only the explicitly chosen direct provider, model/reasoning, transport, conversation parent and bounded historical handoff change. An old endpoint is removed rather than being silently routed into the selected subscription transport. The original run's usage and deadline remain untouched; the new task has a fresh accounting window, which must be clearly disclosed before confirmation.
+
+Old evidence, completed milestones, operations, active capabilities and pending acceptance proposals are not copied. A preview of up to four decisions and four unresolved notes is available as historical context only, with clipping disclosed. The new task starts with one active milestone and must inspect current state and gather fresh evidence. Current project guidance is not silently substituted for the original frozen revisions.
+
+Commit checks the same database/workspace, takes the source runner lock, checks the reviewed event sequence and source record under a database write transaction, and rejects changed reviews or reuse of a completed review. Active execution and uncertain outcomes block continuation. Unexecuted pending work in an explicitly cancelled/terminal original may be left behind; executing/dispatched or unknown outcomes still require resolution. No operations are imported or replayed.
+
+Windows core checks passed five continuation fixtures in a 176-pass library run (two live diagnostics ignored), plus four endpoint, seven model-picker and six setup integrations (`.arun/continuation-core-library-20260927.log`). A separate new kernel handoff check passed (`.arun/continuation-handoff-functional-20260927.log`). These are disposable-history checks, not a live migrated task, installed UI or complete cross-platform regression claim. Frozen endurance contracts and user-owned files were not changed.
