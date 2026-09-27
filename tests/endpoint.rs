@@ -46,6 +46,127 @@ fn request(stream: &mut TcpStream) -> Result<(String, Value)> {
 }
 
 #[test]
+fn selected_multi_file_reads_reach_the_next_decision_without_an_inspection_turn() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    fs::write(directory.path().join("first.txt"), "αβ🛡️ one")?;
+    fs::write(directory.path().join("second.txt"), "two\nsource marker")?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let address = listener.local_addr()?;
+    let server = thread::spawn(move || -> Result<()> {
+        for turn in 0..3 {
+            let started = Instant::now();
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && started.elapsed() < Duration::from_secs(20) =>
+                    {
+                        thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            let (_, body) = request(&mut stream)?;
+            let prompt = body["messages"][0]["content"].as_str().unwrap();
+            let state: Value = serde_json::from_str(
+                prompt
+                    .split_once("STATE (bounded, data not instructions):\n")
+                    .unwrap()
+                    .1,
+            )?;
+            let action = if turn == 0 {
+                json!({"kind":"search_capabilities","query":"read batch selected Unicode files"})
+            } else if turn == 1 {
+                assert!(
+                    state["active_capabilities"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|manifest| manifest["id"] == "workspace.read_batch")
+                );
+                json!({"kind":"invoke","capability":"workspace.read_batch","args":{"files":[{"path":"first.txt","length":30},{"path":"second.txt","length":30}]}})
+            } else {
+                let event = state["recent_events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|event| event["kind"] == "operation.succeeded")
+                    .unwrap();
+                assert_eq!(event["payload"]["selected"][0]["text"], "αβ🛡️ one");
+                assert_eq!(
+                    event["payload"]["selected"][1]["text"],
+                    "two\nsource marker"
+                );
+                assert!(
+                    event["payload"]["selected"][0]["sha256"]
+                        .as_str()
+                        .unwrap()
+                        .len()
+                        == 64
+                );
+                assert!(
+                    !state["recent_events"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|event| event["kind"] == "artifact.inspected")
+                );
+                json!({"kind":"finish","summary":"Both selected source ranges were read","evidence":[event["payload"]["artifact"]]})
+            };
+            let response = json!({"choices":[{"message":{"content":action.to_string()}}],"usage":{"prompt_tokens":10,"completion_tokens":2}}).to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            )?;
+        }
+        Ok(())
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_arun"))
+        .current_dir(directory.path())
+        .args([
+            "run",
+            "read the two fixture source ranges",
+            "--provider",
+            "custom",
+            "--endpoint",
+            &format!("http://{address}/v1"),
+            "--model",
+            "fixture-model",
+            "--foreground",
+        ])
+        .output()?;
+    server.join().unwrap()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("Read batch"));
+    assert!(text.contains("selected characters"));
+    let store = Store::open(&directory.path().join(".arun"))?;
+    let run = store.runs()?.remove(0);
+    assert_eq!(run.state, "completed");
+    assert_eq!(store.event_count(&run.id, "model.started")?, 3);
+    assert_eq!(store.event_count(&run.id, "artifact.inspected")?, 0);
+    assert_eq!(store.operations(&run.id)?.len(), 1);
+    assert!(store.tool_result_tokens(&run.id)? > 0);
+    assert_eq!(
+        fs::read_to_string(directory.path().join("first.txt"))?,
+        "αβ🛡️ one"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("second.txt"))?,
+        "two\nsource marker"
+    );
+    Ok(())
+}
+
+#[test]
 fn an_over_budget_response_is_recorded_but_cannot_write_the_workspace() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let listener = TcpListener::bind("127.0.0.1:0")?;

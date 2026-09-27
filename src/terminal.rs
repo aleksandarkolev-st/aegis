@@ -1006,8 +1006,17 @@ impl Terminal {
                     .or_else(|| args["url"].as_str())
                     .unwrap_or_default();
                 let capability = payload["capability"].as_str().unwrap_or("tool");
+                let detail = if capability == "workspace.read_batch" {
+                    format!(
+                        "{} requested files",
+                        args["files"].as_array().map_or(0, Vec::len)
+                    )
+                } else {
+                    detail.to_owned()
+                };
                 let label = match capability {
                     "workspace.read" => "Read",
+                    "workspace.read_batch" => "Read batch",
                     "workspace.write" | "workspace.patch" => "Edit",
                     "workspace.search" => "Search",
                     "process.run" => "Run",
@@ -1020,7 +1029,7 @@ impl Terminal {
                     &format!(
                         "{}  {}",
                         if label == "Tool" { capability } else { "" },
-                        fit(detail, 160)
+                        fit(&detail, 160)
                     ),
                 )
             }
@@ -1113,6 +1122,9 @@ fn result_summary(payload: &serde_json::Value) -> (Tone, &'static str, String) {
     let capability = detail["capability"].as_str().unwrap_or("tool");
     let target = detail["target"].as_str().unwrap_or(capability);
     let mut text = fit(target, 100);
+    if let Some(characters) = detail["selected_characters"].as_u64() {
+        text.push_str(&format!(" · {characters} selected characters"));
+    }
     let code = detail["exit_code"].as_i64();
     if let Some(code) = code {
         text.push_str(&format!(" · exit {code}"));
@@ -1154,6 +1166,7 @@ fn result_summary(payload: &serde_json::Value) -> (Tone, &'static str, String) {
     let label = match capability {
         "workspace.write" | "workspace.patch" => "Edited",
         "workspace.read" => "Read",
+        "workspace.read_batch" => "Read batch",
         "workspace.search" => "Found",
         "process.run" => "Command finished",
         _ => "Tool finished",

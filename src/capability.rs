@@ -36,6 +36,15 @@ pub fn registry() -> Vec<Manifest> {
             input_schema: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
         },
         Manifest {
+            id: "workspace.read_batch".into(),
+            version: 1,
+            purpose: "Read selected Unicode character ranges from up to eight UTF-8 files in one operation; at most 3000 text characters total. Requested ranges enter the next context directly with whole-file SHA256 and next_offset, avoiding a separate inspection turn. Large full files remain artifact-backed via workspace.read.".into(),
+            permission: "workspace.read".into(),
+            side_effect: "none".into(),
+            cost: 2,
+            input_schema: json!({"type":"object","additionalProperties":false,"properties":{"files":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","additionalProperties":false,"properties":{"path":{"type":"string","minLength":1,"maxLength":128},"offset":{"type":"integer","minimum":0,"maximum":2097152},"length":{"type":"integer","minimum":1,"maximum":3000}},"required":["path","length"]}}},"required":["files"]}),
+        },
+        Manifest {
             id: "workspace.write".into(),
             version: 1,
             purpose: "Write exact UTF-8 content to a workspace file".into(),

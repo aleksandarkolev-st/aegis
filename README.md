@@ -47,6 +47,8 @@ Memory stays deliberately small: at most 16 notes, 512 UTF-8 bytes each, 4 KiB o
 
 ### Pinned project instructions
 
+For coding reads, Aegis can discover `workspace.read_batch`: up to eight selected file ranges in one read-only operation, with 3000 Unicode characters total. Requested ranges appear in the next decision context immediately, eliminating a separate inspection action for them. Larger reads still use bounded artifact inspection. This reduces avoidable action turns, not a claim that native-provider bootstrap cost is fixed or that all tasks use fewer tokens.
+
 F7 → **Project instructions** adds, edits or removes explicit rules for this workspace, an exact relative file, or a `folder/**` subtree. No JSON file or model call is needed. The SQLite ledger keeps at most eight rules / 3 KiB, rejects oversized text instead of truncating it, and gives each edit a revision. New tasks freeze the complete ledger; recovery and checkpoints cannot rewrite it. Saved tasks show their original scoped revisions in Task details → Context.
 
 Runtime safety and grants take precedence, then the current request, applicable pinned rules, reviewed repository guidance, project notes and learned preferences. Ambiguous same-scope prose conflicts are for the agent to clarify, not a semantic guarantee. Rules never grant file/command/network access. Removing a rule affects future tasks, not immutable saved contracts.

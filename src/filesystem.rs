@@ -274,6 +274,7 @@ impl FileScopes {
 
     pub fn authorize(&self, run: &Run, capability: &str, arguments: &Value) -> Result<()> {
         match capability {
+            "workspace.read_batch" => crate::read_batch::authorize(run, arguments)?,
             "workspace.read" | "workspace.write" | "workspace.patch" => {
                 let path = arguments["path"].as_str().context("file path missing")?;
                 self.checked_path(

@@ -235,6 +235,9 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
         bail!("capability version changed after intent was recorded");
     }
     capability::validate_arguments(&manifest, &operation.arguments)?;
+    if operation.capability == "workspace.read_batch" {
+        crate::read_batch::authorize(&run, &operation.arguments)?;
+    }
     let file_scopes = crate::filesystem::FileScopes::from_configuration(&run.budgets)?;
     if let Some(scopes) = &file_scopes {
         scopes.authorize(&run, &operation.capability, &operation.arguments)?;
@@ -271,6 +274,7 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
     let workspace = Path::new(&run.workspace);
     let args = &operation.arguments;
     match operation.capability.as_str() {
+        "workspace.read_batch" => crate::read_batch::read(&run, args),
         "network.fetch" => crate::network::fetch(&mut store, &operation),
         "workspace.read" => {
             let path = relative(workspace, string(args, "path")?)?;
