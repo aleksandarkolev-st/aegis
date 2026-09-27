@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use arun::{process, provider, storage::Store, trace, worker};
+use arun::{process, storage::Store, trace, worker};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -35,6 +35,33 @@ const TASKS: &[(&str, &str, &str)] = &[
 
 fn hash(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+fn reviewed_reference(path: &Path, attestation: &Value) -> Result<PathBuf> {
+    let metadata =
+        fs::symlink_metadata(path).context("Explicit Codex reference binary is unavailable")?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        bail!("Codex reference must be an explicitly reviewed regular native executable");
+    }
+    #[cfg(windows)]
+    if !path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+    {
+        bail!("Select the native Codex .exe, not an npm or shell shim");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            bail!("Codex reference binary is not executable");
+        }
+    }
+    let path = dunce::canonicalize(path)?;
+    if attestation["codex_binary_sha256"] != hash(&fs::read(&path)?) {
+        bail!("Codex reference build does not match readiness record; no reference agent started");
+    }
+    Ok(path)
 }
 
 fn record(log: &mut File, event: Value) -> Result<()> {
@@ -263,6 +290,7 @@ fn main() -> Result<()> {
     let mut preparation = false;
     let mut ready = None;
     let mut aegis = None;
+    let mut codex_reference = None;
     let mut model = "gpt-5.5".to_owned();
     let mut image = "node:22-alpine".to_owned();
     let mut repeats = 2_usize;
@@ -287,6 +315,7 @@ fn main() -> Result<()> {
         match flag {
             "--ready" => ready = Some(PathBuf::from(value)),
             "--aegis" => aegis = Some(dunce::canonicalize(value)?),
+            "--codex-reference" => codex_reference = Some(PathBuf::from(value)),
             "--model" => model = value.clone(),
             "--image" => image = value.clone(),
             "--repeats" => repeats = value.parse()?,
@@ -331,6 +360,8 @@ fn main() -> Result<()> {
         if attestation["aegis_binary_sha256"] != hash(&fs::read(aegis)?) {
             bail!("Aegis build does not match readiness record");
         }
+        let reference = reviewed_reference(codex_reference.as_deref().context("--codex-reference must identify the reviewed external comparator; Aegis never resolves or installs it")?, &attestation)?;
+        codex_reference = Some(reference);
         let resolved = process::background(&mut Command::new("docker"))
             .args(["image", "inspect", "--format", "{{.Id}}", &image])
             .output()?;
@@ -341,7 +372,7 @@ fn main() -> Result<()> {
         if image.len() != 71 || !image.starts_with("sha256:") {
             bail!("container image digest unavailable");
         }
-        let version = process::background(&mut Command::new(provider::executable("codex")?))
+        let version = process::background(&mut Command::new(codex_reference.as_ref().unwrap()))
             .arg("--version")
             .output()?;
         if !version.status.success() {
@@ -354,7 +385,7 @@ fn main() -> Result<()> {
         .join(uuid::Uuid::new_v4().to_string());
     fs::create_dir_all(&root)?;
     let root = dunce::canonicalize(root)?;
-    let manifest = json!({"kind":"public-handwritten-coding-fixtures-v1","benchmark_binary_sha256":binary,"plan_sha256":plan,"grader_sha256":hash(GRADER.as_bytes()),"model":model,"codex_version":codex_version,"image":image,"repeats":repeats,"seconds_per_attempt":seconds,"max_attempts":3,"readiness":attestation,"prepare_only":!run_agents,"policy":"Same task and independent grader. Native Codex uses its own workspace-write harness; Aegis uses scoped file tools and exact containerized Node commands. This is not identical tool isolation, a held-out dataset, SWE-bench or an ARC score."});
+    let manifest = json!({"kind":"public-handwritten-coding-fixtures-v1","benchmark_binary_sha256":binary,"plan_sha256":plan,"grader_sha256":hash(GRADER.as_bytes()),"model":model,"codex_version":codex_version,"codex_reference":codex_reference,"codex_binary_sha256":attestation["codex_binary_sha256"],"image":image,"repeats":repeats,"seconds_per_attempt":seconds,"max_attempts":3,"readiness":attestation,"prepare_only":!run_agents,"policy":"Same task and independent grader. Explicitly reviewed external Codex uses its own workspace-write harness; Aegis uses direct HTTP, scoped file tools and exact containerized Node commands. This is not a native provider adapter, identical tool isolation, a held-out dataset, SWE-bench or an ARC score."});
     fs::write(
         root.join("experiment.json"),
         serde_json::to_vec_pretty(&manifest)?,
@@ -412,7 +443,7 @@ fn main() -> Result<()> {
                         json!({"kind":"attempt.started","task":task,"repeat":repeat,"harness":arm,"attempt":attempt,"created_at":arun::storage::unix_time(),"prompt_sha256":hash(prompt.as_bytes())}),
                     )?;
                     let mut command = Command::new(if arm == "codex" {
-                        provider::executable("codex")?
+                        reviewed_reference(codex_reference.as_ref().unwrap(), &attestation)?
                     } else {
                         aegis.clone().unwrap()
                     });
@@ -541,6 +572,51 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_requires_an_explicit_matching_native_build_without_execution() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join(if cfg!(windows) {
+            "reference.exe"
+        } else {
+            "reference"
+        });
+        fs::write(&path, b"fixture-not-a-real-agent")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert!(
+                reviewed_reference(
+                    &path,
+                    &json!({"codex_binary_sha256":hash(b"fixture-not-a-real-agent")})
+                )
+                .is_err()
+            );
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        }
+        assert!(reviewed_reference(&path, &Value::Null).is_err());
+        assert!(reviewed_reference(directory.path(), &Value::Null).is_err());
+        let attestation = json!({"codex_binary_sha256":hash(b"fixture-not-a-real-agent")});
+        assert_eq!(
+            reviewed_reference(&path, &attestation)?,
+            dunce::canonicalize(&path)?
+        );
+        fs::write(&path, b"changed-build")?;
+        assert!(reviewed_reference(&path, &attestation).is_err());
+        #[cfg(windows)]
+        {
+            let shim = directory.path().join("reference.cmd");
+            fs::write(&shim, b"@echo unexpected-reference-started")?;
+            assert!(
+                reviewed_reference(
+                    &shim,
+                    &json!({"codex_binary_sha256":hash(b"@echo unexpected-reference-started")})
+                )
+                .is_err()
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires Docker and the local node:22-alpine image; no agent calls"]
