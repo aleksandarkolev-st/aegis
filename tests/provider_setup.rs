@@ -58,7 +58,7 @@ fn login_back_never_launches_native_agents_or_creates_a_task() -> Result<()> {
         trap(directory.path())?;
         let mut command = command(directory.path());
         command.args(["login", provider]);
-        let output = input(command, "2\n")?;
+        let output = input(command, "3\n")?;
         assert!(
             output.status.success(),
             "{}",
@@ -95,7 +95,7 @@ fn claude_pending_is_explicit_instead_of_a_native_cli_fallback() -> Result<()> {
 fn declining_setup_does_not_install_or_create_a_task() -> Result<()> {
     let directory = tempfile::tempdir()?;
     trap(directory.path())?;
-    let output = input(command(directory.path()), "3\n2\n")?;
+    let output = input(command(directory.path()), "3\n3\n")?;
     assert!(
         output.status.success(),
         "{}",
@@ -128,7 +128,7 @@ fn sign_out_removes_only_owned_credentials_without_modifying_native_accounts() -
     fs::write(&native, b"native credentials are not modified")?;
     let mut command = command(directory.path());
     command.args(["login", "grok"]);
-    let output = input(command, "2\n")?;
+    let output = input(command, "3\n")?;
     assert!(
         output.status.success(),
         "{}",

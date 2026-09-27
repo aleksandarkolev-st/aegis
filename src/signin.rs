@@ -7,16 +7,25 @@ use anyhow::{Result, anyhow, bail};
 use crossterm::event::{self, Event};
 
 use crate::auth_store::Vault;
-use crate::oauth::{AuthClient, Poll};
+use crate::oauth::{AuthClient, BrowserLogin, DeviceLogin, Poll};
 use crate::terminal::{RawMode, Terminal, Tone};
 
 enum Update {
+    Browser {
+        url: String,
+        seconds: u64,
+    },
     Code {
         url: String,
         code: String,
         seconds: u64,
     },
     Done(Result<()>),
+}
+
+enum Login {
+    Browser(BrowserLogin),
+    Device(DeviceLogin),
 }
 
 struct Worker {
@@ -71,7 +80,10 @@ fn run_with_status(provider: &str, terminal: &Terminal, propagate_failure: bool)
     let selected = crate::direct::provider(provider)?;
     let vault = Vault::user()?;
     let existing = vault.load(provider_name(selected))?.is_some();
-    let mut choices = vec!["Sign in in your browser".to_owned()];
+    let mut choices = vec![
+        "Sign in in your browser · recommended".to_owned(),
+        "Use a device code · remote or headless terminal".to_owned(),
+    ];
     if existing {
         choices.push("Remove Aegis's saved sign-in".into());
     }
@@ -80,7 +92,7 @@ fn run_with_status(provider: &str, terminal: &Terminal, propagate_failure: bool)
     else {
         return Ok(false);
     };
-    if existing && choice == 1 {
+    if existing && choice == 2 {
         AuthClient::new(selected)?.logout(&vault, || false)?;
         terminal.message(
             Tone::Success,
@@ -89,13 +101,13 @@ fn run_with_status(provider: &str, terminal: &Terminal, propagate_failure: bool)
         )?;
         return Ok(false);
     }
-    if choice != 0 {
+    if choice > 1 {
         return Ok(false);
     }
     if cfg!(not(windows)) {
         terminal.message(Tone::Quiet, "Storage", "Aegis stores this session in owner-only files. This platform's file storage is not encrypted.")?;
     }
-    terminal.message(Tone::Quiet, "Sign in", "Only approve a code you requested here. Your chat, tasks and native provider credentials are not part of this sign-in.")?;
+    terminal.message(Tone::Quiet, "Sign in", "Approve only the sign-in you requested here. Your chats, tasks and native provider credentials are not part of this sign-in.")?;
     let cancelled = Arc::new(AtomicBool::new(false));
     let (sender, receiver) = mpsc::channel();
     let worker_cancelled = cancelled.clone();
@@ -103,16 +115,32 @@ fn run_with_status(provider: &str, terminal: &Terminal, propagate_failure: bool)
         let interrupted = || worker_cancelled.load(Ordering::Acquire);
         let outcome = (|| -> Result<()> {
             let client = AuthClient::new(selected)?;
-            let mut login = client.begin(interrupted)?;
-            sender
-                .send(Update::Code {
-                    url: login.verification_url().to_owned(),
-                    code: login.user_code().to_owned(),
-                    seconds: login.expires_in().as_secs(),
-                })
-                .map_err(|_| anyhow!("Sign-in interface closed"))?;
+            let mut login = if choice == 0 {
+                let login = client.begin_browser(interrupted)?;
+                sender
+                    .send(Update::Browser {
+                        url: login.authorization_url().to_owned(),
+                        seconds: login.expires_in().as_secs(),
+                    })
+                    .map_err(|_| anyhow!("Sign-in interface closed"))?;
+                Login::Browser(login)
+            } else {
+                let login = client.begin(interrupted)?;
+                sender
+                    .send(Update::Code {
+                        url: login.verification_url().to_owned(),
+                        code: login.user_code().to_owned(),
+                        seconds: login.expires_in().as_secs(),
+                    })
+                    .map_err(|_| anyhow!("Sign-in interface closed"))?;
+                Login::Device(login)
+            };
             loop {
-                match client.poll(&mut login, interrupted)? {
+                let outcome = match &mut login {
+                    Login::Browser(login) => client.poll_browser(login, interrupted)?,
+                    Login::Device(login) => client.poll(login, interrupted)?,
+                };
+                match outcome {
                     Poll::SignedIn(session) => return client.save(&vault, &session, interrupted),
                     Poll::Pending(delay) => {
                         let wait = Instant::now() + delay;
@@ -166,6 +194,23 @@ fn present(
     let mut label = "Connecting securely".to_owned();
     loop {
         match receiver.recv_timeout(Duration::from_millis(50)) {
+            Ok(Update::Browser { url, seconds }) => {
+                terminal.clear_activity()?;
+                terminal.message(
+                    Tone::Accent,
+                    "Browser sign-in",
+                    &format!(
+                        "Approve within {} minutes; Aegis will continue in this terminal.",
+                        seconds.div_ceil(60)
+                    ),
+                )?;
+                terminal.message(Tone::Quiet, "Privacy", "This link belongs to this sign-in attempt. Never share it or the returned callback.")?;
+                if !terminal.interactive || !open_browser(&url) {
+                    terminal.message(Tone::Accent, "Open", &url)?;
+                    terminal.message(Tone::Quiet, "Browser", "Open this link in your browser. If you are on a remote terminal, cancel and choose device-code sign-in.")?;
+                }
+                label = "Waiting for your browser approval".into();
+            }
             Ok(Update::Code { url, code, seconds }) => {
                 terminal.clear_activity()?;
                 terminal.message(Tone::Accent, "Open", &url)?;

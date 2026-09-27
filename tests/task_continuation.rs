@@ -131,7 +131,7 @@ fn confirmed_continuation_is_saved_even_when_sign_in_is_cancelled() -> Result<()
         let reasoning = if provider_choice == 1 { "1\n" } else { "" };
         let output = run_menu(
             directory.path(),
-            &format!("/sessions\n1\n{action}\n{provider_choice}\n1\n{reasoning}1\n2\n/quit\n"),
+            &format!("/sessions\n1\n{action}\n{provider_choice}\n1\n{reasoning}1\n3\n/quit\n"),
         )?;
         assert!(
             output.status.success(),

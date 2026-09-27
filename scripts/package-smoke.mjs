@@ -76,11 +76,12 @@ const help = await command([npmCli, 'exec', '--offline', '--prefix', prefix, '--
 assert.match(help.stdout, /launch with no arguments for guided terminal tasks/);
 assert.match(help.stdout, /login\|probe <provider>/);
 const launcher = path.join(installedRoot, 'bin', 'aegis.mjs');
-const onboarding = await command([launcher], { cwd: workspace, input: '3\n2\n', timeout: 10000 });
+const onboarding = await command([launcher], { cwd: workspace, input: '3\n3\n', timeout: 10000 });
 assert.match(onboarding.stdout, /Choose your provider/);
 assert.match(onboarding.stdout, /Custom OpenAI-compatible endpoint/);
-const login = await command([launcher, 'login', 'grok'], { cwd: workspace, input: '2\n', timeout: 10000 });
+const login = await command([launcher, 'login', 'grok'], { cwd: workspace, input: '3\n', timeout: 10000 });
 assert.match(login.stdout, /no provider CLI required/);
+assert.match(login.stdout, /Use a device code/);
 const tasks = await command([launcher, 'list'], { cwd: workspace, timeout: 10000 });
 assert.equal(tasks.stdout.trim(), '', 'Declining setup must not create a task');
 for (const folder of [directory, prefix, workspace, root]) {
