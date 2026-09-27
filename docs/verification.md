@@ -2,6 +2,12 @@
 
 This is a development verification record, not a success-rate or performance-improvement claim.
 
+## Latest runtime
+
+Source `038b2ac` passed 158 Windows / 157 Linux Rust checks, seven optional ignored per platform, and ten Node checks per platform. Five Docker checks passed separately. Logs: `.arun/functional-20260927-matching-excerpts.log`, `.arun/linux-functional-matching-excerpts.log`, `.arun/docker-functional-20260927-matching-excerpts.log`. Both packaged local installations and installed version smoke passed. Native SHA256: Windows `5b0db8be301e076ac6dd113095e6a098e8a28acf725fc11d853a32b40ba907f5`; Linux `d21a7f1d39c196913ff925933270b603e25f22f4ee5f0a796379db3805f05a3f`. The Linux tarball is 9,163,547 bytes. Source-only containers had no credentials/live-state mounts.
+
+This includes pure text validation shared without a storage-to-terminal dependency and a reproduced/fixed artifact-search failure after a 5,000-character prefix. Original failure: `.arun/artifact-long-line-reproduction-20260927.log`. Local endpoint fixtures prove slices, plain case-insensitive search and escaped literal search enter the actual next request without inline whole-file dumping. An installed Byte terminal fixture displayed the real long-line match and Unicode offset `4920` through the F3 evidence menu, then exited into the same shell; run `aa27c08b-4689-48cd-a93d-f8d67a8a45e6` under `.arun/ui-long-line-search-20260927/`. Its saved trace remains four synthetic decisions, 56 fixture tokens and one successful operation after browsing. Neither this fixture nor isolated login-launcher checks prove live Claude authentication. No new agent benchmark or readiness attestation was created. Later sections retain earlier builds' historical evidence; full-goal gates remain open.
+
 ## Terminal and package
 
 - Built the release binary with `npm run build:native`.
