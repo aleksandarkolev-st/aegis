@@ -42,7 +42,9 @@ Owned refresh/save/logout operations take a provider-specific OS file lock. A se
 
 Nine OAuth functional checks are included in the 140-pass Windows library run, with one explicitly gated live diagnostic ignored: `.arun/oauth-core-library-20260927-final.log`. Tests exercise both device protocols, single-use exchange, pending/slow-down/denial/cancellation/expiry, unsafe UI/URLs, token/account validation, real concurrent refresh locking, durable non-replay, redirects and body bounds. The earlier eight-test run is `.arun/oauth-core-functional-20260927.log`; the ninth check and source-confirmed ChatGPT JSON refresh encoding were added afterward. Initial compile attempts found the shared version constant's visibility and disabled reqwest form support; form encoding now uses the existing URL serializer, without another dependency download. Failed compile logs remain.
 
-Fresh user authorization, normal dispatch/F4/provider setup/catalog replacement and installed verification are still pending. No production auth service or model was called by these OAuth tests and no real user credential was altered. Linux verification of this follow-up remains pending; the earlier storage result does not prove it. The only newly direct dependency is already-locked/cached base64 0.22.1; no upstream agent code was copied.
+OAuth source `da831ff` also passed 142 Linux library checks, one live diagnostic ignored and ten Node checks: `.arun/linux-oauth-core-da831ff.log`. The source-only container had no network, real credentials, installed agent state or Docker socket. These are functional protocol fixtures, not fresh live sign-in or benchmarks. The Windows/Linux difference includes existing platform-specific tests.
+
+Fresh user authorization, normal dispatch/F4/provider setup/catalog replacement and full all-target/package/installed verification are still pending. No production auth service or model was called by these OAuth tests and no real user credential was altered. The only newly direct dependency is already-locked/cached base64 0.22.1; no upstream agent code was copied.
 
 ## Reviewed protocols
 
