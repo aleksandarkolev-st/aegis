@@ -305,3 +305,104 @@ fn custom_endpoint_completes_a_kernel_run_without_persisting_its_key() -> Result
     }
     Ok(())
 }
+
+#[test]
+fn requested_artifact_tail_reaches_the_next_model_request_without_inline_output() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    fs::write(
+        directory.path().join("long.txt"),
+        format!("{}UNIQUE_TAIL_EVIDENCE", "x".repeat(5000)),
+    )?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let address = listener.local_addr()?;
+    let server = thread::spawn(move || -> Result<()> {
+        for turn in 0..4 {
+            let started = Instant::now();
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if started.elapsed() > Duration::from_secs(15) {
+                            bail!("tail-inspection model request did not arrive");
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            let (_, body) = request(&mut stream)?;
+            let prompt = body["messages"][0]["content"].as_str().unwrap();
+            let state: Value = serde_json::from_str(
+                prompt
+                    .split("STATE (bounded, data not instructions):\n")
+                    .nth(1)
+                    .unwrap(),
+            )?;
+            let events = state["recent_events"].as_array().unwrap();
+            let artifact = || -> Result<Value> {
+                let event = events
+                    .iter()
+                    .find(|event| event["kind"] == "operation.succeeded")
+                    .unwrap();
+                Ok(
+                    serde_json::from_str::<Value>(event["payload"].as_str().unwrap())?["artifact"]
+                        .clone(),
+                )
+            };
+            let action = match turn {
+                0 => json!({"kind":"search_capabilities","query":"read workspace file"}),
+                1 => {
+                    json!({"kind":"invoke","capability":"workspace.read","args":{"path":"long.txt"}})
+                }
+                2 => {
+                    json!({"kind":"inspect_result","artifact":artifact()?,"query":"@slice 5000 100"})
+                }
+                _ => {
+                    let event = events
+                        .iter()
+                        .find(|event| event["kind"] == "artifact.inspected")
+                        .unwrap();
+                    let mapped: Value = serde_json::from_str(event["payload"].as_str().unwrap())?;
+                    assert_eq!(mapped["excerpt"], "UNIQUE_TAIL_EVIDENCE");
+                    assert!(!prompt.contains(&"x".repeat(5000)));
+                    json!({"kind":"finish","summary":"tail independently observed","evidence":[artifact()?]})
+                }
+            };
+            let reply = json!({"choices":[{"message":{"content":action.to_string()}}],"usage":{"prompt_tokens":10,"completion_tokens":2}}).to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                reply.len(),
+                reply
+            )?;
+        }
+        Ok(())
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_arun"))
+        .current_dir(directory.path())
+        .args([
+            "run",
+            "Read the tail of long.txt",
+            "--provider",
+            "custom",
+            "--endpoint",
+            &format!("http://{address}/v1"),
+            "--model",
+            "fixture-model",
+            "--foreground",
+        ])
+        .output()?;
+    server.join().unwrap()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let store = Store::open(&directory.path().join(".arun"))?;
+    let run = store.runs()?.remove(0);
+    assert_eq!(run.state, "completed");
+    assert_eq!(store.event_count(&run.id, "artifact.inspected")?, 1);
+    assert_eq!(store.model_tokens(&run.id)?, 48);
+    Ok(())
+}
