@@ -5,6 +5,33 @@ use anyhow::Result;
 use serde_json::Value;
 
 #[test]
+fn independent_graders_accept_reference_solutions_without_provider_calls() -> Result<()> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("benchmarks/coding");
+    for task in [
+        "json-patch",
+        "dag-scheduler",
+        "sse-decoder",
+        "interval-overlay",
+    ] {
+        let output = Command::new("node")
+            .arg(root.join("grade.mjs"))
+            .arg(task)
+            .arg(root.join("references").join(format!("{task}.mjs")))
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(result["passed"], true);
+        assert_eq!(result["passed_cases"], result["total_cases"]);
+    }
+    Ok(())
+}
+
+#[test]
 fn independent_graders_report_named_cases_and_reject_broken_starters_without_agents() -> Result<()>
 {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("benchmarks/coding");

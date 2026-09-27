@@ -183,20 +183,30 @@ fn summarize(events: &[Value]) -> Value {
 
 fn verify(workspace: &Path, state: &Path, task: &str, image: &str) -> Result<Value> {
     let script = format!(
-        "const {{grade}} = await import('data:text/javascript,' + encodeURIComponent({})); const result = await grade({}, await import('./index.mjs')); console.log(JSON.stringify(result)); if (!result.passed) process.exitCode = 1;",
-        json!(GRADER),
+        "const {{grade}} = await import('data:text/javascript,' + encodeURIComponent(process.argv.slice(1).join(''))); const result = await grade({}, await import('./index.mjs')); console.log(JSON.stringify(result)); if (!result.passed) process.exitCode = 1;",
         json!(task)
     );
-    if script.len() > 24_000 {
+    if script.len() + GRADER.len() > 24_000 {
         bail!("private grader exceeds portable command bound");
     }
+    let mut arguments = vec!["--input-type=module".to_owned(), "-e".to_owned(), script];
+    let mut chunk = String::new();
+    for character in GRADER.chars() {
+        if chunk.len() + character.len_utf8() > 4096 {
+            arguments.push(std::mem::take(&mut chunk));
+        }
+        chunk.push(character);
+    }
+    if !chunk.is_empty() {
+        arguments.push(chunk);
+    }
     let mut store = Store::open(state)?;
-    let run = store.create_run("Independent coding fixture grading",workspace,"verifier",json!(["process.run","process:node"]),json!({"container_image":image,"process_seconds":30,"wall_seconds":60,"command_scopes":{"commands":[{"program":"node","args":["--input-type=module","-e",script]}]}}),"Read-only independent assertion suite")?;
+    let run = store.create_run("Independent coding fixture grading",workspace,"verifier",json!(["process.run","process:node"]),json!({"container_image":image,"process_seconds":30,"wall_seconds":60,"command_scopes":{"commands":[{"program":"node","args":arguments}]}}),"Read-only independent assertion suite")?;
     store.state(&run.id, "running", json!({}))?;
     let operation = store.begin_operation(
         &run.id,
         "process.run",
-        json!({"program":"node","args":["--input-type=module","-e",script]}),
+        json!({"program":"node","args":arguments}),
         true,
     )?;
     store.operation_state(&operation, "dispatched", None, json!({}))?;
@@ -528,6 +538,35 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires Docker and the local node:22-alpine image; no agent calls"]
+    fn isolated_graders_accept_references_and_preserve_the_read_only_workspace() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        for task in [
+            "json-patch",
+            "dag-scheduler",
+            "sse-decoder",
+            "interval-overlay",
+        ] {
+            let workspace = directory.path().join(task);
+            fs::create_dir(&workspace)?;
+            let reference = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("benchmarks/coding/references")
+                .join(format!("{task}.mjs"));
+            let source = fs::read(reference)?;
+            fs::write(workspace.join("index.mjs"), &source)?;
+            let grading = verify(
+                &workspace,
+                &directory.path().join(format!("state-{task}")),
+                task,
+                "node:22-alpine",
+            )?;
+            assert_eq!(grading["passed"], true, "{grading}");
+            assert_eq!(fs::read(workspace.join("index.mjs"))?, source);
+        }
+        Ok(())
+    }
 
     #[test]
     fn unknown_native_usage_is_never_complete_or_inferred_from_text_length() {
