@@ -255,3 +255,6 @@ The broader `plan.txt` still needs multi-hour live demonstrations. Forced-restar
 F6 selects a model and then its advertised reasoning effort in the same terminal. ChatGPT/Codex and Grok options come from their installed model catalogs, not a hard-coded claim of availability. Provider default leaves the setting untouched. Custom endpoints can explicitly opt into `reasoning_effort`; compatibility is endpoint-dependent. The selection applies only to new turns, with saved task contracts unchanged. Advanced commands also accept `--reasoning <level>`; `/reasoning` opens just the effort picker.
 
 Codex's override uses [`model_reasoning_effort`](https://developers.openai.com/codex/config-reference). Grok's installed CLI uses `--reasoning-effort`.
+### Saved chats
+
+F3 opens searchable saved conversations. Linked follow-up turns appear as one recent chat. Continue a chat to restore its conversation context without restarting old tools, or read its saved user/assistant messages (including earlier pages). Unfinished task recovery remains a separate explicit action. F5 starts a separate conversation; no startup modal blocks the composer.

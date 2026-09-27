@@ -68,7 +68,7 @@ pub struct Store {
     artifacts: PathBuf,
 }
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock predates Unix epoch")

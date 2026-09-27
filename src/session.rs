@@ -1516,13 +1516,17 @@ fn tools_view(root: &Path, id: &str, terminal: &Terminal) -> Result<()> {
 fn sessions(
     root: &Path,
     terminal: &mut Terminal,
-    profile: &Profile,
+    profile: &mut Profile,
     secret: Option<&str>,
 ) -> Result<()> {
     let store = Store::open(root)?;
-    let runs = store.runs()?;
+    let runs = chat_heads(store.runs()?);
     if runs.is_empty() {
-        terminal.message(Tone::Quiet, "Sessions", "No tasks yet.")?;
+        terminal.message(
+            Tone::Quiet,
+            "Chats",
+            "Your conversations will be saved here automatically.",
+        )?;
         return Ok(());
     }
     let selected: Vec<_> = runs.iter().take(100).collect();
@@ -1530,21 +1534,28 @@ fn sessions(
         .iter()
         .map(|run| {
             format!(
-                "{} · {} · {}",
-                run.state,
-                name(&run.provider),
-                crate::terminal::fit(&run.task, 70)
+                "{}  ·  {} · {}",
+                crate::terminal::fit(&run.task, 50),
+                chat_state(&run.state),
+                relative_age(run.created_at)
             )
         })
         .collect();
     choices.push("Back".into());
-    let Some(index) = terminal.select("Recent tasks", &choices)? else {
+    let Some(index) = terminal.select("Saved chats · type to search", &choices)? else {
         return Ok(());
     };
     let Some(run) = selected.get(index) else {
         return Ok(());
     };
+    terminal.message(Tone::Accent, "You", &crate::terminal::fit(&run.task, 2000))?;
+    if let Some(summary) = store.run_summary(&run.id)? {
+        terminal.message(Tone::Quiet, "Aegis", &crate::terminal::fit(&summary, 800))?;
+    } else {
+        terminal.message(Tone::Quiet, "Saved", chat_state(&run.state))?;
+    }
     let choices = [
+        "Continue this chat · return to typing",
         "Follow task",
         "Resume task",
         "Cancel task",
@@ -1554,12 +1565,18 @@ fn sessions(
         "View active tools",
         "Inspect evidence artifacts",
         "Review interrupted operations",
+        "Read saved messages",
         "Back",
     ]
     .map(str::to_owned);
-    match terminal.select("Task controls", &choices)? {
-        Some(0) => follow(root, &run.id, terminal)?,
-        Some(1) => {
+    match terminal.select("Chat actions", &choices)? {
+        Some(0) => {
+            profile.previous_run = Some(run.id.clone());
+            save(root, profile)?;
+            terminal.message(Tone::Accent, "Chat restored", "Your next message continues this conversation. Unfinished tool work is not restarted automatically.")?;
+        }
+        Some(1) => follow(root, &run.id, terminal)?,
+        Some(2) if !run.is_terminal() => {
             let matching_endpoint = profile.endpoint.as_ref().is_some_and(|endpoint| {
                 run.budgets
                     .pointer("/endpoint/base_url")
@@ -1573,20 +1590,126 @@ fn sessions(
             };
             resume(root, &run.id, terminal, credentials)?;
         }
-        Some(2) if !run.is_terminal() => {
+        Some(3) if !run.is_terminal() => {
             cancel_task(root, Some(&run.id), terminal)?;
         }
-        Some(3) => {
+        Some(4) => {
             for milestone in store.milestones(&run.id)? {
                 terminal.message(Tone::Quiet, &milestone.state, &milestone.title)?;
             }
         }
-        Some(4) => trace::display(run, &store.events(&run.id)?),
-        Some(5) => context_view(root, &run.id, terminal)?,
-        Some(6) => tools_view(root, &run.id, terminal)?,
-        Some(7) => artifacts(root, &run.id, terminal)?,
-        Some(8) => review_operations(root, &run.id, terminal)?,
+        Some(5) => trace::display(run, &store.events(&run.id)?),
+        Some(6) => context_view(root, &run.id, terminal)?,
+        Some(7) => tools_view(root, &run.id, terminal)?,
+        Some(8) => artifacts(root, &run.id, terminal)?,
+        Some(9) => review_operations(root, &run.id, terminal)?,
+        Some(10) => saved_messages(&store, &run.id, terminal)?,
         _ => {}
+    }
+    Ok(())
+}
+
+fn chat_heads(runs: Vec<crate::storage::Run>) -> Vec<crate::storage::Run> {
+    let parents: std::collections::HashSet<_> = runs
+        .iter()
+        .filter_map(|run| {
+            run.budgets["previous_run"]
+                .as_str()
+                .filter(|parent| *parent != run.id)
+                .map(str::to_owned)
+        })
+        .collect();
+    runs.into_iter()
+        .filter(|run| !parents.contains(&run.id))
+        .collect()
+}
+
+fn chat_state(state: &str) -> &str {
+    match state {
+        "answered" => "replied",
+        "completed" => "done",
+        "running" => "working",
+        "ready" => "ready",
+        "waiting_recovery" => "paused",
+        "cancelled" => "stopped",
+        "failed" => "needs attention",
+        _ => state,
+    }
+}
+
+fn relative_age(created: i64) -> String {
+    let seconds = crate::storage::now().saturating_sub(created).max(0) as u64 / 1000;
+    match seconds {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{}m ago", seconds / 60),
+        3600..=86399 => format!("{}h ago", seconds / 3600),
+        _ => format!("{}d ago", seconds / 86400),
+    }
+}
+
+fn saved_messages(store: &Store, id: &str, terminal: &Terminal) -> Result<()> {
+    let workspace = store.run(id)?.workspace;
+    let mut next = Some(id.to_owned());
+    let mut seen = std::collections::HashSet::new();
+    while let Some(first) = next.take() {
+        let mut turns = Vec::new();
+        let mut cursor = Some(first);
+        while turns.len() < 50 {
+            let Some(id) = cursor.take() else {
+                break;
+            };
+            if !seen.insert(id.clone()) {
+                break;
+            }
+            let run = store.run(&id)?;
+            if run.workspace != workspace {
+                break;
+            }
+            cursor = run.budgets["previous_run"].as_str().map(str::to_owned);
+            turns.push(run);
+        }
+        let mut choices: Vec<_> = turns
+            .iter()
+            .map(|run| {
+                format!(
+                    "{} · {}",
+                    crate::terminal::fit(&run.task, 70),
+                    relative_age(run.created_at)
+                )
+            })
+            .collect();
+        let older = choices.len();
+        if cursor.is_some() {
+            choices.push("Earlier messages…".into());
+        }
+        choices.push("Back".into());
+        loop {
+            let Some(index) = terminal.select("Saved messages · newest first", &choices)? else {
+                return Ok(());
+            };
+            if let Some(run) = turns.get(index) {
+                terminal.message(Tone::Accent, "You", &run.task)?;
+                let events = store.events(&run.id)?;
+                if let Some(reply) = events
+                    .iter()
+                    .rev()
+                    .find(|event| matches!(event.kind.as_str(), "run.completed" | "run.answered"))
+                {
+                    terminal.message(
+                        Tone::Quiet,
+                        "Aegis",
+                        reply.payload["summary"].as_str().unwrap_or_default(),
+                    )?;
+                } else {
+                    terminal.message(Tone::Quiet, "Saved", chat_state(&run.state))?;
+                }
+            } else if index == older && cursor.is_some() {
+                next = cursor;
+                break;
+            } else {
+                return Ok(());
+            }
+        }
     }
     Ok(())
 }
@@ -1725,32 +1848,6 @@ pub fn interactive(root: &Path) -> Result<()> {
         )?;
     }
     show_selection(&terminal, &profile)?;
-    if terminal.interactive {
-        if let Some(id) = &profile.previous_run {
-            let store = Store::open(root)?;
-            if let Ok(run) = store.run(id) {
-                if !run.is_terminal() {
-                    let choices = [
-                        "Continue my last task",
-                        "Start a new task",
-                        "Open saved tasks",
-                    ]
-                    .map(str::to_owned);
-                    terminal.message(Tone::Quiet, "Last task", &run.task)?;
-                    match terminal.select("Welcome back", &choices)? {
-                        Some(0) => resume(
-                            root,
-                            id,
-                            &mut terminal,
-                            secret_reference(&profile).zip(secret.as_deref()),
-                        )?,
-                        Some(2) => sessions(root, &mut terminal, &profile, secret.as_deref())?,
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
     let mut history: Vec<_> = Store::open(root)?
         .runs()?
         .iter()
@@ -1769,7 +1866,7 @@ pub fn interactive(root: &Path) -> Result<()> {
             Input::Help => help(&terminal)?,
             Input::Checkpoint => checkpoint_view(root, profile.previous_run.as_deref(), &terminal)?,
             Input::CancelTask => cancel_task(root, profile.previous_run.as_deref(), &terminal)?,
-            Input::Sessions => sessions(root, &mut terminal, &profile, secret.as_deref())?,
+            Input::Sessions => sessions(root, &mut terminal, &mut profile, secret.as_deref())?,
             Input::NewConversation => {
                 new_conversation(root, &terminal, &mut profile)?;
                 history.clear();
@@ -1818,7 +1915,7 @@ pub fn interactive(root: &Path) -> Result<()> {
                         history.clear();
                     }
                     "/sessions" | "/status" => {
-                        sessions(root, &mut terminal, &profile, secret.as_deref())?
+                        sessions(root, &mut terminal, &mut profile, secret.as_deref())?
                     }
                     "/context" | "/tools" | "/artifacts" | "/trace" | "/tasks" => {
                         if let Some(id) = &profile.previous_run {
@@ -1887,6 +1984,36 @@ pub fn interactive(root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_chat_heads_hide_parent_turns_without_merging_new_conversations() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let first =
+            store.create_run("first", directory.path(), "codex", json!([]), json!({}), "")?;
+        let second = store.create_run(
+            "follow up",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({"previous_run":first.id}),
+            "",
+        )?;
+        let separate = store.create_run(
+            "new chat",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({}),
+            "",
+        )?;
+        let heads = chat_heads(vec![separate.clone(), second.clone(), first]);
+        assert_eq!(
+            heads.iter().map(|run| run.id.as_str()).collect::<Vec<_>>(),
+            [separate.id, second.id]
+        );
+        Ok(())
+    }
 
     #[test]
     fn only_a_quick_second_press_interrupts_the_model_turn() {

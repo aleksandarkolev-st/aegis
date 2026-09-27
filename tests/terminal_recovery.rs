@@ -54,7 +54,7 @@ fn guided_recovery_requires_a_receipt_and_does_not_repeat_a_write() -> Result<()
             .stdin
             .take()
             .unwrap()
-            .write_all(format!("/sessions\n1\n9\n1\n{choice}\n{note}\n/quit\n").as_bytes())?;
+            .write_all(format!("/sessions\n1\n10\n1\n{choice}\n{note}\n/quit\n").as_bytes())?;
         let output = child.wait_with_output()?;
         assert!(
             output.status.success(),
