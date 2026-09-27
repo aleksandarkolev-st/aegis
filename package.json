@@ -10,6 +10,7 @@
   "scripts": {
     "postinstall": "node scripts/install.mjs",
     "build:native": "node scripts/build-native.mjs",
+    "test:package": "node scripts/package-smoke.mjs",
     "test": "node --test tests/npm/*.test.mjs"
   },
   "repository": { "type": "git", "url": "https://github.com/aleksandarkolev-st/aegis.git" },
