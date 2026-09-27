@@ -287,6 +287,7 @@ fn main() -> Result<()> {
     store.set_learning(&workspace, false)?;
     let mut totals = 0_u64;
     let mut complete_usage = true;
+    let mut finished_runs = 0_u64;
     for game in &games {
         record(
             &mut log,
@@ -325,6 +326,7 @@ fn main() -> Result<()> {
             && execution["stopped"].is_null();
         totals = totals.saturating_add(metrics.model_tokens);
         complete_usage &= accounted;
+        finished_runs += 1;
         let final_state: Value = serde_json::from_slice(&fs::read(session.join("state.json"))?)?;
         record(
             &mut log,
@@ -345,7 +347,15 @@ fn main() -> Result<()> {
     } else {
         Value::Null
     };
-    let summary = json!({"official_closed_scorecard":scorecard,"scorecard_sha256":if scorecard.is_null(){Value::Null}else{json!(hash(&serde_json::to_vec(&scorecard)?))},"competition_mode":competition,"recorded_model_tokens":totals,"complete_usage":complete_usage,"selected_games":games,"played_games":state["played"],"uncertain_request":state["pending"],"notes":"Server score is authoritative RHAE, not token efficiency or percentage of games solved. Public sample results must not be labeled competition scores. Unknown model usage stays incomplete. No learned evaluation memory or previous-game conversations."});
+    let completed_games = scorecard["total_environments_completed"].as_u64();
+    let tokens_per_completed_game = if complete_usage {
+        completed_games
+            .filter(|count| *count > 0)
+            .map(|count| totals as f64 / count as f64)
+    } else {
+        None
+    };
+    let summary = json!({"official_closed_scorecard":scorecard,"scorecard_sha256":if scorecard.is_null(){Value::Null}else{json!(hash(&serde_json::to_vec(&scorecard)?))},"competition_mode":competition,"recorded_model_tokens":totals,"complete_usage":complete_usage,"finished_model_runs":finished_runs,"all_selected_games_attempted":finished_runs as usize == games.len(),"server_completed_games":completed_games,"tokens_per_server_completed_game":tokens_per_completed_game,"selected_games":games,"played_games":state["played"],"uncertain_request":state["pending"],"notes":"Server score is authoritative RHAE, not token efficiency or percentage of games solved. Token ratio includes all recorded failed-game costs and uses the closed scorecard completed-game denominator; missing usage, missing closure or no wins yields null. Public sample results must not be labeled competition scores. No learned evaluation memory or previous-game conversations."});
     fs::write(
         root.join("summary.json"),
         serde_json::to_vec_pretty(&summary)?,
