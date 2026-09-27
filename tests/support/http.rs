@@ -33,6 +33,7 @@ impl Endpoint {
                     }
                     Err(error) => return Err(error.into()),
                 };
+                stream.set_nonblocking(false)?;
                 stream.set_read_timeout(Some(Duration::from_secs(5)))?;
                 stream.set_write_timeout(Some(Duration::from_secs(5)))?;
                 let body = request(&mut stream)?;
