@@ -332,12 +332,13 @@ fn models_url(
         std::str::from_utf8(&bytes).map_err(|_| anyhow!("Provider catalog was not UTF-8"))?;
     let mut value: Value = serde_json::from_str(text)
         .map_err(|_| anyhow!("Provider returned an invalid model catalog"))?;
-    if let Some(entries) = value[if provider == Provider::ChatGpt {
-        "models"
-    } else {
-        "data"
-    }]
-    .as_array_mut()
+    if let Some(entries) = value
+        .get_mut(if provider == Provider::ChatGpt {
+            "models"
+        } else {
+            "data"
+        })
+        .and_then(Value::as_array_mut)
     {
         for entry in entries {
             redact_catalog_fields(credentials, entry);
@@ -771,6 +772,11 @@ mod tests {
             ("403 Forbidden", "fixture-secret-token"),
             ("200 OK", "fixture-secret-token"),
             ("200 OK", "{}"),
+            ("200 OK", "[]"),
+            ("200 OK", "null"),
+            ("200 OK", "42"),
+            ("200 OK", "true"),
+            ("200 OK", "\"not-a-catalog\""),
         ] {
             let (url, handle) = server(
                 status,
