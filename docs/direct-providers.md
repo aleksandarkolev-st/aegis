@@ -68,6 +68,8 @@ Schema 7 performs one transactional backfill from existing hot failures and vali
 
 Windows verification passed 171 library tests (two opt-in live diagnostics ignored), four endpoint, seven model-picker and six provider-setup checks (`.arun/rejected-usage-functional-20260927-corrected.log`). Checks cover rejected receipt budget enforcement before another model call, no action execution, archive/snapshot-tail backfill, idempotence, multi-run rollback, preserved immutable history and custom reported/missing usage. This is functional accounting verification, not a coding/ARC benchmark or installed UX gate.
 
+Exact accounting source `422d54b` also passed Linux source-only, network-disabled verification: 174 library tests (two live diagnostics ignored), the same 17 targeted integrations and ten Node checks (`.arun/linux-rejected-usage-422d54b.log`). The owned verifier finished with exit 0. Full all-target and installed usability gates remain separate.
+
 ## Reviewed protocols
 
 ### Independent catalog transport groundwork
