@@ -1483,6 +1483,74 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "one real direct model call; requires explicitly selected saved login and model"]
+    fn direct_saved_login_greeting_uses_the_real_kernel_context_without_native_clis() -> Result<()>
+    {
+        let provider = std::env::var("AEGIS_LIVE_DIRECT_PROVIDER")
+            .context("Explicit AEGIS_LIVE_DIRECT_PROVIDER is required")?;
+        let (transport, provider_id) = match provider.as_str() {
+            "chatgpt" => (crate::direct::Provider::ChatGpt, "codex"),
+            "grok" => (crate::direct::Provider::Grok, "grok"),
+            _ => bail!("Only direct ChatGPT/Grok diagnostic calls are supported"),
+        };
+        let model = std::env::var("AEGIS_LIVE_DIRECT_MODEL")
+            .context("Explicit AEGIS_LIVE_DIRECT_MODEL is required")?;
+        let path = std::env::var_os("AEGIS_LIVE_DIRECT_LOGIN")
+            .context("Explicit AEGIS_LIVE_DIRECT_LOGIN is required")?;
+        let credentials =
+            crate::direct::Credentials::from_saved_session(transport, Path::new(&path))?;
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "hello", directory.path(), provider_id, json!([]),
+            json!({"model":model,"reasoning_effort":"low","actions":2,"model_tokens":30000,"wall_seconds":120,"model_seconds":90,"model_response_bytes":65536}), "",
+        )?;
+        let prompt = context(&store, &run)?;
+        let measured = crate::tokenization::measure(&prompt)?;
+        let started = Instant::now();
+        let response = crate::direct::call(
+            transport,
+            &credentials,
+            &crate::direct::Request {
+                model: &model,
+                prompt: &prompt,
+                reasoning: Some("low"),
+                timeout: Duration::from_secs(90),
+                response_bytes: 65536,
+            },
+            || false,
+        ).map_err(|error| {
+            if let Some(rejected) = error.downcast_ref::<crate::direct::RejectedResponse>() {
+                println!("DIRECT_LOGIN_REJECTED {}", json!({"provider":provider,"model":model,"shape":rejected.shape,"usage":rejected.usage,"scope":"failed direct protocol diagnostic; no action applied"}));
+            }
+            error
+        })?;
+        let Action::Finish { summary, evidence } = &response.action else {
+            bail!("Direct provider did not answer the greeting without tools");
+        };
+        assert!(!summary.trim().is_empty());
+        assert!(evidence.is_empty());
+        assert!(store.operations(&run.id)?.is_empty());
+        let usage = response
+            .usage
+            .context("Direct provider did not report authoritative usage")?;
+        assert_eq!(usage.source, "provider");
+        assert!(usage.input_tokens + usage.output_tokens <= 30000);
+        println!(
+            "DIRECT_LOGIN_DIAGNOSTIC {}",
+            json!({
+                "provider":provider,"model":model,"reasoning":"low","reply":summary,
+                "input_tokens":usage.input_tokens,"output_tokens":usage.output_tokens,"cached_input_tokens":usage.cached_input_tokens,
+                "total_reported_tokens":usage.input_tokens + usage.output_tokens,
+                "raw_prompt_units":measured.raw_prompt_tokens,"prompt_characters":prompt.chars().count(),
+                "elapsed_ms":started.elapsed().as_millis(),"operations":0,"native_cli_processes":0,
+                "scope":"direct protocol/auth diagnostic, not installed agent verification or benchmark"
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
     fn context_is_bounded_and_only_exposes_activated_schemas() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let mut store = Store::open(directory.path())?;
