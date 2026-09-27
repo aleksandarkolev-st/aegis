@@ -12,6 +12,7 @@ use crossterm::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::storage::Event as RunEvent;
+pub use crate::text::clean;
 
 #[derive(Debug, PartialEq)]
 pub enum Input {
@@ -112,15 +113,6 @@ impl Drop for RawMode {
             let _ = io::stdout().flush();
         }
     }
-}
-
-pub fn clean(text: &str) -> String {
-    text.chars()
-        .filter(|character| !character.is_control() || *character == '\n')
-        .filter(
-            |character| !matches!(*character, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'),
-        )
-        .collect()
 }
 
 pub fn friendly_error(error: &str) -> String {

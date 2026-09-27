@@ -408,7 +408,7 @@ impl Store {
         replace: Option<&str>,
     ) -> Result<String> {
         let text = text.trim();
-        if text.is_empty() || text.len() > 512 || crate::terminal::clean(text) != text {
+        if text.is_empty() || text.len() > 512 || crate::text::clean(text) != text {
             bail!("memory must be safe, nonempty text of at most 512 UTF-8 bytes");
         }
         let lower = text.to_lowercase();

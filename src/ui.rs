@@ -163,7 +163,7 @@ impl UiOptions {
         {
             if text.width() > 64
                 || text.len() > 256
-                || text != &crate::terminal::clean(text)
+                || text != &crate::text::clean(text)
                 || text.contains('\n')
             {
                 bail!("style text must be one safe line, at most 64 columns and 256 bytes");
