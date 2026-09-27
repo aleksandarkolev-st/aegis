@@ -1,0 +1,22 @@
+# Aegis-owned browser sign-in
+
+ChatGPT and Grok have a browser authorization-code flow with S256 PKCE, per-attempt state and nonce, and an owned IPv4 loopback callback. It is separate from device-code authentication and never starts a provider agent. The terminal's sign-in menu recommends browser approval and explicitly offers device codes for remote/headless use. Back and removal of Aegis's sign-in remain separate choices.
+
+ChatGPT binds only its registered callback ports 1455 or 1457. If both are occupied, the error recommends device codes; no existing listener is reused. Grok binds an OS-selected port after bounded discovery at its fixed issuer. Authorization/token URLs must stay at that exact issuer origin, with no credentials, query or fragment. Public xAI [discovery metadata](https://auth.x.ai/.well-known/openid-configuration) was inspected on 2026-09-27; it advertises authorization-code, S256 and the implemented endpoint paths. Metadata availability is not successful account sign-in.
+
+The browser flow uses Aegis identity and the same narrow scopes as its device flow, without importing upstream connector, conversation or workspace-write scopes. Source-visible public client identifiers are not proof of permission for third-party reuse, entitlement or hosted acceptance. Claude remains pending by user direction.
+
+## Callback and exchange boundary
+
+- Only the owned loopback listener, exact callback path and Host, a header-only GET, unique parameters and matching state can deliver a code. An optional returned issuer must match. Bare-code paste and caller-supplied tokens are not supported.
+- Malformed, cross-host, wrong/missing/duplicate-state, oversized or unrelated callbacks do not spend a code. A matched denial ends the attempt. Headers are limited to 8 KiB and two seconds per connection; cancellation is checked during reads. The overall wait is bounded to 15 minutes.
+- A valid callback closes the listener and irrevocably marks the attempt used before one token exchange. Network errors, malformed tokens, cancellation or validation failure cannot automatically replay that authorization code. The browser page says verification is in progress, not that sign-in succeeded, and echoes no code/state/token.
+- The initial token reply must include matching issuer, client-only audience/authorized party, nonempty ASCII subject, current issuance/expiration and the original nonce. Supported algorithm headers and any access/code hashes are checked. Existing ChatGPT account-agreement checks still apply. Only then can the existing private vault save the session.
+
+Identity provenance is the direct, certificate-validated HTTPS response from the fixed token endpoint, not an independently verified JWT signature. [OpenID Connect Core section 3.1.3.7](https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation) permits that transport-based validation for this specific authorization-code token-endpoint channel. This private validator must not be reused for pasted, saved, front-channel or otherwise untrusted ID tokens; those require signature verification. No JWT/crypto dependency or remote JWK cache was added. Synthetic tests intentionally use fixture signatures and test channel/claim binding, not cryptographic signature verification.
+
+## Verification scope
+
+Five bounded loopback fixtures cover both protocol exchanges, PKCE consistency, identity/code binding, single use, rejected callbacks, denial/expiry, listener ownership/port conflicts, slow-read cancellation and secret-free error/browser responses. The terminal keeps its owned cancellable/joined worker and reports success only after validation and persistence. Windows final source passed 183 library checks (two opt-in live diagnostics ignored), seven picker, six provider setup and three continuation integrations: `.arun/browser-signin-functional-20260927-hardened.log`.
+
+This is functional source verification, not a fresh hosted browser approval, full regression coverage or installed binary proof. Existing user approvals were not reopened. Linux verification and rebuilt package receipts must be recorded separately. The standard desktop browser path and explicit headless fallback follow the distinction in [official OpenAI authentication documentation](https://learn.chatgpt.com/docs/auth); that documentation describes Codex, not a guarantee that Aegis can reuse its registered client.

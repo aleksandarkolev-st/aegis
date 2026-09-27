@@ -8,6 +8,9 @@ use serde_json::{Value, json};
 use crate::auth_store::{Session, Vault};
 use crate::direct::{Credentials, Provider};
 
+mod browser;
+pub use browser::BrowserLogin;
+
 const CHATGPT_CLIENT: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const GROK_CLIENT: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 const GROK_SCOPES: &str = "openid profile email offline_access grok-cli:access api:access";
@@ -417,9 +420,12 @@ impl AuthClient {
                 .user_agent(concat!("aegis/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .map_err(|_| anyhow!("Could not initialize secure sign-in transport"))?;
-            let mut request = client
-                .post(self.origin.join(path)?)
-                .header("Accept", "application/json");
+            let url = self.origin.join(path)?;
+            let mut request = if matches!(body, Body::Get) {
+                client.get(url)
+            } else {
+                client.post(url)
+            }.header("Accept", "application/json");
             if self.provider == Provider::Grok {
                 request = request
                     .header("x-grok-client-version", crate::direct::GROK_REFERENCE_TRANSPORT_VERSION)
@@ -428,6 +434,7 @@ impl AuthClient {
                     .header("x-aegis-client-version", env!("CARGO_PKG_VERSION"));
             }
             request = match body {
+                Body::Get => request,
                 Body::Json(value) => request.json(&value),
                 Body::Form(fields) => {
                     let mut encoded = self.origin.clone();
@@ -481,6 +488,7 @@ impl AuthClient {
 }
 
 enum Body {
+    Get,
     Json(Value),
     Form(Vec<(&'static str, String)>),
 }
@@ -539,7 +547,7 @@ fn status_error(status: StatusCode) -> anyhow::Error {
     anyhow!(match status.as_u16() {
         400 | 401 => "Sign-in was rejected or expired; start sign-in again",
         403 => "Provider does not permit this sign-in; check account access",
-        404 => "Device sign-in is unavailable for this account or provider",
+        404 => "Requested sign-in flow is unavailable for this account or provider",
         429 => "Too many sign-in requests; wait before trying again",
         300..=399 => "Sign-in redirect was refused to protect credentials",
         _ => "Sign-in service is unavailable; try again later",
