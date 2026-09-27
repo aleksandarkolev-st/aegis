@@ -19,6 +19,7 @@ pub mod patch;
 pub mod policy;
 pub mod process;
 pub mod provider;
+pub mod recall;
 pub mod restart;
 pub mod session;
 pub mod storage;

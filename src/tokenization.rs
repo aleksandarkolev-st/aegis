@@ -60,7 +60,10 @@ pub fn measure(prompt: &str) -> Result<Exposure> {
         let kind = event["kind"].as_str().unwrap_or("");
         if kind.starts_with("operation.")
             || kind.starts_with("acceptance.")
-            || matches!(kind, "artifact.inspected" | "capability.search")
+            || matches!(
+                kind,
+                "artifact.inspected" | "conversation.inspected" | "capability.search"
+            )
         {
             tools = tools.saturating_add(count(&event.to_string()));
         }

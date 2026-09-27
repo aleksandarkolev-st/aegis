@@ -1046,6 +1046,18 @@ impl Terminal {
                     payload["summary"].as_str().unwrap_or_default(),
                 )
             }
+            "conversation.inspected" => self.message(
+                Tone::Quiet,
+                "Recall",
+                &format!(
+                    "Saved chat · {} characters · context only",
+                    event.payload["excerpt"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .chars()
+                        .count()
+                ),
+            ),
             "checkpoint.created" => self.message(
                 Tone::Quiet,
                 "Checkpoint",

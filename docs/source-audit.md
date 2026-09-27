@@ -13,7 +13,7 @@ This is a targeted source review, not a comparative benchmark, security certific
 
 Source links: [Codex guidance loader](https://github.com/openai/codex/blob/41f9084b30812db321a0b592def4f500d1e79cf4/codex-rs/core/src/agents_md.rs), [Codex compaction](https://github.com/openai/codex/blob/41f9084b30812db321a0b592def4f500d1e79cf4/codex-rs/core/src/compact.rs), [Grok guidance loader](https://github.com/xai-org/grok-build/blob/f0e3be1100ef5252488e3be8bb0e91cf68d8c305/crates/codegen/xai-grok-agent/src/prompt/agents_md.rs), [Grok compaction helpers](https://github.com/xai-org/grok-build/blob/f0e3be1100ef5252488e3be8bb0e91cf68d8c305/crates/codegen/xai-chat-state/src/compaction_utils.rs), [Hermes prompt builder](https://github.com/NousResearch/hermes-agent/blob/062dc1e7f0f5faa5114b4d98b94c48f5ec5df36f/agent/prompt_builder.py), [Hermes compressor](https://github.com/NousResearch/hermes-agent/blob/062dc1e7f0f5faa5114b4d98b94c48f5ec5df36f/agent/context_compressor.py).
 
-## Aegis's own gaps and implementation order
+## Aegis's gaps at audit start and implementation order
 
 1. **Instructions:** project notes and learned preferences are frozen, but there is no distinct user-authored instruction ledger, scope/provenance display or pinned-rule contract. Existing repository guidance is not explicitly imported by Aegis. Add bounded, editable SQLite instructions, freeze them into new runs, show priority and scope, and keep them outside lossy model summaries. Reject oversize rules rather than silently truncate. Current requests and machine-enforced grants still take precedence; prose never authorizes an effect.
 2. **Long conversations:** `src/kernel.rs::conversation` includes only four parents, truncates old requests and can include large replies. Add bounded relevance recall and explicit full-record handles, without leaking other workspaces/branches or replaying tools. Keep full records on disk and account for selected text; disclose retrieval limits. Do not claim semantic recall or perfect memory.
@@ -22,3 +22,9 @@ Source links: [Codex guidance loader](https://github.com/openai/codex/blob/41f90
 5. **Evaluation:** new coding comparisons and ARC-AGI-3 remain deferred while these newly requested changes are unfinished. Preserve old failures and multi-hour evidence; do not generate a readiness attestation prematurely.
 
 No competitor source is copied into Aegis. Potential issues above are opportunities/tradeoffs unless a reproducible failure is explicitly recorded. Better instruction retention and efficiency require Aegis regression evidence and later measurements, not marketing claims.
+
+## Implemented follow-up
+
+- `d3aa163`: explicit scoped/revisioned SQLite instructions, immutable per-run capture, separate instruction-priority section and keyboard add/edit/remove. No automatic repository-guidance import yet. Focused bounds/recovery/permission/UI checks passed.
+- Bounded older-chat lexical recall and explicit same-chain full-message inspection now preserve access beyond the previous four-turn window. The fixed horizon, clipped previews and search coverage are disclosed. Retrieval cannot provide completion evidence or cross branches/workspaces; its mapped text is accounted before provider calls. Focused model-free, guided-chat and recovery checks passed. Latest installed release still needs rebuilding after these changes.
+- Native provider bootstrap cost, unnecessary action turns and repository-guidance compatibility remain open optimization targets. No superiority claim or new agent benchmark is made.

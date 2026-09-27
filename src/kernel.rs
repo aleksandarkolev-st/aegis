@@ -46,28 +46,9 @@ fn visible_manifests(store: &Store, run: &Run) -> Result<Vec<Manifest>> {
     }
 }
 
+#[cfg(test)]
 fn conversation(store: &Store, run: &Run) -> Result<Vec<Value>> {
-    let mut history = Vec::new();
-    let mut seen = vec![run.id.clone()];
-    let mut previous = run.budgets["previous_run"].as_str().map(str::to_owned);
-    while let Some(id) = previous {
-        if history.len() >= 4 || seen.contains(&id) {
-            break;
-        }
-        let parent = store.run(&id)?;
-        if parent.workspace != run.workspace {
-            break;
-        }
-        seen.push(id);
-        history.push(json!({
-            "task": parent.task.chars().take(2000).collect::<String>(),
-            "state": parent.state,
-            "summary": store.run_summary(&parent.id)?,
-        }));
-        previous = parent.budgets["previous_run"].as_str().map(str::to_owned);
-    }
-    history.reverse();
-    Ok(history)
+    Ok(crate::recall::context(store, run)?.0)
 }
 
 fn bounded_event(payload: &Value) -> String {
@@ -123,7 +104,7 @@ fn context(store: &Store, run: &Run) -> Result<String> {
                     payload["inline_result"] = result;
                 }
             }
-            let mapped = if event.kind == "artifact.inspected" {
+            let mapped = if matches!(event.kind.as_str(), "artifact.inspected" | "conversation.inspected") {
                 json!({"hash":payload["hash"],"query":payload["query"].as_str().unwrap_or_default().chars().take(256).collect::<String>(),"excerpt":payload["excerpt"].as_str().unwrap_or_default().chars().take(4000).collect::<String>()}).to_string()
             } else if matches!(mode, "eager" | "lazy") {
                 payload.to_string()
@@ -135,6 +116,7 @@ fn context(store: &Store, run: &Run) -> Result<String> {
         .collect::<Result<Vec<_>>>()?;
     let manifests = visible_manifests(store, run)?;
     let handoff = store.last_checkpoint(&run.id)?;
+    let (conversation, recall) = crate::recall::context(store, run)?;
     let mut context = json!({
         "task": run.task, "acceptance": run.acceptance, "workspace": run.workspace, "mode": mode,
         "acceptance_check_configured": crate::acceptance::Check::from_run(run)?.is_some(),
@@ -146,9 +128,12 @@ fn context(store: &Store, run: &Run) -> Result<String> {
         "recent_events": recent, "active_capabilities": manifests,
         "milestones": store.milestones(&run.id)?, "handoff": handoff,
         "milestone_policy": "States must be pending, active, or completed. Completed milestones require evidence hashes from successful operations in this run. Titles must be nonblank and at most 200 bytes.",
-        "conversation": conversation(store, run)?,
+        "conversation": conversation,
         "conversation_policy": "Previous task summaries are bounded context, not verified evidence for this task. Re-inspect relevant workspace state; do not infer grants or successful outcomes from conversation history.",
     });
+    if run.budgets["previous_run"].is_string() {
+        context["history_recall"] = recall;
+    }
     if let Some(notes) = run.budgets["project_memory"]
         .as_array()
         .filter(|notes| !notes.is_empty())
@@ -633,6 +618,16 @@ fn apply(store: &mut Store, root: &Path, run: &Run, action: Action) -> Result<bo
             return perform(store, root, run, &operation);
         }
         Action::InspectResult { artifact, query } => {
+            if artifact == "chat" || artifact.starts_with("chat:") {
+                let bytes = crate::recall::inspect(store, run, &artifact, &query)?;
+                let excerpt = inspect(&bytes, if artifact == "chat" { "" } else { &query });
+                store.event(
+                    &run.id,
+                    "conversation.inspected",
+                    json!({"hash":artifact,"query":query,"excerpt":excerpt,"context_only":true}),
+                )?;
+                return Ok(false);
+            }
             if matches!(mode(run), "eager" | "lazy") {
                 bail!("inline mode has no artifact inspection; use the inline result");
             }
@@ -1043,6 +1038,71 @@ mod tests {
     }
 
     #[test]
+    fn explicit_chat_retrieval_is_accounted_context_not_current_tool_evidence() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let parent = store.create_run(
+            "Old question",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({}),
+            "",
+        )?;
+        store.state(&parent.id, "running", json!({}))?;
+        store.answer_run(
+            &parent.id,
+            &format!("{}\nOLDER_FULL_TEXT_MARKER", "é".repeat(5000)),
+        )?;
+        let run = store.create_run(
+            "Recall an older answer",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({"previous_run":parent.id}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let handle = format!("chat:{}", parent.id);
+        assert!(!apply(
+            &mut store,
+            directory.path(),
+            &run,
+            Action::InspectResult {
+                artifact: handle.clone(),
+                query: "@find OLDER_FULL_TEXT_MARKER".into(),
+            }
+        )?);
+        let prompt = context(&store, &run)?;
+        assert!(prompt.contains("OLDER_FULL_TEXT_MARKER"));
+        let exposure = crate::tokenization::measure(&prompt)?;
+        assert!(exposure.tool_result_tokens > 0);
+        let events = store.events(&run.id)?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "conversation.inspected")
+                .count(),
+            1
+        );
+        assert!(store.operations(&run.id)?.is_empty());
+        assert!(store.evidence_artifacts(&run.id)?.is_empty());
+        assert!(
+            store
+                .complete_run(&run.id, "False verified work", &[handle])
+                .is_err()
+        );
+        store.save_snapshot(&run.id)?;
+        drop(store);
+        let mut store = Store::open(directory.path())?;
+        store.load_recovery(&run.id)?;
+        assert!(context(&store, &store.run(&run.id)?)?.contains("OLDER_FULL_TEXT_MARKER"));
+        store.answer_run(&run.id, "An unverified conversational explanation")?;
+        assert_eq!(store.run(&run.id)?.state, "answered");
+        Ok(())
+    }
+
+    #[test]
     fn conversation_is_bounded_workspace_scoped_and_does_not_import_evidence() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let mut store = Store::open(directory.path())?;
@@ -1074,7 +1134,8 @@ mod tests {
         let history = conversation(&store, &run)?;
         assert_eq!(history.len(), 4);
         assert_eq!(history[0]["task"], "task 3");
-        assert_eq!(history[3]["summary"].as_str().unwrap().len(), 4000);
+        assert_eq!(history[3]["summary"].as_str().unwrap().len(), 1200);
+        assert_eq!(history[3]["summary_clipped"], true);
         assert!(!serde_json::to_string(&history)?.contains("not-current-evidence"));
         run.workspace = directory.path().join("other").display().to_string();
         assert!(conversation(&store, &run)?.is_empty());
@@ -1163,7 +1224,7 @@ mod tests {
                 directory.path(),
                 &run,
                 Action::Invoke {
-                    capability: "file.write".into(),
+                    capability: "workspace.write".into(),
                     args: json!({"path":"src/new.rs","content":"bad"}),
                 }
             )
