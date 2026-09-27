@@ -79,8 +79,7 @@ pub fn prepare(
     if reasoning.is_some_and(|effort| !crate::catalog::valid_effort(effort)) {
         bail!("Choose a valid reasoning effort before continuing");
     }
-    let source = store.run(source_id)?;
-    eligible(store, &source, workspace)?;
+    let source = inspect_source(store, source_id, workspace)?;
     let sequence = store.connection.query_row(
         "SELECT last_seq FROM run_projection WHERE run_id=?1",
         [source_id],
@@ -108,6 +107,12 @@ pub fn prepare(
         reasoning: reasoning.map(str::to_owned),
         handoff,
     })
+}
+
+pub fn inspect_source(store: &Store, source_id: &str, workspace: &Path) -> Result<Run> {
+    let source = store.run(source_id)?;
+    eligible(store, &source, workspace)?;
+    Ok(source)
 }
 
 pub fn commit(store: &mut Store, root: &Path, review: &Review) -> Result<Run> {

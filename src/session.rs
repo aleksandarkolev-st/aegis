@@ -1508,6 +1508,145 @@ fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
     }
 }
 
+fn continue_legacy(
+    root: &Path,
+    id: &str,
+    terminal: &mut Terminal,
+    profile: &mut Profile,
+) -> Result<()> {
+    let mut store = Store::open(root)?;
+    if kernel::is_active(root, id)? {
+        return terminal.message(
+            Tone::Warning,
+            "Task still active",
+            "Pause the original task before reviewing a new continuation.",
+        );
+    }
+    let source = match crate::continuation::inspect_source(&store, id, &std::env::current_dir()?) {
+        Ok(source) => source,
+        Err(error) => {
+            return terminal.message(Tone::Warning, "Original task kept", &error.to_string());
+        }
+    };
+    terminal.message(Tone::Accent, "Continue directly", "This older task used a native provider transport. Aegis can create a reviewed new task without running that provider's CLI.")?;
+    let choices = ["ChatGPT", "Grok", "Back · keep original task"].map(str::to_owned);
+    let Some(choice @ (0 | 1)) = terminal.select_at(
+        "Connection for the new task",
+        &choices,
+        usize::from(profile.provider == "grok"),
+    )?
+    else {
+        return Ok(());
+    };
+    let mut draft = profile.clone();
+    draft.provider = if choice == 0 { "codex" } else { "grok" }.into();
+    draft.endpoint = None;
+    draft.model = if crate::provider::canonical(&source.provider) == draft.provider {
+        source.budgets["model"]
+            .as_str()
+            .filter(|id| crate::catalog::valid_id(id))
+            .map(str::to_owned)
+    } else if profile.provider == draft.provider {
+        profile.model.clone()
+    } else {
+        None
+    };
+    draft.reasoning_effort = None;
+    let Some(Some(model)) = choose_model(terminal, &draft, None)? else {
+        return Ok(());
+    };
+    draft.model = Some(model.clone());
+    let Some(reasoning) = choose_reasoning(terminal, &draft)? else {
+        return Ok(());
+    };
+    draft.reasoning_effort = reasoning.clone();
+    let review = match crate::continuation::prepare(
+        &store,
+        id,
+        &std::env::current_dir()?,
+        &draft.provider,
+        &model,
+        reasoning.as_deref(),
+    ) {
+        Ok(review) => review,
+        Err(error) => {
+            return terminal.message(Tone::Warning, "Original task kept", &error.to_string());
+        }
+    };
+    terminal.message(
+        Tone::Accent,
+        "New connection",
+        &format!(
+            "{} · {} · reasoning {}",
+            name(&draft.provider),
+            model,
+            reasoning.as_deref().unwrap_or("provider default")
+        ),
+    )?;
+    terminal.message(Tone::Quiet, "Workspace", &source.workspace)?;
+    let permissions = serde_json::from_value::<Vec<String>>(source.grants.clone())?;
+    terminal.message(
+        Tone::Quiet,
+        "Same permissions",
+        &if permissions.is_empty() {
+            "Conversation only · no workspace tools".into()
+        } else {
+            permissions.join(" · ")
+        },
+    )?;
+    terminal.message(Tone::Quiet, "Frozen guidance", "Original rules, memory, command/file/network scopes and acceptance checks are retained. No current settings or new permissions are substituted.")?;
+    let limits = ["actions", "model_tokens", "wall_seconds"].map(|key| {
+        source.budgets[key]
+            .as_u64()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "runtime default".into())
+    });
+    terminal.message(Tone::Warning, "Fresh task budget", &format!("Same limits: {} turns · {} tokens · {} seconds. Usage and time restart for this NEW task; the original accounting stays untouched.",limits[0],limits[1],limits[2]))?;
+    terminal.message(Tone::Quiet, "Fresh evidence", "Old operations, evidence and completed milestones are not copied. Aegis will inspect current files and verify again, not replay old calls.")?;
+    if let Some(next) = review.handoff()["next_action"].as_str() {
+        terminal.message(Tone::Quiet, "Old next step · context only", next)?;
+        if review.handoff()["clipped"] == true {
+            terminal.message(
+                Tone::Quiet,
+                "Handoff preview",
+                "Older notes are clipped; saved task details retain the full original handoff.",
+            )?;
+        }
+    }
+    let choices = [
+        "Create new task and start",
+        "Keep original · do not create a task",
+        "Inspect original task details",
+    ]
+    .map(str::to_owned);
+    loop {
+        match terminal.select_at("Review continuation", &choices, 1)? {
+            Some(0) => break,
+            Some(2) => context_view(root, id, terminal)?,
+            _ => return Ok(()),
+        }
+    }
+    let child = match crate::continuation::commit(&mut store, root, &review) {
+        Ok(child) => child,
+        Err(error) => {
+            return terminal.message(Tone::Warning, "Original task kept", &error.to_string());
+        }
+    };
+    profile.provider = draft.provider;
+    profile.model = draft.model;
+    profile.reasoning_effort = draft.reasoning_effort;
+    profile.endpoint = None;
+    profile.previous_run = Some(child.id.clone());
+    save(root, profile)?;
+    terminal.message(Tone::Success, "Continuation saved", "The original task is unchanged. The new task is in saved chats even if sign-in or startup is cancelled.")?;
+    drop(store);
+    if !ensure_provider(terminal, &profile.provider)? {
+        return Ok(());
+    }
+    kernel::spawn(root, &child.id, None)?;
+    follow(root, &child.id, terminal)
+}
+
 fn resume(
     root: &Path,
     id: &str,
@@ -1842,7 +1981,20 @@ fn sessions(
     .map(str::to_owned)
     .to_vec();
     if !run.is_terminal() {
-        choices.extend(["Follow task", "Resume task", "Cancel task"].map(str::to_owned));
+        choices.extend(
+            [
+                "Follow task",
+                if crate::continuation::needed(run) {
+                    "Continue work as new direct task"
+                } else {
+                    "Resume task"
+                },
+                "Cancel task",
+            ]
+            .map(str::to_owned),
+        );
+    } else if crate::continuation::needed(run) {
+        choices.push("Continue work as new direct task".into());
     }
     choices.push("Back".into());
     match terminal.select("Chat actions", &choices)? {
@@ -1854,8 +2006,14 @@ fn sessions(
         Some(1) => saved_messages(&store, &run.id, terminal)?,
         Some(2) => artifacts(root, &run.id, terminal)?,
         Some(3) => chat_details(root, run, &store, terminal)?,
+        Some(4) if run.is_terminal() && crate::continuation::needed(run) => {
+            continue_legacy(root, &run.id, terminal, profile)?;
+        }
         Some(4) if !run.is_terminal() => follow(root, &run.id, terminal)?,
         Some(5) if !run.is_terminal() => {
+            if crate::continuation::needed(run) {
+                return continue_legacy(root, &run.id, terminal, profile);
+            }
             let matching_endpoint = profile.endpoint.as_ref().is_some_and(|endpoint| {
                 run.budgets
                     .pointer("/endpoint/base_url")
