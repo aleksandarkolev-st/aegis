@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use arun::{mcp, process, provider, storage::Store, trace};
+use arun::{mcp, process, storage::Store, trace};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -155,7 +155,6 @@ fn main() -> Result<()> {
     let plan_hash = hash(include_bytes!("../plan.txt"));
     let bridge_hash = hash(BRIDGE.as_bytes());
     let mut attestation = Value::Null;
-    let mut provider_version = Value::Null;
     if run {
         let reviewed = reviewed.context("ARC agent benchmarks stay gated until implementation and functional verification are complete")?;
         if fs::metadata(&reviewed)?.len() > 8192 {
@@ -176,13 +175,7 @@ fn main() -> Result<()> {
                 "ARC readiness review incomplete or source/build changed; no API or agent calls started"
             );
         }
-        let version = process::background(&mut Command::new(provider::executable(&backend)?))
-            .arg("--version")
-            .output()?;
-        if !version.status.success() || version.stdout.len() > 4096 {
-            bail!("native provider version unavailable");
-        }
-        provider_version = json!(String::from_utf8_lossy(&version.stdout).trim());
+        arun::direct::provider(&backend)?;
     }
     let root = std::env::current_dir()?
         .join(".arun/arc-bench")
@@ -196,7 +189,7 @@ fn main() -> Result<()> {
     let session = dunce::canonicalize(session)?;
     let bridge = root.join("bridge.mjs");
     fs::write(&bridge, BRIDGE)?;
-    let manifest = json!({"kind":"arc-agi-3-online-v1","prepare_only":!run,"competition_mode":competition,"benchmark_binary_sha256":binary_hash,"plan_sha256":plan_hash,"bridge_sha256":bridge_hash,"readiness":attestation,"provider":backend,"provider_version":provider_version,"model":model,"requested_games":games,"move_limit_per_game":moves,"seconds_per_game":seconds,"cold_start":true,"policy":"Authoritative closed server scorecard; public subset is not an official competition score. Reset only after GAME_OVER, each game once. API actions and normalized/model token receipts are distinct metrics. No automatic uncertain-move retry or in-flight score polling."});
+    let manifest = json!({"kind":"arc-agi-3-online-v1","prepare_only":!run,"competition_mode":competition,"benchmark_binary_sha256":binary_hash,"plan_sha256":plan_hash,"bridge_sha256":bridge_hash,"readiness":attestation,"provider":backend,"provider_version":null,"provider_transport":"aegis-direct-v1","native_provider_cli_started":false,"model":model,"requested_games":games,"move_limit_per_game":moves,"seconds_per_game":seconds,"cold_start":true,"policy":"Authoritative closed server scorecard; public subset is not an official competition score. Aegis uses direct provider HTTP, not a native agent CLI. Reset only after GAME_OVER, each game once. API actions and normalized/model token receipts are distinct metrics. No automatic uncertain-move retry or in-flight score polling."});
     fs::write(
         root.join("experiment.json"),
         serde_json::to_vec_pretty(&manifest)?,

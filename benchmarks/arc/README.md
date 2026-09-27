@@ -1,6 +1,6 @@
 # ARC-AGI-3 recorded evaluation
 
-This optional developer runner is separate from the installed terminal UI. It uses native ChatGPT, Claude or Grok login through Aegis. No Python environment, model API key or extra runtime dependency is required. Node is already an installation prerequisite. An ARC game-service credential is separate from model authentication: `ARC_API_KEY` is optional; otherwise the documented anonymous-key endpoint is used after readiness review.
+This optional developer runner is separate from the installed terminal UI. It uses Aegis-owned direct ChatGPT or Grok authentication and HTTP inference, without starting a native provider CLI. Claude remains pending and is rejected before game-service work. No Python environment, model API key or extra runtime dependency is required. Node is already an installation prerequisite. An ARC game-service credential is separate from model authentication: `ARC_API_KEY` is optional; otherwise the documented anonymous-key endpoint is used after readiness review.
 
 `cargo run --locked --example arc_bench -- --prepare-only` freezes the adapter, configuration, source/build hashes and empty recording structure. **It does not contact ARC or call a model.** The default public-sample selection is one lexicographically first game from the later recorded versioned registry. `--games` selects exact comma-separated IDs; `--competition` instead selects every available game once with one competition scorecard. Sample results are not official competition scores.
 
@@ -17,7 +17,7 @@ Live evaluation requires `--run --ready reviewed.json --aegis /path/to/verified/
 - Learning is disabled and previous-game conversations are not imported. Unknown/estimated model usage is incomplete, never zero. An agent's `finish` does not prove a game win. The authoritative closed server scorecard is preserved rather than recalculating scoring from completion percentages or token usage. Uncertain requests may prevent automatic closure and yield no official final score; that is a failed/incomplete record, not success.
 - Tokens per server-completed game include failed-game costs and use the authoritative closed scorecard's completed-game count, not model claims. Missing usage, missing closure or no completed games produces `null`. Selected, attempted and completed game denominators remain separate; an early-stopped competition is recorded as incomplete rather than silently dropping unplayed games.
 
-The transport tests use synthetic frames and injected replies only. They do not establish a live ARC score or service compatibility. Native protocol discovery/cached observation is tested without network. No new ARC agent evaluation has been started.
+The transport tests use synthetic frames and injected replies only. They do not establish a live ARC score or service compatibility. MCP protocol discovery/cached observation is tested without network. Provider version is unknown for hosted HTTP inference, not filled from an unrelated CLI version. No new ARC agent evaluation has been started.
 
 ## Service and submission boundaries
 
