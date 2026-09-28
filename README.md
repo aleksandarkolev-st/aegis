@@ -25,7 +25,7 @@ Set `NO_COLOR=1` to disable colors or `AEGIS_REDUCED_MOTION=1` to disable animat
 
 Sensible budgets and evidence checks are enabled by default. Optional F7 **Task budgets** settings offer Standard (four hours, 200 model turns, 800,000 model tokens and ten-minute commands), Quick (one hour and one-minute commands), or custom limits up to 24 hours per task and two hours per command. Limits are saved in the profile and copied into immutable task contracts. Provider usage allowances still apply; these limits are not price estimates. Advanced runs can set `--process-seconds` separately from `--wall-seconds`. A command deadline is always clamped to the task's remaining time.
 
-Follow-up tasks carry bounded summaries of the previous four tasks, including after reopening Aegis or switching providers. Earlier summaries do not grant permissions or count as evidence for a new task. F5 (or optional `/new`) clears that continuation; task history remains available under F3.
+Follow-up tasks carry a bounded latest-chat preview and up to two older relevant previews, including after reopening Aegis or switching providers. Earlier summaries do not grant permissions or count as evidence for a new task. F5 (or optional `/new`) clears that continuation; task history remains available under F3.
 
 Reopening an interactive terminal offers continuing your unfinished task. Interrupted non-idempotent calls remain paused: the recovery menu lets you select the operation and record an externally verified success or failure with a receipt, without entering operation IDs or replaying uncertain side effects. Evidence inspection offers bounded previews, literal text search, line ranges and character ranges through menus, even for large stored logs. Browsing evidence makes no model or tool calls.
 
@@ -275,6 +275,8 @@ Direct ChatGPT requests use `reasoning.effort`; direct Grok requests use `reason
 ### Saved chats
 
 F3 opens searchable saved conversations. Linked follow-up turns appear as one recent chat. Continue a chat to restore its conversation context without restarting old tools, or read its saved user/assistant messages (including earlier pages). Unfinished task recovery remains a separate explicit action. F5 starts a separate conversation; no startup modal blocks the composer.
+
+F3's context view (or `/context`) separates recorded model input, output and reported cached-input tokens from local normalized prompt/schema/tool-result exposure. It also shows estimated and unaccounted model attempts; missing usage is not treated as free. Local prompt units are not provider billing tokens.
 
 Older native-transport tasks offer **Continue work as new direct task** in F3. Choose the direct provider/model/reasoning and review the retained permissions, frozen guidance and fresh budget window before confirming. The original task is untouched; old operations and evidence are not copied. Cancelling sign-in leaves the confirmed new task saved and ready. Uncertain outcomes must be reviewed first. See [continuation behavior and checks](docs/saved-chat-continuation.md).
 

@@ -2008,6 +2008,39 @@ fn context_view(root: &Path, id: &str, terminal: &Terminal) -> Result<()> {
             store.evidence_artifacts(id)?.len()
         ),
     )?;
+    let usage = trace::metrics(&store.events(id)?);
+    if usage.model_attempts > 0 {
+        terminal.message(
+            Tone::Quiet,
+            "Model usage",
+            &format!(
+                "{} input ({} reported cached) + {} output tokens · calls {} · estimated {} · unaccounted {}",
+                usage.input_tokens,
+                usage.cached_input_tokens,
+                usage.output_tokens,
+                usage.model_attempts,
+                usage.estimated_turns,
+                usage.unaccounted_model_attempts
+            ),
+        )?;
+        if usage.context_tokenizer.is_some() {
+            terminal.message(
+                Tone::Quiet,
+                "Prompt exposure",
+                &format!(
+                    "{} normalized units · {} schema · {} tool results{}; not provider billing",
+                    usage.raw_prompt_tokens,
+                    usage.schema_tokens_total.unwrap_or(0),
+                    usage.tool_result_tokens,
+                    if usage.unaccounted_context_attempts > 0 {
+                        " · partial history"
+                    } else {
+                        ""
+                    }
+                ),
+            )?;
+        }
+    }
     terminal.message(Tone::Quiet, "Acceptance", &run.acceptance)?;
     for rule in crate::instructions::frozen(&run.budgets)? {
         terminal.message(

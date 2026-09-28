@@ -9,6 +9,9 @@ pub struct Metrics {
     pub failed_model_turns: usize,
     pub unaccounted_model_attempts: usize,
     pub model_tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_input_tokens: u64,
     pub estimated_turns: usize,
     pub schema_bytes_initial: u64,
     pub schema_bytes_peak: u64,
@@ -92,6 +95,13 @@ pub fn metrics(events: &[Event]) -> Metrics {
                 let input = event.payload["usage"]["input_tokens"].as_u64();
                 let output = event.payload["usage"]["output_tokens"].as_u64();
                 missing_response_usage += usize::from(input.is_none() || output.is_none());
+                summary.input_tokens = summary.input_tokens.saturating_add(input.unwrap_or(0));
+                summary.output_tokens = summary.output_tokens.saturating_add(output.unwrap_or(0));
+                summary.cached_input_tokens = summary.cached_input_tokens.saturating_add(
+                    event.payload["usage"]["cached_input_tokens"]
+                        .as_u64()
+                        .unwrap_or(0),
+                );
                 summary.model_tokens = summary
                     .model_tokens
                     .saturating_add(input.unwrap_or(0))
@@ -107,6 +117,13 @@ pub fn metrics(events: &[Event]) -> Metrics {
                 let input = event.payload["usage"]["input_tokens"].as_u64();
                 let output = event.payload["usage"]["output_tokens"].as_u64();
                 accounted_failures += usize::from(input.is_some() && output.is_some());
+                summary.input_tokens = summary.input_tokens.saturating_add(input.unwrap_or(0));
+                summary.output_tokens = summary.output_tokens.saturating_add(output.unwrap_or(0));
+                summary.cached_input_tokens = summary.cached_input_tokens.saturating_add(
+                    event.payload["usage"]["cached_input_tokens"]
+                        .as_u64()
+                        .unwrap_or(0),
+                );
                 summary.model_tokens = summary
                     .model_tokens
                     .saturating_add(input.unwrap_or(0))
@@ -228,6 +245,9 @@ mod tests {
         ];
         let result = metrics(&events);
         assert_eq!(result.model_tokens, 45);
+        assert_eq!(result.input_tokens, 40);
+        assert_eq!(result.output_tokens, 5);
+        assert_eq!(result.cached_input_tokens, 0);
         assert_eq!(result.schema_bytes_initial, 300);
         assert_eq!(result.schema_bytes_peak, 600);
         assert_eq!(result.schema_count_peak, 4);
@@ -284,6 +304,9 @@ mod tests {
         ];
         let result = metrics(&events);
         assert_eq!(result.model_tokens, 17);
+        assert_eq!(result.input_tokens, 14);
+        assert_eq!(result.output_tokens, 3);
+        assert_eq!(result.cached_input_tokens, 8);
         assert_eq!(result.model_turns, 1);
         assert_eq!(result.failed_model_turns, 2);
         assert_eq!(result.unaccounted_model_attempts, 1);
