@@ -405,6 +405,9 @@ impl Store {
         if !budgets.is_object() {
             bail!("run configuration must be an object");
         }
+        if budgets.get("obligations").is_none() {
+            budgets["obligations"] = json!(crate::obligations::from_task(task)?);
+        }
         if budgets.get("tool_result_tokens").is_none() {
             budgets["tool_result_tokens"] = json!(crate::tokenization::DEFAULT_TOOL_TOKENS);
         }

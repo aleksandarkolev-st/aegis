@@ -49,6 +49,45 @@ fn titles(configuration: &Value) -> Result<Vec<String>> {
     Ok(titles)
 }
 
+pub fn from_task(task: &str) -> Result<Vec<String>> {
+    let mut in_requirements = false;
+    let mut saw_requirements = false;
+    let mut entries = Vec::new();
+    for line in task.lines() {
+        let line = line.trim();
+        if line.eq_ignore_ascii_case("requirements:") {
+            in_requirements = true;
+            saw_requirements = true;
+            continue;
+        }
+        if !in_requirements {
+            continue;
+        }
+        if line.is_empty() {
+            if !entries.is_empty() {
+                in_requirements = false;
+            }
+            continue;
+        }
+        let bullet = line
+            .strip_prefix("- ")
+            .or_else(|| line.strip_prefix("* "))
+            .or_else(|| {
+                let (number, text) = line.split_once(". ")?;
+                (!number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()))
+                    .then_some(text)
+            });
+        let Some(title) = bullet else {
+            bail!("list each requirement under Requirements: with a bullet or number");
+        };
+        entries.push(Value::String(title.trim().to_owned()));
+    }
+    if saw_requirements && entries.is_empty() {
+        bail!("Requirements: needs at least one listed requirement");
+    }
+    titles(&serde_json::json!({"obligations":entries}))
+}
+
 pub(crate) fn insert(transaction: &Transaction<'_>, run: &Run) -> Result<()> {
     let titles = titles(&run.budgets)?;
     transaction.execute(
@@ -266,6 +305,26 @@ impl Store {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn user_requirement_bullets_become_immutable_run_obligations() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let task = "Refactor the parser.\n\nRequirements:\n- support nested expressions\n- preserve public API compatibility\n- add regression tests\n- full test suite must pass";
+        let run = store.create_run(task, directory.path(), "codex", json!([]), json!({}), "")?;
+        let obligations = store.obligations(&run.id)?;
+        assert_eq!(obligations.len(), 5);
+        assert_eq!(obligations[1].title, "support nested expressions");
+        assert_eq!(obligations[4].title, "full test suite must pass");
+        assert_eq!(run.budgets["obligations"].as_array().unwrap().len(), 4);
+        assert_eq!(
+            from_task("Explain how parsing works")?,
+            Vec::<String>::new()
+        );
+        assert!(from_task("Do work\nRequirements:\n- first\nsecond without bullet").is_err());
+        assert!(from_task("Do work\nRequirements:").is_err());
+        Ok(())
+    }
 
     #[test]
     fn explicit_obligations_survive_restart_and_model_replanning() -> Result<()> {

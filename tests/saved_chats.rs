@@ -134,3 +134,49 @@ fn saved_chat_context_shows_recorded_token_breakdown_without_a_model_call() -> R
     assert_eq!(store.model_tokens(&run.id)?, 108);
     Ok(())
 }
+
+#[test]
+fn saved_chat_context_shows_kernel_obligations_without_running_a_model() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join(".arun");
+    let mut store = Store::open(&root)?;
+    let run = store.create_run(
+        "Repair parser\nRequirements:\n- nested expressions\n- public API compatibility",
+        directory.path(),
+        "codex",
+        json!([]),
+        json!({}),
+        "",
+    )?;
+    fs::write(
+        root.join("profile.json"),
+        serde_json::to_vec(
+            &json!({"provider":"codex","model":null,"endpoint":null,"write":false,"image":null,"previous_run":run.id}),
+        )?,
+    )?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_arun"))
+        .current_dir(directory.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"/context\n/quit\n")?;
+    let output = child.wait_with_output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("2 user requirements"));
+    assert!(text.contains("O1 · open"));
+    assert!(text.contains("nested expressions"));
+    assert!(text.contains("O2 · open"));
+    assert!(text.contains("public API compatibility"));
+    assert_eq!(store.runs()?.len(), 1);
+    Ok(())
+}

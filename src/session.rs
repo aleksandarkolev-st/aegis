@@ -2041,6 +2041,33 @@ fn context_view(root: &Path, id: &str, terminal: &Terminal) -> Result<()> {
             )?;
         }
     }
+    let obligations = store.obligations(id)?;
+    if obligations.len() > 1 {
+        terminal.message(
+            Tone::Accent,
+            "Obligations",
+            &format!(
+                "{} user requirements · workspace revision {}",
+                obligations.len() - 1,
+                store.workspace_revision(id)?.unwrap_or(0)
+            ),
+        )?;
+        for obligation in obligations.iter().skip(1) {
+            terminal.message(
+                if obligation.state == "verified" {
+                    Tone::Success
+                } else {
+                    Tone::Warning
+                },
+                &format!("O{} · {}", obligation.id, obligation.state),
+                &format!(
+                    "{} · {} evidence",
+                    obligation.title,
+                    obligation.evidence.len()
+                ),
+            )?;
+        }
+    }
     terminal.message(Tone::Quiet, "Acceptance", &run.acceptance)?;
     for rule in crate::instructions::frozen(&run.budgets)? {
         terminal.message(
@@ -2384,6 +2411,17 @@ fn task(
         budgets,
         acceptance,
     )?;
+    let obligations = store.obligations(&run.id)?;
+    if obligations.len() > 1 {
+        terminal.message(
+            Tone::Accent,
+            "Tracking requirements",
+            &format!(
+                "{} user-written items are frozen for this task; F3 shows what remains open.",
+                obligations.len() - 1
+            ),
+        )?;
+    }
     drop(store);
     profile.previous_run = Some(run.id.clone());
     save(root, profile)?;
