@@ -25,6 +25,8 @@ struct Profile {
     model: Option<String>,
     #[serde(default)]
     reasoning_effort: Option<String>,
+    #[serde(default)]
+    fallback_routes: Vec<crate::routing::Route>,
     endpoint: Option<Endpoint>,
     write: bool,
     image: Option<String>,
@@ -237,6 +239,7 @@ fn switch_provider(
         profile.model = selected.model;
         profile.reasoning_effort = None;
         profile.endpoint = selected.endpoint;
+        profile.fallback_routes.clear();
         *secret = key;
         save(root, profile)?;
         remember_selection(terminal, profile)?;
@@ -373,6 +376,7 @@ fn blank_profile(provider: String) -> Profile {
         provider,
         model: None,
         reasoning_effort: None,
+        fallback_routes: Vec::new(),
         endpoint: None,
         write: false,
         image: None,
@@ -595,6 +599,7 @@ fn settings(root: &Path, terminal: &mut Terminal, profile: &mut Profile) -> Resu
         "File access scopes · optional exact files / folders",
         "Web access · optional approved HTTPS domains",
         "Project instructions · pinned, scoped rules",
+        "Automatic provider fallback · optional",
         "Back",
     ]
     .map(str::to_owned);
@@ -616,6 +621,7 @@ fn settings(root: &Path, terminal: &mut Terminal, profile: &mut Profile) -> Resu
         Some(6) => configure_file_scopes(terminal, &mut selected)?,
         Some(7) => configure_network_scopes(terminal, &mut selected)?,
         Some(8) => return instruction_menu(root, terminal),
+        Some(9) => configure_fallback(terminal, &mut selected)?,
         _ => false,
     };
     if changed {
@@ -628,6 +634,99 @@ fn settings(root: &Path, terminal: &mut Terminal, profile: &mut Profile) -> Resu
         )?;
     }
     Ok(())
+}
+
+fn configure_fallback(terminal: &Terminal, profile: &mut Profile) -> Result<bool> {
+    if !matches!(profile.provider.as_str(), "codex" | "grok") {
+        terminal.message(
+            Tone::Quiet,
+            "Fallback",
+            "Direct ChatGPT and Grok tasks can use an approved fallback. Custom endpoints and Claude cannot yet switch automatically.",
+        )?;
+        return Ok(false);
+    }
+    let other = if profile.provider == "codex" {
+        "grok"
+    } else {
+        "codex"
+    };
+    let choices = [
+        format!(
+            "Keep current · {}",
+            profile
+                .fallback_routes
+                .first()
+                .map_or("off", |route| route.model.as_str())
+        ),
+        format!("Use {} as fallback", name(other)),
+        "Turn automatic fallback off".into(),
+        "Back".into(),
+    ];
+    match terminal.select("Switch only for quota or provider outage", &choices)? {
+        Some(2) => {
+            profile.fallback_routes.clear();
+            Ok(true)
+        }
+        Some(1) => {
+            if !ensure_provider(terminal, other)? {
+                return Ok(false);
+            }
+            let candidate = blank_profile(other.into());
+            let Some(Some(model)) = choose_model(terminal, &candidate, None)? else {
+                return Ok(false);
+            };
+            let provider = crate::direct::provider(other)?;
+            let catalog = crate::background::run(
+                terminal,
+                "Verifying fallback account and model",
+                move |cancelled| {
+                    crate::provider_catalog::refresh(
+                        &crate::auth_store::Vault::user()?,
+                        provider,
+                        || cancelled.load(std::sync::atomic::Ordering::Acquire),
+                    )
+                },
+            );
+            let models = match catalog {
+                Ok(Some(models)) => models,
+                Ok(None) => return Ok(false),
+                Err(error) => {
+                    terminal.message(Tone::Warning, "Fallback unavailable", &error.to_string())?;
+                    return Ok(false);
+                }
+            };
+            if !models.iter().any(|entry| entry.id == model) {
+                terminal.message(
+                    Tone::Warning,
+                    "Fallback unavailable",
+                    "The selected model is not in this account's live catalog. No fallback was saved.",
+                )?;
+                return Ok(false);
+            }
+            let route = crate::routing::Route {
+                provider: other.into(),
+                model,
+                reasoning_effort: None,
+            };
+            route.validate()?;
+            terminal.message(
+                Tone::Accent,
+                "Review fallback",
+                &format!(
+                    "{} / {} · same task, permissions, evidence, and budget",
+                    name(&route.provider),
+                    route.model
+                ),
+            )?;
+            let confirmation = ["Keep fallback off", "Approve this fallback"].map(str::to_owned);
+            if terminal.select("Approve automatic switch?", &confirmation)? != Some(1) {
+                return Ok(false);
+            }
+            profile.fallback_routes = vec![route];
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 fn configure_network_scopes(terminal: &Terminal, profile: &mut Profile) -> Result<bool> {
@@ -1996,6 +2095,19 @@ fn context_view(root: &Path, id: &str, terminal: &Terminal) -> Result<()> {
     let store = Store::open(root)?;
     let run = store.run(id)?;
     terminal.message(Tone::Accent, "Task", &run.task)?;
+    if let Ok(route) = store.current_route(id) {
+        if route.provider != run.provider {
+            terminal.message(
+                Tone::Accent,
+                "Current model",
+                &format!(
+                    "{} / {} · switched within this task",
+                    name(&route.provider),
+                    route.model
+                ),
+            )?;
+        }
+    }
     terminal.message(
         Tone::Quiet,
         "Context",
@@ -2482,6 +2594,7 @@ fn task(
     budgets["provider_transport"] = json!("aegis-direct-v1");
     budgets["model"] = json!(profile.model);
     budgets["reasoning_effort"] = json!(profile.reasoning_effort);
+    budgets["fallback_routes"] = json!(profile.fallback_routes);
     budgets["endpoint"] = json!(profile.endpoint);
     budgets["container_image"] = json!(profile.image);
     budgets["previous_run"] = json!(profile.previous_run);
@@ -2848,6 +2961,7 @@ mod tests {
             provider: "custom".into(),
             model: Some("model".into()),
             reasoning_effort: None,
+            fallback_routes: Vec::new(),
             endpoint: Some(Endpoint {
                 base_url: "https://example.test/v1".into(),
                 api_key_env: Some("ARUN_SESSION_API_KEY".into()),

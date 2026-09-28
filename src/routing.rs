@@ -22,7 +22,7 @@ pub enum Reason {
 }
 
 impl Reason {
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::UsageLimit => "usage_limit",
             Self::Outage => "provider_outage",
@@ -48,6 +48,9 @@ impl Route {
     }
 
     pub fn configuration(&self, run: &Run) -> Value {
+        if self.provider == run.provider {
+            return run.budgets.clone();
+        }
         let mut configuration = run.budgets.clone();
         configuration["provider_transport"] = json!("aegis-direct-v1");
         configuration["model"] = json!(self.model);
@@ -64,6 +67,9 @@ pub fn approved(run: &Run) -> Result<Vec<Route>> {
         .context("fallback_routes must be a reviewed list of direct routes")?;
     if routes.len() > 3 {
         bail!("at most three fallback routes may be approved");
+    }
+    if !routes.is_empty() && !matches!(run.provider.as_str(), "codex" | "grok") {
+        bail!("automatic fallback requires a direct ChatGPT or Grok primary provider");
     }
     let mut providers = std::collections::HashSet::new();
     providers.insert(run.provider.as_str());
@@ -118,6 +124,12 @@ impl Store {
             return Ok(None);
         }
         let current = self.current_route(run_id)?;
+        let latest = self.recent_events(run_id, 1)?;
+        if latest.first().is_none_or(|event| {
+            event.kind != "model.failed" || event.payload["recoverable_reason"] != reason.name()
+        }) {
+            return Ok(None);
+        }
         let next = if current.provider == run.provider {
             routes.first()
         } else {
@@ -134,6 +146,13 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state: String =
+            transaction.query_row("SELECT state FROM runs WHERE id = ?1", [run_id], |row| {
+                row.get(0)
+            })?;
+        if state != "running" {
+            bail!("task ended before provider transition");
+        }
         let attempt: i64 = transaction.query_row(
             "SELECT COALESCE(MAX(seq),0) FROM events WHERE run_id = ?1 AND kind = 'model.started'",
             [run_id],
@@ -172,10 +191,17 @@ mod tests {
         )?;
         store.state(&run.id, "running", json!({}))?;
         store.event(&run.id, "model.started", json!({"turn":1}))?;
+        store.event(&run.id, "model.failed", json!({"error":"bad JSON"}))?;
+        assert!(
+            store
+                .transition_provider(&run.id, Reason::UsageLimit)?
+                .is_none()
+        );
+        store.event(&run.id, "model.started", json!({"turn":2}))?;
         store.event(
             &run.id,
             "model.failed",
-            json!({"error":"quota","usage":{"input_tokens":7,"output_tokens":3}}),
+            json!({"error":"quota","recoverable_reason":"usage_limit","usage":{"input_tokens":7,"output_tokens":3}}),
         )?;
         let before = store.obligations(&run.id)?;
         let fallback = store
@@ -218,6 +244,24 @@ mod tests {
                 .is_none()
         );
         assert_eq!(store.event_count(&run.id, "provider.transition")?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn primary_route_does_not_reinterpret_legacy_transport_as_direct() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "old task",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({"model":"legacy-model"}),
+            "",
+        )?;
+        let route = store.current_route(&run.id)?;
+        assert_eq!(route.provider, "codex");
+        assert_eq!(route.configuration(&run)["provider_transport"], Value::Null);
         Ok(())
     }
 }

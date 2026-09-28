@@ -1155,6 +1155,17 @@ impl Terminal {
                 "Retry",
                 "Invalid model reply; asking once more without applying an action.",
             ),
+            "provider.transition" => self.message(
+                Tone::Accent,
+                "Switching models",
+                &format!(
+                    "{} / {} → {} / {} · same task and evidence retained",
+                    payload["from"]["provider"].as_str().unwrap_or("provider"),
+                    payload["from"]["model"].as_str().unwrap_or("model"),
+                    payload["to"]["provider"].as_str().unwrap_or("provider"),
+                    payload["to"]["model"].as_str().unwrap_or("model")
+                ),
+            ),
             "operation.cancelled" => self.message(
                 Tone::Warning,
                 "Interrupted",

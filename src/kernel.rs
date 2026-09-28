@@ -186,6 +186,7 @@ fn context(store: &Store, run: &Run) -> Result<String> {
         "recent_events": recent, "active_capabilities": manifests,
         "milestones": store.milestones(&run.id)?, "handoff": handoff,
         "obligations": store.obligations(&run.id)?,
+        "current_route": store.current_route(&run.id)?,
         "workspace_revision": store.workspace_revision(&run.id)?,
         "milestone_policy": "States must be pending, active, or completed. Completed milestones require evidence hashes from successful operations in this run. Titles must be nonblank and at most 200 bytes.",
         "conversation": conversation,
@@ -806,6 +807,7 @@ fn record_model_failure(
     elapsed: Duration,
 ) -> Result<()> {
     let rejected = error.downcast_ref::<crate::direct::RejectedResponse>();
+    let recoverable = error.downcast_ref::<crate::direct::RecoverableFailure>();
     store.event(
         run_id,
         "model.failed",
@@ -815,6 +817,7 @@ fn record_model_failure(
             "elapsed_ms":elapsed.as_millis(),
             "usage":rejected.and_then(|response| response.usage.as_ref()),
             "response_shape":rejected.map(|response| &response.shape),
+            "recoverable_reason":recoverable.filter(|_| !interrupted).map(|failure| failure.reason.name()),
         }),
     )?;
     Ok(())
@@ -957,10 +960,12 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
             )?;
             break;
         }
+        let route = store.current_route(run_id)?;
         store.event(
             run_id,
             "model.started",
             json!({"turn": actions + 1, "prompt_chars": prompt_chars,
+                "route":route,
                 "context_tokenizer":exposure.encoding,"schema_tokens":exposure.schema_tokens,
                 "tool_result_tokens":exposure.tool_result_tokens,"raw_prompt_tokens":exposure.raw_prompt_tokens,
                 "schema_count": manifests.len(), "schema_bytes": serde_json::to_vec(&manifests)?.len()}),
@@ -975,8 +980,8 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
                 .min(remaining_seconds(&store, &run)?),
         );
         let response = match model::call_configured(
-            &run.provider,
-            &run.budgets,
+            &route.provider,
+            &route.configuration(&run),
             &prompt,
             root,
             timeout,
@@ -1014,6 +1019,14 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
                 )?;
                 if store.run(run_id)?.state == "cancelled" {
                     break;
+                }
+                if !interrupted {
+                    if let Some(failure) = error.downcast_ref::<crate::direct::RecoverableFailure>()
+                    {
+                        if store.transition_provider(run_id, failure.reason)?.is_some() {
+                            continue;
+                        }
+                    }
                 }
                 let format_retry = !interrupted
                     && error

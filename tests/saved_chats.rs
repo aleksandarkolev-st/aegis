@@ -180,3 +180,106 @@ fn saved_chat_context_shows_kernel_obligations_without_running_a_model() -> Resu
     assert_eq!(store.runs()?.len(), 1);
     Ok(())
 }
+
+#[test]
+fn saved_task_replaces_a_requirement_only_after_terminal_confirmation() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join(".arun");
+    let mut store = Store::open(&root)?;
+    let run = store.create_run(
+        "Refactor parser\nRequirements:\n- preserve public API",
+        directory.path(),
+        "codex",
+        json!([]),
+        json!({}),
+        "",
+    )?;
+    fs::write(
+        root.join("profile.json"),
+        serde_json::to_vec(
+            &json!({"provider":"codex","model":null,"endpoint":null,"write":false,"image":null,"previous_run":run.id}),
+        )?,
+    )?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_arun"))
+        .current_dir(directory.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child.stdin.take().unwrap().write_all(
+        b"/sessions\n1\n4\n6\n1\nAllow a v2 API\nUser approved breaking compatibility\n2\n/quit\n",
+    )?;
+    let output = child.wait_with_output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("Approve this change?"));
+    assert!(text.contains("Requirement updated"));
+    let obligations = store.obligations(&run.id)?;
+    assert_eq!(obligations[1].state, "superseded");
+    assert_eq!(obligations[1].superseded_by, Some(2));
+    assert_eq!(obligations[2].title, "Allow a v2 API");
+    assert_eq!(store.event_count(&run.id, "model.started")?, 0);
+    Ok(())
+}
+
+#[test]
+fn switched_provider_is_visible_in_saved_task_without_changing_run_identity() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join(".arun");
+    let mut store = Store::open(&root)?;
+    let run = store.create_run(
+        "Review parser",
+        directory.path(),
+        "codex",
+        json!([]),
+        json!({"provider_transport":"aegis-direct-v1","model":"primary","fallback_routes":[{"provider":"grok","model":"fallback"}]}),
+        "",
+    )?;
+    store.state(&run.id, "running", json!({}))?;
+    store.event(&run.id, "model.started", json!({"turn":1}))?;
+    store.event(
+        &run.id,
+        "model.failed",
+        json!({"recoverable_reason":"usage_limit"}),
+    )?;
+    store.transition_provider(&run.id, arun::routing::Reason::UsageLimit)?;
+    store.state(
+        &run.id,
+        "waiting_recovery",
+        json!({"reason":"fixture paused"}),
+    )?;
+    fs::write(
+        root.join("profile.json"),
+        serde_json::to_vec(
+            &json!({"provider":"codex","model":null,"endpoint":null,"write":false,"image":null,"previous_run":run.id}),
+        )?,
+    )?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_arun"))
+        .current_dir(directory.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"/context\n/quit\n")?;
+    let output = child.wait_with_output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("Grok / fallback · switched within this task")
+    );
+    assert_eq!(store.run(&run.id)?.provider, "codex");
+    assert_eq!(store.event_count(&run.id, "provider.transition")?, 1);
+    Ok(())
+}

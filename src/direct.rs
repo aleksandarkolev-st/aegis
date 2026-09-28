@@ -53,6 +53,47 @@ pub struct RejectedResponse {
     pub shape: Value,
 }
 
+#[derive(Debug)]
+pub struct RecoverableFailure {
+    pub reason: crate::routing::Reason,
+    pub status: Option<u16>,
+}
+
+impl std::fmt::Display for RecoverableFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.reason, self.status) {
+            (crate::routing::Reason::UsageLimit, Some(status)) => {
+                write!(formatter, "Provider usage limit reached (HTTP {status})")
+            }
+            (crate::routing::Reason::ModelRemoved, Some(status)) => {
+                write!(
+                    formatter,
+                    "Selected model is no longer available (HTTP {status})"
+                )
+            }
+            (_, Some(status)) => {
+                write!(
+                    formatter,
+                    "Provider is temporarily unavailable (HTTP {status})"
+                )
+            }
+            (_, None) => formatter.write_str("Provider connection failed before dispatch"),
+        }
+    }
+}
+
+impl std::error::Error for RecoverableFailure {}
+
+fn recoverable_status(status: u16) -> Option<crate::routing::Reason> {
+    use crate::routing::Reason;
+    match status {
+        429 => Some(Reason::UsageLimit),
+        410 => Some(Reason::ModelRemoved),
+        502..=504 => Some(Reason::Outage),
+        _ => None,
+    }
+}
+
 impl std::fmt::Display for RejectedResponse {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("Provider returned invalid Aegis action JSON")
@@ -450,9 +491,20 @@ fn request_bytes(
             }
         }
         let fetch = async {
-            let mut response = http.send().await.map_err(|_| anyhow!("Provider connection failed"))?;
+            let mut response = http.send().await.map_err(|error| {
+                if request.method == reqwest::Method::POST && error.is_connect() {
+                    anyhow!(RecoverableFailure { reason: crate::routing::Reason::Outage, status: None })
+                } else {
+                    anyhow!("Provider connection failed")
+                }
+            })?;
             if !response.status().is_success() {
                 let status = response.status().as_u16();
+                if request.method == reqwest::Method::POST {
+                    if let Some(reason) = recoverable_status(status) {
+                        return Err(anyhow!(RecoverableFailure { reason, status: Some(status) }));
+                    }
+                }
                 match status {
                     401 => bail!("Provider sign-in expired or was rejected (HTTP 401); sign in again"),
                     403 => bail!("Provider account does not permit this direct request (HTTP 403)"),
@@ -740,6 +792,42 @@ mod tests {
             timeout: Duration::from_secs(3),
             response_bytes: 8192,
         }
+    }
+
+    #[test]
+    fn only_classified_provider_failures_are_eligible_for_failover() -> Result<()> {
+        for (status, expected) in [
+            (
+                "429 Too Many Requests",
+                Some(crate::routing::Reason::UsageLimit),
+            ),
+            ("410 Gone", Some(crate::routing::Reason::ModelRemoved)),
+            (
+                "503 Service Unavailable",
+                Some(crate::routing::Reason::Outage),
+            ),
+            ("400 Bad Request", None),
+            ("401 Unauthorized", None),
+            ("500 Internal Server Error", None),
+        ] {
+            let (url, handle) = server(
+                status,
+                "Content-Length: 0\r\n",
+                String::new(),
+                Duration::ZERO,
+            )?;
+            let error =
+                call_url(Provider::ChatGpt, &credentials(), &request(), url, || false).unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<RecoverableFailure>()
+                    .map(|failure| failure.reason),
+                expected
+            );
+            handle.join().unwrap()?;
+        }
+        assert_eq!(recoverable_status(404), None);
+        Ok(())
     }
 
     #[test]
@@ -1223,7 +1311,7 @@ mod tests {
                     .as_array()
                     .unwrap()
                     .len(),
-                6
+                7
             );
             assert!(!request.to_string().contains("skills_instructions"));
             assert!(!request.to_string().contains("multi_agent"));
