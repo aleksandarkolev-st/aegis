@@ -104,3 +104,51 @@ fn read_only_commands_work_without_metadata_directories_in_the_workspace() -> Re
     assert!(!workspace.join("unauthorized").exists());
     Ok(())
 }
+
+#[test]
+#[ignore = "requires Docker and the local aegis-linux-functional:local image"]
+fn read_only_cargo_tests_execute_from_the_scoped_temporary_target() -> Result<()> {
+    let directory = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR"))?;
+    let workspace = directory.path().join("workspace");
+    std::fs::create_dir_all(workspace.join("src"))?;
+    std::fs::write(
+        workspace.join("Cargo.toml"),
+        "[package]\nname = \"aegis-container-check\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )?;
+    std::fs::write(
+        workspace.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"aegis-container-check\"\nversion = \"0.1.0\"\n",
+    )?;
+    std::fs::write(
+        workspace.join("src/lib.rs"),
+        "#[test] fn passes() { assert_eq!(2 + 2, 4); }\n",
+    )?;
+    let root = directory.path().join("state");
+    let mut store = Store::open(&root)?;
+    let run = store.create_run(
+        "compile and execute isolated tests",
+        &workspace,
+        "fixture",
+        json!(["process.run", "process:cargo"]),
+        json!({"container_image":"aegis-linux-functional:local","process_seconds":45}),
+        "",
+    )?;
+    store.state(&run.id, "running", json!({}))?;
+    let operation = store.begin_operation(
+        &run.id,
+        "process.run",
+        json!({"program":"cargo","args":["test","--locked","--offline"]}),
+        false,
+    )?;
+    store.operation_state(&operation, "dispatched", None, json!({}))?;
+    let result = worker::execute(&root, &operation.id)?;
+    let output = store.artifact(result["output_artifact"].as_str().unwrap())?;
+    assert_eq!(
+        result["exit_code"],
+        0,
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(!workspace.join("target").exists());
+    Ok(())
+}

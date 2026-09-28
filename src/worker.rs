@@ -86,7 +86,9 @@ fn docker_command(
         "--workdir",
         "/workspace",
         "--tmpfs",
-        "/tmp:rw,size=256m",
+        "/tmp:rw,noexec,size=256m",
+        "--tmpfs",
+        "/tmp/target:rw,exec,size=512m",
         "--env",
         "HOME=/tmp",
         "--env",
@@ -780,6 +782,14 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert!(args.windows(2).any(|pair| pair == ["--network", "none"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--tmpfs", "/tmp:rw,noexec,size=256m"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--tmpfs", "/tmp/target:rw,exec,size=512m"])
+        );
         assert!(args.iter().any(|argument| argument == "--pull=never"));
         assert!(
             args.windows(2)
