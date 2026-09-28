@@ -389,6 +389,16 @@ impl Store {
                 COMMIT;",
             )?;
         }
+        if schema_version < 10 {
+            store.connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS provider_routes (
+                    run_id TEXT PRIMARY KEY REFERENCES runs(id), route TEXT NOT NULL
+                );
+                PRAGMA user_version=10;
+                COMMIT;",
+            )?;
+        }
         Ok(store)
     }
 
@@ -439,6 +449,7 @@ impl Store {
         crate::policy::CommandScopes::from_configuration(&run.budgets)?;
         crate::filesystem::FileScopes::from_configuration(&run.budgets)?;
         crate::network::NetworkScopes::from_configuration(&run.budgets)?;
+        crate::routing::approved(&run)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
