@@ -190,6 +190,17 @@ mod tests {
             "",
         )?;
         store.state(&run.id, "running", json!({}))?;
+        let operation = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
+        let evidence = store.put_artifact(b"compatibility proof")?;
+        store.operation_state(&operation, "succeeded", Some(&evidence), json!({}))?;
+        store.verify_obligation(&run.id, 1, &[evidence.clone()])?;
+        let checkpoint = crate::model::Checkpoint {
+            decisions: vec!["keep API".into()],
+            unresolved: Vec::new(),
+            next_action: "run tests".into(),
+            milestones: Vec::new(),
+        };
+        store.save_checkpoint(&run.id, &checkpoint)?;
         store.event(&run.id, "model.started", json!({"turn":1}))?;
         store.event(&run.id, "model.failed", json!({"error":"bad JSON"}))?;
         assert!(
@@ -211,6 +222,11 @@ mod tests {
         assert_eq!(store.run(&run.id)?.provider, "codex");
         assert_eq!(store.model_tokens(&run.id)?, 10);
         assert_eq!(store.obligations(&run.id)?, before);
+        assert_eq!(store.last_checkpoint(&run.id)?, Some(checkpoint.clone()));
+        assert!(store.has_evidence(&run.id, &evidence)?);
+        assert_eq!(store.operations(&run.id)?.len(), 1);
+        assert_eq!(store.run(&run.id)?.budgets, run.budgets);
+        assert_eq!(store.run(&run.id)?.grants, run.grants);
         assert_eq!(store.event_count(&run.id, "provider.transition")?, 1);
         assert!(
             store
@@ -221,6 +237,8 @@ mod tests {
         let store = Store::open(directory.path())?;
         assert_eq!(store.current_route(&run.id)?, fallback);
         assert_eq!(store.run(&run.id)?.id, run.id);
+        assert_eq!(store.last_checkpoint(&run.id)?, Some(checkpoint));
+        assert!(store.has_evidence(&run.id, &evidence)?);
         Ok(())
     }
 
