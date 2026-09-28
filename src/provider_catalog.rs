@@ -55,11 +55,12 @@ fn validate(models: &[RemoteModel], credentials: &Credentials) -> Result<()> {
     Ok(())
 }
 
-pub fn cached(
+fn stored(
     vault: &Vault,
     provider: Provider,
     cancelled: impl Fn() -> bool,
-) -> Result<Option<Vec<RemoteModel>>> {
+    require_fresh: bool,
+) -> Result<Option<(Vec<RemoteModel>, u64)>> {
     let _lock = vault.lock(provider.session_name(), TIMEOUT, &cancelled)?;
     if cancelled() {
         bail!("Model catalog request cancelled");
@@ -80,7 +81,7 @@ pub fn cached(
     if catalog.version != 1
         || catalog.binding != credentials.catalog_binding(provider)
         || catalog.fetched_at > current
-        || current.saturating_sub(catalog.fetched_at) >= TTL_SECONDS
+        || (require_fresh && current.saturating_sub(catalog.fetched_at) >= TTL_SECONDS)
     {
         return Ok(None);
     }
@@ -88,7 +89,26 @@ pub fn cached(
     if cancelled() {
         bail!("Model catalog request cancelled before accepting metadata");
     }
-    Ok(Some(catalog.models))
+    Ok(Some((
+        catalog.models,
+        current.saturating_sub(catalog.fetched_at),
+    )))
+}
+
+pub fn cached(
+    vault: &Vault,
+    provider: Provider,
+    cancelled: impl Fn() -> bool,
+) -> Result<Option<Vec<RemoteModel>>> {
+    Ok(stored(vault, provider, cancelled, true)?.map(|(models, _)| models))
+}
+
+pub fn saved_for_selection(
+    vault: &Vault,
+    provider: Provider,
+    cancelled: impl Fn() -> bool,
+) -> Result<Option<(Vec<RemoteModel>, u64)>> {
+    stored(vault, provider, cancelled, false)
 }
 
 pub fn save(
@@ -251,18 +271,21 @@ mod tests {
         current.account_id = Some("another-account".into());
         vault.save(&current)?;
         assert!(cached(&vault, provider, || false)?.is_none());
+        assert!(saved_for_selection(&vault, provider, || false)?.is_none());
         save(&vault, provider, &current.credentials()?, models(), || {
             false
         })?;
         current.access_token = "another-private-token".into();
         vault.save(&current)?;
         assert!(cached(&vault, provider, || false)?.is_none());
+        assert!(saved_for_selection(&vault, provider, || false)?.is_none());
         save(&vault, provider, &current.credentials()?, models(), || {
             false
         })?;
         current.expires_at = 1;
         vault.save(&current)?;
         assert!(cached(&vault, provider, || false)?.is_none());
+        assert!(saved_for_selection(&vault, provider, || false)?.is_none());
         assert!(
             get_with(&vault, provider, &|| false, |_, _, _| panic!(
                 "Expired unrefreshable session must not fetch"
@@ -313,6 +336,14 @@ mod tests {
             };
             vault.save_catalog(provider.session_name(), serde_json::to_vec(&saved)?)?;
             assert!(cached(&vault, provider, || false)?.is_none());
+            let selectable = saved_for_selection(&vault, provider, || false)?;
+            if version == 1 && fetched_at <= now()? {
+                let (listed, age) = selectable.expect("stale same-account list remains visible");
+                assert_eq!(listed, models());
+                assert!(age >= TTL_SECONDS);
+            } else {
+                assert!(selectable.is_none());
+            }
             let error = get_with(&vault, provider, &|| false, |_, _, _| {
                 bail!("Fixture HTTP 403 account refusal")
             })

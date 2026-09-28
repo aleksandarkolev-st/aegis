@@ -87,7 +87,7 @@ fn load_catalog(
                         source: "Your endpoint's /models catalog".into(),
                     })
             } else {
-                crate::catalog::available(&provider, interrupted)
+                crate::catalog::for_selection(&provider, interrupted)
             })
         },
     )
@@ -225,7 +225,7 @@ fn switch_model(
         }
         candidate.model = model;
         if terminal.interactive {
-            let Some(effort) = choose_reasoning(terminal, &candidate)? else {
+            let Some(effort) = choose_reasoning(terminal, &candidate, false)? else {
                 return Ok(());
             };
             candidate.reasoning_effort = effort;
@@ -243,8 +243,12 @@ fn switch_model(
     Ok(())
 }
 
-fn choose_reasoning(terminal: &Terminal, profile: &Profile) -> Result<Option<Option<String>>> {
-    if let Ok(provider) = crate::direct::provider(&profile.provider) {
+fn choose_reasoning(
+    terminal: &Terminal,
+    profile: &Profile,
+    refresh: bool,
+) -> Result<Option<Option<String>>> {
+    if refresh && let Ok(provider) = crate::direct::provider(&profile.provider) {
         if crate::auth_store::Vault::user()?
             .load(provider.session_name())?
             .is_some()
@@ -321,7 +325,7 @@ fn choose_reasoning(terminal: &Terminal, profile: &Profile) -> Result<Option<Opt
 }
 
 fn switch_reasoning(root: &Path, terminal: &Terminal, profile: &mut Profile) -> Result<()> {
-    if let Some(effort) = choose_reasoning(terminal, profile)? {
+    if let Some(effort) = choose_reasoning(terminal, profile, true)? {
         profile.reasoning_effort = effort;
         save(root, profile)?;
         remember_selection(terminal, profile)?;
@@ -1644,7 +1648,7 @@ fn continue_legacy(
         return Ok(());
     };
     draft.model = Some(model.clone());
-    let Some(reasoning) = choose_reasoning(terminal, &draft)? else {
+    let Some(reasoning) = choose_reasoning(terminal, &draft, false)? else {
         return Ok(());
     };
     draft.reasoning_effort = reasoning.clone();

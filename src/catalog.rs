@@ -246,12 +246,14 @@ pub fn reasoning_levels(provider: &str, id: &str) -> Result<Vec<String>> {
     if let Ok(selected) = crate::direct::provider(provider) {
         let vault = crate::auth_store::Vault::user()?;
         if vault.load(selected.session_name())?.is_some() {
-            return Ok(crate::provider_catalog::cached(&vault, selected, || false)?
-                .into_iter()
-                .flatten()
-                .find(|model| model.id == id)
-                .map(|model| model.reasoning_levels)
-                .unwrap_or_default());
+            return Ok(
+                crate::provider_catalog::saved_for_selection(&vault, selected, || false)?
+                    .into_iter()
+                    .flat_map(|(models, _)| models)
+                    .find(|model| model.id == id)
+                    .map(|model| model.reasoning_levels)
+                    .unwrap_or_default(),
+            );
         }
     }
     let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
@@ -286,11 +288,13 @@ pub fn advertised_reasoning_default(provider: &str, id: &str) -> Result<Option<S
     if vault.load(selected.session_name())?.is_none() {
         return Ok(None);
     }
-    Ok(crate::provider_catalog::cached(&vault, selected, || false)?
-        .into_iter()
-        .flatten()
-        .find(|model| model.id == id)
-        .and_then(|model| model.default_reasoning))
+    Ok(
+        crate::provider_catalog::saved_for_selection(&vault, selected, || false)?
+            .into_iter()
+            .flat_map(|(models, _)| models)
+            .find(|model| model.id == id)
+            .and_then(|model| model.default_reasoning),
+    )
 }
 
 fn insert(models: &mut Vec<Model>, id: &str, label: &str) {
@@ -448,6 +452,51 @@ pub fn available(provider: &str, cancelled: impl Fn() -> bool) -> Result<Catalog
     })
 }
 
+pub fn for_selection(provider: &str, cancelled: impl Fn() -> bool) -> Result<Catalog> {
+    match available(provider, &cancelled) {
+        Ok(catalog) => Ok(catalog),
+        Err(error) => {
+            let selected = crate::direct::provider(provider)?;
+            let vault = crate::auth_store::Vault::user()?;
+            saved_selection(&vault, selected, &cancelled, error)
+        }
+    }
+}
+
+fn saved_selection(
+    vault: &crate::auth_store::Vault,
+    provider: crate::direct::Provider,
+    cancelled: impl Fn() -> bool,
+    error: anyhow::Error,
+) -> Result<Catalog> {
+    if cancelled() {
+        return Err(error);
+    }
+    let Some((models, age)) =
+        crate::provider_catalog::saved_for_selection(vault, provider, cancelled)?
+    else {
+        return Err(error);
+    };
+    let age = match age {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{}m ago", age / 60),
+        3600..=86399 => format!("{}h ago", age / 3600),
+        _ => format!("{}d ago", age / 86400),
+    };
+    Ok(Catalog {
+        models: models
+            .into_iter()
+            .map(|model| Model {
+                id: model.id,
+                label: model.label,
+            })
+            .collect(),
+        source: format!(
+            "Saved Aegis model list · {age} · live refresh unavailable; access may have changed"
+        ),
+    })
+}
+
 pub fn endpoint_value(value: &Value) -> Result<Vec<Model>> {
     let mut models = Vec::new();
     for model in value["data"]
@@ -467,6 +516,44 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::fs;
+
+    #[test]
+    fn saved_picker_fallback_is_account_bound_and_never_used_after_cancellation() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let vault = crate::auth_store::Vault::new(directory.path().join("auth"));
+        let provider = crate::direct::Provider::ChatGpt;
+        let mut session = crate::auth_store::Session {
+            provider: "chatgpt".into(),
+            access_token: "fixture-access".into(),
+            refresh_token: None,
+            account_id: Some("fixture-account".into()),
+            expires_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs()
+                + 3600,
+        };
+        vault.save(&session)?;
+        crate::provider_catalog::save(
+            &vault,
+            provider,
+            &session.credentials()?,
+            vec![RemoteModel {
+                id: "fixture-model".into(),
+                label: "Fixture model".into(),
+                reasoning_levels: vec!["low".into(), "high".into()],
+                default_reasoning: Some("low".into()),
+            }],
+            || false,
+        )?;
+        let catalog = saved_selection(&vault, provider, || false, anyhow::anyhow!("offline"))?;
+        assert_eq!(catalog.models[0].id, "fixture-model");
+        assert!(catalog.source.contains("access may have changed"));
+        assert!(saved_selection(&vault, provider, || true, anyhow::anyhow!("cancelled")).is_err());
+        session.account_id = Some("different-account".into());
+        vault.save(&session)?;
+        assert!(saved_selection(&vault, provider, || false, anyhow::anyhow!("offline")).is_err());
+        Ok(())
+    }
 
     #[test]
     fn remote_display_labels_have_byte_and_column_bounds_even_for_combining_marks() {
