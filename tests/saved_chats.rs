@@ -207,7 +207,7 @@ fn saved_task_replaces_a_requirement_only_after_terminal_confirmation() -> Resul
         .stderr(Stdio::piped())
         .spawn()?;
     child.stdin.take().unwrap().write_all(
-        b"/sessions\n1\n4\n6\n1\nAllow a v2 API\nUser approved breaking compatibility\n2\n/quit\n",
+        b"/sessions\n1\n4\n6\n1\nAllow a v2 API\nUser approved breaking compatibility\n2\n/context\n/quit\n",
     )?;
     let output = child.wait_with_output()?;
     assert!(
@@ -218,6 +218,7 @@ fn saved_task_replaces_a_requirement_only_after_terminal_confirmation() -> Resul
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(text.contains("Approve this change?"));
     assert!(text.contains("Requirement updated"));
+    assert!(text.contains("1 user requirement"));
     let obligations = store.obligations(&run.id)?;
     assert_eq!(obligations[1].state, "superseded");
     assert_eq!(obligations[1].superseded_by, Some(2));

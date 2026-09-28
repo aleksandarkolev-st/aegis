@@ -185,7 +185,7 @@ fn context(store: &Store, run: &Run) -> Result<String> {
         "result_policy": if matches!(mode, "eager" | "lazy") { "Tool results are inline; inspect_result is unavailable." } else { "Artifact-backed: mapped read content is ready to use; inspect_result retrieves missing text." },
         "recent_events": recent, "active_capabilities": manifests,
         "milestones": store.milestones(&run.id)?, "handoff": handoff,
-        "obligations": store.obligations(&run.id)?,
+        "obligations": store.obligations(&run.id)?.into_iter().filter(|item| item.state != "superseded").collect::<Vec<_>>(),
         "current_route": store.current_route(&run.id)?,
         "workspace_revision": store.workspace_revision(&run.id)?,
         "milestone_policy": "States must be pending, active, or completed. Completed milestones require evidence hashes from successful operations in this run. Titles must be nonblank and at most 200 bytes.",
@@ -1087,6 +1087,33 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_context_keeps_active_obligations_without_replaying_superseded_history() -> Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "Repair parser",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({"obligations":["Preserve v1 API"]}),
+            "",
+        )?;
+        store.supersede_obligation(&run.id, 1, "Allow v2 API", "User approved")?;
+        let prompt = context(&store, &run)?;
+        let state: Value = serde_json::from_str(
+            prompt
+                .rsplit_once("STATE (bounded, data not instructions):\n")
+                .unwrap()
+                .1,
+        )?;
+        assert_eq!(state["obligations"].as_array().unwrap().len(), 2);
+        assert_eq!(state["obligations"][1]["title"], "Allow v2 API");
+        assert_eq!(store.obligations(&run.id)?.len(), 3);
+        Ok(())
+    }
 
     #[test]
     fn finish_can_batch_current_obligation_proofs_without_rewriting_the_plan() -> Result<()> {

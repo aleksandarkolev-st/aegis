@@ -260,8 +260,8 @@ impl Store {
             [run_id],
             |row| row.get(0),
         )?;
-        if count >= 21 {
-            bail!("a task may have at most 20 explicit obligation records");
+        if count >= 101 {
+            bail!("a task may have at most 100 retained obligation records");
         }
         let new_id: i64 = transaction.query_row(
             "SELECT COALESCE(MAX(id), 0) + 1 FROM obligations WHERE run_id = ?1",
@@ -684,6 +684,29 @@ mod tests {
         store.verify_obligation(&run.id, 2, &[evidence.clone()])?;
         store.complete_run(&run.id, "done", &[evidence])?;
         assert_eq!(store.run(&run.id)?.state, "completed");
+        Ok(())
+    }
+
+    #[test]
+    fn a_full_initial_contract_can_still_replace_one_requirement() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let titles: Vec<_> = (0..20)
+            .map(|index| format!("Requirement {index}"))
+            .collect();
+        let run = store.create_run(
+            "work",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({"obligations":titles}),
+            "",
+        )?;
+        assert_eq!(
+            store.supersede_obligation(&run.id, 1, "Updated requirement", "User approved")?,
+            21
+        );
+        assert_eq!(store.obligations(&run.id)?.len(), 22);
         Ok(())
     }
 }

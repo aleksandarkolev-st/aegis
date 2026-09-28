@@ -2155,12 +2155,21 @@ fn context_view(root: &Path, id: &str, terminal: &Terminal) -> Result<()> {
     }
     let obligations = store.obligations(id)?;
     if obligations.len() > 1 {
+        let active = obligations
+            .iter()
+            .filter(|item| item.id > 0 && item.state != "superseded")
+            .count();
         terminal.message(
             Tone::Accent,
             "Obligations",
             &format!(
-                "{} user requirements · workspace revision {}",
-                obligations.len() - 1,
+                "{} user {} · workspace revision {}",
+                active,
+                if active == 1 {
+                    "requirement"
+                } else {
+                    "requirements"
+                },
                 store.workspace_revision(id)?.unwrap_or(0)
             ),
         )?;
