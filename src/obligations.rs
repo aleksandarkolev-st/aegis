@@ -231,6 +231,16 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let state: String =
+            transaction.query_row("SELECT state FROM runs WHERE id = ?1", [run_id], |row| {
+                row.get(0)
+            })?;
+        if matches!(
+            state.as_str(),
+            "completed" | "answered" | "cancelled" | "failed"
+        ) {
+            bail!("completed tasks cannot change obligations");
+        }
         let current: Option<(String, String)> = transaction
             .query_row(
                 "SELECT title, state FROM obligations WHERE run_id = ?1 AND id = ?2",

@@ -1035,6 +1035,14 @@ impl Store {
         if state != "running" {
             bail!("only a running run can complete");
         }
+        let outstanding: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM obligations WHERE run_id = ?1 AND id > 0 AND state != 'superseded' AND (state != 'verified' OR verified_revision IS NULL OR verified_revision != (SELECT revision FROM workspace_revisions WHERE run_id = ?1))",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if outstanding > 0 {
+            bail!("kernel obligations changed before completion; verify current evidence");
+        }
         if milestones.len() == 1 && milestones[0].title == "Task request" {
             transaction.execute(
                 "UPDATE milestones SET state = 'completed', evidence = ?2 WHERE run_id = ?1",
