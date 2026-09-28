@@ -2220,7 +2220,7 @@ fn chat_state(state: &str) -> &str {
 }
 
 fn relative_age(created: i64) -> String {
-    let seconds = crate::storage::now().saturating_sub(created).max(0) as u64 / 1000;
+    let seconds = crate::storage::now().saturating_sub(created).max(0) as u64;
     match seconds {
         0..=59 => "just now".into(),
         60..=3599 => format!("{}m ago", seconds / 60),
@@ -2607,6 +2607,16 @@ pub fn interactive(root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_chat_ages_use_storage_seconds() {
+        let now = crate::storage::now();
+        assert_eq!(relative_age(now), "just now");
+        assert_eq!(relative_age(now - 120), "2m ago");
+        assert_eq!(relative_age(now - 7200), "2h ago");
+        assert_eq!(relative_age(now - 3 * 86400), "3d ago");
+        assert_eq!(relative_age(now + 60), "just now");
+    }
 
     #[test]
     fn saved_chat_heads_hide_parent_turns_without_merging_new_conversations() -> Result<()> {
