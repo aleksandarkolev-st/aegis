@@ -22,9 +22,14 @@ pub enum Action {
     Checkpoint {
         checkpoint: Checkpoint,
     },
+    VerifyObligations {
+        obligations: Vec<crate::obligations::Proof>,
+    },
     Finish {
         summary: String,
         evidence: Vec<String>,
+        #[serde(default)]
+        obligations: Vec<crate::obligations::Proof>,
     },
     Blocked {
         reason: String,
@@ -61,7 +66,7 @@ pub struct Response {
     pub usage: Option<Usage>,
 }
 
-const SCHEMA: &str = r#"{"type":"object","properties":{"kind":{"type":"string","enum":["search_capabilities","invoke","inspect_result","checkpoint","finish","blocked"]},"query":{"type":"string"},"capability":{"type":"string"},"args":{"type":"string"},"artifact":{"type":"string"},"checkpoint":{"type":"string"},"summary":{"type":"string"},"evidence":{"type":"array","items":{"type":"string"}},"reason":{"type":"string"}},"required":["kind","query","capability","args","artifact","checkpoint","summary","evidence","reason"],"additionalProperties":false}"#;
+const SCHEMA: &str = r#"{"type":"object","properties":{"kind":{"type":"string","enum":["search_capabilities","invoke","inspect_result","checkpoint","verify_obligations","finish","blocked"]},"query":{"type":"string"},"capability":{"type":"string"},"args":{"type":"string"},"artifact":{"type":"string"},"checkpoint":{"type":"string"},"summary":{"type":"string"},"evidence":{"type":"array","items":{"type":"string"}},"obligations":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer"},"evidence":{"type":"array","items":{"type":"string"}}},"required":["id","evidence"],"additionalProperties":false}},"reason":{"type":"string"}},"required":["kind","query","capability","args","artifact","checkpoint","summary","evidence","obligations","reason"],"additionalProperties":false}"#;
 
 pub(crate) fn schema() -> Result<Value> {
     Ok(serde_json::from_str(SCHEMA)?)

@@ -16,6 +16,12 @@ pub struct Obligation {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Proof {
+    pub id: i64,
+    pub evidence: Vec<String>,
+}
+
 fn titles(configuration: &Value) -> Result<Vec<String>> {
     let Some(entries) = configuration.get("obligations") else {
         return Ok(Vec::new());
@@ -148,19 +154,21 @@ pub(crate) fn validate_completion(store: &Store, run_id: &str) -> Result<()> {
 
 impl Store {
     pub fn verify_obligation(&mut self, run_id: &str, id: i64, evidence: &[String]) -> Result<()> {
-        if id <= 0 || evidence.is_empty() || evidence.len() > 20 {
-            bail!("select an explicit obligation and 1..20 evidence artifacts");
+        self.verify_obligations(
+            run_id,
+            &[Proof {
+                id,
+                evidence: evidence.to_vec(),
+            }],
+        )
+    }
+
+    pub fn verify_obligations(&mut self, run_id: &str, proofs: &[Proof]) -> Result<()> {
+        if proofs.is_empty() || proofs.len() > 20 {
+            bail!("verify 1..20 explicit obligations at a time");
         }
         if self.run(run_id)?.state != "running" {
             bail!("only a running task can verify obligations");
-        }
-        let obligation = self
-            .obligations(run_id)?
-            .into_iter()
-            .find(|obligation| obligation.id == id)
-            .context("obligation does not belong to this run")?;
-        if obligation.state == "superseded" {
-            bail!("a superseded obligation cannot be verified");
         }
         let transaction = self
             .connection
@@ -170,29 +178,48 @@ impl Store {
             [run_id],
             |row| row.get(0),
         )?;
-        for hash in evidence {
-            let current: i64 = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM operations AS operation JOIN operation_revisions AS revision ON revision.operation_id = operation.id WHERE operation.run_id = ?1 AND operation.state = 'succeeded' AND revision.revision = ?2 AND (operation.artifact = ?3 OR EXISTS (SELECT 1 FROM operation_artifacts AS linked WHERE linked.operation_id = operation.id AND linked.hash = ?3)))",
-                params![run_id, revision, hash],
-                |row| row.get(0),
-            )?;
-            if current == 0 {
-                bail!("obligation evidence must be successful and current for this run");
+        let mut seen = std::collections::HashSet::new();
+        for proof in proofs {
+            if proof.id <= 0
+                || proof.evidence.is_empty()
+                || proof.evidence.len() > 20
+                || !seen.insert(proof.id)
+            {
+                bail!("select distinct explicit obligations and 1..20 evidence artifacts each");
+            }
+            let state: Option<String> = transaction
+                .query_row(
+                    "SELECT state FROM obligations WHERE run_id = ?1 AND id = ?2",
+                    params![run_id, proof.id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if state.is_none() || state.as_deref() == Some("superseded") {
+                bail!("obligation is unavailable or superseded");
+            }
+            for hash in &proof.evidence {
+                let current: i64 = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM operations AS operation JOIN operation_revisions AS revision ON revision.operation_id = operation.id WHERE operation.run_id = ?1 AND operation.state = 'succeeded' AND revision.revision = ?2 AND (operation.artifact = ?3 OR EXISTS (SELECT 1 FROM operation_artifacts AS linked WHERE linked.operation_id = operation.id AND linked.hash = ?3)))",
+                    params![run_id, revision, hash],
+                    |row| row.get(0),
+                )?;
+                if current == 0 {
+                    bail!("obligation evidence must be successful and current for this run");
+                }
             }
         }
-        let updated = transaction.execute(
-            "UPDATE obligations SET state = 'verified', evidence = ?3, verified_revision = ?4 WHERE run_id = ?1 AND id = ?2 AND state != 'superseded'",
-            params![run_id, id, serde_json::to_string(evidence)?, revision],
-        )?;
-        if updated != 1 {
-            bail!("obligation changed before verification");
+        for proof in proofs {
+            transaction.execute(
+                "UPDATE obligations SET state = 'verified', evidence = ?3, verified_revision = ?4 WHERE run_id = ?1 AND id = ?2",
+                params![run_id, proof.id, serde_json::to_string(&proof.evidence)?, revision],
+            )?;
+            append_event(
+                &transaction,
+                run_id,
+                "obligation.verified",
+                serde_json::json!({"id":proof.id,"evidence":proof.evidence,"revision":revision}),
+            )?;
         }
-        append_event(
-            &transaction,
-            run_id,
-            "obligation.verified",
-            serde_json::json!({"id":id,"evidence":evidence,"revision":revision}),
-        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -403,6 +430,43 @@ mod tests {
         store.verify_obligation(&run.id, 1, &[current_evidence.clone()])?;
         store.complete_run(&run.id, "done", &[current_evidence])?;
         assert_eq!(store.obligations(&run.id)?[1].verified_revision, Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn obligation_proof_batch_rejects_stale_or_foreign_evidence_atomically() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "Repair parser",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({"obligations":["Nested expressions","API compatibility"]}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let operation = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
+        let evidence = store.put_artifact(b"current receipt")?;
+        store.operation_state(&operation, "succeeded", Some(&evidence), json!({}))?;
+        let invalid = [
+            Proof {
+                id: 1,
+                evidence: vec![evidence.clone()],
+            },
+            Proof {
+                id: 2,
+                evidence: vec!["0".repeat(64)],
+            },
+        ];
+        assert!(store.verify_obligations(&run.id, &invalid).is_err());
+        assert!(
+            store
+                .obligations(&run.id)?
+                .iter()
+                .all(|item| item.state == "open")
+        );
+        assert_eq!(store.event_count(&run.id, "obligation.verified")?, 0);
         Ok(())
     }
 }
