@@ -155,16 +155,44 @@ pub fn get(
     )
 }
 
+pub fn refresh(
+    vault: &Vault,
+    provider: Provider,
+    cancelled: impl Fn() -> bool,
+) -> Result<Vec<RemoteModel>> {
+    get_with_policy(
+        vault,
+        provider,
+        &cancelled,
+        false,
+        |credentials, remaining, interrupted| {
+            crate::direct::models(provider, credentials, remaining, interrupted)
+        },
+    )
+}
+
 fn get_with(
     vault: &Vault,
     provider: Provider,
     cancelled: &impl Fn() -> bool,
     fetch: impl FnOnce(&Credentials, Duration, &dyn Fn() -> bool) -> Result<Vec<RemoteModel>>,
 ) -> Result<Vec<RemoteModel>> {
+    get_with_policy(vault, provider, cancelled, true, fetch)
+}
+
+fn get_with_policy(
+    vault: &Vault,
+    provider: Provider,
+    cancelled: &impl Fn() -> bool,
+    use_cache: bool,
+    fetch: impl FnOnce(&Credentials, Duration, &dyn Fn() -> bool) -> Result<Vec<RemoteModel>>,
+) -> Result<Vec<RemoteModel>> {
     let started = Instant::now();
     let interrupted = || cancelled() || started.elapsed() >= TIMEOUT;
-    if let Some(models) = cached(vault, provider, interrupted)? {
-        return Ok(models);
+    if use_cache {
+        if let Some(models) = cached(vault, provider, interrupted)? {
+            return Ok(models);
+        }
     }
     let credentials = crate::oauth::AuthClient::new(provider)?.credentials(vault, interrupted)?;
     let remaining = TIMEOUT.saturating_sub(started.elapsed());
@@ -255,6 +283,23 @@ mod tests {
                 original
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_refresh_replaces_a_fresh_saved_list() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let vault = Vault::new(directory.path().join("auth"));
+        let provider = Provider::Grok;
+        vault.save(&session(provider))?;
+        let first = get_with(&vault, provider, &|| false, |_, _, _| Ok(models()))?;
+        let mut replacement = models();
+        replacement[0].id = "new-advertised-model".into();
+        let refreshed = get_with_policy(&vault, provider, &|| false, false, |_, _, _| {
+            Ok(replacement.clone())
+        })?;
+        assert_ne!(first, refreshed);
+        assert_eq!(cached(&vault, provider, || false)?, Some(refreshed));
         Ok(())
     }
 

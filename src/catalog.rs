@@ -439,7 +439,11 @@ pub fn available(provider: &str, cancelled: impl Fn() -> bool) -> Result<Catalog
         return Ok(catalog);
     }
     let models = crate::provider_catalog::get(&vault, selected, cancelled)?;
-    Ok(Catalog {
+    Ok(owned_models(models))
+}
+
+fn owned_models(models: Vec<RemoteModel>) -> Catalog {
+    Catalog {
         models: models
             .into_iter()
             .map(|model| Model {
@@ -449,7 +453,27 @@ pub fn available(provider: &str, cancelled: impl Fn() -> bool) -> Result<Catalog
             .collect(),
         source: "Aegis account-bound catalog · cached up to 15 minutes · availability can change"
             .into(),
-    })
+    }
+}
+
+pub fn saved_only_for_selection(provider: &str) -> Result<Option<Catalog>> {
+    let Ok(selected) = crate::direct::provider(provider) else {
+        return Ok(None);
+    };
+    let vault = crate::auth_store::Vault::user()?;
+    saved_catalog(&vault, selected, false, || false)
+}
+
+pub fn refresh_for_selection(provider: &str, cancelled: impl Fn() -> bool) -> Result<Catalog> {
+    let selected = crate::direct::provider(provider)?;
+    let vault = crate::auth_store::Vault::user()?;
+    if vault.load(selected.session_name())?.is_none() {
+        return available(provider, cancelled);
+    }
+    match crate::provider_catalog::refresh(&vault, selected, &cancelled) {
+        Ok(models) => Ok(owned_models(models)),
+        Err(error) => saved_selection(&vault, selected, &cancelled, error),
+    }
 }
 
 pub fn for_selection(provider: &str, cancelled: impl Fn() -> bool) -> Result<Catalog> {
@@ -472,10 +496,19 @@ fn saved_selection(
     if cancelled() {
         return Err(error);
     }
+    saved_catalog(vault, provider, true, cancelled)?.ok_or(error)
+}
+
+fn saved_catalog(
+    vault: &crate::auth_store::Vault,
+    provider: crate::direct::Provider,
+    refresh_failed: bool,
+    cancelled: impl Fn() -> bool,
+) -> Result<Option<Catalog>> {
     let Some((models, age)) =
         crate::provider_catalog::saved_for_selection(vault, provider, cancelled)?
     else {
-        return Err(error);
+        return Ok(None);
     };
     let age = match age {
         0..=59 => "just now".into(),
@@ -483,7 +516,7 @@ fn saved_selection(
         3600..=86399 => format!("{}h ago", age / 3600),
         _ => format!("{}d ago", age / 86400),
     };
-    Ok(Catalog {
+    Ok(Some(Catalog {
         models: models
             .into_iter()
             .map(|model| Model {
@@ -492,9 +525,14 @@ fn saved_selection(
             })
             .collect(),
         source: format!(
-            "Saved Aegis model list · {age} · live refresh unavailable; access may have changed"
+            "{} · {age} · access may have changed",
+            if refresh_failed {
+                "Refresh unavailable; showing saved Aegis model list"
+            } else {
+                "Saved Aegis model list"
+            }
         ),
-    })
+    }))
 }
 
 pub fn endpoint_value(value: &Value) -> Result<Vec<Model>> {
@@ -545,6 +583,10 @@ mod tests {
             }],
             || false,
         )?;
+        let immediate = saved_catalog(&vault, provider, false, || false)?
+            .expect("same-account models should be immediately selectable");
+        assert_eq!(immediate.models[0].id, "fixture-model");
+        assert!(immediate.source.starts_with("Saved Aegis model list"));
         let catalog = saved_selection(&vault, provider, || false, anyhow::anyhow!("offline"))?;
         assert_eq!(catalog.models[0].id, "fixture-model");
         assert!(catalog.source.contains("access may have changed"));

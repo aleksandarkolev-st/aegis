@@ -70,6 +70,7 @@ fn load_catalog(
     terminal: &Terminal,
     profile: &Profile,
     secret: Option<&str>,
+    refresh: bool,
 ) -> Result<Option<Result<crate::catalog::Catalog>>> {
     let provider = profile.provider.clone();
     let endpoint = profile.endpoint.clone();
@@ -87,7 +88,11 @@ fn load_catalog(
                         source: "Your endpoint's /models catalog".into(),
                     })
             } else {
-                crate::catalog::for_selection(&provider, interrupted)
+                if refresh {
+                    crate::catalog::refresh_for_selection(&provider, interrupted)
+                } else {
+                    crate::catalog::for_selection(&provider, interrupted)
+                }
             })
         },
     )
@@ -98,85 +103,114 @@ fn choose_model(
     profile: &Profile,
     secret: Option<&str>,
 ) -> Result<Option<Option<String>>> {
-    terminal.message(Tone::Quiet, "Models", "Loading the provider catalog…")?;
-    let Some(catalog) = load_catalog(terminal, profile, secret)? else {
-        return Ok(None);
-    };
-    let models = match catalog {
-        Ok(catalog) => {
-            if terminal.interactive {
-                terminal.message(Tone::Quiet, "", &catalog.source)?;
-            } else {
-                terminal.message(Tone::Quiet, "Catalog", &catalog.source)?;
-            }
-            catalog.models
-        }
-        Err(error) => {
-            terminal.message(
-                Tone::Quiet,
-                "Catalog",
-                &format!(
-                    "{} You can enter an advertised model ID.",
-                    crate::catalog::discovery_error(&error.to_string())
-                ),
-            )?;
-            Vec::new()
-        }
-    };
-    let mut choices = Vec::new();
-    let mut values = Vec::new();
-    for model in models {
-        let current = if profile.model.as_deref() == Some(model.id.as_str()) {
-            " · current"
-        } else {
-            ""
-        };
-        choices.push(if model.label.is_empty() || model.label == model.id {
-            format!("{}{current}", model.id)
-        } else {
-            format!("{} [{}]{current}", model.label, model.id)
-        });
-        values.push(Some(model.id));
-    }
-    if let Some(current) = &profile.model {
-        if !values.iter().any(|value| value.as_ref() == Some(current)) {
-            choices.push(format!("{current} · current (not in catalog)"));
-            values.push(Some(current.clone()));
-        }
-    }
-    let manual = choices.len();
-    choices.push("Enter another model ID…".into());
-    let selected = if choices.len() == 1 {
-        Some(0)
+    let saved = if terminal.interactive && profile.endpoint.is_none() {
+        crate::catalog::saved_only_for_selection(&profile.provider)?
     } else {
-        terminal.select_at(
-            &format!("{} · choose a model", name(&profile.provider)),
-            &choices,
-            values
-                .iter()
-                .position(|model| model == &profile.model)
-                .unwrap_or(0),
-        )?
+        None
     };
-    let Some(selected) = selected else {
-        return Ok(None);
-    };
-    if selected == manual {
-        let Some(id) = field(terminal, "  Model ID › ", false)? else {
+    let mut refresh_available = saved.is_some();
+    let mut catalog = if let Some(catalog) = saved {
+        Ok(catalog)
+    } else {
+        terminal.message(Tone::Quiet, "Models", "Loading the provider catalog…")?;
+        let Some(catalog) = load_catalog(terminal, profile, secret, false)? else {
             return Ok(None);
         };
-        let id = id.trim();
-        if !crate::catalog::valid_id(id) {
-            terminal.message(
-                Tone::Warning,
-                "Model",
-                "Use a nonempty model ID without spaces or control characters (up to 160 bytes).",
-            )?;
-            return Ok(None);
+        catalog
+    };
+    loop {
+        let models = match &catalog {
+            Ok(catalog) => {
+                if terminal.interactive {
+                    terminal.message(Tone::Quiet, "", &catalog.source)?;
+                } else {
+                    terminal.message(Tone::Quiet, "Catalog", &catalog.source)?;
+                }
+                catalog.models.as_slice()
+            }
+            Err(error) => {
+                terminal.message(
+                    Tone::Quiet,
+                    "Catalog",
+                    &format!(
+                        "{} You can enter an advertised model ID.",
+                        crate::catalog::discovery_error(&error.to_string())
+                    ),
+                )?;
+                &[]
+            }
+        };
+        let mut choices = Vec::new();
+        let mut values = Vec::new();
+        for model in models {
+            let current = if profile.model.as_deref() == Some(model.id.as_str()) {
+                " · current"
+            } else {
+                ""
+            };
+            choices.push(if model.label.is_empty() || model.label == model.id {
+                format!("{}{current}", model.id)
+            } else {
+                format!("{} [{}]{current}", model.label, model.id)
+            });
+            values.push(Some(model.id.clone()));
         }
-        return Ok(Some(Some(id.into())));
+        if let Some(current) = &profile.model {
+            if !values.iter().any(|value| value.as_ref() == Some(current)) {
+                choices.push(format!("{current} · current (not in catalog)"));
+                values.push(Some(current.clone()));
+            }
+        }
+        let manual = choices.len();
+        choices.push("Enter another model ID…".into());
+        let refresh = if refresh_available {
+            let index = choices.len();
+            choices.push("Refresh live model list…".into());
+            Some(index)
+        } else {
+            None
+        };
+        let selected = if choices.len() == 1 {
+            Some(0)
+        } else {
+            terminal.select_at(
+                &format!("{} · choose a model", name(&profile.provider)),
+                &choices,
+                values
+                    .iter()
+                    .position(|model| model == &profile.model)
+                    .unwrap_or(0),
+            )?
+        };
+        let Some(selected) = selected else {
+            return Ok(None);
+        };
+        if refresh == Some(selected) {
+            terminal.message(Tone::Quiet, "Models", "Checking the live catalog…")?;
+            let Some(updated) = load_catalog(terminal, profile, secret, true)? else {
+                return Ok(None);
+            };
+            catalog = updated;
+            refresh_available = false;
+            continue;
+        }
+        if selected == manual {
+            let Some(id) = field(terminal, "  Model ID › ", false)? else {
+                return Ok(None);
+            };
+            let id = id.trim();
+            if !crate::catalog::valid_id(id) {
+                terminal.message(
+                    Tone::Warning,
+                    "Model",
+                    "Use a nonempty model ID without spaces or control characters (up to 160 bytes).",
+                )?;
+                return Ok(None);
+            }
+            return Ok(Some(Some(id.into())));
+        }
+        return Ok(Some(values[selected].clone()));
     }
-    Ok(Some(values[selected].clone()))
 }
 
 fn show_selection(terminal: &Terminal, profile: &Profile) -> Result<()> {
@@ -253,7 +287,7 @@ fn choose_reasoning(
             .load(provider.session_name())?
             .is_some()
         {
-            let Some(result) = load_catalog(terminal, profile, None)? else {
+            let Some(result) = load_catalog(terminal, profile, None, true)? else {
                 return Ok(None);
             };
             if let Err(error) = result {
