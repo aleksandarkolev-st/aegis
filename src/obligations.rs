@@ -3,7 +3,7 @@ use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::storage::{Run, Store};
+use crate::storage::{Operation, Run, Store, append_event};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Obligation {
@@ -62,7 +62,141 @@ pub(crate) fn insert(transaction: &Transaction<'_>, run: &Run) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn record_operation(transaction: &Transaction<'_>, operation: &Operation) -> Result<()> {
+    let Some(current) = transaction
+        .query_row(
+            "SELECT revision FROM workspace_revisions WHERE run_id = ?1",
+            [&operation.run_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+    else {
+        return Ok(());
+    };
+    let might_mutate = match operation.capability.as_str() {
+        "workspace.write" | "workspace.patch" => true,
+        "process.run" => {
+            let grants: String = transaction.query_row(
+                "SELECT grants FROM runs WHERE id = ?1",
+                [&operation.run_id],
+                |row| row.get(0),
+            )?;
+            serde_json::from_str::<Vec<String>>(&grants)?
+                .iter()
+                .any(|grant| grant == "workspace.write")
+        }
+        capability if capability.starts_with("mcp.") => {
+            let grants: String = transaction.query_row(
+                "SELECT grants FROM runs WHERE id = ?1",
+                [&operation.run_id],
+                |row| row.get(0),
+            )?;
+            serde_json::from_str::<Vec<String>>(&grants)?
+                .iter()
+                .any(|grant| grant == "workspace.write")
+        }
+        _ => false,
+    };
+    let revision = if might_mutate {
+        current
+            .checked_add(1)
+            .context("workspace revision overflow")?
+    } else {
+        current
+    };
+    if might_mutate {
+        transaction.execute(
+            "UPDATE workspace_revisions SET revision = ?2 WHERE run_id = ?1",
+            params![operation.run_id, revision],
+        )?;
+        transaction.execute(
+            "UPDATE obligations SET state = 'stale' WHERE run_id = ?1 AND state = 'verified'",
+            [&operation.run_id],
+        )?;
+        append_event(
+            transaction,
+            &operation.run_id,
+            "workspace.revision",
+            serde_json::json!({"revision":revision,"operation":operation.id,"capability":operation.capability}),
+        )?;
+    }
+    transaction.execute(
+        "INSERT OR REPLACE INTO operation_revisions(operation_id, run_id, revision) VALUES (?1, ?2, ?3)",
+        params![operation.id, operation.run_id, revision],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn validate_completion(store: &Store, run_id: &str) -> Result<()> {
+    let obligations = store.obligations(run_id)?;
+    if obligations.len() <= 1 {
+        return Ok(());
+    }
+    let revision = store
+        .workspace_revision(run_id)?
+        .context("obligation workspace revision missing")?;
+    if obligations.iter().skip(1).any(|obligation| {
+        obligation.state != "superseded"
+            && (obligation.state != "verified" || obligation.verified_revision != Some(revision))
+    }) {
+        bail!(
+            "kernel obligations remain open or stale; verify them at the current workspace revision before finishing"
+        );
+    }
+    Ok(())
+}
+
 impl Store {
+    pub fn verify_obligation(&mut self, run_id: &str, id: i64, evidence: &[String]) -> Result<()> {
+        if id <= 0 || evidence.is_empty() || evidence.len() > 20 {
+            bail!("select an explicit obligation and 1..20 evidence artifacts");
+        }
+        if self.run(run_id)?.state != "running" {
+            bail!("only a running task can verify obligations");
+        }
+        let obligation = self
+            .obligations(run_id)?
+            .into_iter()
+            .find(|obligation| obligation.id == id)
+            .context("obligation does not belong to this run")?;
+        if obligation.state == "superseded" {
+            bail!("a superseded obligation cannot be verified");
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let revision: i64 = transaction.query_row(
+            "SELECT revision FROM workspace_revisions WHERE run_id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        for hash in evidence {
+            let current: i64 = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM operations AS operation JOIN operation_revisions AS revision ON revision.operation_id = operation.id WHERE operation.run_id = ?1 AND operation.state = 'succeeded' AND revision.revision = ?2 AND (operation.artifact = ?3 OR EXISTS (SELECT 1 FROM operation_artifacts AS linked WHERE linked.operation_id = operation.id AND linked.hash = ?3)))",
+                params![run_id, revision, hash],
+                |row| row.get(0),
+            )?;
+            if current == 0 {
+                bail!("obligation evidence must be successful and current for this run");
+            }
+        }
+        let updated = transaction.execute(
+            "UPDATE obligations SET state = 'verified', evidence = ?3, verified_revision = ?4 WHERE run_id = ?1 AND id = ?2 AND state != 'superseded'",
+            params![run_id, id, serde_json::to_string(evidence)?, revision],
+        )?;
+        if updated != 1 {
+            bail!("obligation changed before verification");
+        }
+        append_event(
+            &transaction,
+            run_id,
+            "obligation.verified",
+            serde_json::json!({"id":id,"evidence":evidence,"revision":revision}),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn obligations(&self, run_id: &str) -> Result<Vec<Obligation>> {
         let mut statement = self.connection.prepare(
             "SELECT id, title, state, evidence, verified_revision, superseded_by, reason FROM obligations WHERE run_id = ?1 ORDER BY id",
@@ -170,6 +304,105 @@ mod tests {
             );
         }
         assert!(store.runs()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn outstanding_obligations_block_finish_even_after_a_rewritten_plan() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "Refactor parser",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({"obligations":["Nested expressions","Public API compatibility"]}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let operation = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
+        let evidence = store.put_artifact(b"fixture evidence")?;
+        store.operation_state(&operation, "succeeded", Some(&evidence), json!({}))?;
+        store.verify_obligation(&run.id, 1, &[evidence.clone()])?;
+        assert!(
+            store
+                .complete_run(&run.id, "done", &[evidence.clone()])
+                .is_err()
+        );
+        assert!(store.answer_run(&run.id, "done without evidence").is_err());
+        store.save_checkpoint(
+            &run.id,
+            &crate::model::Checkpoint {
+                decisions: vec![],
+                unresolved: vec![],
+                next_action: "finish".into(),
+                milestones: vec![crate::model::Milestone {
+                    title: "Implementation compiles".into(),
+                    state: "completed".into(),
+                    evidence: vec![evidence.clone()],
+                }],
+            },
+        )?;
+        assert!(
+            store
+                .complete_run(&run.id, "done", &[evidence.clone()])
+                .is_err()
+        );
+        store.verify_obligation(&run.id, 2, &[evidence.clone()])?;
+        store.complete_run(&run.id, "done", &[evidence])?;
+        assert_eq!(store.run(&run.id)?.state, "completed");
+        assert_eq!(store.obligations(&run.id)?[0].state, "verified");
+        Ok(())
+    }
+
+    #[test]
+    fn committed_workspace_mutation_stales_evidence_and_survives_restart() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "Refactor parser",
+            directory.path(),
+            "codex",
+            json!(["workspace.write"]),
+            json!({"obligations":["Full suite passes"]}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let check = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
+        let old_evidence = store.put_artifact(b"old test result")?;
+        store.operation_state(&check, "succeeded", Some(&old_evidence), json!({}))?;
+        store.verify_obligation(&run.id, 1, &[old_evidence.clone()])?;
+        let edit = store.begin_operation(&run.id, "workspace.write", json!({}), false)?;
+        let edit_evidence = store.put_artifact(b"new file result")?;
+        store.operation_state(&edit, "succeeded", Some(&edit_evidence), json!({}))?;
+        assert_eq!(store.workspace_revision(&run.id)?, Some(1));
+        assert_eq!(store.obligations(&run.id)?[1].state, "stale");
+        assert!(
+            store
+                .verify_obligation(&run.id, 1, &[old_evidence.clone()])
+                .is_err()
+        );
+        assert!(
+            store
+                .complete_run(&run.id, "done", &[edit_evidence.clone()])
+                .is_err()
+        );
+        store.operation_state(&edit, "succeeded", Some(&edit_evidence), json!({}))?;
+        assert_eq!(store.workspace_revision(&run.id)?, Some(1));
+        drop(store);
+        let mut store = Store::open(directory.path())?;
+        assert_eq!(store.obligations(&run.id)?[1].state, "stale");
+        let current_check = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
+        let current_evidence = store.put_artifact(b"current test result")?;
+        store.operation_state(
+            &current_check,
+            "succeeded",
+            Some(&current_evidence),
+            json!({}),
+        )?;
+        store.verify_obligation(&run.id, 1, &[current_evidence.clone()])?;
+        store.complete_run(&run.id, "done", &[current_evidence])?;
+        assert_eq!(store.obligations(&run.id)?[1].verified_revision, Some(1));
         Ok(())
     }
 }

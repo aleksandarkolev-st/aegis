@@ -378,6 +378,17 @@ impl Store {
                 COMMIT;",
             )?;
         }
+        if schema_version < 9 {
+            store.connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS operation_revisions (
+                    operation_id TEXT PRIMARY KEY REFERENCES operations(id),
+                    run_id TEXT NOT NULL REFERENCES runs(id), revision INTEGER NOT NULL
+                );
+                PRAGMA user_version=9;
+                COMMIT;",
+            )?;
+        }
         Ok(store)
     }
 
@@ -918,6 +929,7 @@ impl Store {
                 bail!("completion evidence is not a successful operation artifact: {hash}");
             }
         }
+        crate::obligations::validate_completion(self, run_id)?;
         let milestones = self.milestones(run_id)?;
         if self.run(run_id)?.state != "running" {
             bail!("only a running run can complete");
@@ -961,6 +973,14 @@ impl Store {
             bail!(
                 "a conversational reply cannot replace started or planned tool work; finish with evidence instead"
             );
+        }
+        let explicit: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM obligations WHERE run_id = ?1 AND id > 0",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if explicit > 0 {
+            bail!("a conversational reply cannot bypass kernel-owned obligations");
         }
         transaction.execute("UPDATE runs SET state = 'answered' WHERE id = ?1", [run_id])?;
         append_event(
@@ -1011,6 +1031,19 @@ impl Store {
             .any(|milestone| milestone.state != "completed")
         {
             bail!("all planned milestones must have evidence before completion");
+        }
+        let revision: Option<i64> = transaction
+            .query_row(
+                "SELECT revision FROM workspace_revisions WHERE run_id = ?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(revision) = revision {
+            transaction.execute(
+                "UPDATE obligations SET state = 'verified', evidence = ?2, verified_revision = ?3 WHERE run_id = ?1 AND id = 0",
+                params![run_id, serde_json::to_string(evidence)?, revision],
+            )?;
         }
         transaction.execute(
             "UPDATE runs SET state = 'completed' WHERE id = ?1",
@@ -1134,10 +1167,18 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous: String = transaction.query_row(
+            "SELECT state FROM operations WHERE id = ?1 AND run_id = ?2",
+            params![operation.id, operation.run_id],
+            |row| row.get(0),
+        )?;
         transaction.execute(
             "UPDATE operations SET state = ?2, artifact = COALESCE(?3, artifact) WHERE id = ?1",
             params![operation.id, state, artifact],
         )?;
+        if state == "succeeded" && previous != "succeeded" {
+            crate::obligations::record_operation(&transaction, operation)?;
+        }
         append_event(
             &transaction,
             &operation.run_id,
