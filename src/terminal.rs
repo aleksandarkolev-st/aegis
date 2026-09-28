@@ -717,8 +717,8 @@ impl Terminal {
                 })
                 .collect();
             let (visible, caret_width) = input_view(&displayed, caret, available);
-            if composer {
-                let buffer = crate::widgets::composer(
+            let input_column = if composer {
+                let (buffer, origin) = crate::widgets::composer(
                     &draft_label,
                     &visible,
                     &self.input_status.borrow(),
@@ -733,6 +733,7 @@ impl Terminal {
                     }
                 }
                 queue!(io::stdout(), cursor::MoveUp(1), ResetColor)?;
+                origin as usize
             } else {
                 queue!(
                     io::stdout(),
@@ -745,10 +746,11 @@ impl Terminal {
                 write!(io::stdout(), "{label}")?;
                 queue!(io::stdout(), ResetColor)?;
                 write!(io::stdout(), "{visible}")?;
-            }
+                label.width()
+            };
             queue!(
                 io::stdout(),
-                cursor::MoveToColumn((label.width() + caret_width) as u16)
+                cursor::MoveToColumn((input_column + caret_width) as u16)
             )?;
             io::stdout().flush()?;
             match event::read()? {

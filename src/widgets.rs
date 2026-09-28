@@ -103,7 +103,13 @@ pub fn home(
     buffer
 }
 
-pub fn composer(prefix: &str, text: &str, status: &str, width: u16, palette: &Palette) -> Buffer {
+pub fn composer(
+    prefix: &str,
+    text: &str,
+    status: &str,
+    width: u16,
+    palette: &Palette,
+) -> (Buffer, u16) {
     let area = Rect::new(0, 0, width, 3);
     let mut buffer = Buffer::empty(area);
     let border = Block::bordered()
@@ -137,7 +143,7 @@ pub fn composer(prefix: &str, text: &str, status: &str, width: u16, palette: &Pa
         ),
         &mut buffer,
     );
-    buffer
+    (buffer, inner.x + offset)
 }
 
 pub fn menu(
@@ -234,9 +240,24 @@ mod tests {
         assert!(buffer[(2, 2)].modifier.contains(Modifier::REVERSED));
         assert!((0..buffer.area.height).all(|row| row_text(&buffer, row).width() == 40));
         for width in [16, 40, 76, 96] {
-            let buffer = composer("› ", "日本語 🦊", "model · low", width, &palette);
+            let (buffer, input_column) =
+                composer("› ", "日本語 🦊", "model · low", width, &palette);
             assert_eq!(buffer.area.height, 3);
             assert!((0..3).all(|row| row_text(&buffer, row).width() == width as usize));
+            assert_eq!(input_column, 4);
         }
+    }
+
+    #[test]
+    fn composer_reports_the_rendered_input_column() {
+        let palette = Palette::default();
+        for prefix in ["› ", "日本語 ", "🦊 "] {
+            let (buffer, input_column) = composer(prefix, "x", "model · low", 80, &palette);
+            assert_eq!(buffer[(input_column, 1)].symbol(), "x");
+            assert_eq!(input_column as usize, 2 + prefix.width());
+        }
+        let (buffer, input_column) = composer("› ", &"x".repeat(300), "model · low", 80, &palette);
+        assert_eq!(buffer[(input_column, 1)].symbol(), "x");
+        assert_eq!(row_text(&buffer, 1).width(), 80);
     }
 }
