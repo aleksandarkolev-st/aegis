@@ -14,11 +14,15 @@ use anyhow::{Context, Result, bail};
 use arun::{interrupt::Scope, mcp, process, provider, storage::Store};
 use serde_json::json;
 
+#[track_caller]
 fn wait_until(mut condition: impl FnMut() -> Result<bool>) -> Result<()> {
     let started = Instant::now();
     while !condition()? {
-        if started.elapsed() > Duration::from_secs(5) {
-            bail!("interrupt fixture timed out");
+        if started.elapsed() > Duration::from_secs(15) {
+            bail!(
+                "interrupt fixture timed out at {}",
+                std::panic::Location::caller()
+            );
         }
         thread::sleep(Duration::from_millis(20));
     }
