@@ -256,7 +256,7 @@ fn context(store: &Store, run: &Run) -> Result<String> {
     let discovery = if mode == "eager" {
         "All granted capability schemas are available; invoke directly."
     } else {
-        "Search before invoking; only active capability schemas may be invoked."
+        "Search before invoking a capability that is not active. Active capability schemas are ready to invoke; do not search again for an active capability."
     };
     let acceptance_guidance = if crate::acceptance::Check::from_run(run)?.is_some() {
         "A configured independent acceptance check runs automatically after finish; it is not a capability to invoke. Once the requested work and tests are done, finish with existing successful-operation evidence instead of repeating verified actions. If acceptance fails, the runtime returns feedback for correction."
@@ -1925,6 +1925,7 @@ mod tests {
         let initial = context(&store, &run)?;
         assert!(initial.contains("States must be pending, active, or completed"));
         assert!(initial.contains("Completed milestones require evidence hashes"));
+        assert!(initial.contains("do not search again for an active capability"));
         assert!(!initial.contains("A configured independent acceptance check runs"));
         assert!(!initial.contains("Write exact UTF-8"));
         store.activate(&run.id, "workspace.read", 1)?;
