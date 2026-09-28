@@ -196,9 +196,15 @@ pub fn friendly_error(error: &str) -> String {
         return "This model isn't available for your account. Press F6 to choose another model."
             .into();
     }
-    if ["timed out", "timeout", "deadline"]
-        .iter()
-        .any(|needle| lower.contains(needle))
+    if [
+        "timed out",
+        "timeout",
+        "deadline elapsed",
+        "deadline exceeded",
+        "deadline reached",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
     {
         return "The operation exceeded its time limit. Your task is saved; review its outcome in F3 before continuing.".into();
     }
@@ -1421,6 +1427,11 @@ mod tests {
             friendly_error("file not found: src/main.rs"),
             "file not found: src/main.rs"
         );
+        assert_eq!(
+            friendly_error("Task and command deadlines are enforced."),
+            "Task and command deadlines are enforced."
+        );
+        assert!(friendly_error("Model request deadline elapsed").contains("time limit"));
         assert!(friendly_error(&"failure ".repeat(100)).width() <= 240);
     }
 
