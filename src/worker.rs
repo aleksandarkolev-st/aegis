@@ -382,9 +382,16 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
             }
             fs::create_dir_all(path.parent().context("write parent missing")?)?;
             fs::write(&path, content)?;
-            Ok(
-                json!({"path": path.strip_prefix(workspace)?.to_string_lossy(), "bytes": content.len()}),
-            )
+            let written = fs::read(&path)?;
+            if written != content.as_bytes() {
+                bail!("written file did not match its immediate read-back");
+            }
+            use sha2::Digest;
+            let mut result = json!({"path":path.strip_prefix(workspace)?.to_string_lossy(),"bytes":written.len(),"sha256":hex::encode(sha2::Sha256::digest(&written))});
+            if content.chars().take(1025).count() <= 1024 {
+                result["content"] = json!(content);
+            }
+            Ok(result)
         }
         "process.run" => {
             let program = string(args, "program")?;
@@ -550,7 +557,29 @@ mod tests {
             store.operation_state(&operation, "dispatched", None, json!({}))?;
             let result = execute(&root, &operation.id)?;
             assert_eq!(result["bytes"], 5);
+            assert_eq!(result["content"], "hello");
+            use sha2::Digest;
+            assert_eq!(
+                result["sha256"],
+                hex::encode(sha2::Sha256::digest(b"hello"))
+            );
             assert_eq!(fs::read_to_string(directory.path().join(path))?, "hello");
+            let large_path = format!("src/{}/nested/large.txt", run.id);
+            let large_content = "x".repeat(1025);
+            let large = store.begin_operation(
+                &run.id,
+                "workspace.write",
+                json!({"path":large_path,"content":large_content}),
+                false,
+            )?;
+            store.operation_state(&large, "dispatched", None, json!({}))?;
+            let result = execute(&root, &large.id)?;
+            assert!(result["content"].is_null());
+            assert_eq!(result["bytes"], 1025);
+            assert_eq!(
+                result["sha256"],
+                hex::encode(sha2::Sha256::digest(large_content.as_bytes()))
+            );
         }
         assert!(relative(directory.path(), ".git/new/file.txt").is_err());
         assert!(!directory.path().join(".git").exists());

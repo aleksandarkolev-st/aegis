@@ -47,7 +47,7 @@ pub fn registry() -> Vec<Manifest> {
         Manifest {
             id: "workspace.write".into(),
             version: 1,
-            purpose: "Write exact UTF-8 content to a workspace file".into(),
+            purpose: "Write exact UTF-8 content to a workspace file; return immediate read-back SHA256 and complete small text".into(),
             permission: "workspace.write".into(),
             side_effect: "workspace".into(),
             cost: 4,
