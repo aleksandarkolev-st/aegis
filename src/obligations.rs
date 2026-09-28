@@ -180,6 +180,20 @@ pub(crate) fn validate_completion(store: &Store, run_id: &str) -> Result<()> {
     let revision = store
         .workspace_revision(run_id)?
         .context("obligation workspace revision missing")?;
+    for obligation in obligations
+        .iter()
+        .skip(1)
+        .filter(|item| item.state == "superseded")
+    {
+        let replacement = obligation
+            .superseded_by
+            .and_then(|id| obligations.iter().find(|item| item.id == id));
+        if obligation.reason.as_deref().is_none_or(str::is_empty)
+            || replacement.is_none_or(|item| item.id <= obligation.id)
+        {
+            bail!("superseded obligation lacks a valid replacement and reason");
+        }
+    }
     if obligations.iter().skip(1).any(|obligation| {
         obligation.state != "superseded"
             && (obligation.state != "verified" || obligation.verified_revision != Some(revision))
@@ -192,6 +206,86 @@ pub(crate) fn validate_completion(store: &Store, run_id: &str) -> Result<()> {
 }
 
 impl Store {
+    pub fn supersede_obligation(
+        &mut self,
+        run_id: &str,
+        id: i64,
+        replacement: &str,
+        reason: &str,
+    ) -> Result<i64> {
+        let replacement = replacement.trim();
+        let reason = reason.trim();
+        if id <= 0
+            || replacement.is_empty()
+            || replacement.len() > 200
+            || crate::text::clean(replacement) != replacement
+            || reason.is_empty()
+            || reason.len() > 500
+            || crate::text::clean(reason) != reason
+        {
+            bail!("supersession requires a safe replacement and explicit reason");
+        }
+        if self.run(run_id)?.is_terminal() {
+            bail!("completed tasks cannot change obligations");
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT title, state FROM obligations WHERE run_id = ?1 AND id = ?2",
+                params![run_id, id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((old_title, state)) = current else {
+            bail!("explicit obligation not found");
+        };
+        if state == "superseded" {
+            bail!("obligation is already superseded");
+        }
+        if old_title == replacement {
+            bail!("replacement must change the obligation");
+        }
+        let duplicate: i64 = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM obligations WHERE run_id = ?1 AND title = ?2)",
+            params![run_id, replacement],
+            |row| row.get(0),
+        )?;
+        if duplicate != 0 {
+            bail!("replacement obligation already exists");
+        }
+        let count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM obligations WHERE run_id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if count >= 21 {
+            bail!("a task may have at most 20 explicit obligation records");
+        }
+        let new_id: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(id), 0) + 1 FROM obligations WHERE run_id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO obligations(run_id, id, title, state, evidence) VALUES (?1, ?2, ?3, 'open', '[]')",
+            params![run_id, new_id, replacement],
+        )?;
+        transaction.execute(
+            "UPDATE obligations SET state = 'superseded', superseded_by = ?3, reason = ?4 WHERE run_id = ?1 AND id = ?2",
+            params![run_id, id, new_id, reason],
+        )?;
+        append_event(
+            &transaction,
+            run_id,
+            "obligation.superseded",
+            serde_json::json!({"id":id,"replacement_id":new_id,"old_title":old_title,"title":replacement,"reason":reason}),
+        )?;
+        transaction.commit()?;
+        Ok(new_id)
+    }
+
     pub fn verify_obligation(&mut self, run_id: &str, id: i64, evidence: &[String]) -> Result<()> {
         self.verify_obligations(
             run_id,
@@ -526,6 +620,70 @@ mod tests {
                 .all(|item| item.state == "open")
         );
         assert_eq!(store.event_count(&run.id, "obligation.verified")?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn approved_supersession_retains_predecessor_and_opens_replacement() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "Refactor parser",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({"obligations":["Preserve public API"]}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let operation = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
+        let evidence = store.put_artifact(b"api compatibility proof")?;
+        store.operation_state(&operation, "succeeded", Some(&evidence), json!({}))?;
+        store.verify_obligation(&run.id, 1, &[evidence.clone()])?;
+        assert!(
+            store
+                .supersede_obligation(&run.id, 1, "Allow v2 API", "")
+                .is_err()
+        );
+        assert!(
+            store
+                .supersede_obligation(&run.id, 0, "Change task", "user approved")
+                .is_err()
+        );
+        assert_eq!(store.obligations(&run.id)?.len(), 2);
+        let replacement = store.supersede_obligation(
+            &run.id,
+            1,
+            "Allow v2 API",
+            "User approved a breaking API change",
+        )?;
+        assert_eq!(replacement, 2);
+        let ledger = store.obligations(&run.id)?;
+        assert_eq!(ledger[1].state, "superseded");
+        assert_eq!(ledger[1].evidence, vec![evidence.clone()]);
+        assert_eq!(ledger[1].superseded_by, Some(2));
+        assert_eq!(
+            ledger[1].reason.as_deref(),
+            Some("User approved a breaking API change")
+        );
+        assert_eq!(ledger[2].state, "open");
+        assert!(
+            store
+                .complete_run(&run.id, "done", &[evidence.clone()])
+                .is_err()
+        );
+        assert!(
+            store
+                .supersede_obligation(&run.id, 1, "Again", "user approved")
+                .is_err()
+        );
+        assert_eq!(store.event_count(&run.id, "obligation.superseded")?, 1);
+        drop(store);
+        let mut store = Store::open(directory.path())?;
+        assert_eq!(store.obligations(&run.id)?, ledger);
+        store.verify_obligation(&run.id, 2, &[evidence.clone()])?;
+        store.complete_run(&run.id, "done", &[evidence])?;
+        assert_eq!(store.run(&run.id)?.state, "completed");
         Ok(())
     }
 }

@@ -2060,11 +2060,20 @@ fn context_view(root: &Path, id: &str, terminal: &Terminal) -> Result<()> {
                     Tone::Warning
                 },
                 &format!("O{} · {}", obligation.id, obligation.state),
-                &format!(
-                    "{} · {} evidence",
-                    obligation.title,
-                    obligation.evidence.len()
-                ),
+                &if let Some(replacement) = obligation.superseded_by {
+                    format!(
+                        "{} → O{} · {}",
+                        obligation.title,
+                        replacement,
+                        obligation.reason.as_deref().unwrap_or("no reason recorded")
+                    )
+                } else {
+                    format!(
+                        "{} · {} evidence",
+                        obligation.title,
+                        obligation.evidence.len()
+                    )
+                },
             )?;
         }
     }
@@ -2233,6 +2242,7 @@ fn chat_details(
         "View context and handoff",
         "View active tools",
         "Review interrupted operations",
+        "Replace a requirement",
         "Back",
     ]
     .map(str::to_owned);
@@ -2246,7 +2256,83 @@ fn chat_details(
         Some(2) => context_view(root, &run.id, terminal)?,
         Some(3) => tools_view(root, &run.id, terminal)?,
         Some(4) => review_operations(root, &run.id, terminal)?,
+        Some(5) => supersede_obligation(root, run, terminal)?,
         _ => {}
+    }
+    Ok(())
+}
+
+fn supersede_obligation(
+    root: &Path,
+    run: &crate::storage::Run,
+    terminal: &mut Terminal,
+) -> Result<()> {
+    if run.is_terminal() {
+        terminal.message(
+            Tone::Warning,
+            "Requirements",
+            "This task has ended; its contract cannot change.",
+        )?;
+        return Ok(());
+    }
+    let mut store = Store::open(root)?;
+    let obligations: Vec<_> = store
+        .obligations(&run.id)?
+        .into_iter()
+        .filter(|item| item.id > 0 && item.state != "superseded")
+        .collect();
+    if obligations.is_empty() {
+        terminal.message(
+            Tone::Quiet,
+            "Requirements",
+            "No explicit requirements to replace.",
+        )?;
+        return Ok(());
+    }
+    let mut choices: Vec<_> = obligations
+        .iter()
+        .map(|item| format!("O{} · {}", item.id, item.title))
+        .collect();
+    choices.push("Back".into());
+    let Some(index) = terminal.select("Replace a requirement", &choices)? else {
+        return Ok(());
+    };
+    let Some(old) = obligations.get(index) else {
+        return Ok(());
+    };
+    let Some(replacement) = field(terminal, "Replacement requirement", false)? else {
+        return Ok(());
+    };
+    let Some(reason) = field(terminal, "Why are you changing the task contract?", false)? else {
+        return Ok(());
+    };
+    let confirmation = [
+        format!("Keep O{} unchanged", old.id),
+        format!(
+            "Approve replacement · {}",
+            crate::terminal::fit(&replacement, 80)
+        ),
+    ];
+    terminal.message(
+        Tone::Warning,
+        "Contract change",
+        &format!(
+            "O{}: {} → {}\nReason: {}",
+            old.id, old.title, replacement, reason
+        ),
+    )?;
+    if terminal.select("Approve this change?", &confirmation)? != Some(1) {
+        return Ok(());
+    }
+    match store.supersede_obligation(&run.id, old.id, &replacement, &reason) {
+        Ok(new_id) => terminal.message(
+            Tone::Success,
+            "Requirement updated",
+            &format!("O{} retained; O{} is now open.", old.id, new_id),
+        )?,
+        Err(error) => {
+            terminal.message(Tone::Warning, "Requirement unchanged", &error.to_string())?
+        }
     }
     Ok(())
 }
