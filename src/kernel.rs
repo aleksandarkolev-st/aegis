@@ -1530,7 +1530,7 @@ mod tests {
             store.event(
                 &run.id,
                 "run.completed",
-                json!({"summary":"x".repeat(10_000), "evidence":["not-current-evidence"]}),
+                json!({"summary":format!("unrelated reply {index}: {}", "x".repeat(10_000)), "evidence":["not-current-evidence"]}),
             )?;
             previous = Some(run.id);
         }
@@ -1543,10 +1543,11 @@ mod tests {
             "",
         )?;
         let history = conversation(&store, &run)?;
-        assert_eq!(history.len(), 4);
-        assert_eq!(history[0]["task"], "task 3");
-        assert_eq!(history[3]["summary"].as_str().unwrap().len(), 1200);
-        assert_eq!(history[3]["summary_clipped"], true);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["task"], "task 6");
+        assert_eq!(history[0]["summary"].as_str().unwrap().len(), 1200);
+        assert_eq!(history[0]["summary_clipped"], true);
+        assert!(!serde_json::to_string(&history)?.contains("unrelated reply 5"));
         assert!(!serde_json::to_string(&history)?.contains("not-current-evidence"));
         assert!(context(&store, &run)?.contains("Previous task summaries are bounded context"));
         run.workspace = directory.path().join("other").display().to_string();
