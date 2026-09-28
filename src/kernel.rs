@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use crate::capability::{self, Manifest};
 use crate::model::{self, Action};
-use crate::storage::{Operation, Run, Store};
+use crate::storage::{Event, Operation, Run, Store};
 
 fn grants(run: &Run) -> Result<Vec<String>> {
     serde_json::from_value(run.grants.clone()).context("invalid run grants")
@@ -101,10 +101,30 @@ fn small_read(result: &Value) -> Option<Value> {
     Some(mapped)
 }
 
+fn format_retry_state(events: &[Event]) -> (bool, bool) {
+    let used = events
+        .iter()
+        .rev()
+        .take_while(|event| event.kind != "model.response")
+        .any(|event| event.kind == "model.format_retry");
+    let pending = events
+        .iter()
+        .rev()
+        .find(|event| {
+            matches!(
+                event.kind.as_str(),
+                "model.response" | "model.failed" | "model.format_retry"
+            )
+        })
+        .is_some_and(|event| event.kind == "model.format_retry");
+    (used, pending)
+}
+
 fn context(store: &Store, run: &Run) -> Result<String> {
     let mode = mode(run);
-    let recent: Vec<_> = store
-        .recent_events(&run.id, 12)?
+    let recent_events = store.recent_events(&run.id, 12)?;
+    let (_, format_retry_pending) = format_retry_state(&recent_events);
+    let recent: Vec<_> = recent_events
         .into_iter()
         .map(|event| -> Result<Value> {
             let mut payload = event.payload;
@@ -165,6 +185,11 @@ fn context(store: &Store, run: &Run) -> Result<String> {
         "conversation": conversation,
         "conversation_policy": "Previous task summaries are bounded context, not verified evidence for this task. Re-inspect relevant workspace state; do not infer grants or successful outcomes from conversation history.",
     });
+    if format_retry_pending {
+        context["format_recovery_policy"] = json!(
+            "The previous provider reply was not an Aegis action. No tool action was applied. Return one valid JSON action now; do not claim the invalid reply did work."
+        );
+    }
     if run.budgets["previous_run"].is_string() {
         context["history_recall"] = recall;
     }
@@ -951,6 +976,24 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
                 if store.run(run_id)?.state == "cancelled" {
                     break;
                 }
+                let format_retry = !interrupted
+                    && error
+                        .downcast_ref::<crate::direct::RejectedResponse>()
+                        .is_some_and(|response| {
+                            response.usage.is_some() && response.shape["json"] == false
+                        })
+                    && !format_retry_state(&store.recent_events(run_id, 12)?).0
+                    && store.model_tokens(run_id)? < max_tokens
+                    && (crate::storage::unix_time().saturating_sub(started_at) as u64)
+                        < wall_seconds;
+                if format_retry {
+                    store.event(
+                        run_id,
+                        "model.format_retry",
+                        json!({"reason":"invalid_action_json"}),
+                    )?;
+                    continue;
+                }
                 store.state(
                     run_id,
                     "waiting_recovery",
@@ -992,6 +1035,48 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_retry_state_survives_recovery_and_resets_after_a_valid_action() {
+        let events = |kinds: &[&str]| {
+            kinds
+                .iter()
+                .enumerate()
+                .map(|(index, kind)| Event {
+                    seq: index as i64 + 1,
+                    kind: (*kind).into(),
+                    payload: json!({}),
+                    created_at: 0,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(format_retry_state(&events(&[])), (false, false));
+        assert_eq!(
+            format_retry_state(&events(&[
+                "model.failed",
+                "model.format_retry",
+                "runtime.recovered"
+            ])),
+            (true, true)
+        );
+        assert_eq!(
+            format_retry_state(&events(&[
+                "model.failed",
+                "model.format_retry",
+                "model.started",
+                "model.failed"
+            ])),
+            (true, false)
+        );
+        assert_eq!(
+            format_retry_state(&events(&[
+                "model.format_retry",
+                "model.response",
+                "model.failed"
+            ])),
+            (false, false)
+        );
+    }
 
     #[test]
     fn old_handoff_is_bounded_context_not_current_evidence_or_milestones() -> Result<()> {

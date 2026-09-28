@@ -1144,6 +1144,11 @@ impl Terminal {
                 "!",
                 &friendly_error(payload["error"].as_str().unwrap_or("Action failed")),
             ),
+            "model.format_retry" => self.message(
+                Tone::Quiet,
+                "Retry",
+                "Invalid model reply; asking once more without applying an action.",
+            ),
             "operation.cancelled" => self.message(
                 Tone::Warning,
                 "Interrupted",
