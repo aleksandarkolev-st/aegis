@@ -12,6 +12,7 @@ use serde_json::json;
 use crate::{
     endpoint::{Endpoint, ResponseFormat},
     kernel, provider,
+    selection::{Selection, SelectionStore},
     storage::Store,
     terminal::{Input, RawMode, Terminal, Tone},
     trace,
@@ -204,6 +205,7 @@ fn switch_provider(
         profile.endpoint = selected.endpoint;
         *secret = key;
         save(root, profile)?;
+        remember_selection(terminal, profile)?;
         show_selection(terminal, profile)?;
         terminal.message(Tone::Quiet, "Settings kept", "Workspace permissions, budgets and saved tasks are unchanged. This selection applies to new tasks; saved tasks retain their original provider.")?;
     }
@@ -230,6 +232,7 @@ fn switch_model(
         }
         *profile = candidate;
         save(root, profile)?;
+        remember_selection(terminal, profile)?;
         show_selection(terminal, profile)?;
         terminal.message(
             Tone::Quiet,
@@ -321,9 +324,34 @@ fn switch_reasoning(root: &Path, terminal: &Terminal, profile: &mut Profile) -> 
     if let Some(effort) = choose_reasoning(terminal, profile)? {
         profile.reasoning_effort = effort;
         save(root, profile)?;
+        remember_selection(terminal, profile)?;
         show_selection(terminal, profile)?;
     }
     Ok(())
+}
+
+fn blank_profile(provider: String) -> Profile {
+    Profile {
+        provider,
+        model: None,
+        reasoning_effort: None,
+        endpoint: None,
+        write: false,
+        image: None,
+        limits: crate::budget::Limits::default(),
+        acceptance_check: None,
+        command_scopes: None,
+        filesystem_scopes: None,
+        network_scopes: None,
+        previous_run: None,
+    }
+}
+
+fn profile_from_selection(selection: Selection) -> Profile {
+    let mut profile = blank_profile(selection.provider);
+    profile.model = Some(selection.model);
+    profile.reasoning_effort = selection.reasoning_effort;
+    profile
 }
 
 fn configure_provider(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
@@ -338,20 +366,7 @@ fn configure_provider(terminal: &Terminal) -> Result<Option<(Profile, Option<Str
         return Ok(None);
     };
     let provider = ["codex", "claude", "grok", "custom"][choice].to_owned();
-    let mut profile = Profile {
-        provider,
-        model: None,
-        reasoning_effort: None,
-        endpoint: None,
-        write: false,
-        image: None,
-        limits: crate::budget::Limits::default(),
-        acceptance_check: None,
-        command_scopes: None,
-        filesystem_scopes: None,
-        network_scopes: None,
-        previous_run: None,
-    };
+    let mut profile = blank_profile(provider);
     let mut secret = None;
     if profile.provider == "custom" {
         let Some(url) = field(terminal, "  Endpoint URL › ", false)? else {
@@ -403,7 +418,52 @@ fn configure_provider(terminal: &Terminal) -> Result<Option<(Profile, Option<Str
 }
 
 fn configure(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
-    let Some((mut profile, secret)) = configure_provider(terminal)? else {
+    let saved = if terminal.interactive {
+        match SelectionStore::user().and_then(|store| store.load()) {
+            Ok(selection) => selection,
+            Err(_) => {
+                terminal.message(
+                    Tone::Quiet,
+                    "Preferences",
+                    "Saved account shortcut is unavailable; choose a provider instead.",
+                )?;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let selected = if let Some(selection) = saved {
+        let choices = [
+            format!(
+                "Use saved {} · {} · reasoning {}",
+                name(&selection.provider),
+                selection.model,
+                selection
+                    .reasoning_effort
+                    .as_deref()
+                    .unwrap_or("provider default")
+            ),
+            "Choose another provider".into(),
+        ];
+        match terminal.select(
+            "Quick start · workspace permissions are reviewed next",
+            &choices,
+        )? {
+            Some(0) => {
+                let profile = profile_from_selection(selection);
+                if !ensure_provider(terminal, &profile.provider)? {
+                    return Ok(None);
+                }
+                Some((profile, None))
+            }
+            Some(1) => configure_provider(terminal)?,
+            _ => return Ok(None),
+        }
+    } else {
+        configure_provider(terminal)?
+    };
+    let Some((mut profile, secret)) = selected else {
         return Ok(None);
     };
     if !configure_environment(terminal, &mut profile)? {
@@ -1355,6 +1415,34 @@ fn save(root: &Path, profile: &Profile) -> Result<()> {
     Ok(())
 }
 
+fn remember_selection(terminal: &Terminal, profile: &Profile) -> Result<()> {
+    if !terminal.interactive {
+        return Ok(());
+    }
+    let Some(model) = &profile.model else {
+        return Ok(());
+    };
+    let selection = Selection {
+        provider: profile.provider.clone(),
+        model: model.clone(),
+        reasoning_effort: profile.reasoning_effort.clone(),
+    };
+    if selection.validate().is_err() {
+        return Ok(());
+    }
+    if SelectionStore::user()
+        .and_then(|store| store.save(&selection))
+        .is_err()
+    {
+        terminal.message(
+            Tone::Quiet,
+            "Preferences",
+            "This account/model shortcut could not be saved. Workspace settings are unchanged.",
+        )?;
+    }
+    Ok(())
+}
+
 fn secret_reference(profile: &Profile) -> Option<&str> {
     profile
         .endpoint
@@ -2287,7 +2375,7 @@ pub fn interactive(root: &Path) -> Result<()> {
         Some(profile) => (profile, None),
         None => {
             terminal.welcome(
-                "Choose a provider to get started",
+                "Set up this workspace",
                 &std::env::current_dir()?.display().to_string(),
             )?;
             let Some(configured) = configure(&terminal)? else {
@@ -2297,6 +2385,7 @@ pub fn interactive(root: &Path) -> Result<()> {
             configured
         }
     };
+    remember_selection(&terminal, &profile)?;
     if secret_reference(&profile).is_some() && secret.is_none() {
         secret = field(&terminal, "  API key for this session (hidden) › ", true)?;
     }
@@ -2591,5 +2680,24 @@ mod tests {
             "claude"
         );
         Ok(())
+    }
+
+    #[test]
+    fn saved_account_shortcut_never_imports_workspace_permissions() {
+        let profile = profile_from_selection(Selection {
+            provider: "codex".into(),
+            model: "advertised-model".into(),
+            reasoning_effort: Some("low".into()),
+        });
+        assert_eq!(profile.model.as_deref(), Some("advertised-model"));
+        assert_eq!(profile.reasoning_effort.as_deref(), Some("low"));
+        assert!(!profile.write);
+        assert!(profile.image.is_none());
+        assert!(profile.endpoint.is_none());
+        assert!(profile.acceptance_check.is_none());
+        assert!(profile.command_scopes.is_none());
+        assert!(profile.filesystem_scopes.is_none());
+        assert!(profile.network_scopes.is_none());
+        assert!(profile.previous_run.is_none());
     }
 }

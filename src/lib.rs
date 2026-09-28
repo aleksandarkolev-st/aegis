@@ -29,6 +29,7 @@ pub mod read_batch;
 pub mod recall;
 pub mod repository_rules;
 pub mod restart;
+mod selection;
 pub mod session;
 pub mod signin;
 pub mod storage;
