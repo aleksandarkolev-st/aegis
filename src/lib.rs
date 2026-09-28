@@ -20,6 +20,7 @@ pub mod mcp;
 pub mod model;
 pub mod network;
 pub mod oauth;
+pub mod obligations;
 pub mod patch;
 pub mod policy;
 pub mod process;

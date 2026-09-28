@@ -173,6 +173,7 @@ pub(crate) fn insert_run(transaction: &Transaction<'_>, run: &Run) -> Result<()>
         "INSERT INTO milestones VALUES (?1, 0, 'Task request', 'active', '[]')",
         [&run.id],
     )?;
+    crate::obligations::insert(transaction, run)?;
     crate::habits::record(transaction, run)?;
     Ok(())
 }
@@ -360,6 +361,22 @@ impl Store {
         };
         if schema_version < 7 {
             store.migrate_failed_model_usage()?;
+        }
+        if schema_version < 8 {
+            store.connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS workspace_revisions (
+                    run_id TEXT PRIMARY KEY REFERENCES runs(id), revision INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS obligations (
+                    run_id TEXT NOT NULL REFERENCES runs(id), id INTEGER NOT NULL,
+                    title TEXT NOT NULL, state TEXT NOT NULL, evidence TEXT NOT NULL,
+                    verified_revision INTEGER, superseded_by INTEGER, reason TEXT,
+                    PRIMARY KEY(run_id, id)
+                );
+                PRAGMA user_version=8;
+                COMMIT;",
+            )?;
         }
         Ok(store)
     }
