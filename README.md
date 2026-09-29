@@ -13,8 +13,8 @@ ChatGPT/Grok sign-in now offers browser approval with a protected local callback
 The scrollback interface has an animated activity line, elapsed time and token counts, editable input with history, and these shortcuts:
 
 - F2: choose a provider without resetting workspace access.
-- F3: select saved tasks, follow or resume them, cancel, inspect context/tools/evidence, or review interrupted outcomes.
-- F4: manage Aegis-owned sign-in or enter a custom endpoint key privately; if an unfinished saved task switched providers, choose that task's current route or the provider for new tasks.
+- F3: select saved tasks, follow or resume them, cancel, inspect context/tools/evidence, or review interrupted outcomes; resume privately asks for a missing custom endpoint key.
+- F4: manage Aegis-owned sign-in or enter a custom endpoint key privately; an unfinished saved task can take a key bound to its own endpoint without replacing the key for new tasks.
 - F5: start a fresh conversation without deleting previous tasks.
 - Ctrl+C once: interrupt the active operation. Press twice within 900 ms to interrupt the model turn. Ctrl+D detaches without stopping the task; cancel the entire task from its F3 menu.
 - Ctrl+D at an empty prompt: exit. Up/Down: recall task input; Down past the latest request restores your unsent draft and cursor. Ctrl+U clears it.
