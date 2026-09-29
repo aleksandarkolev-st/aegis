@@ -705,9 +705,17 @@ impl Terminal {
                 },
                 width.saturating_sub(4),
             );
-            let available = width
-                .saturating_sub(label.width() + if composer { 5 } else { 1 })
-                .max(1);
+            let composer_width = width.saturating_sub(4).max(4) as u16;
+            let available = if composer {
+                crate::widgets::composer_input_area(
+                    &draft_label,
+                    ratatui::layout::Rect::new(0, 0, composer_width, 3),
+                )
+                .width as usize
+            } else {
+                width.saturating_sub(label.width() + 1)
+            }
+            .max(1);
             let displayed: Vec<_> = text
                 .iter()
                 .map(|character| {
@@ -728,18 +736,19 @@ impl Terminal {
                     &draft_label,
                     &visible,
                     &self.input_status.borrow(),
-                    width.saturating_sub(4).max(4) as u16,
+                    composer_width,
                     &self.skin.palette(),
                 );
+                let margin = 2;
                 queue!(io::stdout(), cursor::MoveUp(1))?;
                 for row in 0..3 {
-                    self.paint_widget_row(&buffer, row, 2)?;
+                    self.paint_widget_row(&buffer, row, margin)?;
                     if row < 2 {
                         write!(io::stdout(), "\r\n")?;
                     }
                 }
                 queue!(io::stdout(), cursor::MoveUp(1), ResetColor)?;
-                origin as usize
+                composer_input_column(origin, margin)
             } else {
                 queue!(
                     io::stdout(),
@@ -1297,6 +1306,10 @@ fn input_view(text: &[char], caret: usize, width: usize) -> (String, usize) {
     )
 }
 
+fn composer_input_column(origin: u16, margin: u16) -> usize {
+    origin as usize + margin as usize
+}
+
 fn wrap_text(text: &str, first_width: usize, next_width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     for paragraph in text.split('\n') {
@@ -1516,6 +1529,33 @@ mod tests {
             assert!(column <= 7);
         }
         assert_eq!(input_view(&['h', 'i'], 2, 20), ("hi".into(), 2));
+    }
+
+    #[test]
+    fn composer_cursor_accounts_for_the_painted_margin_and_input_viewport() {
+        let prefix = "› ";
+        let margin = 2;
+        let width = 40;
+        let area = ratatui::layout::Rect::new(0, 0, width - 4, 3);
+        let input = crate::widgets::composer_input_area(prefix, area);
+        let text: Vec<_> = "hello 日本語 world".chars().collect();
+        for caret in 0..=text.len() {
+            let (visible, caret_width) = input_view(&text, caret, input.width as usize);
+            let (buffer, origin) = crate::widgets::composer(
+                prefix,
+                &visible,
+                "model · low",
+                area.width,
+                &crate::ui::Palette::default(),
+            );
+            assert_eq!(origin, input.x);
+            assert_eq!(
+                buffer[(origin, 1)].symbol(),
+                visible.chars().next().unwrap().to_string()
+            );
+            assert_eq!(composer_input_column(origin, margin), input.x as usize + 2);
+            assert!(composer_input_column(origin, margin) + caret_width < width as usize);
+        }
     }
 
     #[test]

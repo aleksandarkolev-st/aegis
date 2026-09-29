@@ -123,7 +123,7 @@ pub fn composer(
     Paragraph::new(prefix.clone())
         .style(Style::new().fg(rgb(palette.accent)))
         .render(inner, &mut buffer);
-    let offset = prefix.width().min(inner.width as usize) as u16;
+    let input = composer_input_area(&prefix, area);
     Paragraph::new(if text.is_empty() {
         "Type a message…".to_owned()
     } else {
@@ -134,16 +134,24 @@ pub fn composer(
     } else {
         Color::Reset
     }))
-    .render(
-        Rect::new(
-            inner.x + offset,
-            inner.y,
-            inner.width.saturating_sub(offset),
-            1,
-        ),
-        &mut buffer,
-    );
-    (buffer, inner.x + offset)
+    .render(input, &mut buffer);
+    (buffer, input.x)
+}
+
+pub fn composer_input_area(prefix: &str, area: Rect) -> Rect {
+    let inner = Block::bordered()
+        .padding(Padding::horizontal(1))
+        .inner(area);
+    let offset = crate::text::clean(prefix)
+        .trim_start()
+        .width()
+        .min(inner.width as usize) as u16;
+    Rect::new(
+        inner.x + offset,
+        inner.y,
+        inner.width.saturating_sub(offset),
+        1,
+    )
 }
 
 pub fn menu(
@@ -259,5 +267,20 @@ mod tests {
         let (buffer, input_column) = composer("› ", &"x".repeat(300), "model · low", 80, &palette);
         assert_eq!(buffer[(input_column, 1)].symbol(), "x");
         assert_eq!(row_text(&buffer, 1).width(), 80);
+    }
+
+    #[test]
+    fn composer_input_area_matches_rendered_text_at_narrow_and_wide_widths() {
+        let palette = Palette::default();
+        for width in [16, 40, 80] {
+            for prefix in ["› ", "日本語 ", "🦊 "] {
+                let area = Rect::new(0, 0, width, 3);
+                let input = composer_input_area(prefix, area);
+                let (buffer, origin) = composer(prefix, "x", "model · low", width, &palette);
+                assert_eq!(origin, input.x);
+                assert_eq!(buffer[(input.x, input.y)].symbol(), "x");
+                assert_eq!(input.x + input.width, width - 2);
+            }
+        }
     }
 }
