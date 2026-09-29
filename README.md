@@ -15,6 +15,7 @@ The scrollback interface has an animated activity line, elapsed time and token c
 - F2: choose a provider without resetting workspace access.
 - F3: select saved tasks, follow or resume them, cancel, inspect context/tools/evidence, or review interrupted outcomes; resume privately asks for a missing custom endpoint key.
 - F4: manage Aegis-owned sign-in or enter a custom endpoint key privately; an unfinished saved task can take a key bound to its own endpoint without replacing the key for new tasks.
+- If an active task gets an authentication error, Aegis offers sign-in for that task's current provider or a replacement custom key, then retries the same saved task once; declining leaves it paused.
 - F5: start a fresh conversation without deleting previous tasks.
 - Ctrl+C once: interrupt the active operation. Press twice within 900 ms to interrupt the model turn. Ctrl+D detaches without stopping the task; cancel the entire task from its F3 menu.
 - Ctrl+D at an empty prompt: exit. Up/Down: recall task input; Down past the latest request restores your unsent draft and cursor. Ctrl+U clears it.
