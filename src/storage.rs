@@ -1198,8 +1198,16 @@ impl Store {
             "UPDATE operations SET state = ?2, artifact = COALESCE(?3, artifact) WHERE id = ?1",
             params![operation.id, state, artifact],
         )?;
-        if state == "succeeded" && previous != "succeeded" {
-            crate::obligations::record_operation(&transaction, operation)?;
+        if matches!(
+            state,
+            "succeeded" | "failed" | "cancelled" | "outcome_unknown"
+        ) && !matches!(
+            previous.as_str(),
+            "succeeded" | "failed" | "cancelled" | "outcome_unknown"
+        ) {
+            let may_have_run =
+                state == "succeeded" || matches!(previous.as_str(), "dispatched" | "executing");
+            crate::obligations::record_operation(&transaction, operation, may_have_run)?;
         }
         append_event(
             &transaction,

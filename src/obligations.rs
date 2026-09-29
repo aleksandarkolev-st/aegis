@@ -107,7 +107,19 @@ pub(crate) fn insert(transaction: &Transaction<'_>, run: &Run) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn record_operation(transaction: &Transaction<'_>, operation: &Operation) -> Result<()> {
+pub(crate) fn record_operation(
+    transaction: &Transaction<'_>,
+    operation: &Operation,
+    may_have_run: bool,
+) -> Result<()> {
+    let already_recorded: i64 = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM operation_revisions WHERE operation_id = ?1)",
+        [&operation.id],
+        |row| row.get(0),
+    )?;
+    if already_recorded != 0 {
+        return Ok(());
+    }
     let Some(current) = transaction
         .query_row(
             "SELECT revision FROM workspace_revisions WHERE run_id = ?1",
@@ -142,14 +154,15 @@ pub(crate) fn record_operation(transaction: &Transaction<'_>, operation: &Operat
         }
         _ => false,
     };
-    let revision = if might_mutate {
+    let invalidates = might_mutate && may_have_run;
+    let revision = if invalidates {
         current
             .checked_add(1)
             .context("workspace revision overflow")?
     } else {
         current
     };
-    if might_mutate {
+    if invalidates {
         transaction.execute(
             "UPDATE workspace_revisions SET revision = ?2 WHERE run_id = ?1",
             params![operation.run_id, revision],
@@ -717,6 +730,37 @@ mod tests {
             21
         );
         assert_eq!(store.obligations(&run.id)?.len(), 22);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_write_capable_operation_stales_prior_proofs_once() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "Refactor parser",
+            directory.path(),
+            "codex",
+            json!(["workspace.write"]),
+            json!({"obligations":["Full suite passes"]}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let check = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
+        let receipt = store.put_artifact(b"test pass before edit")?;
+        store.operation_state(&check, "succeeded", Some(&receipt), json!({}))?;
+        store.verify_obligation(&run.id, 1, &[receipt.clone()])?;
+        let command = store.begin_operation(&run.id, "process.run", json!({}), true)?;
+        store.operation_state(&command, "dispatched", None, json!({}))?;
+        store.operation_state(&command, "failed", None, json!({"exit_code":1}))?;
+        assert_eq!(store.workspace_revision(&run.id)?, Some(1));
+        assert_eq!(store.obligations(&run.id)?[1].state, "stale");
+        assert!(store.verify_obligation(&run.id, 1, &[receipt]).is_err());
+        store.operation_state(&command, "failed", None, json!({}))?;
+        assert_eq!(store.workspace_revision(&run.id)?, Some(1));
+        let undispatched = store.begin_operation(&run.id, "workspace.write", json!({}), false)?;
+        store.operation_state(&undispatched, "cancelled", None, json!({}))?;
+        assert_eq!(store.workspace_revision(&run.id)?, Some(1));
         Ok(())
     }
 }
