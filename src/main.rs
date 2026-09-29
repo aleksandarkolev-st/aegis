@@ -550,9 +550,7 @@ fn execute() -> Result<()> {
             if run.is_terminal() || store.unknown_count(id)? > 0 {
                 bail!("run cannot resume until unknown operations are reconciled");
             }
-            if run.state == "waiting_recovery" {
-                store.state(id, "ready", json!({"source":"user_resume"}))?;
-            }
+            store.resume_paused(id)?;
             drop(store);
             if arguments.iter().any(|argument| argument == "--foreground") {
                 kernel::drive(&root, id)?;
@@ -593,6 +591,13 @@ fn execute() -> Result<()> {
         }
         Some("cancel") => {
             Store::open(&root)?.state(required(1)?, "cancelled", json!({"source":"user"}))?;
+            Ok(())
+        }
+        Some("pause") => {
+            arun::pause::request(&root, required(1)?)?;
+            println!(
+                "Pause requested; the current action will record its outcome before inference stops."
+            );
             Ok(())
         }
         Some("interrupt") => {

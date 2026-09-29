@@ -2069,6 +2069,37 @@ fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
                 if key.kind == KeyEventKind::Release {
                     continue;
                 }
+                if key.code == KeyCode::Char('/') && !key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    terminal.clear_activity()?;
+                    if let Input::Submit(command) = terminal.input("/", false, &[])? {
+                        let mut words = command.split_whitespace();
+                        let command = words.next().unwrap_or_default().trim_start_matches('/');
+                        if command == "pause" {
+                            crate::pause::request(root, id)?;
+                            terminal.message(
+                                Tone::Quiet,
+                                "Pause requested",
+                                "Waiting for the current action's safe boundary.",
+                            )?;
+                        } else if crate::control::VIEWS.contains(&command) {
+                            match crate::control::view(&store, id, command, words.next()) {
+                                Ok(value) => terminal.message(
+                                    Tone::Quiet,
+                                    command,
+                                    &crate::control::display(command, &value),
+                                )?,
+                                Err(error) => terminal.message(
+                                    Tone::Warning,
+                                    "View unavailable",
+                                    &error.to_string(),
+                                )?,
+                            }
+                        } else {
+                            terminal.message(Tone::Quiet,"Task controls","/goal /status /why /evidence O3 /verify /provider /budget /handoff /pause")?;
+                        }
+                    }
+                }
                 if key.code == KeyCode::F(8) {
                     terminal.clear_activity()?;
                     checkpoint_view(root, Some(id), terminal)?;
@@ -2279,12 +2310,68 @@ fn resume(
         )?;
         return Ok(());
     }
-    if run.state == "waiting_recovery" {
-        store.state(id, "ready", json!({"source":"terminal_resume"}))?;
-    }
+    store.resume_paused(id)?;
     drop(store);
     kernel::spawn(root, id, secret)?;
     follow(root, id, terminal)
+}
+
+fn resume_current(
+    root: &Path,
+    terminal: &mut Terminal,
+    profile: &Profile,
+    secret: Option<&str>,
+    task_secret: &mut Option<TaskSecret>,
+) -> Result<()> {
+    let Some(id) = profile.previous_run.as_deref() else {
+        return terminal.message(
+            Tone::Quiet,
+            "No current task",
+            "Select a saved task with F3.",
+        );
+    };
+    let store = Store::open(root)?;
+    let run = store.run(id)?;
+    if kernel::is_active(root, id)? {
+        return follow(root, id, terminal);
+    }
+    let route = store.current_route(id)?;
+    let profile_credentials = run_secret_reference(profile, &run).zip(secret);
+    if route_key_reference(&run, &route).is_some()
+        && profile_credentials.is_none()
+        && task_secret
+            .as_ref()
+            .is_none_or(|saved| !saved.matches(&run, &route))
+    {
+        if let Some(key) = field(terminal, "Key for this saved task (hidden)", true)? {
+            if !key.trim().is_empty()
+                && (route.provider != "claude-api" || crate::claude_api::validate_key(&key).is_ok())
+                && let Some(target) = route_secret_target(&run, &route)
+            {
+                *task_secret = Some(TaskSecret {
+                    run_id: run.id.clone(),
+                    target,
+                    value: key,
+                });
+            }
+        }
+    }
+    let credentials = task_secret
+        .as_ref()
+        .filter(|saved| saved.matches(&run, &route))
+        .and_then(|saved| {
+            route_key_reference(&run, &route).map(|reference| (reference, saved.value.as_str()))
+        })
+        .or(profile_credentials);
+    if route_key_reference(&run, &route).is_some() && credentials.is_none() {
+        return terminal.message(
+            Tone::Warning,
+            "Key needed",
+            "The saved task remains paused.",
+        );
+    }
+    resume(root, id, terminal, credentials)?;
+    recover_auth_after_follow(root, id, terminal)
 }
 
 fn review_operations(root: &Path, id: &str, terminal: &Terminal) -> Result<()> {
@@ -3332,7 +3419,18 @@ pub fn interactive(root: &Path) -> Result<()> {
                         new_conversation(root, &terminal, &mut profile)?;
                         history.clear();
                     }
-                    "/sessions" | "/chats" | "/resume" => {
+                    "/pause" => {
+                        if let Some(id)=profile.previous_run.as_deref() {
+                            match crate::pause::request(root,id) {
+                                Ok(())=>terminal.message(Tone::Quiet,"Pause requested","Inference stops after the current action records its outcome. /resume continues the same task.")?,
+                                Err(error)=>terminal.message(Tone::Warning,"Pause unavailable",&error.to_string())?,
+                            }
+                        } else { terminal.message(Tone::Quiet,"No current task","Select a saved task with F3.")?; }
+                    }
+                    "/resume" => {
+                        if let Err(error)=resume_current(root,&mut terminal,&profile,secret.as_deref(),&mut task_secret) { terminal.message(Tone::Warning,"Resume unavailable",&error.to_string())?; }
+                    }
+                    "/sessions" | "/chats" => {
                         sessions(
                             root,
                             &mut terminal,

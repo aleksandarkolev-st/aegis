@@ -899,6 +899,9 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
     if run.is_terminal() {
         bail!("run is {}", run.state);
     }
+    if run.state == "paused" || crate::pause::boundary(&mut store, run_id)? {
+        return Ok(());
+    }
     if mode(&run) == "durable" {
         if store.load_recovery(run_id)?.is_none() {
             store.save_snapshot(run_id)?;
@@ -943,6 +946,12 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
         if perform(&mut store, root, &run, operation)? {
             return Ok(());
         }
+        if crate::pause::boundary(&mut store, run_id)? {
+            return Ok(());
+        }
+    }
+    if crate::pause::boundary(&mut store, run_id)? {
+        return Ok(());
     }
     if crate::acceptance::resume(&mut store, root, &run)? {
         return Ok(());
@@ -963,6 +972,9 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
         .and_then(Value::as_u64)
         .unwrap_or(3600);
     loop {
+        if crate::pause::boundary(&mut store, run_id)? {
+            break;
+        }
         if mode(&run) == "durable" {
             store.maintain_history(run_id)?;
         }
@@ -1025,7 +1037,7 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
             break;
         }
         let route = store.current_route(run_id)?;
-        store.event(
+        let start_result = store.event(
             run_id,
             "model.started",
             json!({"turn": actions + 1, "prompt_chars": prompt_chars,
@@ -1033,7 +1045,13 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
                 "context_tokenizer":exposure.encoding,"schema_tokens":exposure.schema_tokens,
                 "tool_result_tokens":exposure.tool_result_tokens,"raw_prompt_tokens":exposure.raw_prompt_tokens,
                 "schema_count": manifests.len(), "schema_bytes": serde_json::to_vec(&manifests)?.len()}),
-        )?;
+        );
+        if let Err(error) = start_result {
+            if crate::pause::boundary(&mut store, run_id)? {
+                break;
+            }
+            return Err(error);
+        }
         let model_started = Instant::now();
         let model_target = store.current_model_target(run_id)?;
         let timeout = Duration::from_secs(
@@ -1082,6 +1100,9 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
                     &model_target,
                 )?;
                 if store.run(run_id)?.state == "cancelled" {
+                    break;
+                }
+                if crate::pause::boundary(&mut store, run_id)? {
                     break;
                 }
                 if !interrupted {

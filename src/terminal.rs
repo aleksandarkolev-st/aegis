@@ -1195,7 +1195,12 @@ impl Terminal {
                     .as_str()
                     .unwrap_or("Operation needs review"),
             ),
-            "run.waiting_recovery" | "run.failed" => self.message(
+            "pause.requested" => self.message(
+                Tone::Quiet,
+                "Pause requested",
+                "The current action will record its outcome before inference stops.",
+            ),
+            "run.paused" | "run.waiting_recovery" | "run.failed" => self.message(
                 Tone::Warning,
                 "Paused",
                 payload["reason"]

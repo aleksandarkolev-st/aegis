@@ -24,6 +24,7 @@ pub mod network;
 pub mod oauth;
 pub mod obligations;
 pub mod patch;
+pub mod pause;
 pub mod policy;
 pub mod process;
 pub mod provider;

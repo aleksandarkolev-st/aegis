@@ -86,6 +86,16 @@ pub(crate) fn append_event(
     payload: Value,
 ) -> Result<()> {
     let timestamp = now();
+    if kind == "model.started" {
+        let paused: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pause_requests WHERE run_id=?1 AND pending=1)",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if paused {
+            bail!("user pause pending before inference");
+        }
+    }
     if kind == "model.started" && payload.get("context_tokenizer").is_some() {
         if payload["context_tokenizer"] != crate::tokenization::ENCODING {
             bail!("model attempt uses an unsupported context tokenizer");
@@ -399,6 +409,7 @@ impl Store {
                 COMMIT;",
             )?;
         }
+        store.connection.execute_batch("CREATE TABLE IF NOT EXISTS pause_requests (run_id TEXT PRIMARY KEY REFERENCES runs(id), pending INTEGER NOT NULL)")?;
         Ok(store)
     }
 

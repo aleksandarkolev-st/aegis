@@ -89,6 +89,7 @@ impl Snapshot {
                 self.started_at.get_or_insert(event.created_at);
             }
             "run.ready"
+            | "run.paused"
             | "run.waiting_recovery"
             | "run.failed"
             | "run.cancelled"
