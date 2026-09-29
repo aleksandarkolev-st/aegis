@@ -13,7 +13,7 @@ ChatGPT/Grok sign-in now offers browser approval with a protected local callback
 The scrollback interface has an animated activity line, elapsed time and token counts, editable input with history, and these shortcuts:
 
 - F2: choose a provider without resetting workspace access.
-- F3: select saved tasks, follow or resume them, cancel, inspect context/tools/evidence, or review interrupted outcomes; resume privately asks for a missing custom endpoint key.
+- F3: select saved tasks, follow or resume them, cancel, inspect context/tools/evidence, or review interrupted outcomes; resume privately asks for a missing custom endpoint key, and Follow offers sign-in for a paused task's active provider.
 - F4: manage Aegis-owned sign-in or enter a custom endpoint key privately; an unfinished saved task can take a key bound to its own endpoint without replacing the key for new tasks.
 - If an active task gets an authentication error, Aegis offers sign-in for that task's current provider or a replacement custom key, then retries the same saved task once; declining leaves it paused.
 - F5: start a fresh conversation without deleting previous tasks.
