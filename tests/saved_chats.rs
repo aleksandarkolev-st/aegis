@@ -290,6 +290,65 @@ fn switched_provider_is_visible_in_saved_task_without_changing_run_identity() ->
 }
 
 #[test]
+fn following_a_paused_switched_task_offers_its_active_provider_sign_in() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join(".arun");
+    let mut store = Store::open(&root)?;
+    let run = store.create_run(
+        "Review parser",
+        directory.path(),
+        "codex",
+        json!([]),
+        json!({"provider_transport":"aegis-direct-v1","model":"primary","fallback_routes":[{"provider":"grok","model":"fallback"}]}),
+        "",
+    )?;
+    store.state(&run.id, "running", json!({}))?;
+    store.event(&run.id, "model.started", json!({"turn":1}))?;
+    store.event(
+        &run.id,
+        "model.failed",
+        json!({"recoverable_reason":"usage_limit"}),
+    )?;
+    store.transition_provider(&run.id, arun::routing::Reason::UsageLimit)?;
+    store.event(&run.id, "model.started", json!({"turn":2}))?;
+    store.event(&run.id, "model.failed", json!({"error":"HTTP 401"}))?;
+    store.state(
+        &run.id,
+        "waiting_recovery",
+        json!({"reason":"model unavailable"}),
+    )?;
+    fs::write(
+        root.join("profile.json"),
+        serde_json::to_vec(
+            &json!({"provider":"codex","model":"primary","endpoint":null,"write":false,"image":null,"previous_run":run.id}),
+        )?,
+    )?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_arun"))
+        .current_dir(directory.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"/sessions\n1\n5\n2\n/quit\n")?;
+    let output = child.wait_with_output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("Sign in to Grok and continue this task"));
+    assert!(!text.contains("Sign in to ChatGPT and continue this task"));
+    assert_eq!(store.run(&run.id)?.state, "waiting_recovery");
+    assert_eq!(store.event_count(&run.id, "model.started")?, 2);
+    Ok(())
+}
+
+#[test]
 fn switched_custom_route_asks_for_its_key_without_rewriting_the_primary_profile() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let root = directory.path().join(".arun");

@@ -2573,7 +2573,10 @@ fn sessions(
         Some(4) if run.is_terminal() && crate::continuation::needed(run) => {
             continue_legacy(root, &run.id, terminal, profile)?;
         }
-        Some(4) if !run.is_terminal() => follow(root, &run.id, terminal)?,
+        Some(4) if !run.is_terminal() => {
+            follow(root, &run.id, terminal)?;
+            recover_auth_after_follow(root, &run.id, terminal)?;
+        }
         Some(5) if !run.is_terminal() => {
             if crate::continuation::needed(run) {
                 return continue_legacy(root, &run.id, terminal, profile);
