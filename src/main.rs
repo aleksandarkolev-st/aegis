@@ -644,6 +644,20 @@ fn execute() -> Result<()> {
             Ok(())
         }
         Some("login") => login(required(1)?),
+        Some("models") => {
+            let provider = required(1)?;
+            let catalog = arun::catalog::for_selection(provider, || false)?;
+            println!("{}", catalog.source);
+            for model in catalog.models {
+                println!(
+                    "{}  {}  reasoning: {}",
+                    model.id,
+                    model.label,
+                    arun::catalog::reasoning_levels(provider, &model.id)?.join(", ")
+                );
+            }
+            Ok(())
+        }
         Some("probe") => {
             Store::open(&root)?;
             let provider = match required(1)? {
