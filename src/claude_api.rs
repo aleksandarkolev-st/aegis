@@ -7,7 +7,153 @@ use serde_json::{Value, json};
 use crate::model::{self, Response, Usage};
 
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
+const MODELS_URL: &str = "https://api.anthropic.com/v1/models";
 const API_VERSION: &str = "2023-06-01";
+
+fn validate_key(key: &str) -> Result<()> {
+    if key.is_empty() || key.len() > 32_768 || !key.bytes().all(|byte| byte.is_ascii_graphic()) {
+        bail!("Claude API key is unavailable or invalid");
+    }
+    Ok(())
+}
+
+fn catalog_page(value: &Value, key: &str) -> Result<(Vec<crate::catalog::Model>, Option<String>)> {
+    let entries = value["data"]
+        .as_array()
+        .context("Claude API returned an invalid model catalog")?;
+    if entries.len() > 1000 {
+        bail!("Claude API model catalog page exceeds its bound");
+    }
+    let mut models = Vec::new();
+    for entry in entries {
+        let Some(id) = entry["id"]
+            .as_str()
+            .filter(|id| crate::catalog::valid_id(id) && !id.contains(key))
+        else {
+            continue;
+        };
+        let label = entry["display_name"]
+            .as_str()
+            .filter(|label| !label.contains(key))
+            .map(crate::catalog::display_label)
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| id.to_owned());
+        models.push(crate::catalog::Model {
+            id: id.to_owned(),
+            label,
+        });
+    }
+    let next = match value["has_more"].as_bool() {
+        Some(true) => Some(
+            value["last_id"]
+                .as_str()
+                .filter(|id| crate::catalog::valid_id(id) && !id.contains(key))
+                .context("Claude API model catalog omitted its next-page cursor")?
+                .to_owned(),
+        ),
+        Some(false) => None,
+        None => bail!("Claude API model catalog omitted pagination state"),
+    };
+    Ok((models, next))
+}
+
+pub fn models(key: &str, cancelled: impl Fn() -> bool) -> Result<Vec<crate::catalog::Model>> {
+    models_at(Url::parse(MODELS_URL)?, key, cancelled)
+}
+
+fn models_at(
+    url: Url,
+    key: &str,
+    cancelled: impl Fn() -> bool,
+) -> Result<Vec<crate::catalog::Model>> {
+    validate_key(key)?;
+    if cancelled() {
+        bail!("Claude API model discovery cancelled before dispatch");
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        let mut cursor = None;
+        let mut seen = std::collections::HashSet::new();
+        let mut models = Vec::new();
+        for _ in 0..5 {
+            if cancelled() {
+                bail!("Claude API model discovery cancelled");
+            }
+            let mut page_url = url.clone();
+            {
+                let mut query = page_url.query_pairs_mut();
+                query.append_pair("limit", "1000");
+                if let Some(cursor) = cursor.as_deref() {
+                    query.append_pair("after_id", cursor);
+                }
+            }
+            let fetch = async {
+                let mut response = client
+                    .get(page_url)
+                    .bearer_auth(key)
+                    .header("anthropic-version", API_VERSION)
+                    .send()
+                    .await
+                    .map_err(|_| anyhow!("Claude API model discovery unavailable"))?;
+                if !response.status().is_success() {
+                    let status = response.status().as_u16();
+                    bail!("Claude API model discovery returned HTTP {status}; remote body omitted");
+                }
+                if response
+                    .content_length()
+                    .is_some_and(|length| length > 1024 * 1024)
+                {
+                    bail!("Claude API model catalog exceeds 1 MiB per page");
+                }
+                let mut bytes = Vec::new();
+                while let Some(chunk) = response
+                    .chunk()
+                    .await
+                    .map_err(|_| anyhow!("Claude API model discovery interrupted"))?
+                {
+                    if bytes.len() + chunk.len() > 1024 * 1024 {
+                        bail!("Claude API model catalog exceeds 1 MiB per page");
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                Ok::<_, anyhow::Error>(bytes)
+            };
+            tokio::pin!(fetch);
+            let bytes = loop {
+                tokio::select! {
+                    result = &mut fetch => break result,
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                        if cancelled() { bail!("Claude API model discovery cancelled"); }
+                    }
+                }
+            }?;
+            let value: Value = serde_json::from_slice(&bytes)
+                .map_err(|_| anyhow!("Claude API model catalog was not JSON"))?;
+            let (page, next) = catalog_page(&value, key)?;
+            for model in page {
+                if seen.insert(model.id.clone()) {
+                    models.push(model);
+                }
+            }
+            if models.len() > 4096 {
+                bail!("Claude API model catalog exceeds its total bound");
+            }
+            match next {
+                Some(next) if cursor.as_deref() != Some(next.as_str()) => cursor = Some(next),
+                Some(_) => bail!("Claude API model catalog repeated its page cursor"),
+                None => return Ok(models),
+            }
+        }
+        bail!("Claude API model catalog exceeded five pages")
+    })
+}
 
 fn body(model: &str, prompt: &str, output_tokens: u64, effort: Option<&str>) -> Result<Value> {
     if !crate::catalog::valid_id(model) || !(1..=300_000).contains(&output_tokens) {
@@ -126,9 +272,7 @@ fn call_at(
     timeout: Duration,
     cancelled: impl Fn() -> bool,
 ) -> Result<Response> {
-    if key.is_empty() || key.len() > 32_768 || !key.bytes().all(|byte| byte.is_ascii_graphic()) {
-        bail!("Claude API key is unavailable or invalid");
-    }
+    validate_key(key)?;
     crate::budget::validate_response_bytes(response_bytes)?;
     let request = body(model, prompt, output_tokens, effort)?;
     if timeout.is_zero() || cancelled() {
@@ -340,6 +484,60 @@ mod tests {
         server.join().map_err(|_| anyhow!("fixture panicked"))??;
         assert!(matches!(response.action, model::Action::Finish { .. }));
         assert_eq!(response.usage.unwrap().input_tokens, 9);
+        Ok(())
+    }
+
+    #[test]
+    fn model_catalog_uses_account_pages_without_a_fixed_model_list() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let url = Url::parse(&format!("http://{}/v1/models", listener.local_addr()?))?;
+        let server = thread::spawn(move || -> Result<()> {
+            for (index, page) in [
+                json!({"data":[{"id":"account-a","display_name":"Account A"}],"has_more":true,"last_id":"account-a"}),
+                json!({"data":[{"id":"account-a","display_name":"Duplicate"},{"id":"account-b","display_name":"Account B"}],"has_more":false,"last_id":"account-b"}),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+                let mut request = Vec::new();
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut buffer = [0; 2048];
+                    let count = stream.read(&mut buffer)?;
+                    if count == 0 || request.len() + count > 8192 {
+                        bail!("catalog fixture request was incomplete or too large");
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let request = String::from_utf8(request)?;
+                assert!(request.starts_with("GET /v1/models?limit=1000"));
+                assert_eq!(request.contains("after_id=account-a"), index == 1);
+                assert!(request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer private-fixture-key"));
+                let response = page.to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                )?;
+            }
+            Ok(())
+        });
+        let models = models_at(url, "private-fixture-key", || false)?;
+        server.join().map_err(|_| anyhow!("fixture panicked"))??;
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "account-a");
+        assert_eq!(models[1].label, "Account B");
+        assert!(
+            catalog_page(
+                &json!({"data":[{"id":"private-fixture-key"}],"has_more":false}),
+                "private-fixture-key"
+            )?
+            .0
+            .is_empty()
+        );
         Ok(())
     }
 }
