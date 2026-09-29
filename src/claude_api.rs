@@ -10,7 +10,7 @@ const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const MODELS_URL: &str = "https://api.anthropic.com/v1/models";
 const API_VERSION: &str = "2023-06-01";
 
-fn validate_key(key: &str) -> Result<()> {
+pub(crate) fn validate_key(key: &str) -> Result<()> {
     if key.is_empty() || key.len() > 32_768 || !key.bytes().all(|byte| byte.is_ascii_graphic()) {
         bail!("Claude API key is unavailable or invalid");
     }

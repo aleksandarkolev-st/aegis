@@ -28,6 +28,8 @@ struct Profile {
     #[serde(default)]
     fallback_routes: Vec<crate::routing::Route>,
     endpoint: Option<Endpoint>,
+    #[serde(default)]
+    api_key_env: Option<String>,
     write: bool,
     image: Option<String>,
     #[serde(default)]
@@ -46,18 +48,37 @@ struct Profile {
 
 struct TaskSecret {
     run_id: String,
-    endpoint_url: String,
+    target: String,
     value: String,
 }
 
 impl TaskSecret {
     fn matches(&self, run: &crate::storage::Run, route: &crate::routing::Route) -> bool {
-        self.run_id == run.id
-            && route
-                .endpoint
-                .as_ref()
-                .is_some_and(|endpoint| endpoint.base_url == self.endpoint_url)
+        self.run_id == run.id && route_secret_target(run, route).as_deref() == Some(&self.target)
     }
+}
+
+fn route_secret_target(run: &crate::storage::Run, route: &crate::routing::Route) -> Option<String> {
+    if route.provider == "claude-api" && run.provider == "claude-api" {
+        return Some("claude-api".into());
+    }
+    route
+        .endpoint
+        .as_ref()
+        .map(|endpoint| endpoint.base_url.clone())
+}
+
+fn route_key_reference<'a>(
+    run: &'a crate::storage::Run,
+    route: &'a crate::routing::Route,
+) -> Option<&'a str> {
+    if route.provider == "claude-api" && run.provider == "claude-api" {
+        return run.budgets["api_key_env"].as_str();
+    }
+    route
+        .endpoint
+        .as_ref()
+        .and_then(|endpoint| endpoint.api_key_env.as_deref())
 }
 
 fn profile_provider<'de, Decoder: serde::Deserializer<'de>>(
@@ -70,6 +91,7 @@ fn profile_provider<'de, Decoder: serde::Deserializer<'de>>(
 fn name(provider: &str) -> &str {
     match crate::provider::canonical(provider) {
         "codex" => "ChatGPT",
+        "claude-api" => "Claude API",
         "claude" => "Claude · pending",
         "grok" => "Grok",
         "custom" => "Custom endpoint",
@@ -92,13 +114,23 @@ fn load_catalog(
 ) -> Result<Option<Result<crate::catalog::Catalog>>> {
     let provider = profile.provider.clone();
     let endpoint = profile.endpoint.clone();
+    let api_key_env = profile.api_key_env.clone();
     let secret = secret.map(str::to_owned);
     crate::background::run(
         terminal,
         "Discovering your available models",
         move |cancelled| {
             let interrupted = || cancelled.load(std::sync::atomic::Ordering::Acquire);
-            Ok(if let Some(endpoint) = endpoint {
+            Ok(if provider == "claude-api" {
+                let key = secret.or_else(|| api_key_env.and_then(|name| std::env::var(name).ok()));
+                key.as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("Claude API key is needed for model discovery"))
+                    .and_then(|key| crate::claude_api::models(key, interrupted))
+                    .map(|models| crate::catalog::Catalog {
+                        models,
+                        source: "Claude API models available to this key".into(),
+                    })
+            } else if let Some(endpoint) = endpoint {
                 endpoint
                     .models_with_cancel(secret.as_deref(), interrupted)
                     .map(|models| crate::catalog::Catalog {
@@ -121,11 +153,12 @@ fn choose_model(
     profile: &Profile,
     secret: Option<&str>,
 ) -> Result<Option<Option<String>>> {
-    let saved = if terminal.interactive && profile.endpoint.is_none() {
-        crate::catalog::saved_only_for_selection(&profile.provider)?
-    } else {
-        None
-    };
+    let saved =
+        if terminal.interactive && profile.endpoint.is_none() && profile.provider != "claude-api" {
+            crate::catalog::saved_only_for_selection(&profile.provider)?
+        } else {
+            None
+        };
     let mut refresh_available = saved.is_some();
     let mut catalog = if let Some(catalog) = saved {
         Ok(catalog)
@@ -255,6 +288,7 @@ fn switch_provider(
         profile.model = selected.model;
         profile.reasoning_effort = None;
         profile.endpoint = selected.endpoint;
+        profile.api_key_env = selected.api_key_env;
         profile.fallback_routes.clear();
         *secret = key;
         save(root, profile)?;
@@ -394,6 +428,7 @@ fn blank_profile(provider: String) -> Profile {
         reasoning_effort: None,
         fallback_routes: Vec::new(),
         endpoint: None,
+        api_key_env: None,
         write: false,
         image: None,
         limits: crate::budget::Limits::default(),
@@ -416,6 +451,7 @@ fn configure_provider(terminal: &Terminal) -> Result<Option<(Profile, Option<Str
     let choices = [
         "ChatGPT — direct account sign-in",
         "Claude — subscription sign-in pending",
+        "Claude API — Console key, separate billing",
         "Grok — direct account sign-in",
         "Custom OpenAI-compatible endpoint",
     ]
@@ -423,10 +459,21 @@ fn configure_provider(terminal: &Terminal) -> Result<Option<(Profile, Option<Str
     let Some(choice) = terminal.select("Choose your provider", &choices)? else {
         return Ok(None);
     };
-    let provider = ["codex", "claude", "grok", "custom"][choice].to_owned();
+    let provider = ["codex", "claude", "claude-api", "grok", "custom"][choice].to_owned();
     let mut profile = blank_profile(provider);
     let mut secret = None;
-    if profile.provider == "custom" {
+    if profile.provider == "claude-api" {
+        terminal.message(Tone::Quiet, "Claude API", "Uses a Claude Console API key with separate API billing, not Claude Code subscription login.")?;
+        let Some(key) = field(terminal, "  Claude API key (hidden) › ", true)? else {
+            return Ok(None);
+        };
+        if let Err(error) = crate::claude_api::validate_key(&key) {
+            terminal.message(Tone::Warning, "Key needed", &error.to_string())?;
+            return Ok(None);
+        }
+        profile.api_key_env = Some("ARUN_SESSION_API_KEY".into());
+        secret = Some(key);
+    } else if profile.provider == "custom" {
         let Some(url) = field(terminal, "  Endpoint URL › ", false)? else {
             return Ok(None);
         };
@@ -671,7 +718,7 @@ fn configure_fallback(
         terminal.message(
             Tone::Quiet,
             "Fallback",
-            "Claude subscription fallback is pending. ChatGPT, Grok and custom endpoints can be reviewed here.",
+            "Fallback for this provider is not available yet. ChatGPT, Grok and custom endpoints can be reviewed here.",
         )?;
         return Ok(false);
     }
@@ -1721,9 +1768,14 @@ fn remember_selection(terminal: &Terminal, profile: &Profile) -> Result<()> {
 
 fn secret_reference(profile: &Profile) -> Option<&str> {
     profile
-        .endpoint
-        .as_ref()
-        .and_then(|endpoint| endpoint.api_key_env.as_deref())
+        .api_key_env
+        .as_deref()
+        .or_else(|| {
+            profile
+                .endpoint
+                .as_ref()
+                .and_then(|endpoint| endpoint.api_key_env.as_deref())
+        })
         .or_else(|| {
             profile
                 .fallback_routes
@@ -1751,6 +1803,7 @@ fn sign_in_for_selection(
     let current_route = current.as_ref().map(|(_, route)| route);
     let current_selected = if let Some(route) = current_route.as_ref().filter(|route| {
         route.provider != profile.provider
+            || route.provider == "claude-api"
             || (route.provider == "custom" && route.endpoint != profile.endpoint)
     }) {
         let choices = [
@@ -1771,7 +1824,31 @@ fn sign_in_for_selection(
     } else {
         &profile.provider
     };
-    if selected == "custom" {
+    if selected == "claude-api" {
+        let Some(key) = field(terminal, "  Claude API key (hidden) › ", true)? else {
+            return Ok(());
+        };
+        if let Err(error) = crate::claude_api::validate_key(&key) {
+            terminal.message(Tone::Warning, "Key unchanged", &error.to_string())?;
+            return Ok(());
+        }
+        if current_selected {
+            let (run_id, route) = current.as_ref().unwrap();
+            let run = Store::open(root)?.run(run_id)?;
+            let Some(target) = route_secret_target(&run, route) else {
+                return Ok(());
+            };
+            *task_secret = Some(TaskSecret {
+                run_id: run_id.clone(),
+                target,
+                value: key,
+            });
+        } else {
+            profile.api_key_env = Some("ARUN_SESSION_API_KEY".into());
+            *secret = Some(key);
+            save(root, profile)?;
+        }
+    } else if selected == "custom" {
         if current_selected {
             let (run_id, route) = current.as_ref().unwrap();
             let endpoint = route.endpoint.as_ref().unwrap();
@@ -1789,7 +1866,7 @@ fn sign_in_for_selection(
                 } else {
                     *task_secret = Some(TaskSecret {
                         run_id: run_id.clone(),
-                        endpoint_url: endpoint.base_url.clone(),
+                        target: endpoint.base_url.clone(),
                         value: key,
                     });
                 }
@@ -2588,18 +2665,18 @@ fn sessions(
                 .is_none_or(|saved| !saved.matches(run, &current_route))
                 && profile_credentials.is_none()
             {
-                if let Some(endpoint) = current_route
-                    .endpoint
-                    .as_ref()
-                    .filter(|endpoint| endpoint.api_key_env.is_some())
-                {
+                if route_key_reference(run, &current_route).is_some() {
                     if let Some(key) =
                         field(terminal, "  Key for this saved task (hidden) › ", true)?
                     {
-                        if !key.trim().is_empty() {
+                        if (current_route.provider != "claude-api"
+                            || crate::claude_api::validate_key(&key).is_ok())
+                            && !key.trim().is_empty()
+                            && let Some(target) = route_secret_target(run, &current_route)
+                        {
                             *task_secret = Some(TaskSecret {
                                 run_id: run.id.clone(),
-                                endpoint_url: endpoint.base_url.clone(),
+                                target,
                                 value: key,
                             });
                         }
@@ -2610,21 +2687,12 @@ fn sessions(
                 .as_ref()
                 .filter(|saved| saved.matches(run, &current_route))
                 .and_then(|saved| {
-                    current_route
-                        .endpoint
-                        .as_ref()?
-                        .api_key_env
-                        .as_deref()
+                    route_key_reference(run, &current_route)
                         .map(|reference| (reference, saved.value.as_str()))
                 })
                 .or(profile_credentials);
-            if current_route
-                .endpoint
-                .as_ref()
-                .is_some_and(|endpoint| endpoint.api_key_env.is_some())
-                && credentials.is_none()
-            {
-                terminal.message(Tone::Warning, "Key needed", "This saved task needs its endpoint key before it can resume. Open F3 again to continue.")?;
+            if route_key_reference(run, &current_route).is_some() && credentials.is_none() {
+                terminal.message(Tone::Warning, "Key needed", "This saved task needs its provider key before it can resume. Open F3 again to continue.")?;
                 return Ok(());
             }
             resume(root, &run.id, terminal, credentials)?;
@@ -2888,7 +2956,11 @@ fn task(
         .unwrap_or("Reply directly to conversation; verify requested tool work with successful-operation evidence");
     let mut budgets = serde_json::to_value(profile.limits)?;
     budgets["provider_transport"] = json!("aegis-direct-v1");
+    if profile.provider == "claude-api" {
+        budgets["provider_transport"] = json!("aegis-claude-api-v1");
+    }
     budgets["model"] = json!(profile.model);
+    budgets["api_key_env"] = json!(profile.api_key_env);
     budgets["reasoning_effort"] = json!(profile.reasoning_effort);
     budgets["fallback_routes"] = json!(profile.fallback_routes);
     budgets["endpoint"] = json!(profile.endpoint);
@@ -2930,8 +3002,29 @@ fn recover_auth_after_follow(root: &Path, id: &str, terminal: &mut Terminal) -> 
     let Some(route) = auth_recovery_route(&store, id)? else {
         return Ok(());
     };
+    let run = store.run(id)?;
+    let reference = route_key_reference(&run, &route).map(str::to_owned);
     drop(store);
-    if route.provider == "custom" {
+    if route.provider == "claude-api" {
+        let Some(reference) = reference else {
+            return Ok(());
+        };
+        let choices = [
+            "Enter a current Claude API key and continue this task",
+            "Leave task paused",
+        ]
+        .map(str::to_owned);
+        if terminal.select("This task's Claude API key was rejected", &choices)? == Some(0)
+            && let Some(key) = field(terminal, "  Replacement key (hidden) › ", true)?
+        {
+            match crate::claude_api::validate_key(&key) {
+                Ok(()) => resume(root, id, terminal, Some((&reference, &key)))?,
+                Err(error) => {
+                    terminal.message(Tone::Warning, "Key unchanged", &error.to_string())?
+                }
+            }
+        }
+    } else if route.provider == "custom" {
         let Some(reference) = route
             .endpoint
             .as_ref()
@@ -3202,7 +3295,7 @@ pub fn interactive(root: &Path) -> Result<()> {
                     _ if request.starts_with('/') => terminal.message(Tone::Quiet, "Unknown shortcut", "Press F1 for help, F3 for chats, F6 for model/reasoning, or describe your task without a slash.")?,
                     _ => {
                         history.push(request.to_owned());
-                        if profile.provider != "custom"
+                        if !matches!(profile.provider.as_str(), "custom" | "claude-api")
                             && !ensure_provider(&terminal, &profile.provider)?
                         {
                             continue;
@@ -3365,6 +3458,7 @@ mod tests {
                 response_format: ResponseFormat::Schema,
                 allow_insecure: false,
             }),
+            api_key_env: None,
             write: false,
             image: None,
             limits: crate::budget::Limits::default(),
@@ -3423,6 +3517,58 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<Profile>(aliased)?.provider,
             "claude"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn claude_api_secret_is_bound_to_its_saved_run_and_never_persisted() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut profile = blank_profile("claude-api".into());
+        profile.model = Some("account-model".into());
+        profile.api_key_env = Some("ARUN_SESSION_API_KEY".into());
+        save(directory.path(), &profile)?;
+        let saved = fs::read_to_string(directory.path().join("profile.json"))?;
+        assert!(!saved.contains("secret-example"));
+        assert_eq!(secret_reference(&profile), Some("ARUN_SESSION_API_KEY"));
+
+        let mut store = Store::open(directory.path())?;
+        let budgets = json!({"provider_transport":"aegis-claude-api-v1","model":"account-model","api_key_env":"ARUN_SESSION_API_KEY"});
+        let first = store.create_run(
+            "first",
+            directory.path(),
+            "claude-api",
+            json!([]),
+            budgets.clone(),
+            "",
+        )?;
+        let second = store.create_run(
+            "second",
+            directory.path(),
+            "claude-api",
+            json!([]),
+            budgets,
+            "",
+        )?;
+        let route = store.current_route(&first.id)?;
+        assert_eq!(
+            route_key_reference(&first, &route),
+            Some("ARUN_SESSION_API_KEY")
+        );
+        assert_eq!(
+            route_secret_target(&first, &route).as_deref(),
+            Some("claude-api")
+        );
+        assert_eq!(run_secret_reference(&profile, &first), None);
+        let key = TaskSecret {
+            run_id: first.id.clone(),
+            target: "claude-api".into(),
+            value: "secret-example".into(),
+        };
+        assert!(key.matches(&first, &route));
+        assert!(!key.matches(&second, &route));
+        assert!(
+            !fs::read_to_string(directory.path().join("profile.json"))?.contains("secret-example")
         );
         Ok(())
     }
