@@ -26,7 +26,7 @@ fn guided_presets_and_custom_limits_are_saved_without_terminal_commands() -> Res
             .spawn()?;
         child.stdin.take().unwrap().write_all(
             format!(
-                "4\nhttp://127.0.0.1:9/v1\n1\n\nfixture\n2\n/settings\n2\n{choice}\n{fields}/quit\n"
+                "5\nhttp://127.0.0.1:9/v1\n1\n\nfixture\n2\n/settings\n2\n{choice}\n{fields}/quit\n"
             )
             .as_bytes(),
         )?;

@@ -34,7 +34,7 @@ fn guided_image_download_requires_a_choice_and_records_the_environment() -> Resu
             .spawn()?;
         let choice = if download { 1 } else { 3 };
         child.stdin.take().unwrap().write_all(
-            format!("4\nhttp://127.0.0.1:9/v1\n1\n\nfixture\n3\n{choice}\n/quit\n").as_bytes(),
+            format!("5\nhttp://127.0.0.1:9/v1\n1\n\nfixture\n3\n{choice}\n/quit\n").as_bytes(),
         )?;
         let output = child.wait_with_output()?;
         assert!(
