@@ -2625,6 +2625,7 @@ fn sessions(
                 return Ok(());
             }
             resume(root, &run.id, terminal, credentials)?;
+            recover_auth_after_follow(root, &run.id, terminal)?;
         }
         Some(6) if !run.is_terminal() => {
             cancel_task(root, Some(&run.id), terminal)?;
@@ -2918,22 +2919,67 @@ fn task(
     save(root, profile)?;
     kernel::spawn(root, &run.id, secret_reference(profile).zip(secret))?;
     follow(root, &run.id, terminal)?;
+    recover_auth_after_follow(root, &run.id, terminal)
+}
+
+fn recover_auth_after_follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
     let store = Store::open(root)?;
-    let authentication_failed = store.events(&run.id)?.iter().any(|event| {
-        event.kind == "model.failed"
-            && event.payload["error"]
-                .as_str()
-                .is_some_and(|error| is_auth_error(error))
-    });
-    if authentication_failed && profile.provider != "custom" {
-        let choices = ["Sign in and continue this task", "Leave task paused"].map(str::to_owned);
-        if terminal.select("Your provider sign-in needs refreshing", &choices)? == Some(0) {
-            if crate::signin::run(&profile.provider, terminal)? {
-                resume(root, &run.id, terminal, None)?;
+    let Some(route) = auth_recovery_route(&store, id)? else {
+        return Ok(());
+    };
+    drop(store);
+    if route.provider == "custom" {
+        let Some(reference) = route
+            .endpoint
+            .as_ref()
+            .and_then(|endpoint| endpoint.api_key_env.as_deref())
+        else {
+            return Ok(());
+        };
+        let choices = [
+            "Enter a new key and continue this task",
+            "Leave task paused",
+        ]
+        .map(str::to_owned);
+        if terminal.select("This endpoint rejected its key", &choices)? == Some(0) {
+            if let Some(key) = field(terminal, "  Replacement key (hidden) › ", true)? {
+                if !key.trim().is_empty() {
+                    resume(root, id, terminal, Some((reference, &key)))?;
+                }
             }
+        }
+    } else {
+        let choices = [
+            format!(
+                "Sign in to {} and continue this task",
+                name(&route.provider)
+            ),
+            "Leave task paused".into(),
+        ];
+        if terminal.select("This task's provider needs sign-in", &choices)? == Some(0)
+            && crate::signin::run(&route.provider, terminal)?
+        {
+            resume(root, id, terminal, None)?;
         }
     }
     Ok(())
+}
+
+fn auth_recovery_route(store: &Store, id: &str) -> Result<Option<crate::routing::Route>> {
+    if store.run(id)?.state != "waiting_recovery" {
+        return Ok(None);
+    }
+    let latest_model = store
+        .recent_events(id, 8)?
+        .into_iter()
+        .rev()
+        .find(|event| matches!(event.kind.as_str(), "model.failed" | "model.response"));
+    if !latest_model.is_some_and(|event| {
+        event.kind == "model.failed" && event.payload["error"].as_str().is_some_and(is_auth_error)
+    }) {
+        return Ok(None);
+    }
+    Ok(Some(store.current_route(id)?))
 }
 
 fn new_conversation(root: &Path, terminal: &Terminal, profile: &mut Profile) -> Result<()> {
@@ -3184,6 +3230,47 @@ pub fn interactive(root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_recovery_targets_the_switched_route_not_the_primary_profile() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "Repair parser",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({"provider_transport":"aegis-direct-v1","model":"primary","fallback_routes":[{"provider":"grok","model":"fallback"}]}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        store.event(&run.id, "model.started", json!({"turn":1}))?;
+        store.event(
+            &run.id,
+            "model.failed",
+            json!({"recoverable_reason":"usage_limit"}),
+        )?;
+        store.transition_provider(&run.id, crate::routing::Reason::UsageLimit)?;
+        store.event(&run.id, "model.started", json!({"turn":2}))?;
+        store.event(&run.id, "model.failed", json!({"error":"HTTP 401"}))?;
+        store.state(
+            &run.id,
+            "waiting_recovery",
+            json!({"reason":"model unavailable"}),
+        )?;
+        assert_eq!(
+            auth_recovery_route(&store, &run.id)?.unwrap().provider,
+            "grok"
+        );
+
+        store.state(&run.id, "ready", json!({}))?;
+        assert!(auth_recovery_route(&store, &run.id)?.is_none());
+        store.state(&run.id, "running", json!({}))?;
+        store.event(&run.id, "model.response", json!({"action":"blocked"}))?;
+        store.state(&run.id, "waiting_recovery", json!({"reason":"other"}))?;
+        assert!(auth_recovery_route(&store, &run.id)?.is_none());
+        Ok(())
+    }
 
     #[test]
     fn saved_chat_ages_use_storage_seconds() {

@@ -302,6 +302,94 @@ fn saved_task_key_reaches_frozen_endpoint(manual_sign_in: bool) -> Result<()> {
 }
 
 #[test]
+fn rejected_custom_key_can_be_replaced_without_starting_a_new_task() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join(".arun");
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let address = listener.local_addr()?;
+    Store::open(&root)?;
+    fs::write(
+        root.join("profile.json"),
+        serde_json::to_vec(
+            &json!({"provider":"custom","model":"local-model","endpoint":{"base_url":format!("http://{address}/v1"),"api_key_env":"ARUN_SESSION_API_KEY"},"write":false,"image":null}),
+        )?,
+    )?;
+    let server = thread::spawn(move || -> Result<()> {
+        for (attempt, key) in ["old-key", "replacement-key"].iter().enumerate() {
+            let started = Instant::now();
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if started.elapsed() > Duration::from_secs(15) {
+                            bail!("model attempt {attempt} did not reach the endpoint");
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            let (headers, body) = request(&mut stream)?;
+            assert!(headers.starts_with("POST /v1/chat/completions HTTP/1.1"));
+            assert!(
+                headers
+                    .to_lowercase()
+                    .contains(&format!("authorization: bearer {key}"))
+            );
+            assert_eq!(body["model"], "local-model");
+            if attempt == 0 {
+                write!(
+                    stream,
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )?;
+            } else {
+                let action =
+                    json!({"kind":"finish","summary":"Recovered in the same chat","evidence":[]});
+                let response = json!({"choices":[{"message":{"content":action.to_string()}}],"usage":{"prompt_tokens":10,"completion_tokens":2}}).to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                )?;
+            }
+        }
+        Ok(())
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_arun"))
+        .current_dir(directory.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"old-key\nhello\n1\nreplacement-key\n/quit\n")?;
+    let output = child.wait_with_output()?;
+    server.join().unwrap()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("This endpoint rejected its key"));
+    assert!(text.contains("Recovered in the same chat"));
+    assert!(!text.contains("old-key"));
+    assert!(!text.contains("replacement-key"));
+    let store = Store::open(&root)?;
+    let runs = store.runs()?;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].state, "answered");
+    assert_eq!(store.event_count(&runs[0].id, "model.failed")?, 1);
+    assert_eq!(store.event_count(&runs[0].id, "model.response")?, 1);
+    assert_eq!(store.event_count(&runs[0].id, "provider.transition")?, 0);
+    Ok(())
+}
+
+#[test]
 fn selected_multi_file_reads_reach_the_next_decision_without_an_inspection_turn() -> Result<()> {
     let directory = tempfile::tempdir()?;
     fs::write(directory.path().join("first.txt"), "αβ🛡️ one")?;
