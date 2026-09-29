@@ -341,3 +341,49 @@ fn switched_custom_route_asks_for_its_key_without_rewriting_the_primary_profile(
     assert_eq!(store.current_route(&run.id)?.provider, "custom");
     Ok(())
 }
+
+#[test]
+fn current_custom_task_with_a_different_endpoint_has_its_own_sign_in_choice() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join(".arun");
+    let mut store = Store::open(&root)?;
+    let run = store.create_run(
+        "Review parser",
+        directory.path(),
+        "custom",
+        json!([]),
+        json!({"model":"saved-model","endpoint":{"base_url":"http://127.0.0.1:1234/v1","api_key_env":"FROZEN_KEY"}}),
+        "",
+    )?;
+    store.state(
+        &run.id,
+        "waiting_recovery",
+        json!({"reason":"fixture paused"}),
+    )?;
+    let profile = json!({"provider":"custom","model":"new-model","endpoint":{"base_url":"http://127.0.0.1:5678/v1","api_key_env":"ARUN_SESSION_API_KEY"},"write":false,"image":null,"previous_run":run.id});
+    let original_profile = serde_json::to_vec(&profile)?;
+    fs::write(root.join("profile.json"), &original_profile)?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_arun"))
+        .current_dir(directory.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"new-task-key\n/login\n1\nsaved-task-key\n/quit\n")?;
+    let output = child.wait_with_output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("Current task · Custom endpoint / saved-model"));
+    assert!(text.contains("New tasks · Custom endpoint"));
+    assert!(!text.contains("saved-task-key"));
+    assert_eq!(fs::read(root.join("profile.json"))?, original_profile);
+    Ok(())
+}

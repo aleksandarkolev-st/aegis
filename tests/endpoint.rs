@@ -197,6 +197,99 @@ fn local_fallback_continuation(key: Option<&str>) -> Result<()> {
 }
 
 #[test]
+fn reentered_saved_task_key_reaches_only_its_frozen_endpoint() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join(".arun");
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let endpoint_url = format!("http://{}/v1", listener.local_addr()?);
+    let frozen_route = json!({"provider":"custom","model":"frozen-model","endpoint":{"base_url":endpoint_url,"api_key_env":"ARUN_SESSION_API_KEY"}});
+    let mut store = Store::open(&root)?;
+    let run = store.create_run(
+        "hello",
+        directory.path(),
+        "codex",
+        json!([]),
+        json!({"provider_transport":"aegis-direct-v1","model":"primary","fallback_routes":[frozen_route]}),
+        "",
+    )?;
+    store.state(&run.id, "running", json!({}))?;
+    store.event(&run.id, "model.started", json!({"turn":1}))?;
+    store.event(
+        &run.id,
+        "model.failed",
+        json!({"recoverable_reason":"usage_limit"}),
+    )?;
+    store.transition_provider(&run.id, Reason::UsageLimit)?;
+    store.state(
+        &run.id,
+        "waiting_recovery",
+        json!({"reason":"fixture paused"}),
+    )?;
+    let profile = json!({"provider":"codex","model":"primary","endpoint":null,"write":false,"image":null,"previous_run":run.id,"fallback_routes":[{"provider":"custom","model":"new-task-model","endpoint":{"base_url":"http://127.0.0.1:9/v1","api_key_env":"ARUN_SESSION_API_KEY"}}]});
+    let original_profile = serde_json::to_vec(&profile)?;
+    fs::write(root.join("profile.json"), &original_profile)?;
+
+    let server = thread::spawn(move || -> Result<()> {
+        let started = Instant::now();
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if started.elapsed() > Duration::from_secs(15) {
+                        bail!("saved task did not reach its frozen endpoint");
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let (headers, body) = request(&mut stream)?;
+        assert!(headers.starts_with("POST /v1/chat/completions HTTP/1.1"));
+        assert!(
+            headers
+                .to_lowercase()
+                .contains("authorization: bearer saved-task-key")
+        );
+        assert_eq!(body["model"], "frozen-model");
+        let action = json!({"kind":"finish","summary":"Recovered reply","evidence":[]});
+        let response = json!({"choices":[{"message":{"content":action.to_string()}}],"usage":{"prompt_tokens":10,"completion_tokens":2}}).to_string();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+            response.len()
+        )?;
+        Ok(())
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_arun"))
+        .current_dir(directory.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"new-task-key\n/login\n1\nsaved-task-key\n/sessions\n1\n6\n/quit\n")?;
+    let output = child.wait_with_output()?;
+    server.join().unwrap()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("saved-task-key"));
+    assert_eq!(fs::read(root.join("profile.json"))?, original_profile);
+    let store = Store::open(&root)?;
+    assert_eq!(store.run(&run.id)?.state, "answered");
+    assert_eq!(store.current_route(&run.id)?.provider, "custom");
+    assert_eq!(store.event_count(&run.id, "provider.transition")?, 1);
+    assert!(!serde_json::to_string(&store.events(&run.id)?)?.contains("saved-task-key"));
+    Ok(())
+}
+
+#[test]
 fn selected_multi_file_reads_reach_the_next_decision_without_an_inspection_turn() -> Result<()> {
     let directory = tempfile::tempdir()?;
     fs::write(directory.path().join("first.txt"), "αβ🛡️ one")?;

@@ -44,6 +44,12 @@ struct Profile {
     previous_run: Option<String>,
 }
 
+struct TaskSecret {
+    run_id: String,
+    endpoint_url: String,
+    value: String,
+}
+
 fn profile_provider<'de, Decoder: serde::Deserializer<'de>>(
     decoder: Decoder,
 ) -> std::result::Result<String, Decoder::Error> {
@@ -1721,45 +1727,45 @@ fn sign_in_for_selection(
     terminal: &Terminal,
     profile: &mut Profile,
     secret: &mut Option<String>,
+    task_secret: &mut Option<TaskSecret>,
 ) -> Result<()> {
     let current = if let Some(id) = profile.previous_run.as_deref() {
         let store = Store::open(root)?;
         match store.run(id) {
-            Ok(run) if !run.is_terminal() => Some(store.current_route(id)?),
+            Ok(run) if !run.is_terminal() => Some((id.to_owned(), store.current_route(id)?)),
             _ => None,
         }
     } else {
         None
     };
-    let selected = if let Some(route) = current
-        .as_ref()
-        .filter(|route| route.provider != profile.provider)
-    {
+    let current_route = current.as_ref().map(|(_, route)| route);
+    let current_selected = if let Some(route) = current_route.as_ref().filter(|route| {
+        route.provider != profile.provider
+            || (route.provider == "custom" && route.endpoint != profile.endpoint)
+    }) {
         let choices = [
             format!("Current task · {} / {}", name(&route.provider), route.model),
             format!("New tasks · {}", name(&profile.provider)),
             "Back".into(),
         ];
         match terminal.select("Sign in for which task?", &choices)? {
-            Some(0) => route.provider.as_str(),
-            Some(1) => profile.provider.as_str(),
+            Some(0) => true,
+            Some(1) => false,
             _ => return Ok(()),
         }
     } else {
-        profile.provider.as_str()
+        false
+    };
+    let selected = if current_selected {
+        &current_route.unwrap().provider
+    } else {
+        &profile.provider
     };
     if selected == "custom" {
-        if current
-            .as_ref()
-            .is_some_and(|route| route.provider == "custom")
-            && profile.provider != "custom"
-        {
-            if current
-                .as_ref()
-                .and_then(|route| route.endpoint.as_ref())
-                .and_then(|endpoint| endpoint.api_key_env.as_ref())
-                .is_none()
-            {
+        if current_selected {
+            let (run_id, route) = current.as_ref().unwrap();
+            let endpoint = route.endpoint.as_ref().unwrap();
+            if endpoint.api_key_env.is_none() {
                 terminal.message(Tone::Quiet, "Endpoint", "This task's custom route was approved without a key. New tasks can review a different endpoint in F7.")?;
                 return Ok(());
             }
@@ -1771,7 +1777,11 @@ fn sign_in_for_selection(
                         "This task's fallback needs a nonempty API key.",
                     )?;
                 } else {
-                    *secret = Some(key);
+                    *task_secret = Some(TaskSecret {
+                        run_id: run_id.clone(),
+                        endpoint_url: endpoint.base_url.clone(),
+                        value: key,
+                    });
                 }
             }
         } else {
@@ -2479,6 +2489,7 @@ fn sessions(
     terminal: &mut Terminal,
     profile: &mut Profile,
     secret: Option<&str>,
+    task_secret: Option<&TaskSecret>,
 ) -> Result<()> {
     let store = Store::open(root)?;
     let runs = chat_heads(store.runs()?);
@@ -2557,7 +2568,24 @@ fn sessions(
             if crate::continuation::needed(run) {
                 return continue_legacy(root, &run.id, terminal, profile);
             }
-            let credentials = run_secret_reference(profile, run).zip(secret);
+            let current_route = store.current_route(&run.id)?;
+            let credentials = task_secret
+                .filter(|saved| {
+                    saved.run_id == run.id
+                        && current_route
+                            .endpoint
+                            .as_ref()
+                            .is_some_and(|endpoint| endpoint.base_url == saved.endpoint_url)
+                })
+                .and_then(|saved| {
+                    current_route
+                        .endpoint
+                        .as_ref()?
+                        .api_key_env
+                        .as_deref()
+                        .map(|reference| (reference, saved.value.as_str()))
+                })
+                .or_else(|| run_secret_reference(profile, run).zip(secret));
             resume(root, &run.id, terminal, credentials)?;
         }
         Some(6) if !run.is_terminal() => {
@@ -2919,6 +2947,7 @@ pub fn interactive(root: &Path) -> Result<()> {
             configured
         }
     };
+    let mut task_secret = None;
     remember_selection(&terminal, &profile)?;
     if secret_reference(&profile).is_some() && secret.is_none() {
         secret = field(&terminal, "  API key for this session (hidden) › ", true)?;
@@ -2983,13 +3012,25 @@ pub fn interactive(root: &Path) -> Result<()> {
             Input::Help => help(&terminal)?,
             Input::Checkpoint => checkpoint_view(root, profile.previous_run.as_deref(), &terminal)?,
             Input::CancelTask => cancel_task(root, profile.previous_run.as_deref(), &terminal)?,
-            Input::Sessions => sessions(root, &mut terminal, &mut profile, secret.as_deref())?,
+            Input::Sessions => sessions(
+                root,
+                &mut terminal,
+                &mut profile,
+                secret.as_deref(),
+                task_secret.as_ref(),
+            )?,
             Input::NewConversation => {
                 new_conversation(root, &terminal, &mut profile)?;
                 history.clear();
             }
             Input::Login => {
-                sign_in_for_selection(root, &terminal, &mut profile, &mut secret)?;
+                sign_in_for_selection(
+                    root,
+                    &terminal,
+                    &mut profile,
+                    &mut secret,
+                    &mut task_secret,
+                )?;
             }
             Input::Submit(request) => {
                 let request = request.trim();
@@ -3011,7 +3052,13 @@ pub fn interactive(root: &Path) -> Result<()> {
                     }
                     "/reasoning" => switch_reasoning(root, &terminal, &mut profile)?,
                     "/login" => {
-                        sign_in_for_selection(root, &terminal, &mut profile, &mut secret)?
+                        sign_in_for_selection(
+                            root,
+                            &terminal,
+                            &mut profile,
+                            &mut secret,
+                            &mut task_secret,
+                        )?
                     }
                     "/settings" => {
                         settings(root, &mut terminal, &mut profile, &mut secret)?;
@@ -3023,7 +3070,13 @@ pub fn interactive(root: &Path) -> Result<()> {
                         history.clear();
                     }
                     "/sessions" | "/chats" | "/resume" | "/status" => {
-                        sessions(root, &mut terminal, &mut profile, secret.as_deref())?
+                        sessions(
+                            root,
+                            &mut terminal,
+                            &mut profile,
+                            secret.as_deref(),
+                            task_secret.as_ref(),
+                        )?
                     }
                     "/context" | "/tools" | "/artifacts" | "/trace" | "/tasks" => {
                         if let Some(id) = &profile.previous_run {
