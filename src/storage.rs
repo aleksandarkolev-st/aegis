@@ -415,9 +415,7 @@ impl Store {
         if !budgets.is_object() {
             bail!("run configuration must be an object");
         }
-        if budgets.get("obligations").is_none() {
-            budgets["obligations"] = json!(crate::obligations::from_task(task)?);
-        }
+        crate::obligations::freeze_requirements(task, &mut budgets)?;
         if budgets.get("tool_result_tokens").is_none() {
             budgets["tool_result_tokens"] = json!(crate::tokenization::DEFAULT_TOOL_TOKENS);
         }
@@ -1084,14 +1082,7 @@ impl Store {
         if unresolved != 0 {
             bail!("operations changed before completion; finish or reconcile them first");
         }
-        let outstanding: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM obligations WHERE run_id = ?1 AND id > 0 AND state != 'superseded' AND (state != 'verified' OR verified_revision IS NULL OR verified_revision != (SELECT revision FROM workspace_revisions WHERE run_id = ?1))",
-            [run_id],
-            |row| row.get(0),
-        )?;
-        if outstanding > 0 {
-            bail!("kernel obligations changed before completion; verify current evidence");
-        }
+        crate::obligations::validate_connection(&transaction, run_id)?;
         if milestones.len() == 1 && milestones[0].title == "Task request" {
             transaction.execute(
                 "UPDATE milestones SET state = 'completed', evidence = ?2 WHERE run_id = ?1",

@@ -88,6 +88,19 @@ pub fn from_task(task: &str) -> Result<Vec<String>> {
     titles(&serde_json::json!({"obligations":entries}))
 }
 
+// Explicit configuration may add requirements, but cannot erase the user's list.
+pub(crate) fn freeze_requirements(task: &str, configuration: &mut Value) -> Result<()> {
+    let mut configured = titles(configuration)?;
+    for title in from_task(task)? {
+        if !configured.contains(&title) {
+            configured.push(title);
+        }
+    }
+    configuration["obligations"] = serde_json::json!(configured);
+    titles(configuration)?;
+    Ok(())
+}
+
 pub(crate) fn insert(transaction: &Transaction<'_>, run: &Run) -> Result<()> {
     let titles = titles(&run.budgets)?;
     transaction.execute(
@@ -186,36 +199,75 @@ pub(crate) fn record_operation(
 }
 
 pub(crate) fn validate_completion(store: &Store, run_id: &str) -> Result<()> {
-    let obligations = store.obligations(run_id)?;
+    validate_connection(&store.connection, run_id)
+}
+
+pub(crate) fn validate_connection(connection: &rusqlite::Connection, run_id: &str) -> Result<()> {
+    let mut statement = connection.prepare(
+        "SELECT id, state, evidence, verified_revision, superseded_by, reason FROM obligations WHERE run_id = ?1 ORDER BY id",
+    )?;
+    let obligations = statement
+        .query_map([run_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     if obligations.len() <= 1 {
         return Ok(());
     }
-    let revision = store
-        .workspace_revision(run_id)?
-        .context("obligation workspace revision missing")?;
-    for obligation in obligations
-        .iter()
-        .skip(1)
-        .filter(|item| item.state == "superseded")
+    let revision: i64 = connection.query_row(
+        "SELECT revision FROM workspace_revisions WHERE run_id = ?1",
+        [run_id],
+        |row| row.get(0),
+    )?;
+    for (id, state, evidence, verified_revision, replacement, reason) in
+        obligations.iter().filter(|item| item.0 > 0)
     {
-        let replacement = obligation
-            .superseded_by
-            .and_then(|id| obligations.iter().find(|item| item.id == id));
-        if obligation.reason.as_deref().is_none_or(str::is_empty)
-            || replacement.is_none_or(|item| item.id <= obligation.id)
-        {
-            bail!("superseded obligation lacks a valid replacement and reason");
+        if state == "superseded" {
+            if reason.as_deref().is_none_or(|text| text.trim().is_empty())
+                || !replacement
+                    .is_some_and(|next| next > *id && obligations.iter().any(|item| item.0 == next))
+            {
+                bail!("superseded obligation lacks a valid replacement and reason");
+            }
+            continue;
+        }
+        if state != "verified" || *verified_revision != Some(revision) {
+            bail!(
+                "kernel obligations remain open or stale; verify them at the current workspace revision before finishing"
+            );
+        }
+        let evidence: Vec<String> = serde_json::from_str(evidence)?;
+        if evidence.is_empty() || evidence.len() > 20 {
+            bail!("verified obligation lacks bounded evidence");
+        }
+        for hash in evidence {
+            if !current_evidence(connection, run_id, revision, &hash)? {
+                bail!(
+                    "verified obligation evidence is no longer successful and current for this run"
+                );
+            }
         }
     }
-    if obligations.iter().skip(1).any(|obligation| {
-        obligation.state != "superseded"
-            && (obligation.state != "verified" || obligation.verified_revision != Some(revision))
-    }) {
-        bail!(
-            "kernel obligations remain open or stale; verify them at the current workspace revision before finishing"
-        );
-    }
     Ok(())
+}
+
+fn current_evidence(
+    connection: &rusqlite::Connection,
+    run_id: &str,
+    revision: i64,
+    hash: &str,
+) -> Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM operations AS operation JOIN operation_revisions AS revision ON revision.operation_id = operation.id AND revision.run_id = operation.run_id WHERE operation.run_id = ?1 AND operation.state = 'succeeded' AND revision.revision = ?2 AND (operation.artifact = ?3 OR EXISTS (SELECT 1 FROM operation_artifacts AS linked WHERE linked.operation_id = operation.id AND linked.hash = ?3)))",
+        params![run_id, revision, hash], |row| row.get(0),
+    )?)
 }
 
 impl Store {
@@ -329,6 +381,13 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let state: String =
+            transaction.query_row("SELECT state FROM runs WHERE id = ?1", [run_id], |row| {
+                row.get(0)
+            })?;
+        if state != "running" {
+            bail!("only a running task can verify obligations");
+        }
         let revision: i64 = transaction.query_row(
             "SELECT revision FROM workspace_revisions WHERE run_id = ?1",
             [run_id],
@@ -354,12 +413,7 @@ impl Store {
                 bail!("obligation is unavailable or superseded");
             }
             for hash in &proof.evidence {
-                let current: i64 = transaction.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM operations AS operation JOIN operation_revisions AS revision ON revision.operation_id = operation.id WHERE operation.run_id = ?1 AND operation.state = 'succeeded' AND revision.revision = ?2 AND (operation.artifact = ?3 OR EXISTS (SELECT 1 FROM operation_artifacts AS linked WHERE linked.operation_id = operation.id AND linked.hash = ?3)))",
-                    params![run_id, revision, hash],
-                    |row| row.get(0),
-                )?;
-                if current == 0 {
+                if !current_evidence(&transaction, run_id, revision, hash)? {
                     bail!("obligation evidence must be successful and current for this run");
                 }
             }
@@ -422,6 +476,80 @@ impl Store {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn configured_requirements_cannot_suppress_task_requirements() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let task = "Fix parser\nRequirements:\n- nested expressions\n- preserve API";
+        for configured in [
+            json!([]),
+            json!(["nested expressions"]),
+            json!(["run tests"]),
+        ] {
+            let run = store.create_run(
+                task,
+                directory.path(),
+                "codex",
+                json!([]),
+                json!({"obligations":configured}),
+                "",
+            )?;
+            let ledger = store.obligations(&run.id)?;
+            assert!(ledger.iter().any(|item| item.title == "nested expressions"));
+            assert!(ledger.iter().any(|item| item.title == "preserve API"));
+        }
+        assert!(
+            store
+                .create_run(
+                    "Fix\nRequirements:\nmalformed",
+                    directory.path(),
+                    "codex",
+                    json!([]),
+                    json!({"obligations":[]}),
+                    ""
+                )
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn completion_rechecks_provenance_and_supersession_inside_transaction() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "work",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({"obligations":["Run tests"]}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let operation = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
+        let evidence = store.put_artifact(b"test receipt")?;
+        store.operation_state(&operation, "succeeded", Some(&evidence), json!({}))?;
+        store.verify_obligation(&run.id, 1, &[evidence.clone()])?;
+        store.operation_state(&operation, "failed", None, json!({}))?;
+        assert!(
+            store
+                .complete_run(&run.id, "done", &[evidence.clone()])
+                .is_err()
+        );
+        assert!(validate_connection(&store.connection, &run.id).is_err());
+        store.operation_state(&operation, "succeeded", Some(&evidence), json!({}))?;
+        let replacement = store.supersede_obligation(&run.id, 1, "Run all tests", "Approved")?;
+        store.verify_obligation(&run.id, replacement, &[evidence.clone()])?;
+        store.connection.execute(
+            "UPDATE obligations SET reason = '' WHERE run_id = ?1 AND id = 1",
+            [&run.id],
+        )?;
+        assert!(validate_connection(&store.connection, &run.id).is_err());
+        assert!(store.complete_run(&run.id, "done", &[evidence]).is_err());
+        assert_eq!(store.run(&run.id)?.state, "running");
+        Ok(())
+    }
 
     #[test]
     fn user_requirement_bullets_become_immutable_run_obligations() -> Result<()> {
