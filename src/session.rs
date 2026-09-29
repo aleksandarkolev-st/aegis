@@ -588,7 +588,12 @@ fn configure_acceptance(terminal: &Terminal, profile: &mut Profile) -> Result<bo
     Ok(true)
 }
 
-fn settings(root: &Path, terminal: &mut Terminal, profile: &mut Profile) -> Result<()> {
+fn settings(
+    root: &Path,
+    terminal: &mut Terminal,
+    profile: &mut Profile,
+    secret: &mut Option<String>,
+) -> Result<()> {
     let choices = [
         "Workspace permissions and command environment",
         "Task budgets",
@@ -604,6 +609,7 @@ fn settings(root: &Path, terminal: &mut Terminal, profile: &mut Profile) -> Resu
     ]
     .map(str::to_owned);
     let mut selected = profile.clone();
+    let mut selected_secret = secret.clone();
     let changed = match terminal.select("Settings · no provider reset", &choices)? {
         Some(0) => configure_environment(terminal, &mut selected)?,
         Some(1) => {
@@ -621,12 +627,16 @@ fn settings(root: &Path, terminal: &mut Terminal, profile: &mut Profile) -> Resu
         Some(6) => configure_file_scopes(terminal, &mut selected)?,
         Some(7) => configure_network_scopes(terminal, &mut selected)?,
         Some(8) => return instruction_menu(root, terminal),
-        Some(9) => configure_fallback(terminal, &mut selected)?,
+        Some(9) => configure_fallback(terminal, &mut selected, &mut selected_secret)?,
         _ => false,
     };
     if changed {
         save(root, &selected)?;
+        if secret_reference(&selected).is_none() {
+            selected_secret = None;
+        }
         *profile = selected;
+        *secret = selected_secret;
         terminal.message(
             Tone::Success,
             "Settings saved",
@@ -636,12 +646,16 @@ fn settings(root: &Path, terminal: &mut Terminal, profile: &mut Profile) -> Resu
     Ok(())
 }
 
-fn configure_fallback(terminal: &Terminal, profile: &mut Profile) -> Result<bool> {
+fn configure_fallback(
+    terminal: &Terminal,
+    profile: &mut Profile,
+    secret: &mut Option<String>,
+) -> Result<bool> {
     if !matches!(profile.provider.as_str(), "codex" | "grok" | "custom") {
         terminal.message(
             Tone::Quiet,
             "Fallback",
-            "Claude subscription fallback is pending. ChatGPT, Grok and keyless custom endpoints can be reviewed here.",
+            "Claude subscription fallback is pending. ChatGPT, Grok and custom endpoints can be reviewed here.",
         )?;
         return Ok(false);
     }
@@ -697,9 +711,18 @@ fn configure_fallback(terminal: &Terminal, profile: &mut Profile) -> Result<bool
             2 => ResponseFormat::None,
             _ => return Ok(false),
         };
+        let Some(key) = field(
+            terminal,
+            "Fallback API key (blank for keyless endpoint)",
+            true,
+        )?
+        else {
+            return Ok(false);
+        };
+        let key = (!key.trim().is_empty()).then_some(key);
         let endpoint = Endpoint {
             base_url,
-            api_key_env: None,
+            api_key_env: key.as_ref().map(|_| "ARUN_SESSION_API_KEY".into()),
             response_format,
             allow_insecure: false,
         };
@@ -708,9 +731,10 @@ fn configure_fallback(terminal: &Terminal, profile: &mut Profile) -> Result<bool
             return Ok(false);
         }
         let discovery = endpoint.clone();
+        let discovery_key = key.clone();
         let catalog =
             crate::background::run(terminal, "Verifying endpoint models", move |cancelled| {
-                discovery.models_with_cancel(None, || {
+                discovery.models_with_cancel(discovery_key.as_deref(), || {
                     cancelled.load(std::sync::atomic::Ordering::Acquire)
                 })
             });
@@ -738,6 +762,7 @@ fn configure_fallback(terminal: &Terminal, profile: &mut Profile) -> Result<bool
         let Some(model) = models.get(index) else {
             return Ok(false);
         };
+        *secret = key;
         crate::routing::Route {
             provider: "custom".into(),
             model: model.id.clone(),
@@ -1667,6 +1692,33 @@ fn secret_reference(profile: &Profile) -> Option<&str> {
         .endpoint
         .as_ref()
         .and_then(|endpoint| endpoint.api_key_env.as_deref())
+        .or_else(|| {
+            profile
+                .fallback_routes
+                .iter()
+                .find_map(|route| route.endpoint.as_ref()?.api_key_env.as_deref())
+        })
+}
+
+fn run_secret_reference<'a>(profile: &Profile, run: &'a crate::storage::Run) -> Option<&'a str> {
+    let endpoint = profile.endpoint.as_ref().or_else(|| {
+        profile
+            .fallback_routes
+            .iter()
+            .find_map(|route| route.endpoint.as_ref())
+    })?;
+    let matches =
+        |value: &serde_json::Value| value["base_url"].as_str() == Some(endpoint.base_url.as_str());
+    let approved = if matches(&run.budgets["endpoint"]) {
+        Some(&run.budgets["endpoint"])
+    } else {
+        run.budgets["fallback_routes"]
+            .as_array()?
+            .iter()
+            .map(|route| &route["endpoint"])
+            .find(|route| matches(route))
+    }?;
+    approved["api_key_env"].as_str()
 }
 
 #[derive(Default)]
@@ -2412,17 +2464,7 @@ fn sessions(
             if crate::continuation::needed(run) {
                 return continue_legacy(root, &run.id, terminal, profile);
             }
-            let matching_endpoint = profile.endpoint.as_ref().is_some_and(|endpoint| {
-                run.budgets
-                    .pointer("/endpoint/base_url")
-                    .and_then(|url| url.as_str())
-                    == Some(endpoint.base_url.as_str())
-            });
-            let credentials = if matching_endpoint {
-                secret_reference(profile).zip(secret)
-            } else {
-                None
-            };
+            let credentials = run_secret_reference(profile, run).zip(secret);
             resume(root, &run.id, terminal, credentials)?;
         }
         Some(6) if !run.is_terminal() => {
@@ -2844,7 +2886,7 @@ pub fn interactive(root: &Path) -> Result<()> {
                 switch_provider(root, &terminal, &mut profile, &mut secret)?;
             }
             Input::Models => switch_model(root, &terminal, &mut profile, secret.as_deref())?,
-            Input::Settings => settings(root, &mut terminal, &mut profile)?,
+            Input::Settings => settings(root, &mut terminal, &mut profile, &mut secret)?,
             Input::Help => help(&terminal)?,
             Input::Checkpoint => checkpoint_view(root, profile.previous_run.as_deref(), &terminal)?,
             Input::CancelTask => cancel_task(root, profile.previous_run.as_deref(), &terminal)?,
@@ -2889,7 +2931,7 @@ pub fn interactive(root: &Path) -> Result<()> {
                     }
                     "/reasoning" => switch_reasoning(root, &terminal, &mut profile)?,
                     "/settings" => {
-                        settings(root, &mut terminal, &mut profile)?;
+                        settings(root, &mut terminal, &mut profile, &mut secret)?;
                     }
                     "/memory" => memory_menu(root, &terminal)?,
                     "/instructions" => instruction_menu(root, &terminal)?,
@@ -3074,8 +3116,37 @@ mod tests {
         let saved: Profile =
             serde_json::from_slice(&fs::read(directory.path().join("profile.json"))?)?;
         assert_eq!(secret_reference(&saved), Some("ARUN_SESSION_API_KEY"));
+        let mut direct = saved.clone();
+        direct.provider = "codex".into();
+        direct.endpoint = None;
+        direct.fallback_routes = vec![crate::routing::Route {
+            provider: "custom".into(),
+            model: "model".into(),
+            reasoning_effort: None,
+            endpoint: saved.endpoint.clone(),
+        }];
+        assert_eq!(secret_reference(&direct), Some("ARUN_SESSION_API_KEY"));
         assert!(saved.write);
         assert_eq!(fs::read_dir(directory.path())?.count(), 1);
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "read fixture",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({"provider_transport":"aegis-direct-v1","model":"primary","fallback_routes":[{"provider":"custom","model":"model","endpoint":{"base_url":"https://example.test/v1","api_key_env":"FROZEN_RUN_KEY"}}]}),
+            "",
+        )?;
+        assert_eq!(run_secret_reference(&direct, &run), Some("FROZEN_RUN_KEY"));
+        let other = store.create_run(
+            "read fixture",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({"provider_transport":"aegis-direct-v1","model":"primary","fallback_routes":[{"provider":"custom","model":"model","endpoint":{"base_url":"https://other.test/v1","api_key_env":"OTHER_KEY"}}]}),
+            "",
+        )?;
+        assert_eq!(run_secret_reference(&direct, &other), None);
         assert!(is_auth_error("OAuth access token has expired. HTTP 401"));
         assert!(!is_auth_error("usage balance exhausted"));
         let mut aliased = serde_json::to_value(&saved)?;

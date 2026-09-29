@@ -496,9 +496,19 @@ fn custom_setup_lists_authenticated_endpoint_models_without_saving_the_key() -> 
 
 #[test]
 fn settings_approve_a_keyless_local_fallback_from_its_live_catalog() -> Result<()> {
+    approve_local_fallback(None)
+}
+
+#[test]
+fn settings_approve_an_authenticated_local_fallback_without_persisting_the_key() -> Result<()> {
+    approve_local_fallback(Some("private-fallback-fixture-key"))
+}
+
+fn approve_local_fallback(key: Option<&str>) -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
     listener.set_nonblocking(true)?;
+    let expected_key = key.map(str::to_owned);
     let server = std::thread::spawn(move || -> Result<()> {
         let started = Instant::now();
         let mut stream = loop {
@@ -525,7 +535,11 @@ fn settings_approve_a_keyless_local_fallback_from_its_live_catalog() -> Result<(
         }
         let headers = String::from_utf8(request)?.to_lowercase();
         assert!(headers.starts_with("get /v1/models "));
-        assert!(!headers.contains("authorization:"));
+        if let Some(key) = expected_key {
+            assert!(headers.contains(&format!("authorization: bearer {key}")));
+        } else {
+            assert!(!headers.contains("authorization:"));
+        }
         let body = json!({"data":[{"id":"qwen-local"}]}).to_string();
         write!(
             stream,
@@ -545,11 +559,13 @@ fn settings_approve_a_keyless_local_fallback_from_its_live_catalog() -> Result<(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(format!("/settings\n10\n3\nhttp://{address}/v1\n1\n1\n2\n/quit\n").as_bytes())?;
+    child.stdin.take().unwrap().write_all(
+        format!(
+            "/settings\n10\n3\nhttp://{address}/v1\n1\n{}\n1\n2\n/quit\n",
+            key.unwrap_or_default()
+        )
+        .as_bytes(),
+    )?;
     let output = child.wait_with_output()?;
     server.join().unwrap()?;
     assert!(
@@ -560,7 +576,14 @@ fn settings_approve_a_keyless_local_fallback_from_its_live_catalog() -> Result<(
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(text.contains("Context sharing"));
     assert!(text.contains("qwen-local"));
-    let saved: Value = serde_json::from_slice(&fs::read(root.join("profile.json"))?)?;
+    if let Some(key) = key {
+        assert!(!text.contains(key));
+    }
+    let profile_bytes = fs::read(root.join("profile.json"))?;
+    if let Some(key) = key {
+        assert!(!String::from_utf8_lossy(&profile_bytes).contains(key));
+    }
+    let saved: Value = serde_json::from_slice(&profile_bytes)?;
     assert_eq!(saved["fallback_routes"][0]["provider"], "custom");
     assert_eq!(saved["fallback_routes"][0]["model"], "qwen-local");
     assert_eq!(
@@ -569,7 +592,7 @@ fn settings_approve_a_keyless_local_fallback_from_its_live_catalog() -> Result<(
     );
     assert_eq!(
         saved["fallback_routes"][0]["endpoint"]["api_key_env"],
-        Value::Null
+        key.map_or(Value::Null, |_| json!("ARUN_SESSION_API_KEY"))
     );
     for key in [
         "provider",
