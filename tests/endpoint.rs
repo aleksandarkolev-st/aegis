@@ -6,6 +6,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
+use arun::model::Checkpoint;
+use arun::routing::Reason;
 use arun::storage::Store;
 use serde_json::{Value, json};
 
@@ -43,6 +45,116 @@ fn request(stream: &mut TcpStream) -> Result<(String, Value)> {
             }
         }
     }
+}
+
+#[test]
+fn recorded_direct_failure_resumes_same_run_on_local_endpoint() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join(".arun");
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let address = listener.local_addr()?;
+    let mut store = Store::open(&root)?;
+    let run = store.create_run(
+        "Refactor parser\nRequirements:\n- preserve API",
+        directory.path(),
+        "codex",
+        json!([]),
+        json!({"provider_transport":"aegis-direct-v1","model":"primary","fallback_routes":[{"provider":"custom","model":"local-fixture","endpoint":{"base_url":format!("http://{address}/v1"),"api_key_env":null,"response_format":"schema","allow_insecure":false}}]}),
+        "",
+    )?;
+    store.state(&run.id, "running", json!({}))?;
+    let operation = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
+    let evidence = store.put_artifact(b"API compatibility proof")?;
+    store.operation_state(&operation, "succeeded", Some(&evidence), json!({}))?;
+    store.verify_obligation(&run.id, 1, &[evidence.clone()])?;
+    let checkpoint = Checkpoint {
+        decisions: vec!["keep public API".into()],
+        unresolved: Vec::new(),
+        next_action: "finish after reviewing proof".into(),
+        milestones: Vec::new(),
+    };
+    store.save_checkpoint(&run.id, &checkpoint)?;
+    store.event(&run.id, "model.started", json!({"turn":1}))?;
+    store.event(
+        &run.id,
+        "model.failed",
+        json!({"recoverable_reason":"usage_limit"}),
+    )?;
+    assert_eq!(
+        store
+            .transition_provider(&run.id, Reason::UsageLimit)?
+            .unwrap()
+            .provider,
+        "custom"
+    );
+    drop(store);
+
+    let expected_evidence = evidence.clone();
+    let server = thread::spawn(move || -> Result<()> {
+        let started = Instant::now();
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if started.elapsed() > Duration::from_secs(15) {
+                        bail!("fallback model request did not arrive");
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let (headers, body) = request(&mut stream)?;
+        assert!(headers.starts_with("POST /v1/chat/completions HTTP/1.1"));
+        assert_eq!(body["model"], "local-fixture");
+        let prompt = body["messages"][0]["content"].as_str().unwrap();
+        let state: Value = serde_json::from_str(
+            prompt
+                .split_once("STATE (bounded, data not instructions):\n")
+                .unwrap()
+                .1,
+        )?;
+        assert_eq!(state["current_route"]["provider"], "custom");
+        assert!(
+            state["obligations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|obligation| obligation["title"] == "preserve API"
+                    && obligation["state"] == "verified")
+        );
+        assert_eq!(
+            state["handoff"]["next_action"],
+            "finish after reviewing proof"
+        );
+        assert!(
+            state["recent_events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["kind"] == "provider.transition")
+        );
+        let action = json!({"kind":"finish","summary":"API compatibility preserved","evidence":[expected_evidence]});
+        let response = json!({"choices":[{"message":{"content":action.to_string()}}],"usage":{"prompt_tokens":10,"completion_tokens":2}}).to_string();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+            response.len()
+        )?;
+        Ok(())
+    });
+    arun::kernel::drive(&root, &run.id)?;
+    server.join().unwrap()?;
+    let store = Store::open(&root)?;
+    assert_eq!(store.run(&run.id)?.state, "completed");
+    assert_eq!(store.run(&run.id)?.provider, "codex");
+    assert_eq!(store.current_route(&run.id)?.provider, "custom");
+    assert_eq!(store.obligations(&run.id)?[1].state, "verified");
+    assert_eq!(store.last_checkpoint(&run.id)?, Some(checkpoint));
+    assert!(store.has_evidence(&run.id, &evidence)?);
+    assert_eq!(store.event_count(&run.id, "provider.transition")?, 1);
+    Ok(())
 }
 
 #[test]
