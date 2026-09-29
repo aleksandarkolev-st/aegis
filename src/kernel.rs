@@ -471,6 +471,9 @@ pub(crate) fn cleanup_container(operation: &Operation) {
 }
 
 fn remove_provider_keys(command: &mut Command, run: &Run) -> Result<()> {
+    if let Some(reference) = run.budgets["api_key_env"].as_str() {
+        command.env_remove(reference);
+    }
     if let Some(reference) = run
         .budgets
         .pointer("/endpoint/api_key_env")
@@ -1200,6 +1203,11 @@ mod tests {
                 "custom",
                 json!({"model":"primary","endpoint":{"base_url":"https://example.test/v1","api_key_env":"PRIMARY_KEY"},"fallback_routes":[{"provider":"grok","model":"fallback"}]}),
                 "PRIMARY_KEY",
+            ),
+            (
+                "claude-api",
+                json!({"provider_transport":"aegis-claude-api-v1","model":"account-model","api_key_env":"CLAUDE_API_SESSION_KEY"}),
+                "CLAUDE_API_SESSION_KEY",
             ),
         ] {
             let run = store.create_run(

@@ -175,6 +175,49 @@ pub fn call_configured(
             Ok(effort)
         })
         .transpose()?;
+    if provider == "claude-api" {
+        if configuration["provider_transport"] != "aegis-claude-api-v1" {
+            bail!(
+                "Claude API tasks require an explicit API-key route; Claude Code subscription login is separate and pending"
+            );
+        }
+        let model = configuration["model"]
+            .as_str()
+            .filter(|model| crate::catalog::valid_id(model))
+            .context("Claude API tasks require a selected model")?;
+        let reference = configuration["api_key_env"]
+            .as_str()
+            .filter(|reference| {
+                !reference.is_empty()
+                    && !reference.as_bytes()[0].is_ascii_digit()
+                    && reference
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            })
+            .context("Claude API tasks require a valid session-only API-key reference")?;
+        let key = std::env::var(reference).with_context(|| {
+            format!("Claude API key for {reference} is missing; enter it again")
+        })?;
+        let output_tokens = configuration
+            .get("output_tokens")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .context("Claude API output_tokens must be a count")
+            })
+            .transpose()?
+            .unwrap_or(4096);
+        return crate::claude_api::call(
+            model,
+            prompt,
+            &key,
+            output_tokens,
+            response_bytes,
+            reasoning,
+            timeout,
+            cancelled,
+        );
+    }
     if provider == "custom" {
         let endpoint: crate::endpoint::Endpoint = serde_json::from_value(
             configuration
@@ -273,6 +316,33 @@ mod tests {
         .unwrap()
         .to_string();
         assert!(error.contains("Choose a model"));
+        Ok(())
+    }
+
+    #[test]
+    fn claude_api_never_reuses_claude_code_subscription_authentication() -> Result<()> {
+        let error = call_configured(
+            "claude-api",
+            &serde_json::json!({"model":"account-model"}),
+            "hello",
+            Path::new("."),
+            Duration::from_secs(1),
+            || false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("explicit API-key route"));
+        let error = call_configured(
+            "claude-api",
+            &serde_json::json!({"provider_transport":"aegis-claude-api-v1","model":"account-model","api_key_env":"BAD-NAME"}),
+            "hello",
+            Path::new("."),
+            Duration::from_secs(1),
+            || false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("API-key reference"));
         Ok(())
     }
 

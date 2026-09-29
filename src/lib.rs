@@ -4,6 +4,7 @@ pub mod background;
 pub mod budget;
 pub mod capability;
 pub mod catalog;
+pub mod claude_api;
 pub mod continuation;
 pub mod direct;
 pub mod endpoint;
