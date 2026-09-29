@@ -470,6 +470,26 @@ pub(crate) fn cleanup_container(operation: &Operation) {
     }
 }
 
+fn remove_provider_keys(command: &mut Command, run: &Run) -> Result<()> {
+    if let Some(reference) = run
+        .budgets
+        .pointer("/endpoint/api_key_env")
+        .and_then(Value::as_str)
+    {
+        command.env_remove(reference);
+    }
+    for route in crate::routing::approved(run)? {
+        if let Some(reference) = route
+            .endpoint
+            .as_ref()
+            .and_then(|endpoint| endpoint.api_key_env.as_deref())
+        {
+            command.env_remove(reference);
+        }
+    }
+    Ok(())
+}
+
 fn dispatch(root: &Path, operation: &Operation, timeout: Duration) -> Result<Value> {
     let output = tempfile::tempdir_in(root)?;
     let stdout = output.path().join("result");
@@ -483,13 +503,7 @@ fn dispatch(root: &Path, operation: &Operation, timeout: Duration) -> Result<Val
         .stdout(Stdio::from(File::create(&stdout)?))
         .stderr(Stdio::from(File::create(&stderr)?));
     let run = Store::open(root)?.run(&operation.run_id)?;
-    if let Some(reference) = run
-        .budgets
-        .pointer("/endpoint/api_key_env")
-        .and_then(Value::as_str)
-    {
-        command.env_remove(reference);
-    }
+    remove_provider_keys(&mut command, &run)?;
     let mut child = crate::process::spawn(command)?;
     let start = Instant::now();
     loop {
@@ -1087,6 +1101,48 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_worker_environment_excludes_primary_and_fallback_provider_keys() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        for (provider, budgets, reference) in [
+            (
+                "codex",
+                json!({"provider_transport":"aegis-direct-v1","model":"primary","fallback_routes":[{"provider":"custom","model":"fallback","endpoint":{"base_url":"https://example.test/v1","api_key_env":"FALLBACK_KEY"}}]}),
+                "FALLBACK_KEY",
+            ),
+            (
+                "custom",
+                json!({"model":"primary","endpoint":{"base_url":"https://example.test/v1","api_key_env":"PRIMARY_KEY"},"fallback_routes":[{"provider":"grok","model":"fallback"}]}),
+                "PRIMARY_KEY",
+            ),
+        ] {
+            let run = store.create_run(
+                "Read a file",
+                directory.path(),
+                provider,
+                json!([]),
+                budgets,
+                "",
+            )?;
+            let mut command = Command::new("fixture");
+            command
+                .env(reference, "secret")
+                .env("OTHER_SETTING", "safe");
+            remove_provider_keys(&mut command, &run)?;
+            assert!(
+                command.get_envs().any(|(name, value)| {
+                    name.to_string_lossy() == reference && value.is_none()
+                })
+            );
+            assert!(command.get_envs().any(|(name, value)| {
+                name.to_string_lossy() == "OTHER_SETTING"
+                    && value.is_some_and(|value| value == "safe")
+            }));
+        }
+        Ok(())
+    }
 
     #[test]
     fn provider_context_keeps_active_obligations_without_replaying_superseded_history() -> Result<()>
