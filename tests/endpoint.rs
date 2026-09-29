@@ -49,6 +49,15 @@ fn request(stream: &mut TcpStream) -> Result<(String, Value)> {
 
 #[test]
 fn recorded_direct_failure_resumes_same_run_on_local_endpoint() -> Result<()> {
+    local_fallback_continuation(None)
+}
+
+#[test]
+fn recorded_direct_failure_resumes_with_private_fallback_key() -> Result<()> {
+    local_fallback_continuation(Some("private-fallback-run-key"))
+}
+
+fn local_fallback_continuation(key: Option<&str>) -> Result<()> {
     let directory = tempfile::tempdir()?;
     let root = directory.path().join(".arun");
     let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -60,7 +69,7 @@ fn recorded_direct_failure_resumes_same_run_on_local_endpoint() -> Result<()> {
         directory.path(),
         "codex",
         json!([]),
-        json!({"provider_transport":"aegis-direct-v1","model":"primary","fallback_routes":[{"provider":"custom","model":"local-fixture","endpoint":{"base_url":format!("http://{address}/v1"),"api_key_env":null,"response_format":"schema","allow_insecure":false}}]}),
+        json!({"provider_transport":"aegis-direct-v1","model":"primary","fallback_routes":[{"provider":"custom","model":"local-fixture","endpoint":{"base_url":format!("http://{address}/v1"),"api_key_env":key.map(|_| "ARUN_SESSION_API_KEY"),"response_format":"schema","allow_insecure":false}}]}),
         "",
     )?;
     store.state(&run.id, "running", json!({}))?;
@@ -91,6 +100,7 @@ fn recorded_direct_failure_resumes_same_run_on_local_endpoint() -> Result<()> {
     drop(store);
 
     let expected_evidence = evidence.clone();
+    let expected_key = key.map(str::to_owned);
     let server = thread::spawn(move || -> Result<()> {
         let started = Instant::now();
         let mut stream = loop {
@@ -107,6 +117,15 @@ fn recorded_direct_failure_resumes_same_run_on_local_endpoint() -> Result<()> {
         };
         let (headers, body) = request(&mut stream)?;
         assert!(headers.starts_with("POST /v1/chat/completions HTTP/1.1"));
+        if let Some(key) = &expected_key {
+            assert!(
+                headers
+                    .to_lowercase()
+                    .contains(&format!("authorization: bearer {key}"))
+            );
+        } else {
+            assert!(!headers.to_lowercase().contains("authorization:"));
+        }
         assert_eq!(body["model"], "local-fixture");
         let prompt = body["messages"][0]["content"].as_str().unwrap();
         let state: Value = serde_json::from_str(
@@ -144,7 +163,23 @@ fn recorded_direct_failure_resumes_same_run_on_local_endpoint() -> Result<()> {
         )?;
         Ok(())
     });
-    arun::kernel::drive(&root, &run.id)?;
+    if let Some(key) = key {
+        let output = Command::new(env!("CARGO_BIN_EXE_arun"))
+            .arg("serve")
+            .arg(&root)
+            .arg(&run.id)
+            .env("ARUN_SESSION_API_KEY", key)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(key));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(key));
+    } else {
+        arun::kernel::drive(&root, &run.id)?;
+    }
     server.join().unwrap()?;
     let store = Store::open(&root)?;
     assert_eq!(store.run(&run.id)?.state, "completed");
@@ -154,6 +189,10 @@ fn recorded_direct_failure_resumes_same_run_on_local_endpoint() -> Result<()> {
     assert_eq!(store.last_checkpoint(&run.id)?, Some(checkpoint));
     assert!(store.has_evidence(&run.id, &evidence)?);
     assert_eq!(store.event_count(&run.id, "provider.transition")?, 1);
+    if let Some(key) = key {
+        assert!(!serde_json::to_string(&store.events(&run.id)?)?.contains(key));
+        assert!(!serde_json::to_string(&store.run(&run.id)?)?.contains(key));
+    }
     Ok(())
 }
 
