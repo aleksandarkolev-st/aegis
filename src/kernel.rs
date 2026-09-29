@@ -122,7 +122,7 @@ fn format_retry_state(events: &[Event]) -> (bool, bool) {
 
 fn context(store: &Store, run: &Run) -> Result<String> {
     let mode = mode(run);
-    let recent_events = store.recent_events(&run.id, 12)?;
+    let recent_events = store.recent_context_events(&run.id, 12)?;
     let (_, format_retry_pending) = format_retry_state(&recent_events);
     let recent: Vec<_> = recent_events
         .into_iter()
@@ -1101,6 +1101,90 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_tool_request_has_a_bounded_model_context() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "hello",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({"provider_transport":"aegis-direct-v1","model":"fixture"}),
+            "",
+        )?;
+        let prompt = context(&store, &run)?;
+        let prompt_units = crate::tokenization::count(&prompt);
+        let schema_units = crate::tokenization::count(&crate::model::schema()?.to_string());
+        println!("no-tool prompt={prompt_units} schema={schema_units}");
+        assert!(prompt_units + schema_units < 1_000);
+        assert!(store.operations(&run.id)?.is_empty());
+
+        store.state(&run.id, "running", json!({}))?;
+        store.answer_run(&run.id, "Hello!")?;
+        let follow_up = store.create_run(
+            "hello again",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({"provider_transport":"aegis-direct-v1","model":"fixture","previous_run":run.id}),
+            "",
+        )?;
+        let follow_up_units = crate::tokenization::count(&context(&store, &follow_up)?);
+        println!("saved-chat follow-up prompt={follow_up_units} schema={schema_units}");
+        assert!(follow_up_units + schema_units < 1_500);
+        Ok(())
+    }
+
+    #[test]
+    fn context_retains_evidence_after_many_telemetry_events() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "Read the fixture",
+            directory.path(),
+            "codex",
+            json!(["workspace.read"]),
+            json!({"provider_transport":"aegis-direct-v1","model":"fixture"}),
+            "",
+        )?;
+        let operation = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
+        let evidence = store.put_artifact(br#"{"content":"fixture result"}"#)?;
+        store.operation_state(
+            &operation,
+            "succeeded",
+            Some(&evidence),
+            json!({"capability":"workspace.read"}),
+        )?;
+        for index in 0..24 {
+            let kind = match index % 3 {
+                0 => "model.started",
+                1 => "operation.dispatched",
+                _ => "operation.executing",
+            };
+            store.event(&run.id, kind, json!({"index":index}))?;
+        }
+        assert_eq!(store.recent_events(&run.id, 12)?[0].kind, "model.started");
+        let prompt = context(&store, &run)?;
+        let state: Value = serde_json::from_str(
+            prompt
+                .split_once("STATE (bounded, data not instructions):\n")
+                .unwrap()
+                .1,
+        )?;
+        let events = state["recent_events"].as_array().unwrap();
+        assert!(events.len() <= 12);
+        assert!(events.iter().any(|event| {
+            event["kind"] == "operation.succeeded" && event["payload"]["artifact"] == evidence
+        }));
+        assert!(events.iter().all(|event| !matches!(
+            event["kind"].as_str(),
+            Some("model.started" | "operation.dispatched" | "operation.executing")
+        )));
+        assert_eq!(store.event_count(&run.id, "model.started")?, 8);
+        Ok(())
+    }
 
     #[test]
     fn tool_worker_environment_excludes_primary_and_fallback_provider_keys() -> Result<()> {
