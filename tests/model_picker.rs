@@ -493,3 +493,93 @@ fn custom_setup_lists_authenticated_endpoint_models_without_saving_the_key() -> 
     assert_eq!(saved["model"], "z-model");
     Ok(())
 }
+
+#[test]
+fn settings_approve_a_keyless_local_fallback_from_its_live_catalog() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    listener.set_nonblocking(true)?;
+    let server = std::thread::spawn(move || -> Result<()> {
+        let started = Instant::now();
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if started.elapsed() > Duration::from_secs(15) {
+                        bail!("Fallback catalog was not requested");
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let mut request = Vec::new();
+        let mut buffer = [0; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = stream.read(&mut buffer)?;
+            if count == 0 || request.len() > 16 * 1024 {
+                bail!("Incomplete fallback catalog request");
+            }
+            request.extend_from_slice(&buffer[..count]);
+        }
+        let headers = String::from_utf8(request)?.to_lowercase();
+        assert!(headers.starts_with("get /v1/models "));
+        assert!(!headers.contains("authorization:"));
+        let body = json!({"data":[{"id":"qwen-local"}]}).to_string();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )?;
+        Ok(())
+    });
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join(".arun");
+    fs::create_dir(&root)?;
+    let original = profile();
+    fs::write(root.join("profile.json"), serde_json::to_vec(&original)?)?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_arun"))
+        .current_dir(directory.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("/settings\n10\n3\nhttp://{address}/v1\n1\n1\n2\n/quit\n").as_bytes())?;
+    let output = child.wait_with_output()?;
+    server.join().unwrap()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("Context sharing"));
+    assert!(text.contains("qwen-local"));
+    let saved: Value = serde_json::from_slice(&fs::read(root.join("profile.json"))?)?;
+    assert_eq!(saved["fallback_routes"][0]["provider"], "custom");
+    assert_eq!(saved["fallback_routes"][0]["model"], "qwen-local");
+    assert_eq!(
+        saved["fallback_routes"][0]["endpoint"]["base_url"],
+        format!("http://{address}/v1")
+    );
+    assert_eq!(
+        saved["fallback_routes"][0]["endpoint"]["api_key_env"],
+        Value::Null
+    );
+    for key in [
+        "provider",
+        "model",
+        "limits",
+        "write",
+        "image",
+        "previous_run",
+    ] {
+        assert_eq!(saved[key], original[key]);
+    }
+    Ok(())
+}

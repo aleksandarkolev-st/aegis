@@ -237,9 +237,25 @@ impl Endpoint {
             let mut request = client.post(url).json(&body);
             if let Some(key) = &key { request = request.bearer_auth(key); }
             let fetch = async {
-                let mut response = request.send().await.context("custom endpoint request failed")?;
+                let mut response = request.send().await.map_err(|error| {
+                    if error.is_connect() {
+                        anyhow!(crate::direct::RecoverableFailure {
+                            reason: crate::routing::Reason::Outage,
+                            status: None,
+                        })
+                    } else {
+                        anyhow!("custom endpoint request failed")
+                    }
+                })?;
                 if !response.status().is_success() {
-                    bail!("custom endpoint returned HTTP {}; response body omitted to protect credentials", response.status().as_u16());
+                    let status = response.status().as_u16();
+                    if let Some(reason) = crate::direct::recoverable_status(status) {
+                        return Err(anyhow!(crate::direct::RecoverableFailure {
+                            reason,
+                            status: Some(status),
+                        }));
+                    }
+                    bail!("custom endpoint returned HTTP {status}; response body omitted to protect credentials");
                 }
                 if response.content_length().is_some_and(|bytes| bytes > max_response) {
                     bail!("custom endpoint response exceeds configured byte limit");
@@ -425,6 +441,33 @@ mod tests {
             thread.join().unwrap();
             assert!(error.to_string().contains("HTTP"));
             assert!(!format!("{error:#}").contains("server-body-secret"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn only_retryable_endpoint_failures_allow_provider_migration() -> Result<()> {
+        use crate::routing::Reason;
+
+        for (status, expected) in [
+            ("429 Too Many Requests", Some(Reason::UsageLimit)),
+            ("410 Gone", Some(Reason::ModelRemoved)),
+            ("503 Service Unavailable", Some(Reason::Outage)),
+            ("400 Bad Request", None),
+            ("401 Unauthorized", None),
+        ] {
+            let (endpoint, thread) = server(status, "", "private-error-body", Duration::ZERO)?;
+            let error = endpoint
+                .call("model", "Return JSON", Duration::from_secs(2), || false)
+                .unwrap_err();
+            thread.join().unwrap();
+            assert_eq!(
+                error
+                    .downcast_ref::<crate::direct::RecoverableFailure>()
+                    .map(|failure| failure.reason),
+                expected
+            );
+            assert!(!format!("{error:#}").contains("private-error-body"));
         }
         Ok(())
     }

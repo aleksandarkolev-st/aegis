@@ -637,97 +637,178 @@ fn settings(root: &Path, terminal: &mut Terminal, profile: &mut Profile) -> Resu
 }
 
 fn configure_fallback(terminal: &Terminal, profile: &mut Profile) -> Result<bool> {
-    if !matches!(profile.provider.as_str(), "codex" | "grok") {
+    if !matches!(profile.provider.as_str(), "codex" | "grok" | "custom") {
         terminal.message(
             Tone::Quiet,
             "Fallback",
-            "Direct ChatGPT and Grok tasks can use an approved fallback. Custom endpoints and Claude cannot yet switch automatically.",
+            "Claude subscription fallback is pending. ChatGPT, Grok and keyless custom endpoints can be reviewed here.",
         )?;
         return Ok(false);
     }
-    let other = if profile.provider == "codex" {
-        "grok"
-    } else {
-        "codex"
+    let available: Vec<_> = ["codex", "grok", "custom"]
+        .into_iter()
+        .filter(|provider| *provider != profile.provider)
+        .collect();
+    let mut choices = vec![format!(
+        "Keep current · {}",
+        profile
+            .fallback_routes
+            .first()
+            .map_or("off".into(), |route| format!(
+                "{} / {}",
+                name(&route.provider),
+                route.model
+            ))
+    )];
+    choices.extend(
+        available
+            .iter()
+            .map(|provider| format!("Use {} as fallback", name(provider))),
+    );
+    choices.extend(["Turn automatic fallback off".into(), "Back".into()]);
+    let selected = terminal.select("Switch on quota, outage or removed model", &choices)?;
+    if selected == Some(available.len() + 1) {
+        profile.fallback_routes.clear();
+        return Ok(true);
+    }
+    let Some(other) = selected
+        .and_then(|index| index.checked_sub(1))
+        .and_then(|index| available.get(index))
+    else {
+        return Ok(false);
     };
-    let choices = [
-        format!(
-            "Keep current · {}",
-            profile
-                .fallback_routes
-                .first()
-                .map_or("off", |route| route.model.as_str())
-        ),
-        format!("Use {} as fallback", name(other)),
-        "Turn automatic fallback off".into(),
-        "Back".into(),
-    ];
-    match terminal.select("Switch only for quota or provider outage", &choices)? {
-        Some(2) => {
-            profile.fallback_routes.clear();
-            Ok(true)
+    let route = if *other == "custom" {
+        let Some(base_url) = field(terminal, "OpenAI-compatible endpoint URL", false)? else {
+            return Ok(false);
+        };
+        let formats = [
+            "Strict JSON schema",
+            "JSON object",
+            "Prompt-only JSON",
+            "Back",
+        ]
+        .map(str::to_owned);
+        let Some(format) = terminal.select("Endpoint response format", &formats)? else {
+            return Ok(false);
+        };
+        let response_format = match format {
+            0 => ResponseFormat::Schema,
+            1 => ResponseFormat::Json,
+            2 => ResponseFormat::None,
+            _ => return Ok(false),
+        };
+        let endpoint = Endpoint {
+            base_url,
+            api_key_env: None,
+            response_format,
+            allow_insecure: false,
+        };
+        if let Err(error) = endpoint.url() {
+            terminal.message(Tone::Warning, "Invalid endpoint", &error.to_string())?;
+            return Ok(false);
         }
-        Some(1) => {
-            if !ensure_provider(terminal, other)? {
-                return Ok(false);
-            }
-            let candidate = blank_profile(other.into());
-            let Some(Some(model)) = choose_model(terminal, &candidate, None)? else {
-                return Ok(false);
-            };
-            let provider = crate::direct::provider(other)?;
-            let catalog = crate::background::run(
-                terminal,
-                "Verifying fallback account and model",
-                move |cancelled| {
-                    crate::provider_catalog::refresh(
-                        &crate::auth_store::Vault::user()?,
-                        provider,
-                        || cancelled.load(std::sync::atomic::Ordering::Acquire),
-                    )
-                },
-            );
-            let models = match catalog {
-                Ok(Some(models)) => models,
-                Ok(None) => return Ok(false),
-                Err(error) => {
-                    terminal.message(Tone::Warning, "Fallback unavailable", &error.to_string())?;
-                    return Ok(false);
-                }
-            };
-            if !models.iter().any(|entry| entry.id == model) {
+        let discovery = endpoint.clone();
+        let catalog =
+            crate::background::run(terminal, "Verifying endpoint models", move |cancelled| {
+                discovery.models_with_cancel(None, || {
+                    cancelled.load(std::sync::atomic::Ordering::Acquire)
+                })
+            });
+        let models = match catalog {
+            Ok(Some(models)) if !models.is_empty() => models,
+            Ok(Some(_)) => {
                 terminal.message(
                     Tone::Warning,
                     "Fallback unavailable",
-                    "The selected model is not in this account's live catalog. No fallback was saved.",
+                    "The endpoint advertised no selectable models.",
                 )?;
                 return Ok(false);
             }
-            let route = crate::routing::Route {
-                provider: other.into(),
-                model,
-                reasoning_effort: None,
-                endpoint: None,
-            };
-            route.validate()?;
-            terminal.message(
-                Tone::Accent,
-                "Review fallback",
-                &format!(
-                    "{} / {} · same task, permissions, evidence, and budget",
-                    name(&route.provider),
-                    route.model
-                ),
-            )?;
-            let confirmation = ["Keep fallback off", "Approve this fallback"].map(str::to_owned);
-            if terminal.select("Approve automatic switch?", &confirmation)? != Some(1) {
+            Ok(None) => return Ok(false),
+            Err(error) => {
+                terminal.message(Tone::Warning, "Fallback unavailable", &error.to_string())?;
                 return Ok(false);
             }
-            profile.fallback_routes = vec![route];
-            Ok(true)
+        };
+        let mut model_choices: Vec<_> = models.iter().map(|model| model.id.clone()).collect();
+        model_choices.push("Back".into());
+        let Some(index) = terminal.select("Choose verified endpoint model", &model_choices)? else {
+            return Ok(false);
+        };
+        let Some(model) = models.get(index) else {
+            return Ok(false);
+        };
+        crate::routing::Route {
+            provider: "custom".into(),
+            model: model.id.clone(),
+            reasoning_effort: None,
+            endpoint: Some(endpoint),
         }
-        _ => Ok(false),
+    } else {
+        if !ensure_provider(terminal, other)? {
+            return Ok(false);
+        }
+        let candidate = blank_profile((*other).into());
+        let Some(Some(model)) = choose_model(terminal, &candidate, None)? else {
+            return Ok(false);
+        };
+        let provider = crate::direct::provider(other)?;
+        let catalog = crate::background::run(
+            terminal,
+            "Verifying fallback account and model",
+            move |cancelled| {
+                crate::provider_catalog::refresh(
+                    &crate::auth_store::Vault::user()?,
+                    provider,
+                    || cancelled.load(std::sync::atomic::Ordering::Acquire),
+                )
+            },
+        );
+        let models = match catalog {
+            Ok(Some(models)) => models,
+            Ok(None) => return Ok(false),
+            Err(error) => {
+                terminal.message(Tone::Warning, "Fallback unavailable", &error.to_string())?;
+                return Ok(false);
+            }
+        };
+        if !models.iter().any(|entry| entry.id == model) {
+            terminal.message(
+                Tone::Warning,
+                "Fallback unavailable",
+                "The selected model is not in this account's live catalog. No fallback was saved.",
+            )?;
+            return Ok(false);
+        }
+        crate::routing::Route {
+            provider: (*other).into(),
+            model,
+            reasoning_effort: None,
+            endpoint: None,
+        }
+    };
+    route.validate()?;
+    let destination = match route.endpoint.as_ref() {
+        Some(endpoint) => endpoint.url()?.to_string(),
+        None => "Aegis signed-in account".into(),
+    };
+    terminal.message(
+        Tone::Accent,
+        "Review fallback",
+        &format!(
+            "{} / {} · {} · same task, permissions, evidence, and budget",
+            name(&route.provider),
+            route.model,
+            destination
+        ),
+    )?;
+    terminal.message(Tone::Warning, "Context sharing", "Aegis sends the task and bounded workspace context to this fallback if the primary fails. No account credential is copied.")?;
+    let confirmation = ["Keep current fallback", "Approve this fallback"].map(str::to_owned);
+    if terminal.select("Approve automatic switch?", &confirmation)? != Some(1) {
+        return Ok(false);
     }
+    profile.fallback_routes = vec![route];
+    Ok(true)
 }
 
 fn configure_network_scopes(terminal: &Terminal, profile: &mut Profile) -> Result<bool> {

@@ -84,7 +84,7 @@ impl std::fmt::Display for RecoverableFailure {
 
 impl std::error::Error for RecoverableFailure {}
 
-fn recoverable_status(status: u16) -> Option<crate::routing::Reason> {
+pub(crate) fn recoverable_status(status: u16) -> Option<crate::routing::Reason> {
     use crate::routing::Reason;
     match status {
         429 => Some(Reason::UsageLimit),

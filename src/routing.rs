@@ -329,4 +329,49 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn custom_primary_can_transition_without_replacing_its_contract() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let endpoint = json!({"base_url":"http://127.0.0.1:1234/v1","api_key_env":null,"response_format":"schema","allow_insecure":false});
+        let run = store.create_run(
+            "Refactor parser\nRequirements:\n- preserve API",
+            directory.path(),
+            "custom",
+            json!([]),
+            json!({"model":"qwen-local","endpoint":endpoint,"fallback_routes":[{"provider":"codex","model":"gpt-fallback"}]}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let operation = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
+        let evidence = store.put_artifact(b"API compatibility proof")?;
+        store.operation_state(&operation, "succeeded", Some(&evidence), json!({}))?;
+        store.verify_obligation(&run.id, 1, &[evidence.clone()])?;
+        store.event(&run.id, "model.started", json!({"turn":1}))?;
+        store.event(
+            &run.id,
+            "model.failed",
+            json!({"recoverable_reason":"provider_outage"}),
+        )?;
+        let obligations = store.obligations(&run.id)?;
+        let route = store.transition_provider(&run.id, Reason::Outage)?.unwrap();
+        assert_eq!(route.provider, "codex");
+        assert_eq!(
+            route.configuration(&run)["provider_transport"],
+            "aegis-direct-v1"
+        );
+        assert_eq!(route.configuration(&run)["model"], "gpt-fallback");
+        assert_eq!(route.configuration(&run)["endpoint"], Value::Null);
+        assert_eq!(store.run(&run.id)?.budgets, run.budgets);
+        assert_eq!(store.obligations(&run.id)?, obligations);
+        assert!(store.has_evidence(&run.id, &evidence)?);
+        assert_eq!(store.event_count(&run.id, "provider.transition")?, 1);
+        drop(store);
+        assert_eq!(
+            Store::open(directory.path())?.current_route(&run.id)?,
+            route
+        );
+        Ok(())
+    }
 }
