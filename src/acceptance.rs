@@ -66,7 +66,11 @@ pub(crate) fn authorized_check(store: &Store, run: &Run, operation: &Operation) 
         bail!("acceptance operation does not match the pending approved completion");
     }
     let candidate: Proposal = serde_json::from_slice(&store.artifact(proposal)?)?;
-    store.validate_completion(&run.id, &candidate.evidence)?;
+    store.validate_completion_except_operation(
+        &run.id,
+        &candidate.evidence,
+        Some(&operation.id),
+    )?;
     Ok(check)
 }
 
@@ -349,6 +353,10 @@ mod tests {
             json!({"proposal":proposal}),
             true,
         )?;
+        assert!(authorized_check(&store, &run, &operation).is_ok());
+        let unrelated = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
+        assert!(authorized_check(&store, &run, &operation).is_err());
+        store.operation_state(&unrelated, "cancelled", None, json!({}))?;
         assert!(authorized_check(&store, &run, &operation).is_ok());
         let failed = store.put_artifact(br#"{"exit_code":1}"#)?;
         store.operation_state(&operation, "succeeded", Some(&failed), json!({}))?;

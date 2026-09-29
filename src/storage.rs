@@ -935,8 +935,25 @@ impl Store {
     }
 
     pub fn validate_completion(&self, run_id: &str, evidence: &[String]) -> Result<()> {
+        self.validate_completion_except_operation(run_id, evidence, None)
+    }
+
+    pub(crate) fn validate_completion_except_operation(
+        &self,
+        run_id: &str,
+        evidence: &[String],
+        allowed_operation: Option<&str>,
+    ) -> Result<()> {
         if evidence.is_empty() {
             bail!("completion requires evidence");
+        }
+        let unresolved: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM operations WHERE run_id = ?1 AND state NOT IN ('succeeded','failed','cancelled') AND (?2 IS NULL OR id != ?2)",
+            params![run_id, allowed_operation],
+            |row| row.get(0),
+        )?;
+        if unresolved != 0 {
+            bail!("completion requires all operations to finish or be reconciled");
         }
         for hash in evidence {
             if !self.has_evidence(run_id, hash)? {
@@ -1034,6 +1051,14 @@ impl Store {
             })?;
         if state != "running" {
             bail!("only a running run can complete");
+        }
+        let unresolved: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM operations WHERE run_id = ?1 AND state NOT IN ('succeeded','failed','cancelled')",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if unresolved != 0 {
+            bail!("operations changed before completion; finish or reconcile them first");
         }
         let outstanding: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM obligations WHERE run_id = ?1 AND id > 0 AND state != 'superseded' AND (state != 'verified' OR verified_revision IS NULL OR verified_revision != (SELECT revision FROM workspace_revisions WHERE run_id = ?1))",

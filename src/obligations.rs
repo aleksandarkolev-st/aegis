@@ -763,4 +763,67 @@ mod tests {
         assert_eq!(store.workspace_revision(&run.id)?, Some(1));
         Ok(())
     }
+
+    #[test]
+    fn completion_waits_for_in_flight_write_and_unknown_outcome() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "Refactor parser",
+            directory.path(),
+            "codex",
+            json!(["workspace.write"]),
+            json!({"obligations":["Full suite passes"]}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let check = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
+        let old_evidence = store.put_artifact(b"passing suite before edit")?;
+        store.operation_state(&check, "succeeded", Some(&old_evidence), json!({}))?;
+        store.verify_obligation(&run.id, 1, &[old_evidence.clone()])?;
+
+        let edit = store.begin_operation(&run.id, "workspace.write", json!({}), false)?;
+        for state in ["pending", "dispatched"] {
+            if state == "dispatched" {
+                store.operation_state(&edit, state, None, json!({}))?;
+            }
+            assert!(
+                store
+                    .validate_completion(&run.id, &[old_evidence.clone()])
+                    .is_err()
+            );
+            assert!(
+                store
+                    .complete_run(&run.id, "done", &[old_evidence.clone()])
+                    .is_err()
+            );
+        }
+        store.operation_state(&edit, "outcome_unknown", None, json!({}))?;
+        assert_eq!(store.obligations(&run.id)?[1].state, "stale");
+        assert!(
+            store
+                .validate_completion(&run.id, &[old_evidence.clone()])
+                .is_err()
+        );
+        assert!(
+            store
+                .complete_run(&run.id, "done", &[old_evidence])
+                .is_err()
+        );
+
+        store.resolve_unknown(
+            &run.id,
+            &edit.id,
+            false,
+            "external check found no committed edit",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let recheck = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
+        let current_evidence = store.put_artifact(b"passing suite after reconciliation")?;
+        store.operation_state(&recheck, "succeeded", Some(&current_evidence), json!({}))?;
+        store.verify_obligation(&run.id, 1, &[current_evidence.clone()])?;
+        store.complete_run(&run.id, "done", &[current_evidence])?;
+        assert_eq!(store.run(&run.id)?.state, "completed");
+        Ok(())
+    }
 }
