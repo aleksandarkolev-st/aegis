@@ -312,7 +312,7 @@ fn switch_model(
         }
         candidate.model = model;
         if terminal.interactive {
-            let Some(effort) = choose_reasoning(terminal, &candidate, false)? else {
+            let Some(effort) = choose_reasoning(terminal, &candidate, secret, false)? else {
                 return Ok(());
             };
             candidate.reasoning_effort = effort;
@@ -333,6 +333,7 @@ fn switch_model(
 fn choose_reasoning(
     terminal: &Terminal,
     profile: &Profile,
+    secret: Option<&str>,
     refresh: bool,
 ) -> Result<Option<Option<String>>> {
     if refresh && let Ok(provider) = crate::direct::provider(&profile.provider) {
@@ -353,11 +354,48 @@ fn choose_reasoning(
             }
         }
     }
-    let levels = profile
-        .model
-        .as_deref()
-        .map(|model| crate::catalog::reasoning_levels(&profile.provider, model).unwrap_or_default())
-        .unwrap_or_default();
+    let levels = if profile.provider == "claude-api" {
+        let Some(model) = profile.model.clone() else {
+            return Ok(Some(None));
+        };
+        let key = secret.map(str::to_owned).or_else(|| {
+            profile
+                .api_key_env
+                .as_deref()
+                .and_then(|reference| std::env::var(reference).ok())
+        });
+        let Some(key) = key else {
+            terminal.message(Tone::Warning, "Reasoning", "Enter your Claude API key with F4 to inspect this model's supported effort levels.")?;
+            return Ok(None);
+        };
+        let result = crate::background::run(
+            terminal,
+            "Checking supported Claude effort",
+            move |cancelled| {
+                Ok(crate::claude_api::efforts(&model, &key, || {
+                    cancelled.load(std::sync::atomic::Ordering::Acquire)
+                }))
+            },
+        )?;
+        let Some(result) = result else {
+            return Ok(None);
+        };
+        match result {
+            Ok(levels) => levels,
+            Err(error) => {
+                terminal.message(Tone::Warning, "Reasoning unavailable", &error.to_string())?;
+                return Ok(None);
+            }
+        }
+    } else {
+        profile
+            .model
+            .as_deref()
+            .map(|model| {
+                crate::catalog::reasoning_levels(&profile.provider, model).unwrap_or_default()
+            })
+            .unwrap_or_default()
+    };
     if levels.is_empty() {
         terminal.message(
             Tone::Quiet,
@@ -411,8 +449,13 @@ fn choose_reasoning(
         }))
 }
 
-fn switch_reasoning(root: &Path, terminal: &Terminal, profile: &mut Profile) -> Result<()> {
-    if let Some(effort) = choose_reasoning(terminal, profile, true)? {
+fn switch_reasoning(
+    root: &Path,
+    terminal: &Terminal,
+    profile: &mut Profile,
+    secret: Option<&str>,
+) -> Result<()> {
+    if let Some(effort) = choose_reasoning(terminal, profile, secret, true)? {
         profile.reasoning_effort = effort;
         save(root, profile)?;
         remember_selection(terminal, profile)?;
@@ -2105,7 +2148,7 @@ fn continue_legacy(
         return Ok(());
     };
     draft.model = Some(model.clone());
-    let Some(reasoning) = choose_reasoning(terminal, &draft, false)? else {
+    let Some(reasoning) = choose_reasoning(terminal, &draft, None, false)? else {
         return Ok(());
     };
     draft.reasoning_effort = reasoning.clone();
@@ -3230,7 +3273,7 @@ pub fn interactive(root: &Path) -> Result<()> {
                     "/model" | "/models" => {
                         switch_model(root, &terminal, &mut profile, secret.as_deref())?
                     }
-                    "/reasoning" => switch_reasoning(root, &terminal, &mut profile)?,
+                    "/reasoning" => switch_reasoning(root, &terminal, &mut profile, secret.as_deref())?,
                     "/login" => {
                         sign_in_for_selection(
                             root,

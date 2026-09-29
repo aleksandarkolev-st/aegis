@@ -61,6 +61,99 @@ pub fn models(key: &str, cancelled: impl Fn() -> bool) -> Result<Vec<crate::cata
     models_at(Url::parse(MODELS_URL)?, key, cancelled)
 }
 
+fn effort_levels(value: &Value) -> Vec<String> {
+    let effort = &value["capabilities"]["effort"];
+    if effort["supported"] != true {
+        return Vec::new();
+    }
+    ["low", "medium", "high", "xhigh", "max"]
+        .into_iter()
+        .filter(|level| effort[level]["supported"] == true)
+        .map(str::to_owned)
+        .collect()
+}
+
+pub fn efforts(model: &str, key: &str, cancelled: impl Fn() -> bool) -> Result<Vec<String>> {
+    efforts_at(Url::parse(MODELS_URL)?, model, key, cancelled)
+}
+
+fn efforts_at(
+    mut url: Url,
+    model: &str,
+    key: &str,
+    cancelled: impl Fn() -> bool,
+) -> Result<Vec<String>> {
+    validate_key(key)?;
+    if !crate::catalog::valid_id(model) || model.contains('/') || model.contains('\\') {
+        bail!("Claude API needs a valid model ID for effort discovery");
+    }
+    if cancelled() {
+        bail!("Claude API effort discovery cancelled before dispatch");
+    }
+    url.path_segments_mut()
+        .map_err(|_| anyhow!("Claude API model URL is invalid"))?
+        .push(model);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        let fetch = async {
+            let mut response = client
+                .get(url)
+                .bearer_auth(key)
+                .header("anthropic-version", API_VERSION)
+                .send()
+                .await
+                .map_err(|_| anyhow!("Claude API effort discovery unavailable"))?;
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                bail!("Claude API effort discovery returned HTTP {status}; remote body omitted");
+            }
+            if response
+                .content_length()
+                .is_some_and(|length| length > 1024 * 1024)
+            {
+                bail!("Claude API model metadata exceeds 1 MiB");
+            }
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|_| anyhow!("Claude API effort discovery interrupted"))?
+            {
+                if bytes.len() + chunk.len() > 1024 * 1024 {
+                    bail!("Claude API model metadata exceeds 1 MiB");
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok::<_, anyhow::Error>(bytes)
+        };
+        tokio::pin!(fetch);
+        let bytes = loop {
+            tokio::select! {
+                result = &mut fetch => break result,
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                    if cancelled() { bail!("Claude API effort discovery cancelled"); }
+                }
+            }
+        }?;
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| anyhow!("Claude API model metadata was not JSON"))?;
+        if !value["id"]
+            .as_str()
+            .is_some_and(|id| crate::catalog::valid_id(id) && !id.contains(key))
+        {
+            bail!("Claude API model metadata omitted a valid model ID");
+        }
+        Ok(effort_levels(&value))
+    })
+}
+
 fn models_at(
     url: Url,
     key: &str,
@@ -538,6 +631,60 @@ mod tests {
             .0
             .is_empty()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn effort_picker_uses_selected_model_capabilities_only() -> Result<()> {
+        let metadata = json!({"id":"account-model","capabilities":{"effort":{
+            "supported":true,"low":{"supported":true},"medium":{"supported":false},
+            "high":{"supported":true},"xhigh":{"supported":true},"max":{"supported":false}
+        }}});
+        assert_eq!(effort_levels(&metadata), ["low", "high", "xhigh"]);
+        assert!(
+            effort_levels(
+                &json!({"capabilities":{"effort":{"supported":false,"low":{"supported":true}}}})
+            )
+            .is_empty()
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let url = Url::parse(&format!("http://{}/v1/models", listener.local_addr()?))?;
+        let server = thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            let mut request = Vec::new();
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let mut buffer = [0; 2048];
+                let count = stream.read(&mut buffer)?;
+                if count == 0 || request.len() + count > 8192 {
+                    bail!("effort fixture request was incomplete or too large");
+                }
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let request = String::from_utf8(request)?;
+            assert!(request.starts_with("GET /v1/models/account-model HTTP/1.1"));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer private-fixture-key")
+            );
+            let response = metadata.to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                response.len()
+            )?;
+            Ok(())
+        });
+        assert_eq!(
+            efforts_at(url.clone(), "account-model", "private-fixture-key", || {
+                false
+            })?,
+            ["low", "high", "xhigh"]
+        );
+        server.join().map_err(|_| anyhow!("fixture panicked"))??;
+        assert!(efforts_at(url, "bad/model", "private-fixture-key", || false).is_err());
         Ok(())
     }
 }
