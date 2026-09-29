@@ -110,7 +110,11 @@ impl Store {
             )
             .optional()?
         {
-            return Ok(serde_json::from_str(&route)?);
+            let route: Route = serde_json::from_str(&route)?;
+            if !approved(&run)?.contains(&route) {
+                bail!("stored provider route is not approved by this task contract");
+            }
+            return Ok(route);
         }
         Ok(Route {
             provider: run.provider,
@@ -371,6 +375,44 @@ mod tests {
         assert_eq!(
             Store::open(directory.path())?.current_route(&run.id)?,
             route
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resumed_route_cannot_change_endpoint_outside_the_frozen_contract() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let endpoint = json!({"base_url":"http://127.0.0.1:1234/v1","api_key_env":"FALLBACK_KEY","response_format":"schema","allow_insecure":false});
+        let run = store.create_run(
+            "Repair parser",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({"provider_transport":"aegis-direct-v1","model":"primary","fallback_routes":[{"provider":"custom","model":"reviewed-model","endpoint":endpoint}]}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        store.event(&run.id, "model.started", json!({"turn":1}))?;
+        store.event(
+            &run.id,
+            "model.failed",
+            json!({"recoverable_reason":"provider_outage"}),
+        )?;
+        let approved = store.transition_provider(&run.id, Reason::Outage)?.unwrap();
+        assert_eq!(store.current_route(&run.id)?, approved);
+        let mut changed = serde_json::to_value(&approved)?;
+        changed["endpoint"]["base_url"] = json!("https://unreviewed.example/v1");
+        store.connection.execute(
+            "UPDATE provider_routes SET route = ?2 WHERE run_id = ?1",
+            params![run.id, serde_json::to_string(&changed)?],
+        )?;
+        assert!(store.current_route(&run.id).is_err());
+        drop(store);
+        assert!(
+            Store::open(directory.path())?
+                .current_route(&run.id)
+                .is_err()
         );
         Ok(())
     }
