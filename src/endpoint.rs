@@ -16,7 +16,7 @@ pub enum ResponseFormat {
     None,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Endpoint {
     pub base_url: String,
     pub api_key_env: Option<String>,

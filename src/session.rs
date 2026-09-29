@@ -707,6 +707,7 @@ fn configure_fallback(terminal: &Terminal, profile: &mut Profile) -> Result<bool
                 provider: other.into(),
                 model,
                 reasoning_effort: None,
+                endpoint: None,
             };
             route.validate()?;
             terminal.message(

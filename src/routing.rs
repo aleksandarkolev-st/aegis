@@ -5,13 +5,15 @@ use serde_json::{Value, json};
 
 use crate::storage::{Run, Store, append_event};
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Route {
     pub provider: String,
     pub model: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<crate::endpoint::Endpoint>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,8 +35,15 @@ impl Reason {
 
 impl Route {
     pub fn validate(&self) -> Result<()> {
-        if !matches!(self.provider.as_str(), "codex" | "grok") {
-            bail!("automatic fallback supports only direct ChatGPT or Grok sign-in");
+        match self.provider.as_str() {
+            "codex" | "grok" if self.endpoint.is_none() => {}
+            "custom" => {
+                self.endpoint
+                    .as_ref()
+                    .context("custom fallback requires an OpenAI-compatible endpoint")?
+                    .url()?;
+            }
+            _ => bail!("fallback route must be direct ChatGPT/Grok or a validated custom endpoint"),
         }
         if !crate::catalog::valid_id(&self.model)
             || self
@@ -55,6 +64,7 @@ impl Route {
         configuration["provider_transport"] = json!("aegis-direct-v1");
         configuration["model"] = json!(self.model);
         configuration["reasoning_effort"] = json!(self.reasoning_effort);
+        configuration["endpoint"] = json!(self.endpoint);
         configuration
     }
 }
@@ -64,12 +74,12 @@ pub fn approved(run: &Run) -> Result<Vec<Route>> {
         return Ok(Vec::new());
     };
     let routes: Vec<Route> = serde_json::from_value(value.clone())
-        .context("fallback_routes must be a reviewed list of direct routes")?;
+        .context("fallback_routes must be a reviewed list of provider routes")?;
     if routes.len() > 3 {
         bail!("at most three fallback routes may be approved");
     }
-    if !routes.is_empty() && !matches!(run.provider.as_str(), "codex" | "grok") {
-        bail!("automatic fallback requires a direct ChatGPT or Grok primary provider");
+    if !routes.is_empty() && !matches!(run.provider.as_str(), "codex" | "grok" | "custom") {
+        bail!("automatic fallback requires an Aegis direct or custom primary provider");
     }
     let mut providers = std::collections::HashSet::new();
     providers.insert(run.provider.as_str());
@@ -79,7 +89,10 @@ pub fn approved(run: &Run) -> Result<Vec<Route>> {
             bail!("fallback providers must be distinct from the primary and each other");
         }
     }
-    if !routes.is_empty() && run.budgets["provider_transport"] != "aegis-direct-v1" {
+    if !routes.is_empty()
+        && run.provider != "custom"
+        && run.budgets["provider_transport"] != "aegis-direct-v1"
+    {
         bail!("automatic fallback requires a direct primary provider");
     }
     Ok(routes)
@@ -103,6 +116,7 @@ impl Store {
             provider: run.provider,
             model: run.budgets["model"].as_str().unwrap_or_default().into(),
             reasoning_effort: run.budgets["reasoning_effort"].as_str().map(str::to_owned),
+            endpoint: serde_json::from_value(run.budgets["endpoint"].clone())?,
         })
     }
 
@@ -280,6 +294,39 @@ mod tests {
         let route = store.current_route(&run.id)?;
         assert_eq!(route.provider, "codex");
         assert_eq!(route.configuration(&run)["provider_transport"], Value::Null);
+        Ok(())
+    }
+
+    #[test]
+    fn approved_custom_route_uses_only_its_reviewed_endpoint_after_restart() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let endpoint = json!({"base_url":"http://127.0.0.1:1234/v1","api_key_env":null,"response_format":"schema","allow_insecure":false});
+        let run = store.create_run(
+            "Repair parser",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({"provider_transport":"aegis-direct-v1","model":"primary","fallback_routes":[{"provider":"custom","model":"qwen-local","endpoint":endpoint}]}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        store.event(&run.id, "model.started", json!({"turn":1}))?;
+        store.event(
+            &run.id,
+            "model.failed",
+            json!({"recoverable_reason":"provider_outage"}),
+        )?;
+        let route = store.transition_provider(&run.id, Reason::Outage)?.unwrap();
+        assert_eq!(route.provider, "custom");
+        assert_eq!(route.configuration(&run)["model"], "qwen-local");
+        assert_eq!(route.configuration(&run)["endpoint"], endpoint);
+        assert_eq!(store.run(&run.id)?.provider, "codex");
+        drop(store);
+        assert_eq!(
+            Store::open(directory.path())?.current_route(&run.id)?,
+            route
+        );
         Ok(())
     }
 }
