@@ -387,7 +387,7 @@ impl Terminal {
             self.message(
                 Tone::Quiet,
                 "",
-                "F3 chats   F6 model + reasoning   F7 style / settings   F1 help",
+                "F2 provider  F4 sign in  F6 model/reasoning  F3 chats  F7 style  F1 help",
             )?;
             write!(output, "\r\n")?;
         }
