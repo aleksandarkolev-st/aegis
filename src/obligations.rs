@@ -271,6 +271,60 @@ fn current_evidence(
 }
 
 impl Store {
+    pub fn add_obligation(&mut self, run_id: &str, title: &str, reason: &str) -> Result<i64> {
+        let title = title.trim();
+        titles(&serde_json::json!({"obligations":[title]}))?;
+        let reason = reason.trim();
+        if reason.is_empty() || reason.len() > 500 || crate::text::clean(reason) != reason {
+            bail!("Adding a requirement needs a safe, explicit reason");
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let state: String =
+            transaction.query_row("SELECT state FROM runs WHERE id=?1", [run_id], |row| {
+                row.get(0)
+            })?;
+        if matches!(
+            state.as_str(),
+            "completed" | "answered" | "cancelled" | "failed"
+        ) {
+            bail!("Ended tasks cannot change obligations");
+        }
+        let (active,total):(i64,i64)=transaction.query_row("SELECT SUM(CASE WHEN id>0 AND state!='superseded' THEN 1 ELSE 0 END),COUNT(*) FROM obligations WHERE run_id=?1",[run_id],|row|Ok((row.get::<_,Option<i64>>(0)?.unwrap_or(0),row.get(1)?)))?;
+        if total == 0 {
+            bail!("Legacy tasks need a new reviewed contract before adding requirements");
+        }
+        if active >= 20 || total >= 101 {
+            bail!("At most 20 active and 100 retained explicit obligations");
+        }
+        let duplicate: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM obligations WHERE run_id=?1 AND title=?2)",
+            params![run_id, title],
+            |row| row.get(0),
+        )?;
+        if duplicate {
+            bail!("Requirement already exists in the retained contract");
+        }
+        let id: i64 = transaction.query_row(
+            "SELECT MAX(id)+1 FROM obligations WHERE run_id=?1",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO obligations(run_id,id,title,state,evidence) VALUES (?1,?2,?3,'open','[]')",
+            params![run_id, id, title],
+        )?;
+        append_event(
+            &transaction,
+            run_id,
+            "obligation.added",
+            serde_json::json!({"id":id,"title":title,"reason":reason,"source":"user"}),
+        )?;
+        transaction.commit()?;
+        Ok(id)
+    }
+
     pub fn supersede_obligation(
         &mut self,
         run_id: &str,

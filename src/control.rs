@@ -126,6 +126,9 @@ pub fn view(store: &Store, run_id: &str, command: &str, argument: Option<&str>) 
     let checkpoint = store.last_checkpoint(run_id)?;
     let route = store.current_route(run_id)?;
     match command {
+        "goal" | "contract" if argument == Some("history") => Ok(
+            json!({"goal":run.task,"requirements":obligations,"history":store.events(run_id)?.into_iter().filter(|event|event.kind.starts_with("obligation.") || event.kind == "workspace.revision").collect::<Vec<_>>()}),
+        ),
         "goal" | "contract" => Ok(
             json!({"run":run.id,"goal":run.task,"requirements":obligations,"workspace_revision":revision,"current_plan":milestones,"checkpoint":checkpoint,"current_provider":route,"fallbacks":crate::routing::approved(&run)?}),
         ),
@@ -263,6 +266,9 @@ fn route_label(route: &Value) -> String {
 }
 
 pub fn display(command: &str, value: &Value) -> String {
+    if matches!(command, "goal" | "contract") && value["history"].is_array() {
+        return display("goal_history", value);
+    }
     let mut lines = Vec::new();
     match command {
         "goal" | "contract" => {
@@ -298,6 +304,16 @@ pub fn display(command: &str, value: &Value) -> String {
                     "[{}] {}",
                     item["state"].as_str().unwrap_or_default(),
                     item["title"].as_str().unwrap_or_default()
+                ));
+            }
+        }
+        "goal_history" => {
+            for event in value["history"].as_array().into_iter().flatten() {
+                lines.push(format!(
+                    "event {} · {} · {}",
+                    event["seq"],
+                    event["kind"].as_str().unwrap_or_default(),
+                    event["payload"]
                 ));
             }
         }

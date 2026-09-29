@@ -129,3 +129,62 @@ fn completion_explanation_is_saved_with_the_terminal_event() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn goal_add_and_targeted_replace_require_review_and_retain_original_contract() -> Result<()> {
+    for approval in [1, 2] {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(".arun");
+        let mut store = Store::open(&root)?;
+        let run = store.create_run(
+            "Repair parser\nRequirements:\n- preserve API",
+            directory.path(),
+            "custom",
+            json!([]),
+            json!({}),
+            "",
+        )?;
+        fs::write(
+            root.join("profile.json"),
+            serde_json::to_vec(
+                &json!({"provider":"custom","model":"fixture","write":false,"image":null,"previous_run":run.id,"endpoint":{"base_url":"http://127.0.0.1:9/v1","api_key_env":null}}),
+            )?,
+        )?;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_arun"))
+            .current_dir(directory.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child.stdin.take().unwrap().write_all(format!("/goal add\nRegression tests\nUser requested coverage\n{approval}\n/goal replace O1\nAllow v2 API\nUser approved v2\n{approval}\n/goal history\n/quit\n").as_bytes())?;
+        let output = child.wait_with_output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(store.run(&run.id)?.task, run.task);
+        assert_eq!(store.run(&run.id)?.budgets, run.budgets);
+        assert_eq!(store.event_count(&run.id, "model.started")?, 0);
+        let ledger = store.obligations(&run.id)?;
+        if approval == 1 {
+            assert_eq!(ledger.len(), 2);
+            assert_eq!(ledger[1].state, "open");
+        } else {
+            assert_eq!(ledger.len(), 4);
+            assert_eq!(ledger[1].state, "superseded");
+            assert_eq!(ledger[1].superseded_by, Some(3));
+            assert_eq!(ledger[2].title, "Regression tests");
+            assert_eq!(ledger[3].title, "Allow v2 API");
+            assert!(
+                store
+                    .add_obligation(&run.id, "Regression tests", "Repeated")
+                    .is_err()
+            );
+            let text = String::from_utf8_lossy(&output.stdout);
+            assert!(text.contains("obligation.added"));
+            assert!(text.contains("obligation.superseded"));
+        }
+    }
+    Ok(())
+}

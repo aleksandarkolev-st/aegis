@@ -2875,7 +2875,7 @@ fn chat_details(
         Some(2) => context_view(root, &run.id, terminal)?,
         Some(3) => tools_view(root, &run.id, terminal)?,
         Some(4) => review_operations(root, &run.id, terminal)?,
-        Some(5) => supersede_obligation(root, run, terminal)?,
+        Some(5) => supersede_obligation(root, run, terminal, None)?,
         _ => {}
     }
     Ok(())
@@ -2885,6 +2885,7 @@ fn supersede_obligation(
     root: &Path,
     run: &crate::storage::Run,
     terminal: &mut Terminal,
+    selected_id: Option<i64>,
 ) -> Result<()> {
     if run.is_terminal() {
         terminal.message(
@@ -2913,8 +2914,20 @@ fn supersede_obligation(
         .map(|item| format!("O{} · {}", item.id, item.title))
         .collect();
     choices.push("Back".into());
-    let Some(index) = terminal.select("Replace a requirement", &choices)? else {
-        return Ok(());
+    let index = if let Some(id) = selected_id {
+        let Some(index) = obligations.iter().position(|item| item.id == id) else {
+            return terminal.message(
+                Tone::Warning,
+                "Requirement unavailable",
+                "Choose an active explicit obligation such as O2.",
+            );
+        };
+        index
+    } else {
+        let Some(index) = terminal.select("Replace a requirement", &choices)? else {
+            return Ok(());
+        };
+        index
     };
     let Some(old) = obligations.get(index) else {
         return Ok(());
@@ -2954,6 +2967,66 @@ fn supersede_obligation(
         }
     }
     Ok(())
+}
+
+fn edit_goal(
+    root: &Path,
+    id: &str,
+    command: &str,
+    selected: Option<&str>,
+    terminal: &mut Terminal,
+) -> Result<()> {
+    let mut store = Store::open(root)?;
+    let run = store.run(id)?;
+    if run.is_terminal() {
+        return terminal.message(
+            Tone::Warning,
+            "Contract retained",
+            "Ended tasks cannot change requirements.",
+        );
+    }
+    if kernel::is_active(root, id)? {
+        return terminal.message(
+            Tone::Warning,
+            "Pause first",
+            "Use /pause and wait for its safe boundary before reviewing contract changes.",
+        );
+    }
+    if command == "replace" {
+        return supersede_obligation(
+            root,
+            &run,
+            terminal,
+            selected.map(crate::control::obligation_id).transpose()?,
+        );
+    }
+    let Some(title) = field(terminal, "New requirement", false)? else {
+        return Ok(());
+    };
+    let Some(reason) = field(terminal, "Reason for adding this requirement", false)? else {
+        return Ok(());
+    };
+    terminal.message(
+        Tone::Accent,
+        "Add requirement",
+        &format!("{title}\nReason: {reason}"),
+    )?;
+    if terminal.select(
+        "Approve this addition?",
+        &[
+            "Keep current contract".into(),
+            "Add this requirement".into(),
+        ],
+    )? != Some(1)
+    {
+        return Ok(());
+    }
+    let id = store.add_obligation(id, &title, &reason)?;
+    terminal.message(
+        Tone::Success,
+        "Requirement added",
+        &format!("O{id} is open. The original task is retained."),
+    )
 }
 
 fn chat_heads(runs: Vec<crate::storage::Run>) -> Vec<crate::storage::Run> {
@@ -3370,8 +3443,23 @@ pub fn interactive(root: &Path) -> Result<()> {
                 let command = words.next().unwrap_or_default().trim_start_matches('/');
                 if request.starts_with('/') && crate::control::VIEWS.contains(&command) {
                     if let Some(id) = profile.previous_run.as_deref() {
+                        let argument = words.next();
+                        if matches!(command, "goal" | "contract")
+                            && matches!(argument, Some("add" | "replace"))
+                        {
+                            if let Err(error) =
+                                edit_goal(root, id, argument.unwrap(), words.next(), &mut terminal)
+                            {
+                                terminal.message(
+                                    Tone::Warning,
+                                    "Contract retained",
+                                    &error.to_string(),
+                                )?;
+                            }
+                            continue;
+                        }
                         let result =
-                            crate::control::view(&Store::open(root)?, id, command, words.next());
+                            crate::control::view(&Store::open(root)?, id, command, argument);
                         match result {
                             Ok(value) => terminal.message(
                                 Tone::Quiet,
