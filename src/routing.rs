@@ -62,6 +62,7 @@ impl Route {
         }
         let mut configuration = run.budgets.clone();
         configuration["provider_transport"] = json!("aegis-direct-v1");
+        configuration["api_key_env"] = Value::Null;
         configuration["model"] = json!(self.model);
         configuration["reasoning_effort"] = json!(self.reasoning_effort);
         configuration["endpoint"] = json!(self.endpoint);
@@ -78,8 +79,15 @@ pub fn approved(run: &Run) -> Result<Vec<Route>> {
     if routes.len() > 3 {
         bail!("at most three fallback routes may be approved");
     }
-    if !routes.is_empty() && !matches!(run.provider.as_str(), "codex" | "grok" | "custom") {
-        bail!("automatic fallback requires an Aegis direct or custom primary provider");
+    if !routes.is_empty()
+        && !matches!(
+            run.provider.as_str(),
+            "codex" | "grok" | "custom" | "claude-api"
+        )
+    {
+        bail!(
+            "automatic fallback requires an Aegis direct, Claude API, or custom primary provider"
+        );
     }
     let mut providers = std::collections::HashSet::new();
     providers.insert(run.provider.as_str());
@@ -89,11 +97,15 @@ pub fn approved(run: &Run) -> Result<Vec<Route>> {
             bail!("fallback providers must be distinct from the primary and each other");
         }
     }
-    if !routes.is_empty()
-        && run.provider != "custom"
-        && run.budgets["provider_transport"] != "aegis-direct-v1"
-    {
-        bail!("automatic fallback requires a direct primary provider");
+    if !routes.is_empty() {
+        let expected = match run.provider.as_str() {
+            "custom" => None,
+            "claude-api" => Some("aegis-claude-api-v1"),
+            _ => Some("aegis-direct-v1"),
+        };
+        if expected.is_some_and(|transport| run.budgets["provider_transport"] != transport) {
+            bail!("automatic fallback requires a verified primary transport");
+        }
     }
     Ok(routes)
 }
@@ -257,6 +269,67 @@ mod tests {
         assert_eq!(store.run(&run.id)?.id, run.id);
         assert_eq!(store.last_checkpoint(&run.id)?, Some(checkpoint));
         assert!(store.has_evidence(&run.id, &evidence)?);
+        Ok(())
+    }
+
+    #[test]
+    fn claude_api_quota_failover_keeps_contract_and_drops_primary_key_reference() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "Refactor parser\nRequirements:\n- preserve API",
+            directory.path(),
+            "claude-api",
+            json!(["workspace.read"]),
+            json!({"provider_transport":"aegis-claude-api-v1","model":"claude-account-model","api_key_env":"CLAUDE_SESSION_KEY","fallback_routes":[{"provider":"codex","model":"account-model"},{"provider":"grok","model":"other-model"}]}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let obligation = store.obligations(&run.id)?;
+        store.event(&run.id, "model.started", json!({"turn":1}))?;
+        store.event(
+            &run.id,
+            "model.failed",
+            json!({"recoverable_reason":"usage_limit"}),
+        )?;
+        let first = store
+            .transition_provider(&run.id, Reason::UsageLimit)?
+            .unwrap();
+        assert_eq!(first.provider, "codex");
+        assert_eq!(
+            first.configuration(&run)["provider_transport"],
+            "aegis-direct-v1"
+        );
+        assert_eq!(first.configuration(&run)["api_key_env"], Value::Null);
+        assert_eq!(
+            store.run(&run.id)?.budgets["api_key_env"],
+            "CLAUDE_SESSION_KEY"
+        );
+        assert_eq!(store.obligations(&run.id)?, obligation);
+        store.event(&run.id, "model.started", json!({"turn":2}))?;
+        store.event(
+            &run.id,
+            "model.failed",
+            json!({"recoverable_reason":"provider_outage"}),
+        )?;
+        let second = store.transition_provider(&run.id, Reason::Outage)?.unwrap();
+        assert_eq!(second.provider, "grok");
+        assert_eq!(store.run(&run.id)?.provider, "claude-api");
+        assert_eq!(store.obligations(&run.id)?, obligation);
+        assert_eq!(store.event_count(&run.id, "provider.transition")?, 2);
+        drop(store);
+        let store = Store::open(directory.path())?;
+        assert_eq!(store.current_route(&run.id)?, second);
+
+        let mut store = Store::open(directory.path())?;
+        assert!(store.create_run(
+            "invalid transport",
+            directory.path(),
+            "claude-api",
+            json!([]),
+            json!({"provider_transport":"aegis-direct-v1","model":"claude-account-model","fallback_routes":[{"provider":"codex","model":"account-model"}]}),
+            "",
+        ).is_err());
         Ok(())
     }
 

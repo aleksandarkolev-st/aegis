@@ -757,11 +757,14 @@ fn configure_fallback(
     profile: &mut Profile,
     secret: &mut Option<String>,
 ) -> Result<bool> {
-    if !matches!(profile.provider.as_str(), "codex" | "grok" | "custom") {
+    if !matches!(
+        profile.provider.as_str(),
+        "codex" | "grok" | "custom" | "claude-api"
+    ) {
         terminal.message(
             Tone::Quiet,
             "Fallback",
-            "Fallback for this provider is not available yet. ChatGPT, Grok and custom endpoints can be reviewed here.",
+            "Claude subscription fallback is pending. ChatGPT, Grok, Claude API and custom endpoint routes can be reviewed here.",
         )?;
         return Ok(false);
     }
@@ -769,6 +772,7 @@ fn configure_fallback(
         .into_iter()
         .filter(|provider| {
             *provider != profile.provider
+                && !(profile.provider == "claude-api" && *provider == "custom")
                 && !profile
                     .fallback_routes
                     .iter()
