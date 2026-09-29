@@ -50,6 +50,16 @@ struct TaskSecret {
     value: String,
 }
 
+impl TaskSecret {
+    fn matches(&self, run: &crate::storage::Run, route: &crate::routing::Route) -> bool {
+        self.run_id == run.id
+            && route
+                .endpoint
+                .as_ref()
+                .is_some_and(|endpoint| endpoint.base_url == self.endpoint_url)
+    }
+}
+
 fn profile_provider<'de, Decoder: serde::Deserializer<'de>>(
     decoder: Decoder,
 ) -> std::result::Result<String, Decoder::Error> {
@@ -2489,7 +2499,7 @@ fn sessions(
     terminal: &mut Terminal,
     profile: &mut Profile,
     secret: Option<&str>,
-    task_secret: Option<&TaskSecret>,
+    task_secret: &mut Option<TaskSecret>,
 ) -> Result<()> {
     let store = Store::open(root)?;
     let runs = chat_heads(store.runs()?);
@@ -2569,14 +2579,33 @@ fn sessions(
                 return continue_legacy(root, &run.id, terminal, profile);
             }
             let current_route = store.current_route(&run.id)?;
+            let profile_credentials = run_secret_reference(profile, run).zip(secret);
+            if task_secret
+                .as_ref()
+                .is_none_or(|saved| !saved.matches(run, &current_route))
+                && profile_credentials.is_none()
+            {
+                if let Some(endpoint) = current_route
+                    .endpoint
+                    .as_ref()
+                    .filter(|endpoint| endpoint.api_key_env.is_some())
+                {
+                    if let Some(key) =
+                        field(terminal, "  Key for this saved task (hidden) › ", true)?
+                    {
+                        if !key.trim().is_empty() {
+                            *task_secret = Some(TaskSecret {
+                                run_id: run.id.clone(),
+                                endpoint_url: endpoint.base_url.clone(),
+                                value: key,
+                            });
+                        }
+                    }
+                }
+            }
             let credentials = task_secret
-                .filter(|saved| {
-                    saved.run_id == run.id
-                        && current_route
-                            .endpoint
-                            .as_ref()
-                            .is_some_and(|endpoint| endpoint.base_url == saved.endpoint_url)
-                })
+                .as_ref()
+                .filter(|saved| saved.matches(run, &current_route))
                 .and_then(|saved| {
                     current_route
                         .endpoint
@@ -2585,7 +2614,16 @@ fn sessions(
                         .as_deref()
                         .map(|reference| (reference, saved.value.as_str()))
                 })
-                .or_else(|| run_secret_reference(profile, run).zip(secret));
+                .or(profile_credentials);
+            if current_route
+                .endpoint
+                .as_ref()
+                .is_some_and(|endpoint| endpoint.api_key_env.is_some())
+                && credentials.is_none()
+            {
+                terminal.message(Tone::Warning, "Key needed", "This saved task needs its endpoint key before it can resume. Open F3 again to continue.")?;
+                return Ok(());
+            }
             resume(root, &run.id, terminal, credentials)?;
         }
         Some(6) if !run.is_terminal() => {
@@ -3017,7 +3055,7 @@ pub fn interactive(root: &Path) -> Result<()> {
                 &mut terminal,
                 &mut profile,
                 secret.as_deref(),
-                task_secret.as_ref(),
+                &mut task_secret,
             )?,
             Input::NewConversation => {
                 new_conversation(root, &terminal, &mut profile)?;
@@ -3075,7 +3113,7 @@ pub fn interactive(root: &Path) -> Result<()> {
                             &mut terminal,
                             &mut profile,
                             secret.as_deref(),
-                            task_secret.as_ref(),
+                            &mut task_secret,
                         )?
                     }
                     "/context" | "/tools" | "/artifacts" | "/trace" | "/tasks" => {

@@ -198,6 +198,15 @@ fn local_fallback_continuation(key: Option<&str>) -> Result<()> {
 
 #[test]
 fn reentered_saved_task_key_reaches_only_its_frozen_endpoint() -> Result<()> {
+    saved_task_key_reaches_frozen_endpoint(true)
+}
+
+#[test]
+fn resuming_saved_task_prompts_for_its_missing_endpoint_key() -> Result<()> {
+    saved_task_key_reaches_frozen_endpoint(false)
+}
+
+fn saved_task_key_reaches_frozen_endpoint(manual_sign_in: bool) -> Result<()> {
     let directory = tempfile::tempdir()?;
     let root = directory.path().join(".arun");
     let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -267,11 +276,11 @@ fn reentered_saved_task_key_reaches_only_its_frozen_endpoint() -> Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"new-task-key\n/login\n1\nsaved-task-key\n/sessions\n1\n6\n/quit\n")?;
+    child.stdin.take().unwrap().write_all(if manual_sign_in {
+        b"new-task-key\n/login\n1\nsaved-task-key\n/sessions\n1\n6\n/quit\n"
+    } else {
+        b"new-task-key\n/sessions\n1\n6\nsaved-task-key\n/quit\n"
+    })?;
     let output = child.wait_with_output()?;
     server.join().unwrap()?;
     assert!(
@@ -280,6 +289,9 @@ fn reentered_saved_task_key_reaches_only_its_frozen_endpoint() -> Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!String::from_utf8_lossy(&output.stdout).contains("saved-task-key"));
+    if !manual_sign_in {
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Key for this saved task"));
+    }
     assert_eq!(fs::read(root.join("profile.json"))?, original_profile);
     let store = Store::open(&root)?;
     assert_eq!(store.run(&run.id)?.state, "answered");
