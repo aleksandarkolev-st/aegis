@@ -261,6 +261,8 @@ fn switched_provider_is_visible_in_saved_task_without_changing_run_identity() ->
     )?;
     let mut child = Command::new(env!("CARGO_BIN_EXE_arun"))
         .current_dir(directory.path())
+        .env("USERPROFILE", directory.path())
+        .env("HOME", directory.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -269,7 +271,7 @@ fn switched_provider_is_visible_in_saved_task_without_changing_run_identity() ->
         .stdin
         .take()
         .unwrap()
-        .write_all(b"/context\n/quit\n")?;
+        .write_all(b"/context\n/login\n1\n3\n/quit\n")?;
     let output = child.wait_with_output()?;
     assert!(
         output.status.success(),
@@ -280,7 +282,62 @@ fn switched_provider_is_visible_in_saved_task_without_changing_run_identity() ->
         String::from_utf8_lossy(&output.stdout)
             .contains("Grok / fallback · switched within this task")
     );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Current task · Grok / fallback"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("New tasks · ChatGPT"));
     assert_eq!(store.run(&run.id)?.provider, "codex");
     assert_eq!(store.event_count(&run.id, "provider.transition")?, 1);
+    Ok(())
+}
+
+#[test]
+fn switched_custom_route_asks_for_its_key_without_rewriting_the_primary_profile() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join(".arun");
+    let route = json!({"provider":"custom","model":"local-model","endpoint":{"base_url":"http://127.0.0.1:1234/v1","api_key_env":"ARUN_SESSION_API_KEY"}});
+    let mut store = Store::open(&root)?;
+    let run = store.create_run(
+        "Review parser",
+        directory.path(),
+        "codex",
+        json!([]),
+        json!({"provider_transport":"aegis-direct-v1","model":"primary","fallback_routes":[route]}),
+        "",
+    )?;
+    store.state(&run.id, "running", json!({}))?;
+    store.event(&run.id, "model.started", json!({"turn":1}))?;
+    store.event(
+        &run.id,
+        "model.failed",
+        json!({"recoverable_reason":"usage_limit"}),
+    )?;
+    store.transition_provider(&run.id, arun::routing::Reason::UsageLimit)?;
+    store.state(
+        &run.id,
+        "waiting_recovery",
+        json!({"reason":"fixture paused"}),
+    )?;
+    let profile = json!({"provider":"codex","model":"primary","endpoint":null,"write":false,"image":null,"previous_run":run.id,"fallback_routes":[route]});
+    let profile_bytes = serde_json::to_vec(&profile)?;
+    fs::write(root.join("profile.json"), &profile_bytes)?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_arun"))
+        .current_dir(directory.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"initial-fixture-key\n/login\n1\nreplacement-fixture-key\n/quit\n")?;
+    let output = child.wait_with_output()?;
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("Current task · Custom endpoint / local-model"));
+    assert!(text.contains("New tasks · ChatGPT"));
+    assert!(!text.contains("initial-fixture-key"));
+    assert!(!text.contains("replacement-fixture-key"));
+    assert_eq!(fs::read(root.join("profile.json"))?, profile_bytes);
+    assert_eq!(store.current_route(&run.id)?.provider, "custom");
     Ok(())
 }

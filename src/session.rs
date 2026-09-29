@@ -1716,6 +1716,83 @@ fn secret_reference(profile: &Profile) -> Option<&str> {
         })
 }
 
+fn sign_in_for_selection(
+    root: &Path,
+    terminal: &Terminal,
+    profile: &mut Profile,
+    secret: &mut Option<String>,
+) -> Result<()> {
+    let current = if let Some(id) = profile.previous_run.as_deref() {
+        let store = Store::open(root)?;
+        match store.run(id) {
+            Ok(run) if !run.is_terminal() => Some(store.current_route(id)?),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let selected = if let Some(route) = current
+        .as_ref()
+        .filter(|route| route.provider != profile.provider)
+    {
+        let choices = [
+            format!("Current task · {} / {}", name(&route.provider), route.model),
+            format!("New tasks · {}", name(&profile.provider)),
+            "Back".into(),
+        ];
+        match terminal.select("Sign in for which task?", &choices)? {
+            Some(0) => route.provider.as_str(),
+            Some(1) => profile.provider.as_str(),
+            _ => return Ok(()),
+        }
+    } else {
+        profile.provider.as_str()
+    };
+    if selected == "custom" {
+        if current
+            .as_ref()
+            .is_some_and(|route| route.provider == "custom")
+            && profile.provider != "custom"
+        {
+            if current
+                .as_ref()
+                .and_then(|route| route.endpoint.as_ref())
+                .and_then(|endpoint| endpoint.api_key_env.as_ref())
+                .is_none()
+            {
+                terminal.message(Tone::Quiet, "Endpoint", "This task's custom route was approved without a key. New tasks can review a different endpoint in F7.")?;
+                return Ok(());
+            }
+            if let Some(key) = field(terminal, "  Key for this task (hidden) › ", true)? {
+                if key.trim().is_empty() {
+                    terminal.message(
+                        Tone::Warning,
+                        "Key unchanged",
+                        "This task's fallback needs a nonempty API key.",
+                    )?;
+                } else {
+                    *secret = Some(key);
+                }
+            }
+        } else {
+            let Some(key) = field(terminal, "  API key (hidden) › ", true)? else {
+                return Ok(());
+            };
+            *secret = (!key.trim().is_empty()).then_some(key);
+            if let Some(endpoint) = &mut profile.endpoint {
+                endpoint.api_key_env = secret
+                    .as_ref()
+                    .filter(|key| !key.trim().is_empty())
+                    .map(|_| "ARUN_SESSION_API_KEY".into());
+            }
+            save(root, profile)?;
+        }
+    } else if let Err(error) = crate::signin::run(selected, terminal) {
+        terminal.message(Tone::Warning, "!", &error.to_string())?;
+    }
+    Ok(())
+}
+
 fn run_secret_reference<'a>(profile: &Profile, run: &'a crate::storage::Run) -> Option<&'a str> {
     let endpoint = profile.endpoint.as_ref().or_else(|| {
         profile
@@ -2912,20 +2989,7 @@ pub fn interactive(root: &Path) -> Result<()> {
                 history.clear();
             }
             Input::Login => {
-                if profile.provider == "custom" {
-                    secret = field(&terminal, "  API key (hidden) › ", true)?;
-                    if let Some(endpoint) = &mut profile.endpoint {
-                        endpoint.api_key_env = secret
-                            .as_ref()
-                            .filter(|key| !key.trim().is_empty())
-                            .map(|_| "ARUN_SESSION_API_KEY".into());
-                    }
-                    save(root, &profile)?;
-                } else {
-                    if let Err(error) = crate::signin::run(&profile.provider, &terminal) {
-                        terminal.message(Tone::Warning, "!", &error.to_string())?;
-                    }
-                }
+                sign_in_for_selection(root, &terminal, &mut profile, &mut secret)?;
             }
             Input::Submit(request) => {
                 let request = request.trim();
@@ -2946,6 +3010,9 @@ pub fn interactive(root: &Path) -> Result<()> {
                         switch_model(root, &terminal, &mut profile, secret.as_deref())?
                     }
                     "/reasoning" => switch_reasoning(root, &terminal, &mut profile)?,
+                    "/login" => {
+                        sign_in_for_selection(root, &terminal, &mut profile, &mut secret)?
+                    }
                     "/settings" => {
                         settings(root, &mut terminal, &mut profile, &mut secret)?;
                     }
