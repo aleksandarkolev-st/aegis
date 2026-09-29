@@ -482,6 +482,9 @@ fn remove_provider_keys(command: &mut Command, run: &Run) -> Result<()> {
         command.env_remove(reference);
     }
     for route in crate::routing::approved(run)? {
+        if let Some(reference) = route.api_key_env.as_deref() {
+            command.env_remove(reference);
+        }
         if let Some(reference) = route
             .endpoint
             .as_ref()
@@ -671,10 +674,46 @@ fn result_detail(operation: &Operation, result: &Value, bytes: usize, elapsed_ms
 }
 
 pub fn spawn(root: &Path, id: &str, secret: Option<(&str, &str)>) -> Result<()> {
+    spawn_with_secrets(root, id, &secret.into_iter().collect::<Vec<_>>())
+}
+
+fn validate_supplied_secrets(run: &Run, secrets: &[(&str, &str)]) -> Result<()> {
+    let mut allowed = std::collections::HashSet::new();
+    for reference in [
+        run.budgets["api_key_env"].as_str(),
+        run.budgets
+            .pointer("/endpoint/api_key_env")
+            .and_then(Value::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        allowed.insert(reference.to_owned());
+    }
+    for route in crate::routing::approved(&run)? {
+        if let Some(reference) = route.api_key_env {
+            allowed.insert(reference);
+        }
+        if let Some(reference) = route.endpoint.and_then(|endpoint| endpoint.api_key_env) {
+            allowed.insert(reference);
+        }
+    }
+    let mut supplied = std::collections::HashSet::new();
+    for (reference, value) in secrets {
+        if !allowed.contains(*reference) || !supplied.insert(*reference) || value.is_empty() {
+            bail!("task credentials must match distinct approved key references");
+        }
+    }
+    Ok(())
+}
+
+pub fn spawn_with_secrets(root: &Path, id: &str, secrets: &[(&str, &str)]) -> Result<()> {
     uuid::Uuid::parse_str(id).context("invalid run ID")?;
     if is_active(root, id)? {
         return Ok(());
     }
+    let run = Store::open(root)?.run(id)?;
+    validate_supplied_secrets(&run, secrets)?;
     let log = File::options()
         .create(true)
         .append(true)
@@ -687,7 +726,7 @@ pub fn spawn(root: &Path, id: &str, secret: Option<(&str, &str)>) -> Result<()> 
         .stdin(Stdio::null())
         .stderr(Stdio::from(log.try_clone()?))
         .stdout(Stdio::from(log));
-    if let Some((name, value)) = secret {
+    for (name, value) in secrets {
         command.env(name, value);
     }
     #[cfg(windows)]
@@ -1209,6 +1248,11 @@ mod tests {
                 json!({"provider_transport":"aegis-claude-api-v1","model":"account-model","api_key_env":"CLAUDE_API_SESSION_KEY"}),
                 "CLAUDE_API_SESSION_KEY",
             ),
+            (
+                "codex",
+                json!({"provider_transport":"aegis-direct-v1","model":"account-model","fallback_routes":[{"provider":"claude-api","model":"claude-account-model","api_key_env":"CLAUDE_FALLBACK_KEY"}]}),
+                "CLAUDE_FALLBACK_KEY",
+            ),
         ] {
             let run = store.create_run(
                 "Read a file",
@@ -1233,6 +1277,34 @@ mod tests {
                     && value.is_some_and(|value| value == "safe")
             }));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_only_accepts_distinct_keys_approved_for_this_run() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "Read a file",
+            directory.path(),
+            "custom",
+            json!([]),
+            json!({"model":"local-model","endpoint":{"base_url":"https://example.test/v1","api_key_env":"PRIMARY_KEY"},"fallback_routes":[{"provider":"claude-api","model":"claude-account-model","api_key_env":"CLAUDE_FALLBACK_KEY"}]}),
+            "",
+        )?;
+        assert!(
+            validate_supplied_secrets(
+                &run,
+                &[("PRIMARY_KEY", "one"), ("CLAUDE_FALLBACK_KEY", "two")]
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_supplied_secrets(&run, &[("PRIMARY_KEY", "one"), ("PRIMARY_KEY", "two")])
+                .is_err()
+        );
+        assert!(validate_supplied_secrets(&run, &[("UNREVIEWED_KEY", "secret")]).is_err());
+        assert!(validate_supplied_secrets(&run, &[("CLAUDE_FALLBACK_KEY", "")]).is_err());
         Ok(())
     }
 

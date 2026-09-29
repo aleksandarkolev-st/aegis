@@ -14,6 +14,17 @@ pub struct Route {
     pub reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<crate::endpoint::Endpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+}
+
+pub(crate) fn valid_key_reference(reference: &str) -> bool {
+    !reference.is_empty()
+        && reference.len() <= 128
+        && !reference.as_bytes()[0].is_ascii_digit()
+        && reference
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,14 +47,21 @@ impl Reason {
 impl Route {
     pub fn validate(&self) -> Result<()> {
         match self.provider.as_str() {
-            "codex" | "grok" if self.endpoint.is_none() => {}
-            "custom" => {
+            "codex" | "grok" if self.endpoint.is_none() && self.api_key_env.is_none() => {}
+            "claude-api" if self.endpoint.is_none() => {
+                if !self.api_key_env.as_deref().is_some_and(valid_key_reference) {
+                    bail!("Claude API fallback requires a session-only API-key reference");
+                }
+            }
+            "custom" if self.api_key_env.is_none() => {
                 self.endpoint
                     .as_ref()
                     .context("custom fallback requires an OpenAI-compatible endpoint")?
                     .url()?;
             }
-            _ => bail!("fallback route must be direct ChatGPT/Grok or a validated custom endpoint"),
+            _ => bail!(
+                "fallback route must be direct ChatGPT/Grok, Claude API, or a validated custom endpoint"
+            ),
         }
         if !crate::catalog::valid_id(&self.model)
             || self
@@ -61,8 +79,12 @@ impl Route {
             return run.budgets.clone();
         }
         let mut configuration = run.budgets.clone();
-        configuration["provider_transport"] = json!("aegis-direct-v1");
-        configuration["api_key_env"] = Value::Null;
+        configuration["provider_transport"] = json!(if self.provider == "claude-api" {
+            "aegis-claude-api-v1"
+        } else {
+            "aegis-direct-v1"
+        });
+        configuration["api_key_env"] = json!(self.api_key_env);
         configuration["model"] = json!(self.model);
         configuration["reasoning_effort"] = json!(self.reasoning_effort);
         configuration["endpoint"] = json!(self.endpoint);
@@ -91,10 +113,38 @@ pub fn approved(run: &Run) -> Result<Vec<Route>> {
     }
     let mut providers = std::collections::HashSet::new();
     providers.insert(run.provider.as_str());
+    let mut key_references = std::collections::HashSet::new();
+    for reference in [
+        run.budgets["api_key_env"].as_str(),
+        run.budgets
+            .pointer("/endpoint/api_key_env")
+            .and_then(Value::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !valid_key_reference(reference) || !key_references.insert(reference) {
+            bail!("provider key references must be valid and distinct");
+        }
+    }
     for route in &routes {
         route.validate()?;
         if !providers.insert(&route.provider) {
             bail!("fallback providers must be distinct from the primary and each other");
+        }
+        for reference in [
+            route.api_key_env.as_deref(),
+            route
+                .endpoint
+                .as_ref()
+                .and_then(|endpoint| endpoint.api_key_env.as_deref()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !valid_key_reference(reference) || !key_references.insert(reference) {
+                bail!("provider key references must be valid and distinct");
+            }
         }
     }
     if !routes.is_empty() {
@@ -133,6 +183,7 @@ impl Store {
             model: run.budgets["model"].as_str().unwrap_or_default().into(),
             reasoning_effort: run.budgets["reasoning_effort"].as_str().map(str::to_owned),
             endpoint: serde_json::from_value(run.budgets["endpoint"].clone())?,
+            api_key_env: None,
         })
     }
 
@@ -328,6 +379,64 @@ mod tests {
             "claude-api",
             json!([]),
             json!({"provider_transport":"aegis-direct-v1","model":"claude-account-model","fallback_routes":[{"provider":"codex","model":"account-model"}]}),
+            "",
+        ).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn claude_api_fallback_uses_a_distinct_reviewed_key_reference() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "Repair parser",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({"provider_transport":"aegis-direct-v1","model":"account-model","fallback_routes":[{"provider":"claude-api","model":"claude-account-model","api_key_env":"CLAUDE_FALLBACK_KEY"}]}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        store.event(&run.id, "model.started", json!({"turn":1}))?;
+        store.event(
+            &run.id,
+            "model.failed",
+            json!({"recoverable_reason":"usage_limit"}),
+        )?;
+        let fallback = store
+            .transition_provider(&run.id, Reason::UsageLimit)?
+            .unwrap();
+        assert_eq!(fallback.provider, "claude-api");
+        assert_eq!(
+            fallback.configuration(&run)["provider_transport"],
+            "aegis-claude-api-v1"
+        );
+        assert_eq!(
+            fallback.configuration(&run)["api_key_env"],
+            "CLAUDE_FALLBACK_KEY"
+        );
+        assert_eq!(store.current_route(&run.id)?, fallback);
+
+        for invalid in [
+            json!({"provider":"claude-api","model":"claude-account-model"}),
+            json!({"provider":"claude-api","model":"claude-account-model","api_key_env":"BAD-NAME"}),
+            json!({"provider":"grok","model":"other-model","api_key_env":"CLAUDE_FALLBACK_KEY"}),
+        ] {
+            assert!(store.create_run(
+                "invalid route",
+                directory.path(),
+                "codex",
+                json!([]),
+                json!({"provider_transport":"aegis-direct-v1","model":"account-model","fallback_routes":[invalid]}),
+                "",
+            ).is_err());
+        }
+        assert!(store.create_run(
+            "colliding keys",
+            directory.path(),
+            "custom",
+            json!([]),
+            json!({"model":"local-model","endpoint":{"base_url":"https://example.test/v1","api_key_env":"SHARED_KEY"},"fallback_routes":[{"provider":"claude-api","model":"claude-account-model","api_key_env":"SHARED_KEY"}]}),
             "",
         ).is_err());
         Ok(())

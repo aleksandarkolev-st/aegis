@@ -58,8 +58,11 @@ impl TaskSecret {
     }
 }
 
-fn route_secret_target(run: &crate::storage::Run, route: &crate::routing::Route) -> Option<String> {
-    if route.provider == "claude-api" && run.provider == "claude-api" {
+fn route_secret_target(
+    _run: &crate::storage::Run,
+    route: &crate::routing::Route,
+) -> Option<String> {
+    if route.provider == "claude-api" {
         return Some("claude-api".into());
     }
     route
@@ -72,8 +75,12 @@ fn route_key_reference<'a>(
     run: &'a crate::storage::Run,
     route: &'a crate::routing::Route,
 ) -> Option<&'a str> {
-    if route.provider == "claude-api" && run.provider == "claude-api" {
-        return run.budgets["api_key_env"].as_str();
+    if route.provider == "claude-api" {
+        return if run.provider == "claude-api" {
+            run.budgets["api_key_env"].as_str()
+        } else {
+            route.api_key_env.as_deref()
+        };
     }
     route
         .endpoint
@@ -894,6 +901,7 @@ fn configure_fallback(
             model: model.id.clone(),
             reasoning_effort: None,
             endpoint: Some(endpoint),
+            api_key_env: None,
         }
     } else {
         if !ensure_provider(terminal, other)? {
@@ -936,6 +944,7 @@ fn configure_fallback(
             model,
             reasoning_effort: None,
             endpoint: None,
+            api_key_env: None,
         }
     };
     route.validate()?;
@@ -3529,6 +3538,7 @@ mod tests {
             model: "model".into(),
             reasoning_effort: None,
             endpoint: saved.endpoint.clone(),
+            api_key_env: None,
         }];
         assert_eq!(secret_reference(&direct), Some("ARUN_SESSION_API_KEY"));
         assert!(saved.write);

@@ -187,13 +187,7 @@ pub fn call_configured(
             .context("Claude API tasks require a selected model")?;
         let reference = configuration["api_key_env"]
             .as_str()
-            .filter(|reference| {
-                !reference.is_empty()
-                    && !reference.as_bytes()[0].is_ascii_digit()
-                    && reference
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-            })
+            .filter(|reference| crate::routing::valid_key_reference(reference))
             .context("Claude API tasks require a valid session-only API-key reference")?;
         let key = std::env::var(reference).with_context(|| {
             format!("Claude API key for {reference} is missing; enter it again")
