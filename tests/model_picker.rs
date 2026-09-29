@@ -606,3 +606,72 @@ fn approve_local_fallback(key: Option<&str>) -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn fallback_menu_offers_only_remaining_provider_after_the_first_choice() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join(".arun");
+    fs::create_dir(&root)?;
+    let mut original = profile();
+    original["fallback_routes"] = json!([{"provider":"custom","model":"qwen-local","endpoint":{"base_url":"http://127.0.0.1:1234/v1","api_key_env":null}}]);
+    let profile_bytes = serde_json::to_vec(&original)?;
+    fs::write(root.join("profile.json"), &profile_bytes)?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_arun"))
+        .current_dir(directory.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"/settings\n10\n4\n/quit\n")?;
+    let output = child.wait_with_output()?;
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("Add Grok after current fallback"));
+    assert!(!text.contains("Use Custom endpoint as fallback"));
+    assert_eq!(fs::read(root.join("profile.json"))?, profile_bytes);
+    Ok(())
+}
+
+#[test]
+fn fallback_order_can_be_swapped_without_signing_in_or_losing_settings() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join(".arun");
+    fs::create_dir(&root)?;
+    let mut original = profile();
+    original["fallback_routes"] = json!([
+        {"provider":"grok","model":"grok-model"},
+        {"provider":"custom","model":"qwen-local","endpoint":{"base_url":"http://127.0.0.1:1234/v1","api_key_env":null}}
+    ]);
+    fs::write(root.join("profile.json"), serde_json::to_vec(&original)?)?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_arun"))
+        .current_dir(directory.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"/settings\n10\n2\n/quit\n")?;
+    let output = child.wait_with_output()?;
+    assert!(output.status.success());
+    let saved: Value = serde_json::from_slice(&fs::read(root.join("profile.json"))?)?;
+    assert_eq!(saved["fallback_routes"][0]["provider"], "custom");
+    assert_eq!(saved["fallback_routes"][1]["provider"], "grok");
+    for key in [
+        "provider",
+        "model",
+        "write",
+        "image",
+        "limits",
+        "previous_run",
+    ] {
+        assert_eq!(saved[key], original[key]);
+    }
+    Ok(())
+}

@@ -661,27 +661,43 @@ fn configure_fallback(
     }
     let available: Vec<_> = ["codex", "grok", "custom"]
         .into_iter()
-        .filter(|provider| *provider != profile.provider)
+        .filter(|provider| {
+            *provider != profile.provider
+                && !profile
+                    .fallback_routes
+                    .iter()
+                    .any(|route| route.provider == *provider)
+        })
         .collect();
-    let mut choices = vec![format!(
-        "Keep current · {}",
+    let current = if profile.fallback_routes.is_empty() {
+        "off".into()
+    } else {
         profile
             .fallback_routes
-            .first()
-            .map_or("off".into(), |route| format!(
-                "{} / {}",
-                name(&route.provider),
-                route.model
-            ))
-    )];
-    choices.extend(
-        available
             .iter()
-            .map(|provider| format!("Use {} as fallback", name(provider))),
-    );
+            .map(|route| format!("{} / {}", name(&route.provider), route.model))
+            .collect::<Vec<_>>()
+            .join(" → ")
+    };
+    let mut choices = vec![format!("Keep current · {}", current)];
+    choices.extend(available.iter().map(|provider| {
+        if profile.fallback_routes.is_empty() {
+            format!("Use {} as fallback", name(provider))
+        } else {
+            format!("Add {} after current fallback", name(provider))
+        }
+    }));
+    let swap = profile.fallback_routes.len() > 1;
+    if swap {
+        choices.push("Swap fallback order".into());
+    }
     choices.extend(["Turn automatic fallback off".into(), "Back".into()]);
     let selected = terminal.select("Switch on quota, outage or removed model", &choices)?;
-    if selected == Some(available.len() + 1) {
+    if swap && selected == Some(available.len() + 1) {
+        profile.fallback_routes.swap(0, 1);
+        return Ok(true);
+    }
+    if selected == Some(available.len() + 1 + usize::from(swap)) {
         profile.fallback_routes.clear();
         return Ok(true);
     }
@@ -832,7 +848,7 @@ fn configure_fallback(
     if terminal.select("Approve automatic switch?", &confirmation)? != Some(1) {
         return Ok(false);
     }
-    profile.fallback_routes = vec![route];
+    profile.fallback_routes.push(route);
     Ok(true)
 }
 

@@ -416,4 +416,53 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn classified_failures_follow_reviewed_fallback_order_once_each() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "Repair parser",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({"provider_transport":"aegis-direct-v1","model":"primary","fallback_routes":[{"provider":"grok","model":"grok-model"},{"provider":"custom","model":"local-model","endpoint":{"base_url":"http://127.0.0.1:1234/v1","api_key_env":null}}]}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        store.event(&run.id, "model.started", json!({"turn":1}))?;
+        store.event(
+            &run.id,
+            "model.failed",
+            json!({"recoverable_reason":"usage_limit"}),
+        )?;
+        assert_eq!(
+            store
+                .transition_provider(&run.id, Reason::UsageLimit)?
+                .unwrap()
+                .provider,
+            "grok"
+        );
+        store.event(&run.id, "model.started", json!({"turn":2}))?;
+        store.event(
+            &run.id,
+            "model.failed",
+            json!({"recoverable_reason":"provider_outage"}),
+        )?;
+        let second = store.transition_provider(&run.id, Reason::Outage)?.unwrap();
+        assert_eq!(second.provider, "custom");
+        assert_eq!(second.model, "local-model");
+        assert_eq!(store.event_count(&run.id, "provider.transition")?, 2);
+        assert!(
+            store
+                .transition_provider(&run.id, Reason::Outage)?
+                .is_none()
+        );
+        drop(store);
+        assert_eq!(
+            Store::open(directory.path())?.current_route(&run.id)?,
+            second
+        );
+        Ok(())
+    }
 }
