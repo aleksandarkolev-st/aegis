@@ -567,10 +567,21 @@ fn execute() -> Result<()> {
             println!("aegis {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Some("status") => {
+        Some(
+            "goal" | "contract" | "status" | "why" | "evidence" | "verify" | "provider" | "budget"
+            | "handoff",
+        ) => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&Store::open(&root)?.run(required(1)?)?)?
+                arun::control::display(
+                    required(0)?,
+                    &arun::control::view(
+                        &Store::open(&root)?,
+                        required(1)?,
+                        required(0)?,
+                        arguments.get(2).map(String::as_str)
+                    )?
+                )
             );
             Ok(())
         }

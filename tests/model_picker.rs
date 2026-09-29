@@ -392,7 +392,7 @@ fn model_and_provider_switches_keep_permissions_budgets_and_task_history() -> Re
             .stderr(Stdio::piped())
             .spawn()?;
         child.stdin.take().unwrap().write_all(if provider_switch {
-            b"/provider\n4\n1\n/quit\n"
+            b"/providers\n4\n1\n/quit\n"
         } else {
             b"/models\n1\n/quit\n"
         })?;

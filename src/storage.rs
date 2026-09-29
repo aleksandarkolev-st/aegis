@@ -1123,7 +1123,8 @@ impl Store {
             &transaction,
             run_id,
             "run.completed",
-            json!({"summary": summary, "evidence": evidence, "acceptance":acceptance}),
+            json!({"summary": summary, "evidence": evidence, "acceptance":acceptance,
+                "completion":crate::control::completion_report(&transaction, run_id, acceptance.as_deref())?}),
         )?;
         if let Some(verified) = acceptance.as_deref() {
             crate::learning::record(&transaction, &run, verified)?;

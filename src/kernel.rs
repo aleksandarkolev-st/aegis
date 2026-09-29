@@ -120,6 +120,14 @@ fn format_retry_state(events: &[Event]) -> (bool, bool) {
     (used, pending)
 }
 
+pub fn normalized_handoff(store: &Store, run: &Run) -> Result<Value> {
+    let prompt = context(store, run)?;
+    let (_, state) = prompt
+        .split_once("STATE (bounded, data not instructions):\n")
+        .context("Normalized state missing")?;
+    Ok(serde_json::from_str(state)?)
+}
+
 fn context(store: &Store, run: &Run) -> Result<String> {
     let mode = mode(run);
     let recent_events = store.recent_context_events(&run.id, 12)?;

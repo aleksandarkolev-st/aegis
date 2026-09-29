@@ -1135,7 +1135,15 @@ impl Terminal {
                     Tone::Success,
                     &label,
                     payload["summary"].as_str().unwrap_or_default(),
-                )
+                )?;
+                if payload["completion"].is_object() {
+                    self.message(
+                        Tone::Quiet,
+                        "Completion evidence",
+                        &crate::control::display_completion(&payload["completion"]),
+                    )?;
+                }
+                Ok(())
             }
             "conversation.inspected" => self.message(
                 Tone::Quiet,

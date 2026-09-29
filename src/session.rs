@@ -3279,8 +3279,35 @@ pub fn interactive(root: &Path) -> Result<()> {
                         continue;
                     }
                 }
+                let mut words = request.split_whitespace();
+                let command = words.next().unwrap_or_default().trim_start_matches('/');
+                if request.starts_with('/') && crate::control::VIEWS.contains(&command) {
+                    if let Some(id) = profile.previous_run.as_deref() {
+                        let result =
+                            crate::control::view(&Store::open(root)?, id, command, words.next());
+                        match result {
+                            Ok(value) => terminal.message(
+                                Tone::Quiet,
+                                command,
+                                &crate::control::display(command, &value),
+                            )?,
+                            Err(error) => terminal.message(
+                                Tone::Warning,
+                                "View unavailable",
+                                &error.to_string(),
+                            )?,
+                        }
+                    } else {
+                        terminal.message(
+                            Tone::Quiet,
+                            "No current task",
+                            "Describe a task or open F3 to select a saved task.",
+                        )?;
+                    }
+                    continue;
+                }
                 match request {
-                    "/provider" => {
+                    "/providers" => {
                         switch_provider(root, &terminal, &mut profile, &mut secret)?;
                     }
                     "/model" | "/models" => {
@@ -3305,7 +3332,7 @@ pub fn interactive(root: &Path) -> Result<()> {
                         new_conversation(root, &terminal, &mut profile)?;
                         history.clear();
                     }
-                    "/sessions" | "/chats" | "/resume" | "/status" => {
+                    "/sessions" | "/chats" | "/resume" => {
                         sessions(
                             root,
                             &mut terminal,
