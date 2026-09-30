@@ -365,6 +365,45 @@ mod tests {
     }
 
     #[test]
+    fn legacy_catalog_bindings_cannot_hide_models_after_a_compatibility_update() -> Result<()> {
+        use sha2::{Digest, Sha256};
+        let directory = tempfile::tempdir()?;
+        let vault = Vault::new(directory.path().join("auth"));
+        let provider = Provider::ChatGpt;
+        let session = session(provider);
+        vault.save(&session)?;
+        let mut hash = Sha256::new();
+        hash.update(b"aegis/catalog-binding/v1");
+        for field in [
+            provider.session_name(),
+            session.account_id.as_deref().unwrap_or(""),
+            &session.access_token,
+        ] {
+            hash.update((field.len() as u64).to_le_bytes());
+            hash.update(field.as_bytes());
+        }
+        vault.save_catalog(
+            provider.session_name(),
+            serde_json::to_vec(&SavedCatalog {
+                version: 1,
+                binding: hex::encode(hash.finalize()),
+                fetched_at: now()?,
+                models: models(),
+            })?,
+        )?;
+        assert!(cached(&vault, provider, || false)?.is_none());
+        assert!(saved_for_selection(&vault, provider, || false)?.is_none());
+        let mut replacement = models();
+        replacement[0].id = "newly-advertised-model".into();
+        let fetched = get_with(&vault, provider, &|| false, |_, _, _| {
+            Ok(replacement.clone())
+        })?;
+        assert_eq!(fetched, replacement);
+        assert_eq!(cached(&vault, provider, || false)?, Some(replacement));
+        Ok(())
+    }
+
+    #[test]
     fn stale_future_and_unknown_version_metadata_are_misses_and_denials_never_fall_back()
     -> Result<()> {
         let directory = tempfile::tempdir()?;
