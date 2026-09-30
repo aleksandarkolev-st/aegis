@@ -632,6 +632,16 @@ pub(crate) fn perform(
     run: &Run,
     operation: &Operation,
 ) -> Result<bool> {
+    perform_with_dispatch(store, root, run, operation, dispatch)
+}
+
+fn perform_with_dispatch(
+    store: &mut Store,
+    root: &Path,
+    run: &Run,
+    operation: &Operation,
+    mut dispatch_fn: impl FnMut(&Path, &Operation, Duration) -> Result<Value>,
+) -> Result<bool> {
     if store.interrupt_requested(&run.id, crate::interrupt::Scope::Operation, &operation.id)? {
         store.operation_state(
             operation,
@@ -651,12 +661,48 @@ pub(crate) fn perform(
         )?;
         return Ok(true);
     }
-    store.operation_state(
-        operation,
-        "dispatched",
-        None,
-        json!({"idempotency_key": operation.idempotency_key}),
-    )?;
+    let needs_remote_approval = run.budgets["remote_origin"] == true
+        && matches!(
+            operation.capability.as_str(),
+            "workspace.write" | "workspace.patch" | "process.run" | "network.fetch"
+        );
+    let mut authorization =
+        crate::remote::authorize_operation_dispatch(store, &run.id, &operation.id)?;
+    if needs_remote_approval && authorization == crate::remote::DispatchAuthorization::Ungated {
+        crate::remote::ensure_remote_approval_gate(
+            store,
+            &run.id,
+            &operation.id,
+            crate::storage::unix_time(),
+        )?;
+        authorization = crate::remote::authorize_operation_dispatch(store, &run.id, &operation.id)?;
+    }
+    let remotely_approved = match authorization {
+        crate::remote::DispatchAuthorization::Ungated => false,
+        crate::remote::DispatchAuthorization::AwaitingDecision => {
+            store.state(
+                &run.id,
+                "waiting_recovery",
+                json!({
+                    "reason":"remote_approval_required",
+                    "operation_id":operation.id,
+                    "capability":operation.capability,
+                }),
+            )?;
+            return Ok(true);
+        }
+        crate::remote::DispatchAuthorization::ApprovedOnce => true,
+        crate::remote::DispatchAuthorization::Denied
+        | crate::remote::DispatchAuthorization::Expired => return Ok(false),
+    };
+    if !remotely_approved {
+        store.operation_state(
+            operation,
+            "dispatched",
+            None,
+            json!({"idempotency_key": operation.idempotency_key}),
+        )?;
+    }
     let timeout = Duration::from_secs(
         run.budgets
             .get("process_seconds")
@@ -665,7 +711,7 @@ pub(crate) fn perform(
             .min(remaining),
     );
     let started = Instant::now();
-    match dispatch(root, operation, timeout) {
+    match dispatch_fn(root, operation, timeout) {
         Ok(result) => {
             commit_result(store, operation, result, started.elapsed().as_millis())?;
         }
@@ -1235,6 +1281,184 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn remote_write_fixture() -> Result<(tempfile::TempDir, Store, Run, Operation)> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "write a protected result",
+            directory.path(),
+            "codex",
+            json!(["workspace.write"]),
+            json!({"remote_origin":true,"wall_seconds":3600}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({"source":"test"}))?;
+        let operation = store.begin_operation(
+            &run.id,
+            "workspace.write",
+            json!({"path":"approved.txt","content":"approved"}),
+            false,
+        )?;
+        Ok((directory, store, run, operation))
+    }
+
+    fn approve_remote_operation(
+        root: &Path,
+        run_id: &str,
+        challenge_id: &str,
+        approve: bool,
+    ) -> Result<()> {
+        let mut authority = crate::remote::Authority::open(root)?;
+        let actor_id = "kernel-test-actor";
+        authority.register_actor(actor_id)?;
+        authority.grant_run(actor_id, run_id)?;
+        let now = crate::storage::unix_time();
+        let command = if approve {
+            crate::remote::Command::ApproveOnce {
+                challenge_id: challenge_id.to_owned(),
+            }
+        } else {
+            crate::remote::Command::Deny {
+                challenge_id: challenge_id.to_owned(),
+            }
+        };
+        let request = crate::remote::CommandEnvelope {
+            version: 1,
+            installation_id: authority.installation_id().to_owned(),
+            actor_id: actor_id.to_owned(),
+            request_id: uuid::Uuid::new_v4().to_string(),
+            issued_at: now,
+            expires_at: now + 60,
+            command,
+        };
+        authority.apply_from_authenticated_relay(actor_id, &request, now)?;
+        Ok(())
+    }
+
+    fn remote_challenge_id(store: &Store, run_id: &str) -> Result<String> {
+        let event = store
+            .events(run_id)?
+            .into_iter()
+            .find(|event| event.kind == "approval.required")
+            .context("remote approval challenge event missing")?;
+        event.payload["challenge_id"]
+            .as_str()
+            .map(str::to_owned)
+            .context("remote approval challenge ID missing")
+    }
+
+    fn resume_remote_test_run(store: &mut Store, run_id: &str) -> Result<()> {
+        store.state(run_id, "ready", json!({"source":"remote_approval_test"}))?;
+        store.state(run_id, "running", json!({"source":"remote_approval_test"}))?;
+        Ok(())
+    }
+
+    #[test]
+    fn remote_origin_write_waits_for_approval_without_dispatching() -> Result<()> {
+        let (directory, mut store, run, operation) = remote_write_fixture()?;
+        let root = directory.path().to_path_buf();
+        let result = perform_with_dispatch(
+            &mut store,
+            &root,
+            &run,
+            &operation,
+            |_, _, _| -> Result<Value> { bail!("pending remote operation must not dispatch") },
+        )?;
+        assert!(result);
+        assert_eq!(store.run(&run.id)?.state, "waiting_recovery");
+        assert_eq!(store.operation(&operation.id)?.state, "pending");
+        assert_eq!(store.event_count(&run.id, "approval.required")?, 1);
+        assert_eq!(store.event_count(&run.id, "operation.dispatched")?, 0);
+        assert!(!root.join("approved.txt").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn remote_origin_write_dispatches_once_after_exact_approval() -> Result<()> {
+        let (directory, mut store, run, operation) = remote_write_fixture()?;
+        let root = directory.path().to_path_buf();
+        assert!(perform_with_dispatch(
+            &mut store,
+            &root,
+            &run,
+            &operation,
+            |_, _, _| -> Result<Value> { bail!("pending remote operation must not dispatch") },
+        )?);
+        let challenge_id = remote_challenge_id(&store, &run.id)?;
+        approve_remote_operation(&root, &run.id, &challenge_id, true)?;
+        resume_remote_test_run(&mut store, &run.id)?;
+
+        let current_run = store.run(&run.id)?;
+        let current_operation = store.operation(&operation.id)?;
+        let mut dispatches = 0;
+        let result = perform_with_dispatch(
+            &mut store,
+            &root,
+            &current_run,
+            &current_operation,
+            |workspace, operation, _| -> Result<Value> {
+                dispatches += 1;
+                assert_eq!(operation.id, current_operation.id);
+                let path = workspace.join(operation.arguments["path"].as_str().unwrap());
+                std::fs::write(&path, operation.arguments["content"].as_str().unwrap())?;
+                Ok(json!({"path":"approved.txt","bytes":8,"exit_code":0}))
+            },
+        )?;
+        assert!(!result);
+        assert_eq!(dispatches, 1);
+        assert_eq!(store.operation(&operation.id)?.state, "succeeded");
+        assert_eq!(store.event_count(&run.id, "operation.dispatched")?, 1);
+        assert_eq!(
+            std::fs::read_to_string(root.join("approved.txt"))?,
+            "approved"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn remote_origin_denial_and_expiry_cancel_without_dispatch() -> Result<()> {
+        for expired in [false, true] {
+            let (directory, mut store, run, operation) = remote_write_fixture()?;
+            let root = directory.path().to_path_buf();
+            assert!(perform_with_dispatch(
+                &mut store,
+                &root,
+                &run,
+                &operation,
+                |_, _, _| -> Result<Value> { bail!("pending remote operation must not dispatch") },
+            )?);
+            let challenge_id = remote_challenge_id(&store, &run.id)?;
+            if expired {
+                store.connection.execute(
+                    "UPDATE remote_operation_gates SET expires_at=?1 WHERE challenge_id=?2",
+                    rusqlite::params![crate::storage::unix_time() - 1, challenge_id],
+                )?;
+            } else {
+                approve_remote_operation(&root, &run.id, &challenge_id, false)?;
+            }
+            resume_remote_test_run(&mut store, &run.id)?;
+            let current_run = store.run(&run.id)?;
+            let current_operation = store.operation(&operation.id)?;
+            let mut dispatches = 0;
+            let result = perform_with_dispatch(
+                &mut store,
+                &root,
+                &current_run,
+                &current_operation,
+                |_, _, _| -> Result<Value> {
+                    dispatches += 1;
+                    Ok(json!({"unexpected_dispatch":true}))
+                },
+            )?;
+            assert!(!result);
+            assert_eq!(dispatches, 0);
+            assert_eq!(store.operation(&operation.id)?.state, "cancelled");
+            assert_eq!(store.event_count(&run.id, "operation.dispatched")?, 0);
+            assert_eq!(store.event_count(&run.id, "operation.cancelled")?, 1);
+        }
+        Ok(())
+    }
 
     #[test]
     fn no_tool_request_has_a_bounded_model_context() -> Result<()> {
