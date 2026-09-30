@@ -80,7 +80,24 @@ pub(crate) fn parse_action(raw: &str) -> Result<Action> {
         .unwrap_or(trimmed)
         .trim();
     let trimmed = content.strip_suffix("```").unwrap_or(content).trim();
-    let mut value: Value = serde_json::from_str(trimmed).context("model response was not JSON")?;
+    let mut value: Value = match serde_json::from_str(trimmed) {
+        Ok(value) => value,
+        Err(error) => {
+            // Some transports emit the same action twice, with reordered object keys.
+            // Accept that exact semantic duplicate once; never select among different actions.
+            let mut values = serde_json::Deserializer::from_str(trimmed).into_iter::<Value>();
+            let first = values.next().transpose()?;
+            let second = values.next().transpose()?;
+            if let (Some(first), Some(second), None) = (first, second, values.next()) {
+                let first = parse_action(&first.to_string())?;
+                let second = parse_action(&second.to_string())?;
+                if first == second {
+                    return Ok(first);
+                }
+            }
+            return Err(error).context("model response was not one unambiguous JSON action");
+        }
+    };
     if value.get("kind").is_some() {
         let encoded = match value.get("kind").and_then(Value::as_str) {
             Some("invoke") => Some("args"),
@@ -337,6 +354,29 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("API-key reference"));
+        Ok(())
+    }
+
+    #[test]
+    fn identical_duplicate_actions_apply_once_and_distinct_or_extra_actions_are_rejected()
+    -> Result<()> {
+        let first = r#"{"kind":"invoke","capability":"workspace.write","args":"{\"path\":\"a.txt\",\"content\":\"hello\"}"}"#;
+        let reordered = r#"{"args":{"content":"hello","path":"a.txt"},"capability":"workspace.write","kind":"invoke"}"#;
+        assert_eq!(
+            parse_action(&format!("{first}\n{reordered}"))?,
+            parse_action(first)?
+        );
+        assert!(
+            parse_action(&format!(
+                "{first}{}",
+                reordered.replace("hello", "different")
+            ))
+            .is_err()
+        );
+        assert!(parse_action(&format!("{first}{reordered}{first}")).is_err());
+        assert!(parse_action(&format!("I will do this: {first}")).is_err());
+        assert!(parse_action(&format!("{first}{reordered} trailing text")).is_err());
+        assert!(parse_action(&format!("{first}{{")).is_err());
         Ok(())
     }
 
