@@ -195,6 +195,7 @@ fn context(store: &Store, run: &Run) -> Result<String> {
         "milestones": store.milestones(&run.id)?, "handoff": handoff,
         "obligations": store.obligations(&run.id)?.into_iter().filter(|item| item.state != "superseded").collect::<Vec<_>>(),
         "current_route": store.current_route(&run.id)?,
+        "identity_policy": "You are Aegis. Report model and reasoning from current_route exactly when asked. The internal codex provider label means ChatGPT transport; it does not mean a Codex CLI or Codex agent runs the task. Never invent a model identity from training or conversation history.",
         "workspace_revision": store.workspace_revision(&run.id)?,
         "milestone_policy": "States must be pending, active, or completed. Completed milestones require evidence hashes from successful operations in this run. Titles must be nonblank and at most 200 bytes.",
         "conversation": conversation,
@@ -954,6 +955,24 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
         return Ok(());
     }
     if crate::acceptance::resume(&mut store, root, &run)? {
+        return Ok(());
+    }
+    if crate::identity::is_question(&run.task)
+        && crate::acceptance::Check::from_run(&run)?.is_none()
+        && store.operations(run_id)?.is_empty()
+        && store.obligations(run_id)?.iter().all(|item| item.id == 0)
+        && store
+            .milestones(run_id)?
+            .iter()
+            .all(|item| item.title == "Task request")
+    {
+        let reply = crate::identity::describe(&store.current_route(run_id)?);
+        store.event(
+            run_id,
+            "identity.reported",
+            json!({"source":"persisted_route"}),
+        )?;
+        store.answer_run(run_id, &reply)?;
         return Ok(());
     }
     let max_actions = run
