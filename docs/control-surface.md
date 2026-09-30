@@ -1,6 +1,6 @@
 # Task controls
 
-Slash commands inspect the selected saved task. Press `/` while following a task to enter a command. F3 selects another saved task. Inspection uses persisted kernel state and makes no model calls.
+Typing `/` at the task prompt opens the searchable command menu. Scroll or type to filter all commands and aliases; selection fills the prompt, and Enter runs it. Slash commands inspect the selected saved task. While following a task, `/` opens the same menu; choosing a permitted inspection or pause applies it to the running task. F3 selects another saved task. Inspection uses persisted kernel state and makes no model calls.
 
 | Command | Shows or does |
 | --- | --- |
@@ -22,13 +22,21 @@ F2 or `/providers` selects the provider for new tasks. `/provider` inspects the 
 
 The native CLI exposes the same inspection through `aegis <view> <run-id> [argument]`, plus `aegis pause <run-id>` and `aegis resume <run-id> --foreground`. `aegis models chatgpt` queries the account catalog and lists the supported reasoning levels.
 
+Simple identity questions such as `what model are u` are answered from the persisted active route without inference. The answer names Aegis, the configured model, provider and reasoning level. A fallback's current model is reported, rather than the original primary or a model's guessed identity. These replies remain conversational `answered` records; they cannot bypass explicit obligations or configured acceptance.
+
+Aegis owns its agent loop and tool execution. ChatGPT subscription inference uses direct HTTP transport; it does not launch a Codex CLI or agent harness. The internal `codex` provider alias remains in existing immutable contracts for compatibility.
+
 ## Start and finish
 
 An interactive task with an explicit `Requirements:` list shows its contract before inference and offers Start, Edit, Add or Leave paused. Casual requests bypass this preview. Requirements explicitly supplied in configuration are combined with task requirements, so a partial configuration cannot suppress user bullets.
 
+Piped terminal input preserves bounded bracketed multiline pastes as one request, including the explicit requirement list. An incomplete paste is rejected rather than starting its first line as a partial task.
+
 The kernel saves its completion explanation in `run.completed`. It contains retained requirement states and evidence, operation/program/exit receipts, final revision, independent acceptance evidence and provider transitions. It can still be inspected after event archival and restart.
 
 ## Proof boundaries
+
+Failed operation receipts and their logs remain available through `/artifacts` and model artifact inspection for the owning run. The continuation state retains a bounded summary of recent receipts, including recent process failures, after context rotation and event archival. These summaries count toward tool result exposure; failed receipts cannot verify requirements or complete a task.
 
 Completion rechecks successful operation provenance, artifact integrity, active requirement states and current revisions. Dispatching a write advances the revision even when its outcome fails or is uncertain. Writes also stale proofs for unfinished tasks sharing the workspace. Unknown side effects require reconciliation before a pause can be acknowledged or completion accepted.
 
