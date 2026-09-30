@@ -7,14 +7,14 @@ import test from 'node:test';
 import { releaseTargets } from '../../scripts/platform.mjs';
 import { stageNative, verifyVersion, writeChecksums } from '../../scripts/release.mjs';
 
-test('release checksums require all five native platforms', async () => {
+test('release checksums require all three supported native targets', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'aegis-release-'));
   try {
     await assert.rejects(writeChecksums(directory), /ENOENT/);
     for (const info of releaseTargets()) await writeFile(path.join(directory, info.asset), info.target);
     await writeChecksums(directory);
     const manifest = await readFile(path.join(directory, 'SHA256SUMS'), 'utf8');
-    assert.equal(manifest.trim().split('\n').length, 5);
+    assert.equal(manifest.trim().split('\n').length, 3);
     for (const info of releaseTargets()) {
       const hash = createHash('sha256').update(info.target).digest('hex');
       assert.ok(manifest.includes(hash + '  ' + info.asset + '\n'));

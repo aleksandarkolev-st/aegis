@@ -4,7 +4,7 @@ The npm package is `aegis-arun`; it installs the `aegis` and `arun` commands. np
 
 ## Release the native binaries first
 
-The GitHub release workflow builds Windows x64, Linux x64 and arm64, and macOS Intel and Apple Silicon. It checks that the tag, `package.json`, `package-lock.json`, and `Cargo.toml` all have the same version, then attaches the five binaries, checksums, and npm tarball to a GitHub release.
+The GitHub release workflow supports Windows x64 and Linux x64 and arm64. macOS is unsupported. It checks that the tag, `package.json`, `package-lock.json`, and `Cargo.toml` all have the same version, then attaches the three binaries, checksums, and npm tarball to a GitHub release.
 
 1. Choose the intended package license. `package.json` currently says `UNLICENSED`.
 2. Check that the npm package name is still available and that the version has not been released. At the time of this check, `aegis-arun` returned 404 from npm.
@@ -24,7 +24,7 @@ The GitHub release workflow builds Windows x64, Linux x64 and arm64, and macOS I
    git push origin v0.1.0
    ```
 
-5. Wait for the **Native release** GitHub Actions workflow to finish successfully. Confirm the published GitHub release contains all five platform binaries and `SHA256SUMS` before publishing to npm. Publishing npm first would leave other platforms unable to download their native runtime.
+5. Wait for the **Native release** GitHub Actions workflow to finish successfully. Confirm the published GitHub release contains all three supported platform binaries and `SHA256SUMS` before publishing to npm. Publishing npm first would leave supported platforms unable to download their native runtime.
 
 Manual workflow dispatch builds artifacts but does not create a GitHub release. A pushed `v*` tag runs the full release flow.
 

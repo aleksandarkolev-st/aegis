@@ -99,7 +99,7 @@ Building locally requires Node 20+ and Rust. Published packages download a platf
 
 Maintainers can run `npm run test:package` after `npm run build:native` to check an offline private installation without changing the global command. The check retains a receipt and isolated workspace under `.arun/package-smoke-*`, verifies the packaged file allowlist and binary hash, runs the installed command shim, and declines onboarding/sign-in without creating tasks or starting provider CLIs. It deliberately verifies neither live inference nor interactive animation quality.
 
-The native release workflow builds and tests Windows x64, Linux x64/arm64, and macOS Intel/Apple Silicon. A version tag matching both Rust and Node manifests creates the five assets, `SHA256SUMS`, and an npm tarball. Manual workflow dispatch only builds artifacts. npm publication is a separate authenticated step after the native release is available; no GitHub token is bundled into the package.
+The npm package supports Windows x64 and Linux x64/arm64; macOS is unsupported. The native release workflow builds these three targets. A version tag matching both Rust and Node manifests creates their assets, `SHA256SUMS`, and an npm tarball. Manual workflow dispatch only builds artifacts. npm publication is a separate authenticated step after the native release is available; no GitHub token is bundled into the package.
 
 See [npm publishing](docs/npm-publishing.md) for the maintainer release sequence.
 

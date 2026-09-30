@@ -10,7 +10,9 @@ import { binaryPath, platformTarget } from '../../scripts/platform.mjs';
 
 test('maps only supported platform architectures', () => {
   assert.equal(platformTarget('win32', 'x64').executable, 'arun.exe');
-  assert.equal(platformTarget('darwin', 'arm64').target, 'aarch64-apple-darwin');
+  assert.equal(platformTarget('linux', 'arm64').target, 'aarch64-unknown-linux-gnu');
+  assert.throws(() => platformTarget('darwin', 'x64'), /Unsupported platform/);
+  assert.throws(() => platformTarget('darwin', 'arm64'), /Unsupported platform/);
   assert.throws(() => platformTarget('unknown', 'x64'), /Unsupported platform/);
 });
 
