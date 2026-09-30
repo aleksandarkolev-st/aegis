@@ -20,7 +20,7 @@ Typing `/` at the task prompt opens the searchable command menu. Scroll or type 
 
 F2 or `/providers` selects the provider for new tasks. `/provider` inspects the saved task. Requirement edits require the runner to be stopped; pause first. Neither additions nor replacements rewrite the original task or frozen configuration. Replacements require explicit confirmation and a reason, and the model has no replacement action.
 
-The native CLI exposes the same inspection through `aegis <view> <run-id> [argument]`, plus `aegis pause <run-id>` and `aegis resume <run-id> --foreground`. `aegis models chatgpt` queries the account catalog and lists the supported reasoning levels.
+The native CLI exposes the same inspection through `aegis <view> <run-id> [argument]`, plus `aegis pause <run-id>` and `aegis resume <run-id> --foreground`. `aegis models chatgpt` lists the account catalog and supported reasoning levels; add `--refresh` to bypass its 15-minute cache. The interactive model picker also refreshes expired catalogs automatically. Cache bindings include the reviewed catalog compatibility version, so upgrading that version discards obsolete lists.
 
 Tool discovery returns at most three ranked granted schemas. Its saved result reports whether more matches were omitted. A focused search can activate another granted tool; missing from one search result does not establish that the tool is unavailable.
 
