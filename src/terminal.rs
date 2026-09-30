@@ -1389,7 +1389,11 @@ impl Terminal {
             }
             "operation.succeeded" => {
                 let (tone, label, text) = result_summary(payload);
-                self.message(tone, label, &text)
+                self.message(tone, label, &text)?;
+                if let Some(preview) = operation_output_preview(payload) {
+                    self.message(Tone::Quiet, "Output excerpt", &preview)?;
+                }
+                Ok(())
             }
             "run.answered" => self.message(
                 Tone::Accent,
@@ -1559,6 +1563,24 @@ fn result_summary(payload: &serde_json::Value) -> (Tone, &'static str, String) {
         _ => "Tool finished",
     };
     (Tone::Success, label, text)
+}
+
+fn operation_output_preview(payload: &serde_json::Value) -> Option<String> {
+    if payload["detail"]["capability"].as_str() != Some("process.run") {
+        return None;
+    }
+    let serialized = payload["detail"]["preview"].as_str()?;
+    let result: serde_json::Value = serde_json::from_str(serialized).ok()?;
+    let preview = clean(result["preview"].as_str()?).trim().to_owned();
+    if preview.is_empty() {
+        return None;
+    }
+    let mut characters = preview.chars();
+    let mut bounded = characters.by_ref().take(300).collect::<String>();
+    if characters.next().is_some() {
+        bounded.push('…');
+    }
+    Some(bounded)
 }
 
 fn menu_move(selected: usize, count: usize, key: KeyCode) -> usize {
@@ -1784,6 +1806,27 @@ mod tests {
             .0,
             Tone::Warning
         ));
+    }
+
+    #[test]
+    fn command_output_preview_shows_a_bounded_clean_excerpt() {
+        let serialized = serde_json::json!({
+            "preview": format!("build passed\n{}\u{1b}[2J\u{202e}tail", "x".repeat(400))
+        })
+        .to_string();
+        let payload = serde_json::json!({
+            "detail": {"capability":"process.run", "preview":serialized}
+        });
+        let preview = operation_output_preview(&payload).unwrap();
+        assert!(preview.starts_with("build passed\n"));
+        assert!(!preview.contains('\u{1b}') && !preview.contains('\u{202e}'));
+        assert!(preview.chars().count() <= 301);
+        assert!(preview.ends_with('…'));
+
+        let other_tool = serde_json::json!({
+            "detail": {"capability":"workspace.read", "preview":serialized}
+        });
+        assert!(operation_output_preview(&other_tool).is_none());
     }
 
     #[test]
