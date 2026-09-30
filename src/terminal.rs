@@ -805,11 +805,12 @@ impl Terminal {
             .iter()
             .map(|(command, description)| format!("{command:<24} {description}"))
             .collect::<Vec<_>>();
+        let title = format!(
+            "Slash commands ({}) · search or scroll · Enter fills the prompt",
+            choices.len()
+        );
         Ok(self
-            .select(
-                "Slash commands · search or scroll · selection fills the prompt",
-                &choices,
-            )?
+            .select(&title, &choices)?
             .map(|index| crate::commands::COMMANDS[index].0.to_owned()))
     }
 
@@ -1204,21 +1205,19 @@ impl Terminal {
 
     fn menu(&self, title: &str, choices: &[String], initial: usize) -> Result<Option<usize>> {
         let _raw = RawMode::enter(true)?;
-        let rows = terminal::size()
-            .map(|(_, height)| height.saturating_sub(5).max(1) as usize)
-            .unwrap_or(8)
-            .min(choices.len())
-            .min(7);
         let mut selected = initial.min(choices.len() - 1);
         let mut digits = String::new();
         let mut query = String::new();
         let mut rendered = false;
+        let mut rendered_rows = 0usize;
         loop {
-            let width = terminal::size()
-                .map(|(width, _)| width as usize)
-                .unwrap_or(80);
+            let (width, height) = terminal::size().unwrap_or((80, 24));
+            let rows = menu_rows(height as usize, choices.len());
             if rendered {
-                queue!(io::stdout(), cursor::MoveUp(rows as u16 + 1))?;
+                queue!(
+                    io::stdout(),
+                    cursor::MoveUp(rendered_rows.saturating_sub(1) as u16)
+                )?;
             }
             let matches = menu_matches(choices, &query);
             selected = selected.min(matches.len().saturating_sub(1));
@@ -1229,7 +1228,7 @@ impl Terminal {
                 selected,
                 rows as u16,
                 &query,
-                width.saturating_sub(1).min(120) as u16,
+                width.saturating_sub(1).max(1),
                 &self.skin.palette(),
             );
             for row in 0..buffer.area.height {
@@ -1246,6 +1245,7 @@ impl Terminal {
             )?;
             io::stdout().flush()?;
             rendered = true;
+            rendered_rows = buffer.area.height as usize;
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Release {
                     continue;
@@ -1498,6 +1498,10 @@ fn menu_matches(choices: &[String], query: &str) -> Vec<usize> {
         .filter(|(_, choice)| choice.to_lowercase().contains(&query))
         .map(|(index, _)| index)
         .collect()
+}
+
+fn menu_rows(terminal_height: usize, choices: usize) -> usize {
+    terminal_height.saturating_sub(5).max(1).min(choices.max(1))
 }
 
 fn result_summary(payload: &serde_json::Value) -> (Tone, &'static str, String) {
@@ -1755,6 +1759,9 @@ mod tests {
         assert_eq!(menu_matches(&choices, "SON"), vec![2]);
         assert_eq!(menu_matches(&choices, ""), vec![0, 1, 2, 3]);
         assert!(menu_matches(&choices, "missing").is_empty());
+        assert_eq!(menu_rows(24, 32), 19);
+        assert_eq!(menu_rows(60, 32), 32);
+        assert_eq!(menu_rows(4, 32), 1);
     }
 
     #[test]
