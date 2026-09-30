@@ -105,12 +105,13 @@ pub fn home(
 
 pub fn composer(
     prefix: &str,
-    text: &str,
+    lines: &[String],
     status: &str,
     width: u16,
     palette: &Palette,
 ) -> (Buffer, u16) {
-    let area = Rect::new(0, 0, width, 3);
+    let input_height = lines.len().max(1).min(u16::MAX as usize - 2) as u16;
+    let area = Rect::new(0, 0, width, input_height + 2);
     let mut buffer = Buffer::empty(area);
     let border = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -122,19 +123,27 @@ pub fn composer(
     let prefix = crate::text::clean(prefix).trim_start().to_owned();
     Paragraph::new(prefix.clone())
         .style(Style::new().fg(rgb(palette.accent)))
-        .render(inner, &mut buffer);
+        .render(Rect::new(inner.x, inner.y, inner.width, 1), &mut buffer);
     let input = composer_input_area(&prefix, area);
-    Paragraph::new(if text.is_empty() {
-        "Type a message…".to_owned()
+    let empty = lines.is_empty() || (lines.len() == 1 && lines[0].is_empty());
+    let visible = if empty {
+        vec!["Type a message…".to_owned()]
     } else {
-        crate::text::clean(text)
-    })
-    .style(Style::new().fg(if text.is_empty() {
+        lines.to_vec()
+    };
+    let style = Style::new().fg(if empty {
         rgb(palette.quiet)
     } else {
         Color::Reset
-    }))
-    .render(input, &mut buffer);
+    });
+    for (index, line) in visible.iter().take(input.height as usize).enumerate() {
+        Paragraph::new(crate::text::clean(line))
+            .style(style)
+            .render(
+                Rect::new(input.x, input.y + index as u16, input.width, 1),
+                &mut buffer,
+            );
+    }
     (buffer, input.x)
 }
 
@@ -150,7 +159,7 @@ pub fn composer_input_area(prefix: &str, area: Rect) -> Rect {
         inner.x + offset,
         inner.y,
         inner.width.saturating_sub(offset),
-        1,
+        inner.height,
     )
 }
 
@@ -249,7 +258,7 @@ mod tests {
         assert!((0..buffer.area.height).all(|row| row_text(&buffer, row).width() == 40));
         for width in [16, 40, 76, 96] {
             let (buffer, input_column) =
-                composer("› ", "日本語 🦊", "model · low", width, &palette);
+                composer("› ", &["日本語 🦊".into()], "model · low", width, &palette);
             assert_eq!(buffer.area.height, 3);
             assert!((0..3).all(|row| row_text(&buffer, row).width() == width as usize));
             assert_eq!(input_column, 4);
@@ -260,13 +269,20 @@ mod tests {
     fn composer_reports_the_rendered_input_column() {
         let palette = Palette::default();
         for prefix in ["› ", "日本語 ", "🦊 "] {
-            let (buffer, input_column) = composer(prefix, "x", "model · low", 80, &palette);
+            let (buffer, input_column) =
+                composer(prefix, &["x".into()], "model · low", 80, &palette);
             assert_eq!(buffer[(input_column, 1)].symbol(), "x");
             assert_eq!(input_column as usize, 2 + prefix.width());
         }
-        let (buffer, input_column) = composer("› ", &"x".repeat(300), "model · low", 80, &palette);
-        assert_eq!(buffer[(input_column, 1)].symbol(), "x");
-        assert_eq!(row_text(&buffer, 1).width(), 80);
+        let rows = vec![
+            "first visual row".to_owned(),
+            "second visual row".to_owned(),
+        ];
+        let (buffer, input_column) = composer("› ", &rows, "model · low", 80, &palette);
+        assert_eq!(buffer.area.height, 4);
+        assert_eq!(buffer[(input_column, 1)].symbol(), "f");
+        assert!(row_text(&buffer, 1).contains("first visual row"));
+        assert!(row_text(&buffer, 2).contains("second visual row"));
     }
 
     #[test]
@@ -276,7 +292,8 @@ mod tests {
             for prefix in ["› ", "日本語 ", "🦊 "] {
                 let area = Rect::new(0, 0, width, 3);
                 let input = composer_input_area(prefix, area);
-                let (buffer, origin) = composer(prefix, "x", "model · low", width, &palette);
+                let (buffer, origin) =
+                    composer(prefix, &["x".into()], "model · low", width, &palette);
                 assert_eq!(origin, input.x);
                 assert_eq!(buffer[(input.x, input.y)].symbol(), "x");
                 assert_eq!(input.x + input.width, width - 2);

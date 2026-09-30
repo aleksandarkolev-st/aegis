@@ -14,6 +14,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::storage::Event as RunEvent;
 pub use crate::text::clean;
 
+const MAX_INPUT_BYTES: usize = 65_536;
+
 #[derive(Debug, PartialEq)]
 pub enum Input {
     Submit(String),
@@ -43,6 +45,8 @@ pub struct Terminal {
     animations: bool,
     activity_rows: std::cell::Cell<u16>,
     activity_view: std::cell::RefCell<Option<(usize, String, Option<String>)>>,
+    input_rows: std::cell::Cell<u16>,
+    input_caret_row: std::cell::Cell<u16>,
     input_draft: std::cell::RefCell<Option<(String, Vec<char>, usize)>>,
     input_status: std::cell::RefCell<String>,
     skin: Box<dyn crate::ui::Skin>,
@@ -89,6 +93,128 @@ struct InputHistory<'a> {
     entries: &'a [String],
     index: usize,
     draft: Option<(Vec<char>, usize)>,
+}
+
+#[derive(Debug)]
+struct EditorView {
+    rows: Vec<String>,
+    caret_row: usize,
+    caret_column: usize,
+}
+
+fn editor_view(text: &[char], caret: usize, width: usize, height: usize) -> EditorView {
+    let width = width.max(1);
+    let height = height.max(1);
+    let mut rows = vec![String::new()];
+    let mut positions = vec![(0usize, 0usize); text.len() + 1];
+    let mut row = 0;
+    let mut column = 0;
+
+    for (index, character) in text.iter().copied().enumerate() {
+        if character == '\n' {
+            positions[index] = (row, column);
+            row += 1;
+            rows.push(String::new());
+            column = 0;
+            positions[index + 1] = (row, column);
+            continue;
+        }
+
+        let mut rendered = character;
+        let mut cells = character.width().unwrap_or(0);
+        if cells > 0 && column + cells > width {
+            row += 1;
+            rows.push(String::new());
+            column = 0;
+            positions[index] = (row, column);
+        }
+        if cells > width {
+            rendered = '?';
+            cells = 1;
+        }
+        rows[row].push(rendered);
+        column += cells;
+        positions[index + 1] = (row, column);
+    }
+
+    let caret = caret.min(text.len());
+    let (mut caret_row, mut caret_column) = positions[caret];
+    if caret == text.len() && caret_column >= width {
+        caret_row += 1;
+        caret_column = 0;
+        rows.push(String::new());
+    }
+    while rows.len() <= caret_row {
+        rows.push(String::new());
+    }
+    let scroll = caret_row.saturating_add(1).saturating_sub(height);
+    EditorView {
+        rows: rows.into_iter().skip(scroll).take(height).collect(),
+        caret_row: caret_row.saturating_sub(scroll),
+        caret_column: caret_column.min(width.saturating_sub(1)),
+    }
+}
+
+fn editor_vertical_move(
+    text: &[char],
+    caret: usize,
+    width: usize,
+    direction: KeyCode,
+    preferred_column: Option<usize>,
+) -> Option<(usize, usize)> {
+    let width = width.max(1);
+    let mut positions = vec![(0usize, 0usize); text.len() + 1];
+    let mut row = 0;
+    let mut column = 0;
+    for (index, character) in text.iter().copied().enumerate() {
+        if character == '\n' {
+            positions[index] = (row, column);
+            row += 1;
+            column = 0;
+            positions[index + 1] = (row, column);
+            continue;
+        }
+        let cells = character.width().unwrap_or(0).min(width);
+        if cells > 0 && column + cells > width {
+            row += 1;
+            column = 0;
+            positions[index] = (row, column);
+        }
+        column += cells;
+        positions[index + 1] = (row, column);
+    }
+
+    let caret = caret.min(text.len());
+    let (mut current_row, mut current_column) = positions[caret];
+    if caret == text.len() && current_column >= width {
+        current_row += 1;
+        current_column = 0;
+    }
+    let target_row = match direction {
+        KeyCode::Up if current_row > 0 => current_row - 1,
+        KeyCode::Down if current_row < row => current_row + 1,
+        _ => return None,
+    };
+    let desired = preferred_column.unwrap_or(current_column);
+    positions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (candidate_row, candidate_column))| {
+            let (candidate_row, candidate_column) =
+                if index == text.len() && *candidate_column >= width {
+                    (*candidate_row + 1, 0)
+                } else {
+                    (*candidate_row, *candidate_column)
+                };
+            (candidate_row == target_row).then_some((index, candidate_column))
+        })
+        .min_by_key(|(index, candidate_column)| {
+            (
+                candidate_column.abs_diff(desired),
+                std::cmp::Reverse(*index),
+            )
+        })
+        .map(|(index, candidate_column)| (index, candidate_column))
 }
 
 impl<'a> InputHistory<'a> {
@@ -235,6 +361,8 @@ impl Default for Terminal {
             animations: interactive && std::env::var_os("AEGIS_REDUCED_MOTION").is_none(),
             activity_rows: std::cell::Cell::new(0),
             activity_view: std::cell::RefCell::new(None),
+            input_rows: std::cell::Cell::new(3),
+            input_caret_row: std::cell::Cell::new(1),
             input_draft: std::cell::RefCell::new(None),
             input_status: std::cell::RefCell::new(String::new()),
             skin: Box::new(crate::ui::UiOptions::default()),
@@ -703,8 +831,8 @@ impl Terminal {
             if !secret && text.starts_with("\u{1b}[200~") {
                 text.drain(..6);
                 while !text.contains("\u{1b}[201~") {
-                    if text.len() > 65536 {
-                        anyhow::bail!("Pasted input exceeds 65536 bytes");
+                    if text.len() > MAX_INPUT_BYTES {
+                        anyhow::bail!("Pasted input exceeds {MAX_INPUT_BYTES} bytes");
                     }
                     let mut line = String::new();
                     if io::stdin().read_line(&mut line)? == 0 {
@@ -713,28 +841,28 @@ impl Terminal {
                     text.push_str(&line);
                 }
                 let (paste, tail) = text.split_once("\u{1b}[201~").unwrap();
-                if !tail.trim().is_empty() || paste.len() > 65536 {
+                if !tail.trim().is_empty() || paste.len() > MAX_INPUT_BYTES {
                     anyhow::bail!("Pasted input has trailing data or exceeds its limit");
                 }
-                return Ok(Input::Submit(clean(paste)));
+                return Ok(Input::Submit(normalize_paste(paste)));
             }
             return Ok(Input::Submit(text.trim_end_matches(['\r', '\n']).into()));
         }
         let _raw = RawMode::enter(true)?;
         let composer =
             !secret && label == self.input_prefix() && !self.input_status.borrow().is_empty();
-        if composer {
-            write!(io::stdout(), "\r\n\r\n")?;
-            queue!(io::stdout(), cursor::MoveUp(1))?;
-        }
         let draft_label = label.to_owned();
         let (mut text, mut caret) = self.take_input_draft(label, secret);
         let mut input_history = InputHistory::new(history);
+        let mut rendered_composer = false;
+        let mut previous_draw_rows = 0usize;
+        let mut previous_caret_row = 1usize;
+        let mut preferred_column = None;
+        let mut paste_notice = false;
         loop {
             let width = terminal::size()
                 .map(|(width, _)| width as usize)
                 .unwrap_or(80);
-            let width = if composer { width.min(100) } else { width };
             let label = fit(
                 &if composer {
                     format!("  │ {}", label.trim_start())
@@ -744,10 +872,13 @@ impl Terminal {
                 width.saturating_sub(4),
             );
             let composer_width = width.saturating_sub(4).max(4) as u16;
+            let max_input_rows = terminal::size()
+                .map(|(_, height)| (height as usize).saturating_sub(10).clamp(1, 6))
+                .unwrap_or(5);
             let available = if composer {
                 crate::widgets::composer_input_area(
                     &draft_label,
-                    ratatui::layout::Rect::new(0, 0, composer_width, 3),
+                    ratatui::layout::Rect::new(0, 0, composer_width, (max_input_rows + 2) as u16),
                 )
                 .width as usize
             } else {
@@ -759,7 +890,7 @@ impl Terminal {
                 .map(|character| {
                     if secret {
                         '●'
-                    } else if *character == '\n' {
+                    } else if *character == '\n' && !composer {
                         '↵'
                     } else if character.is_control() {
                         ' '
@@ -768,26 +899,55 @@ impl Terminal {
                     }
                 })
                 .collect();
-            let (visible, caret_width) = input_view(&displayed, caret, available);
-            let input_column = if composer {
+            let (input_column, caret_width) = if composer {
+                let editor = editor_view(&displayed, caret, available, max_input_rows);
+                let status = if paste_notice {
+                    format!("{} · paste exceeds 64 KiB", self.input_status.borrow())
+                } else {
+                    self.input_status.borrow().clone()
+                };
                 let (buffer, origin) = crate::widgets::composer(
                     &draft_label,
-                    &visible,
-                    &self.input_status.borrow(),
+                    &editor.rows,
+                    &status,
                     composer_width,
                     &self.skin.palette(),
                 );
                 let margin = 2;
-                queue!(io::stdout(), cursor::MoveUp(1))?;
-                for row in 0..3 {
-                    self.paint_widget_row(&buffer, row, margin)?;
-                    if row < 2 {
+                let draw_rows = previous_draw_rows.max(buffer.area.height as usize);
+                if rendered_composer {
+                    queue!(io::stdout(), cursor::MoveUp(previous_caret_row as u16))?;
+                } else {
+                    write!(io::stdout(), "\r\n")?;
+                }
+                for row in 0..draw_rows {
+                    if row < buffer.area.height as usize {
+                        self.paint_widget_row(&buffer, row as u16, margin)?;
+                    } else {
+                        queue!(
+                            io::stdout(),
+                            cursor::MoveToColumn(0),
+                            Clear(ClearType::CurrentLine)
+                        )?;
+                    }
+                    if row + 1 < draw_rows {
                         write!(io::stdout(), "\r\n")?;
                     }
                 }
-                queue!(io::stdout(), cursor::MoveUp(1), ResetColor)?;
-                composer_input_column(origin, margin)
+                let caret_row = 1 + editor.caret_row;
+                queue!(
+                    io::stdout(),
+                    cursor::MoveUp(draw_rows.saturating_sub(1 + caret_row) as u16),
+                    ResetColor
+                )?;
+                self.input_rows.set(buffer.area.height);
+                self.input_caret_row.set(caret_row as u16);
+                previous_draw_rows = draw_rows;
+                previous_caret_row = caret_row;
+                rendered_composer = true;
+                (composer_input_column(origin, margin), editor.caret_column)
             } else {
+                let (visible, caret_width) = input_view(&displayed, caret, available);
                 queue!(
                     io::stdout(),
                     cursor::MoveToColumn(0),
@@ -799,7 +959,7 @@ impl Terminal {
                 write!(io::stdout(), "{label}")?;
                 queue!(io::stdout(), ResetColor)?;
                 write!(io::stdout(), "{visible}")?;
-                label.width()
+                (label.width(), caret_width)
             };
             queue!(
                 io::stdout(),
@@ -808,9 +968,18 @@ impl Terminal {
             io::stdout().flush()?;
             match event::read()? {
                 Event::Paste(paste) => {
-                    let characters: Vec<_> = clean(&paste).chars().collect();
-                    text.splice(caret..caret, characters.iter().copied());
-                    caret += characters.len();
+                    let normalized = normalize_paste(&paste);
+                    let current_bytes = text.iter().collect::<String>().len();
+                    if normalized.len() > MAX_INPUT_BYTES
+                        || current_bytes.saturating_add(normalized.len()) > MAX_INPUT_BYTES
+                    {
+                        paste_notice = true;
+                    } else {
+                        let characters: Vec<_> = normalized.chars().collect();
+                        text.splice(caret..caret, characters.iter().copied());
+                        caret += characters.len();
+                        paste_notice = false;
+                    }
                 }
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     let control = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -819,6 +988,20 @@ impl Terminal {
                             .replace(Some((draft_label.clone(), text.clone(), caret)));
                     }
                     match key.code {
+                        KeyCode::Enter
+                            if composer && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                        {
+                            text.insert(caret, '\n');
+                            caret += 1;
+                            paste_notice = false;
+                            preferred_column = None;
+                        }
+                        KeyCode::Char('j') if composer && control => {
+                            text.insert(caret, '\n');
+                            caret += 1;
+                            paste_notice = false;
+                            preferred_column = None;
+                        }
                         KeyCode::Enter => {
                             let submitted: String = text.iter().collect();
                             self.finish_input(
@@ -836,11 +1019,13 @@ impl Terminal {
                             text.clear();
                             caret = 0;
                             input_history.reset();
+                            preferred_column = None;
                         }
                         KeyCode::Char('u') if control => {
                             text.clear();
                             caret = 0;
                             input_history.reset();
+                            preferred_column = None;
                         }
                         KeyCode::F(2) if !secret => {
                             self.finish_input(composer, None)?;
@@ -878,19 +1063,50 @@ impl Terminal {
                             self.finish_input(composer, None)?;
                             return Ok(Input::CancelTask);
                         }
-                        KeyCode::Left => caret = caret.saturating_sub(1),
-                        KeyCode::Right => caret = (caret + 1).min(text.len()),
-                        KeyCode::Home => caret = 0,
-                        KeyCode::End => caret = text.len(),
+                        KeyCode::Left => {
+                            caret = caret.saturating_sub(1);
+                            preferred_column = None;
+                        }
+                        KeyCode::Right => {
+                            caret = (caret + 1).min(text.len());
+                            preferred_column = None;
+                        }
+                        KeyCode::Home => {
+                            caret = 0;
+                            preferred_column = None;
+                        }
+                        KeyCode::End => {
+                            caret = text.len();
+                            preferred_column = None;
+                        }
                         KeyCode::Backspace if caret > 0 => {
                             caret -= 1;
                             text.remove(caret);
+                            preferred_column = None;
                         }
                         KeyCode::Delete if caret < text.len() => {
                             text.remove(caret);
+                            preferred_column = None;
                         }
                         KeyCode::Up | KeyCode::Down if !secret => {
-                            input_history.navigate(key.code, &mut text, &mut caret);
+                            if composer {
+                                let target = editor_vertical_move(
+                                    &displayed,
+                                    caret,
+                                    available,
+                                    key.code,
+                                    preferred_column,
+                                );
+                                if let Some((next, column)) = target {
+                                    caret = next;
+                                    preferred_column = Some(column);
+                                } else {
+                                    input_history.navigate(key.code, &mut text, &mut caret);
+                                    preferred_column = None;
+                                }
+                            } else {
+                                input_history.navigate(key.code, &mut text, &mut caret);
+                            }
                         }
                         KeyCode::Char('/')
                             if !control
@@ -902,14 +1118,15 @@ impl Terminal {
                             let selected = self.command_menu()?.unwrap_or_else(|| "/".into());
                             text = selected.chars().collect();
                             caret = text.len();
-                            if composer {
-                                write!(io::stdout(), "\r\n\r\n")?;
-                                queue!(io::stdout(), cursor::MoveUp(1))?;
-                            }
+                            rendered_composer = false;
+                            previous_draw_rows = 0;
+                            preferred_column = None;
                         }
                         KeyCode::Char(character) if !control => {
                             text.insert(caret, character);
                             caret += 1;
+                            paste_notice = false;
+                            preferred_column = None;
                         }
                         _ => {}
                     }
@@ -924,19 +1141,21 @@ impl Terminal {
             write!(io::stdout(), "\r\n")?;
             return Ok(());
         }
+        let rows = self.input_rows.replace(3).max(1);
+        let caret_row = self.input_caret_row.replace(1).min(rows.saturating_sub(1));
         queue!(
             io::stdout(),
-            cursor::MoveUp(1),
+            cursor::MoveUp(caret_row),
             cursor::MoveToColumn(0),
             ResetColor
         )?;
-        for row in 0..3 {
+        for row in 0..rows {
             queue!(io::stdout(), Clear(ClearType::CurrentLine))?;
-            if row < 2 {
+            if row + 1 < rows {
                 queue!(io::stdout(), cursor::MoveDown(1), cursor::MoveToColumn(0))?;
             }
         }
-        queue!(io::stdout(), cursor::MoveUp(2), cursor::Show)?;
+        queue!(io::stdout(), cursor::MoveUp(rows - 1), cursor::Show)?;
         if let Some(text) = submitted.filter(|text| !text.is_empty()) {
             self.message(Tone::Accent, "You", text)?;
             write!(io::stdout(), "\r\n")?;
@@ -1376,6 +1595,11 @@ fn composer_input_column(origin: u16, margin: u16) -> usize {
     origin as usize + margin as usize
 }
 
+fn normalize_paste(paste: &str) -> String {
+    let normalized = paste.replace("\r\n", "\n").replace('\r', "\n");
+    clean(&normalized)
+}
+
 fn wrap_text(text: &str, first_width: usize, next_width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     for paragraph in text.split('\n') {
@@ -1598,29 +1822,67 @@ mod tests {
     }
 
     #[test]
+    fn editor_wraps_multiline_unicode_and_scrolls_to_the_caret() {
+        let text: Vec<_> = "abcd日本\nlast".chars().collect();
+        let view = editor_view(&text, text.len(), 4, 2);
+        assert_eq!(view.rows, vec!["last", ""]);
+        assert_eq!(view.caret_row, 1);
+        assert_eq!(view.caret_column, 0);
+
+        let resized = editor_view(&text, 4, 3, 4);
+        assert_eq!(resized.rows, vec!["abc", "d日", "本", "las"]);
+        assert_eq!(resized.caret_row, 1);
+        assert_eq!(resized.caret_column, 1);
+    }
+
+    #[test]
+    fn vertical_cursor_moves_between_wrapped_and_explicit_lines_at_the_same_column() {
+        let text: Vec<_> = "abcd\nxy\n1234".chars().collect();
+        let (middle, column) = editor_vertical_move(&text, 2, 4, KeyCode::Down, None).unwrap();
+        assert_eq!((middle, column), (7, 2));
+        let (last, column) =
+            editor_vertical_move(&text, middle, 4, KeyCode::Down, Some(column)).unwrap();
+        assert_eq!((last, column), (10, 2));
+        assert_eq!(
+            editor_vertical_move(&text, last, 4, KeyCode::Up, Some(column)),
+            Some((7, 2))
+        );
+        assert_eq!(editor_vertical_move(&text, 0, 4, KeyCode::Up, None), None);
+    }
+
+    #[test]
+    fn paste_normalizes_line_endings_and_removes_control_sequences() {
+        assert_eq!(
+            normalize_paste("first\r\nsecond\rthird\u{1b}[2J"),
+            "first\nsecond\nthird[2J"
+        );
+    }
+
+    #[test]
     fn composer_cursor_accounts_for_the_painted_margin_and_input_viewport() {
-        let prefix = "› ";
+        let prefix = "> ";
         let margin = 2;
         let width = 40;
-        let area = ratatui::layout::Rect::new(0, 0, width - 4, 3);
+        let area = ratatui::layout::Rect::new(0, 0, width - 4, 5);
         let input = crate::widgets::composer_input_area(prefix, area);
-        let text: Vec<_> = "hello 日本語 world".chars().collect();
+        let text: Vec<_> = "hello 日本語 world\nsecond line".chars().collect();
         for caret in 0..=text.len() {
-            let (visible, caret_width) = input_view(&text, caret, input.width as usize);
+            let view = editor_view(&text, caret, input.width as usize, input.height as usize);
             let (buffer, origin) = crate::widgets::composer(
                 prefix,
-                &visible,
-                "model · low",
+                &view.rows,
+                "model / high",
                 area.width,
                 &crate::ui::Palette::default(),
             );
             assert_eq!(origin, input.x);
-            assert_eq!(
-                buffer[(origin, 1)].symbol(),
-                visible.chars().next().unwrap().to_string()
-            );
+            assert!(view.caret_row < input.height as usize);
+            assert!(view.caret_column < input.width as usize);
+            if !view.rows[view.caret_row].is_empty() {
+                assert_ne!(buffer[(origin, 1 + view.caret_row as u16)].symbol(), " ");
+            }
             assert_eq!(composer_input_column(origin, margin), input.x as usize + 2);
-            assert!(composer_input_column(origin, margin) + caret_width < width as usize);
+            assert!(composer_input_column(origin, margin) + view.caret_column < width as usize);
         }
     }
 
