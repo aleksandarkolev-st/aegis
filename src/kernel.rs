@@ -972,6 +972,7 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
         .and_then(Value::as_u64)
         .unwrap_or(3600);
     loop {
+        store.refresh_observed_files(run_id)?;
         if crate::pause::boundary(&mut store, run_id)? {
             break;
         }

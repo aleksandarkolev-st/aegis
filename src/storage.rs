@@ -410,6 +410,7 @@ impl Store {
             )?;
         }
         store.connection.execute_batch("CREATE TABLE IF NOT EXISTS pause_requests (run_id TEXT PRIMARY KEY REFERENCES runs(id), pending INTEGER NOT NULL)")?;
+        store.connection.execute_batch("CREATE TABLE IF NOT EXISTS observed_files (run_id TEXT NOT NULL REFERENCES runs(id), path TEXT NOT NULL, hash TEXT NOT NULL, PRIMARY KEY(run_id,path))")?;
         Ok(store)
     }
 
@@ -977,6 +978,7 @@ impl Store {
         evidence: &[String],
         allowed_operation: Option<&str>,
     ) -> Result<()> {
+        self.check_observed_files(run_id)?;
         if evidence.is_empty() {
             bail!("completion requires evidence");
         }
@@ -1070,6 +1072,7 @@ impl Store {
     }
 
     pub fn complete_run(&mut self, run_id: &str, summary: &str, evidence: &[String]) -> Result<()> {
+        self.refresh_observed_files(run_id)?;
         self.validate_completion(run_id, evidence)?;
         let run = self.run(run_id)?;
         let acceptance = crate::acceptance::verified_result(self, &run, summary, evidence)?;
@@ -1238,6 +1241,18 @@ impl Store {
         artifact: Option<&str>,
         detail: Value,
     ) -> Result<()> {
+        let observed_result = if state == "succeeded"
+            && matches!(
+                operation.capability.as_str(),
+                "workspace.read" | "workspace.read_batch" | "workspace.write" | "workspace.patch"
+            ) {
+            artifact
+                .map(|hash| self.artifact(hash))
+                .transpose()?
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        } else {
+            None
+        };
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1257,6 +1272,7 @@ impl Store {
             previous.as_str(),
             "succeeded" | "failed" | "cancelled" | "outcome_unknown"
         ) {
+            crate::freshness::record(&transaction, operation, observed_result.as_ref())?;
             let may_have_run =
                 state == "succeeded" || matches!(previous.as_str(), "dispatched" | "executing");
             crate::obligations::record_operation(&transaction, operation, may_have_run)?;

@@ -12,6 +12,7 @@ pub mod endpoint;
 pub mod evaluation;
 pub mod evaluation_report;
 pub mod filesystem;
+pub mod freshness;
 pub mod habits;
 pub mod history;
 pub mod instructions;

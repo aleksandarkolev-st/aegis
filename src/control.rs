@@ -151,6 +151,11 @@ pub fn view(store: &Store, run_id: &str, command: &str, argument: Option<&str>) 
         },
         "verify" => {
             let mut blockers = Vec::new();
+            for (path, _, _) in store.changed_observed_files(run_id)? {
+                blockers.push(format!(
+                    "Observed file changed since its recorded receipt: {path}"
+                ));
+            }
             for item in obligations
                 .iter()
                 .filter(|item| item.id > 0 && item.state != "superseded")

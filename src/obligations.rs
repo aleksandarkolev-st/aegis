@@ -176,39 +176,49 @@ pub(crate) fn record_operation(
         current
     };
     if invalidates {
-        // Another task in this workspace can invalidate these proofs too.
-        let affected = {
-            let mut statement=transaction.prepare("SELECT run.id, revision.revision FROM runs AS run JOIN workspace_revisions AS revision ON revision.run_id=run.id WHERE run.workspace=(SELECT workspace FROM runs WHERE id=?1) AND (run.id=?1 OR run.state NOT IN ('completed','answered','cancelled','failed'))")?;
-            statement
-                .query_map([&operation.run_id], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        for (id, previous) in affected {
-            let next = previous
-                .checked_add(1)
-                .context("workspace revision overflow")?;
-            transaction.execute(
-                "UPDATE workspace_revisions SET revision=?2 WHERE run_id=?1",
-                params![id, next],
-            )?;
-            transaction.execute(
-                "UPDATE obligations SET state='stale' WHERE run_id=?1 AND state='verified'",
-                [&id],
-            )?;
-            append_event(
-                transaction,
-                &id,
-                "workspace.revision",
-                serde_json::json!({"revision":next,"operation":operation.id,"source_run":operation.run_id,"capability":operation.capability}),
-            )?;
-        }
+        invalidate_workspace(
+            transaction,
+            &operation.run_id,
+            serde_json::json!({"operation":operation.id,"capability":operation.capability}),
+        )?;
     }
     transaction.execute(
         "INSERT OR REPLACE INTO operation_revisions(operation_id, run_id, revision) VALUES (?1, ?2, ?3)",
         params![operation.id, operation.run_id, revision],
     )?;
+    Ok(())
+}
+
+pub(crate) fn invalidate_workspace(
+    transaction: &Transaction<'_>,
+    source: &str,
+    detail: Value,
+) -> Result<()> {
+    let affected = {
+        let mut statement=transaction.prepare("SELECT run.id, revision.revision FROM runs AS run JOIN workspace_revisions AS revision ON revision.run_id=run.id WHERE run.workspace=(SELECT workspace FROM runs WHERE id=?1) AND (run.id=?1 OR run.state NOT IN ('completed','answered','cancelled','failed'))")?;
+        statement
+            .query_map([source], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id, previous) in affected {
+        let next = previous
+            .checked_add(1)
+            .context("workspace revision overflow")?;
+        transaction.execute(
+            "UPDATE workspace_revisions SET revision=?2 WHERE run_id=?1",
+            params![id, next],
+        )?;
+        transaction.execute(
+            "UPDATE obligations SET state='stale' WHERE run_id=?1 AND state='verified'",
+            [&id],
+        )?;
+        let mut payload = detail.clone();
+        payload["revision"] = serde_json::json!(next);
+        payload["source_run"] = serde_json::json!(source);
+        append_event(transaction, &id, "workspace.revision", payload)?;
+    }
     Ok(())
 }
 
@@ -440,6 +450,7 @@ impl Store {
     }
 
     pub fn verify_obligations(&mut self, run_id: &str, proofs: &[Proof]) -> Result<()> {
+        self.refresh_observed_files(run_id)?;
         if proofs.is_empty() || proofs.len() > 20 {
             bail!("verify 1..20 explicit obligations at a time");
         }
