@@ -101,6 +101,8 @@ Maintainers can run `npm run test:package` after `npm run build:native` to check
 
 The native release workflow builds and tests Windows x64, Linux x64/arm64, and macOS Intel/Apple Silicon. A version tag matching both Rust and Node manifests creates the five assets, `SHA256SUMS`, and an npm tarball. Manual workflow dispatch only builds artifacts. npm publication is a separate authenticated step after the native release is available; no GitHub token is bundled into the package.
 
+See [npm publishing](docs/npm-publishing.md) for the maintainer release sequence.
+
 ## Advanced CLI and source builds
 
 ```powershell
