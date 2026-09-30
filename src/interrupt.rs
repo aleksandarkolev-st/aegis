@@ -22,6 +22,57 @@ impl Scope {
 }
 
 impl Store {
+    pub fn steer(&mut self, run_id: &str, message: &str) -> Result<bool> {
+        let message = message.replace("\r\n", "\n").replace('\r', "\n");
+        let message = crate::text::clean(&message).trim().to_owned();
+        if message.is_empty() {
+            bail!("steering message must not be empty");
+        }
+        if message.len() > 65_536 {
+            bail!("steering message exceeds 65536 bytes");
+        }
+
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let state: String =
+            transaction.query_row("SELECT state FROM runs WHERE id=?1", [run_id], |row| {
+                row.get(0)
+            })?;
+        if !matches!(state.as_str(), "ready" | "running") {
+            bail!("task is no longer active; message was not queued");
+        }
+
+        append_event(
+            &transaction,
+            run_id,
+            "user.steering",
+            json!({"text":message,"source":"interactive"}),
+        )?;
+        let target: Option<String> = transaction
+            .query_row(
+                "SELECT CAST(seq AS TEXT) FROM events WHERE run_id=?1 AND kind='model.started' AND seq > COALESCE((SELECT MAX(seq) FROM events WHERE run_id=?1 AND kind IN ('model.response','model.failed')),0) ORDER BY seq DESC LIMIT 1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(target) = &target {
+            let changed = transaction.execute(
+                "INSERT OR IGNORE INTO interrupts(run_id,scope,target) VALUES (?1,'model',?2)",
+                params![run_id, target],
+            )?;
+            if changed == 1 {
+                append_event(
+                    &transaction,
+                    run_id,
+                    "interrupt.requested",
+                    json!({"scope":"model","target":target,"source":"steering"}),
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(target.is_some())
+    }
+
     pub fn request_interrupt(&mut self, run_id: &str, scope: Scope) -> Result<Option<String>> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
@@ -154,6 +205,56 @@ mod tests {
         assert_ne!(next, target);
         assert!(!store.interrupt_requested(&run.id, Scope::Model, &next)?);
         assert_eq!(store.run(&run.id)?.state, "running");
+        Ok(())
+    }
+
+    #[test]
+    fn steering_is_saved_before_interrupting_only_an_active_model_turn() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "steer an active task",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        store.event(&run.id, "model.started", json!({"turn":1}))?;
+
+        assert!(store.steer(&run.id, "Keep the change small\r\nand run tests\u{1b}[2J")?);
+        let target = store.current_model_target(&run.id)?;
+        assert!(store.interrupt_requested(&run.id, Scope::Model, &target)?);
+        let events = store.events(&run.id)?;
+        let steering = events
+            .iter()
+            .find(|event| event.kind == "user.steering")
+            .unwrap();
+        assert_eq!(
+            steering.payload["text"],
+            "Keep the change small\nand run tests[2J"
+        );
+        assert!(
+            steering.seq
+                < events
+                    .iter()
+                    .find(|event| event.kind == "interrupt.requested")
+                    .unwrap()
+                    .seq
+        );
+
+        store.event(&run.id, "model.failed", json!({"error":"interrupted"}))?;
+        store.acknowledge_interrupt(&run.id, Scope::Model, &target)?;
+        assert!(!store.steer(&run.id, "Next turn instruction")?);
+        assert_eq!(
+            store
+                .events(&run.id)?
+                .iter()
+                .filter(|event| event.kind == "user.steering")
+                .count(),
+            2
+        );
         Ok(())
     }
 }

@@ -643,6 +643,29 @@ impl Store {
         Ok(events)
     }
 
+    pub fn pending_steering(&self, run_id: &str) -> Result<Vec<Event>> {
+        let mut statement = self.connection.prepare(
+            "SELECT seq, kind, payload, created_at FROM events WHERE run_id = ?1 AND kind = 'user.steering' AND seq > COALESCE((SELECT MAX(seq) FROM events WHERE run_id = ?1 AND kind = 'model.response'), 0) ORDER BY seq",
+        )?;
+        let rows = statement.query_map([run_id], |row| {
+            let payload: String = row.get(2)?;
+            Ok(Event {
+                seq: row.get(0)?,
+                kind: row.get(1)?,
+                payload: serde_json::from_str(&payload).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                created_at: row.get(3)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn events_since(&self, run_id: &str, seq: i64) -> Result<Vec<Event>> {
         let transaction = self.connection.unchecked_transaction()?;
         let seq = seq.max(0);

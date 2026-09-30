@@ -2011,9 +2011,56 @@ impl InterruptKeys {
     }
 }
 
+fn steer_from_follow(
+    terminal: &mut Terminal,
+    store: &mut Store,
+    id: &str,
+    initial: &str,
+) -> Result<()> {
+    if initial.len() > 65_536 {
+        terminal.clear_activity()?;
+        return terminal.message(
+            Tone::Warning,
+            "Steering not sent",
+            "A steering message can contain at most 64 KiB.",
+        );
+    }
+    terminal.clear_activity()?;
+    terminal.set_input_status("Steer this task · Enter sends · Shift+Enter adds a line");
+    if !initial.is_empty() {
+        terminal.set_input_draft(initial);
+    }
+    let label = terminal.input_prefix();
+    let result = terminal.input(&label, false, &[]);
+    terminal.set_input_status("");
+    if let Input::Submit(message) = result? {
+        if message.trim().is_empty() {
+            return Ok(());
+        }
+        match store.steer(id, &message) {
+            Ok(true) => terminal.message(
+                Tone::Accent,
+                "Steering",
+                "Interrupting the current model turn and resuming with your instruction.",
+            )?,
+            Ok(false) => terminal.message(
+                Tone::Accent,
+                "Steering queued",
+                "The current operation will reach its safe boundary before Aegis applies this.",
+            )?,
+            Err(error) => {
+                terminal.message(Tone::Warning, "Steering not sent", &error.to_string())?
+            }
+        }
+    }
+    Ok(())
+}
+
 fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
     let _raw = RawMode::enter(terminal.interactive)?;
     let mut store = Store::open(root)?;
+    let mut task_started_at = store.run_started_at(id)?;
+    terminal.set_task_started_at(task_started_at);
     let mut sequence = store
         .recent_events(id, 64)?
         .first()
@@ -2031,6 +2078,10 @@ fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
             context_status.artifacts = store.evidence_artifacts(id)?.len();
         }
         for event in events {
+            if event.kind == "run.running" && task_started_at.is_none() {
+                task_started_at = Some(event.created_at);
+                terminal.set_task_started_at(task_started_at);
+            }
             match event.kind.as_str() {
                 "model.started" => {
                     phase = "Thinking".into();
@@ -2085,84 +2136,107 @@ fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
         }
         terminal.activity(
             &phase,
-            started.elapsed(),
+            task_started_at
+                .map(|started_at| {
+                    Duration::from_secs(
+                        crate::storage::unix_time()
+                            .saturating_sub(started_at)
+                            .max(0) as u64,
+                    )
+                })
+                .unwrap_or_else(|| started.elapsed()),
             store.model_tokens(id)?,
             &context_status,
         )?;
         if terminal.interactive && event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Release {
-                    continue;
+            match event::read()? {
+                Event::Paste(paste) => {
+                    steer_from_follow(terminal, &mut store, id, &paste)?;
                 }
-                if key.code == KeyCode::Char('/') && !key.modifiers.contains(KeyModifiers::CONTROL)
-                {
-                    terminal.clear_activity()?;
-                    let selected = terminal.command_menu()?;
-                    if let Some(command) = selected {
-                        let mut words = command.split_whitespace();
-                        let command = words.next().unwrap_or_default().trim_start_matches('/');
-                        if command == "pause" {
-                            crate::pause::request(root, id)?;
-                            terminal.message(
-                                Tone::Quiet,
-                                "Pause requested",
-                                "Waiting for the current action's safe boundary.",
-                            )?;
-                        } else if crate::control::VIEWS.contains(&command) {
-                            match crate::control::view(&store, id, command, words.next()) {
-                                Ok(value) => terminal.message(
+                Event::Key(key) => {
+                    if key.kind == KeyEventKind::Release {
+                        continue;
+                    }
+                    if key.code == KeyCode::Char('/')
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        terminal.clear_activity()?;
+                        let selected = terminal.command_menu()?;
+                        if let Some(command) = selected {
+                            let mut words = command.split_whitespace();
+                            let command = words.next().unwrap_or_default().trim_start_matches('/');
+                            if command == "pause" {
+                                crate::pause::request(root, id)?;
+                                terminal.message(
                                     Tone::Quiet,
-                                    command,
-                                    &crate::control::display(command, &value),
-                                )?,
-                                Err(error) => terminal.message(
-                                    Tone::Warning,
-                                    "View unavailable",
-                                    &error.to_string(),
-                                )?,
+                                    "Pause requested",
+                                    "Waiting for the current action's safe boundary.",
+                                )?;
+                            } else if crate::control::VIEWS.contains(&command) {
+                                match crate::control::view(&store, id, command, words.next()) {
+                                    Ok(value) => terminal.message(
+                                        Tone::Quiet,
+                                        command,
+                                        &crate::control::display(command, &value),
+                                    )?,
+                                    Err(error) => terminal.message(
+                                        Tone::Warning,
+                                        "View unavailable",
+                                        &error.to_string(),
+                                    )?,
+                                }
+                            } else {
+                                terminal.message(Tone::Quiet,"Task controls","/goal /status /why /evidence O3 /verify /provider /budget /handoff /pause")?;
                             }
-                        } else {
-                            terminal.message(Tone::Quiet,"Task controls","/goal /status /why /evidence O3 /verify /provider /budget /handoff /pause")?;
+                        }
+                    } else if key.code == KeyCode::F(8) {
+                        terminal.clear_activity()?;
+                        checkpoint_view(root, Some(id), terminal)?;
+                    } else if key.code == KeyCode::F(9) {
+                        terminal.clear_activity()?;
+                        cancel_task(root, Some(id), terminal)?;
+                    } else if key.modifiers.contains(KeyModifiers::CONTROL) {
+                        match key.code {
+                            KeyCode::Char('d') => {
+                                terminal.clear_activity()?;
+                                terminal.message(
+                                    Tone::Quiet,
+                                    "Detached",
+                                    "Your task keeps running. Reopen sessions to follow it.",
+                                )?;
+                                return Ok(());
+                            }
+                            KeyCode::Char('c') => {
+                                let scope = interrupts.next(Instant::now());
+                                terminal.clear_activity()?;
+                                match store.request_interrupt(id, scope) {
+                                    Ok(Some(_)) => terminal.message(Tone::Warning, "Interrupt", match scope {
+                                        crate::interrupt::Scope::Operation => "Stopping this operation; the task itself remains available.",
+                                        crate::interrupt::Scope::Model => "Interrupting this model turn; you can resume the task later.",
+                                    })?,
+                                    Ok(None) => terminal.message(Tone::Quiet, "Interrupt", match scope {
+                                        crate::interrupt::Scope::Operation => "No active operation. Press Ctrl+C again quickly to interrupt the model turn.",
+                                        crate::interrupt::Scope::Model => "No active model turn. Ctrl+D detaches; use the task menu to cancel the whole task.",
+                                    })?,
+                                    Err(error) => terminal.message(Tone::Warning, "Interrupt", &error.to_string())?,
+                                }
+                            }
+                            _ => {}
+                        }
+                    } else if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
+                        if let KeyCode::Char(character) = key.code {
+                            if character != '/' {
+                                steer_from_follow(
+                                    terminal,
+                                    &mut store,
+                                    id,
+                                    &character.to_string(),
+                                )?;
+                            }
                         }
                     }
                 }
-                if key.code == KeyCode::F(8) {
-                    terminal.clear_activity()?;
-                    checkpoint_view(root, Some(id), terminal)?;
-                }
-                if key.code == KeyCode::F(9) {
-                    terminal.clear_activity()?;
-                    cancel_task(root, Some(id), terminal)?;
-                }
-                if key.modifiers.contains(KeyModifiers::CONTROL) {
-                    match key.code {
-                        KeyCode::Char('d') => {
-                            terminal.clear_activity()?;
-                            terminal.message(
-                                Tone::Quiet,
-                                "Detached",
-                                "Your task keeps running. Reopen sessions to follow it.",
-                            )?;
-                            return Ok(());
-                        }
-                        KeyCode::Char('c') => {
-                            let scope = interrupts.next(Instant::now());
-                            terminal.clear_activity()?;
-                            match store.request_interrupt(id, scope) {
-                                Ok(Some(_)) => terminal.message(Tone::Warning, "Interrupt", match scope {
-                                    crate::interrupt::Scope::Operation => "Stopping this operation; the task itself remains available.",
-                                    crate::interrupt::Scope::Model => "Interrupting this model turn; you can resume the task later.",
-                                })?,
-                                Ok(None) => terminal.message(Tone::Quiet, "Interrupt", match scope {
-                                    crate::interrupt::Scope::Operation => "No active operation. Press Ctrl+C again quickly to interrupt the model turn.",
-                                    crate::interrupt::Scope::Model => "No active model turn. Ctrl+D detaches; use the task menu to cancel the whole task.",
-                                })?,
-                                Err(error) => terminal.message(Tone::Warning, "Interrupt", &error.to_string())?,
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+                _ => {}
             }
         } else if !terminal.interactive {
             std::thread::sleep(Duration::from_millis(100));

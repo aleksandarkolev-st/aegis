@@ -47,6 +47,7 @@ pub struct Terminal {
     activity_view: std::cell::RefCell<Option<(usize, String, Option<String>)>>,
     input_rows: std::cell::Cell<u16>,
     input_caret_row: std::cell::Cell<u16>,
+    task_started_at: std::cell::Cell<Option<i64>>,
     input_draft: std::cell::RefCell<Option<(String, Vec<char>, usize)>>,
     input_status: std::cell::RefCell<String>,
     skin: Box<dyn crate::ui::Skin>,
@@ -363,6 +364,7 @@ impl Default for Terminal {
             activity_view: std::cell::RefCell::new(None),
             input_rows: std::cell::Cell::new(3),
             input_caret_row: std::cell::Cell::new(1),
+            task_started_at: std::cell::Cell::new(None),
             input_draft: std::cell::RefCell::new(None),
             input_status: std::cell::RefCell::new(String::new()),
             skin: Box::new(crate::ui::UiOptions::default()),
@@ -470,7 +472,13 @@ impl Terminal {
         } else {
             text.replace('\n', "\r\n    ")
         };
+        if self.colors {
+            queue!(output, SetForegroundColor(self.color(tone)))?;
+        }
         write!(output, "  {text}\r\n")?;
+        if self.colors {
+            queue!(output, ResetColor)?;
+        }
         output.flush()?;
         Ok(())
     }
@@ -490,7 +498,6 @@ impl Terminal {
             .map(|(width, _)| width as usize)
             .unwrap_or(80)
             .saturating_sub(4)
-            .min(96)
             .max(12);
         let mut output = io::stdout();
         write!(output, "\r\n")?;
@@ -674,6 +681,23 @@ impl Terminal {
         Ok(())
     }
 
+    pub fn set_task_started_at(&self, timestamp: Option<i64>) {
+        self.task_started_at.set(timestamp);
+    }
+
+    fn completion_timing(&self, completed_at: i64) -> String {
+        let completed = format_utc(completed_at);
+        match self.task_started_at.get() {
+            Some(started_at) => format!(
+                "Completed {completed} · elapsed {}",
+                format_duration(Duration::from_secs(
+                    completed_at.saturating_sub(started_at).max(0) as u64
+                ))
+            ),
+            None => format!("Completed {completed}"),
+        }
+    }
+
     pub fn activity(
         &mut self,
         label: &str,
@@ -704,19 +728,20 @@ impl Terminal {
         } else {
             "◆"
         };
+        let now = crate::storage::unix_time();
         let width = terminal::size()
             .map(|(width, _)| width as usize)
             .unwrap_or(80);
         let text = format!(
-            "  {frame} {} · {}s · {} recorded tokens · ^C interrupt / ^D detach",
-            fit(label, 20),
-            elapsed.as_secs(),
-            tokens
+            "  {frame} {} · {} elapsed · {} · ^C interrupt / ^D detach",
+            fit(label, 16),
+            format_duration(elapsed),
+            format_clock_utc(now)
         );
         let text = fit(&text, width.saturating_sub(1));
         let footer = self.skin.show_context().then(|| {
             fit(
-                &format!("  {}", context.text(crate::storage::unix_time())),
+                &format!("  {} · {} recorded tokens", context.text(now), tokens),
                 width.saturating_sub(1),
             )
         });
@@ -815,7 +840,11 @@ impl Terminal {
     }
 
     pub fn set_command_draft(&self, command: &str) {
-        let text: Vec<_> = command.chars().collect();
+        self.set_input_draft(command);
+    }
+
+    pub fn set_input_draft(&self, draft: &str) {
+        let text: Vec<_> = draft.chars().collect();
         let caret = text.len();
         self.input_draft
             .replace(Some((self.input_prefix(), text, caret)));
@@ -1319,6 +1348,12 @@ impl Terminal {
     pub fn render_event(&self, event: &RunEvent) -> Result<()> {
         let payload = &event.payload;
         match event.kind.as_str() {
+            "run.running" => {
+                if self.task_started_at.get().is_none() {
+                    self.task_started_at.set(Some(event.created_at));
+                }
+                Ok(())
+            }
             "acceptance.started" => self.message(
                 Tone::Accent,
                 "Verify",
@@ -1395,11 +1430,18 @@ impl Terminal {
                 }
                 Ok(())
             }
-            "run.answered" => self.message(
-                Tone::Accent,
-                "Aegis",
-                payload["summary"].as_str().unwrap_or_default(),
-            ),
+            "run.answered" => {
+                self.message(
+                    Tone::Accent,
+                    "Aegis",
+                    payload["summary"].as_str().unwrap_or_default(),
+                )?;
+                self.message(
+                    Tone::Quiet,
+                    "Goal time",
+                    &self.completion_timing(event.created_at),
+                )
+            }
             "run.completed" => {
                 let face = fit(&self.skin.frame(crate::ui::Phase::Ready, 0), 24);
                 let label = if face.is_empty() {
@@ -1419,7 +1461,11 @@ impl Terminal {
                         &crate::control::display_completion(&payload["completion"]),
                     )?;
                 }
-                Ok(())
+                self.message(
+                    Tone::Quiet,
+                    "Goal time",
+                    &self.completion_timing(event.created_at),
+                )
             }
             "conversation.inspected" => self.message(
                 Tone::Quiet,
@@ -1676,6 +1722,56 @@ pub fn fit(text: &str, width: usize) -> String {
     output
 }
 
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds >= 3600 {
+        format!(
+            "{}h {:02}m {:02}s",
+            seconds / 3600,
+            (seconds / 60) % 60,
+            seconds % 60
+        )
+    } else if seconds >= 60 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn format_utc(timestamp: i64) -> String {
+    let days = timestamp.div_euclid(86_400);
+    let seconds = timestamp.rem_euclid(86_400);
+    let shifted_days = days + 719_468;
+    let era = (if shifted_days >= 0 {
+        shifted_days
+    } else {
+        shifted_days - 146_096
+    }) / 146_097;
+    let day_of_era = shifted_days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_part = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_part + 2) / 5 + 1;
+    let month = month_part + if month_part < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    let hour = seconds / 3600;
+    let minute = seconds / 60 % 60;
+    let second = seconds % 60;
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC")
+}
+
+fn format_clock_utc(timestamp: i64) -> String {
+    let seconds = timestamp.rem_euclid(86_400);
+    format!(
+        "{:02}:{:02}:{:02} UTC",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1683,7 +1779,7 @@ mod tests {
     #[test]
     fn home_panels_align_at_narrow_and_wide_unicode_widths() {
         let terminal = Terminal::default();
-        for width in [16, 32, 60, 72, 76, 96] {
+        for width in [16, 32, 60, 72, 76, 96, 120, 160] {
             let buffer = terminal.home_buffer(
                 "ChatGPT / Codex",
                 "C:\\long\\workspace\\日本語",
@@ -1854,6 +1950,28 @@ mod tests {
         };
         assert!(measured.text(112).contains("ctx 4200 o200k units"));
         assert!(!measured.text(112).contains("4200 chars"));
+    }
+
+    #[test]
+    fn goal_time_uses_utc_and_persisted_start_time() {
+        assert_eq!(format_utc(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(format_utc(-1), "1969-12-31 23:59:59 UTC");
+        assert_eq!(format_utc(1_704_067_200), "2024-01-01 00:00:00 UTC");
+        assert_eq!(format_clock_utc(3_723), "01:02:03 UTC");
+        assert_eq!(format_duration(Duration::from_secs(65)), "1m 05s");
+        assert_eq!(format_duration(Duration::from_secs(3600)), "1h 00m 00s");
+
+        let terminal = Terminal::default();
+        terminal.set_task_started_at(Some(100));
+        assert_eq!(
+            terminal.completion_timing(165),
+            "Completed 1970-01-01 00:02:45 UTC · elapsed 1m 05s"
+        );
+        terminal.set_task_started_at(None);
+        assert_eq!(
+            terminal.completion_timing(0),
+            "Completed 1970-01-01 00:00:00 UTC"
+        );
     }
 
     #[test]

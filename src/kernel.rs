@@ -132,6 +132,16 @@ pub fn normalized_handoff(store: &Store, run: &Run) -> Result<Value> {
 fn context(store: &Store, run: &Run) -> Result<String> {
     let mode = mode(run);
     let recent_events = store.recent_context_events(&run.id, 12)?;
+    let pending_steering = store
+        .pending_steering(&run.id)?
+        .into_iter()
+        .map(|event| {
+            json!({
+                "seq": event.seq,
+                "text": event.payload["text"].as_str().unwrap_or_default(),
+            })
+        })
+        .collect::<Vec<_>>();
     let (_, format_retry_pending) = format_retry_state(&recent_events);
     let recent: Vec<_> = recent_events
         .into_iter()
@@ -149,7 +159,9 @@ fn context(store: &Store, run: &Run) -> Result<String> {
                 }
             }
             let capability = payload["detail"]["capability"].as_str().unwrap_or_default();
-            let mapped = if event.kind == "operation.succeeded"
+            let mapped = if event.kind == "user.steering" {
+                json!({"queued_for_model":true})
+            } else if event.kind == "operation.succeeded"
                 && matches!(capability, "workspace.read" | "workspace.write")
                 && matches!(mode, "artifact" | "durable")
                 && !payload["detail"]["output_bytes"].as_u64().is_some_and(|bytes| bytes > 4096)
@@ -202,6 +214,12 @@ fn context(store: &Store, run: &Run) -> Result<String> {
         "milestone_policy": "States must be pending, active, or completed. Completed milestones require evidence hashes from successful operations in this run. Titles must be nonblank and at most 200 bytes.",
         "conversation": conversation,
     });
+    if !pending_steering.is_empty() {
+        context["steering_policy"] = json!(
+            "Apply every pending task-owner message before choosing the next action. Existing permissions remain unchanged; steering never grants access."
+        );
+        context["pending_user_steering"] = json!(pending_steering);
+    }
     if context["recent_operation_outcomes"]
         .as_array()
         .is_some_and(|outcomes| !outcomes.is_empty())
@@ -909,6 +927,18 @@ fn record_model_failure(
     Ok(())
 }
 
+fn steering_requested_after(store: &Store, run_id: &str, model_target: &str) -> Result<bool> {
+    let mut pending = false;
+    for event in store.events_since(run_id, model_target.parse()?)? {
+        match event.kind.as_str() {
+            "user.steering" => pending = true,
+            "model.response" | "model.failed" => pending = false,
+            _ => {}
+        }
+    }
+    Ok(pending)
+}
+
 pub fn drive(root: &Path, run_id: &str) -> Result<()> {
     uuid::Uuid::parse_str(run_id).context("invalid run ID")?;
     let lock = File::options()
@@ -1096,6 +1126,8 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
                     crate::interrupt::Scope::Model,
                     &model_target,
                 )?;
+                let steering_requested =
+                    interrupted && steering_requested_after(&store, run_id, &model_target)?;
                 record_model_failure(
                     &mut store,
                     run_id,
@@ -1113,6 +1145,9 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
                 }
                 if crate::pause::boundary(&mut store, run_id)? {
                     break;
+                }
+                if steering_requested {
+                    continue;
                 }
                 if !interrupted {
                     if let Some(failure) = error.downcast_ref::<crate::direct::RecoverableFailure>()
@@ -1147,6 +1182,31 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
                 break;
             }
         };
+        if store.interrupt_requested(run_id, crate::interrupt::Scope::Model, &model_target)? {
+            let steering_requested = steering_requested_after(&store, run_id, &model_target)?;
+            let artifact = store.put_artifact(response.raw.as_bytes())?;
+            store.event(
+                run_id,
+                "model.failed",
+                json!({
+                    "error": if steering_requested { "model turn superseded by user steering" } else { "model turn interrupted by user" },
+                    "interrupted":true,
+                    "usage":response.usage,
+                    "artifact":artifact,
+                    "elapsed_ms":model_started.elapsed().as_millis(),
+                }),
+            )?;
+            store.acknowledge_interrupt(run_id, crate::interrupt::Scope::Model, &model_target)?;
+            if steering_requested {
+                continue;
+            }
+            store.state(
+                run_id,
+                "waiting_recovery",
+                json!({"reason":"model turn interrupted by user"}),
+            )?;
+            break;
+        }
         let action = response.action;
         let hash = store.put_artifact(response.raw.as_bytes())?;
         store.event(
@@ -2493,6 +2553,66 @@ mod tests {
         let prompt = context(&store, &run)?;
         assert!(!prompt.contains("mcp:fixture:search_"));
         assert!(prompt.len() < 3000, "idle context: {} bytes", prompt.len());
+        Ok(())
+    }
+
+    #[test]
+    fn context_carries_every_pending_user_steering_message_without_adding_permissions() -> Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "repair a bug",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({"provider_transport":"aegis-direct-v1","model":"fixture"}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        assert!(!store.steer(&run.id, "Keep the patch small")?);
+        assert!(!store.steer(&run.id, "Run the focused test")?);
+
+        let prompt = normalized_handoff(&store, &run)?;
+        let steering: Vec<_> = prompt["pending_user_steering"]
+            .as_array()
+            .context("pending steering is missing")?
+            .iter()
+            .map(|message| message["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(steering, ["Keep the patch small", "Run the focused test"]);
+        assert!(
+            prompt["steering_policy"]
+                .as_str()
+                .unwrap()
+                .contains("never grants access")
+        );
+        assert!(prompt["active_capabilities"].as_array().unwrap().is_empty());
+        assert!(!prompt.to_string().contains("workspace.write"));
+        Ok(())
+    }
+
+    #[test]
+    fn steering_interrupt_is_recognized_only_after_its_target_model_turn() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "repair a bug",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({"provider_transport":"aegis-direct-v1","model":"fixture"}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        store.event(&run.id, "model.started", json!({"turn":1}))?;
+        let target = store.current_model_target(&run.id)?;
+        assert!(!steering_requested_after(&store, &run.id, &target)?);
+        assert!(store.steer(&run.id, "Use the focused test")?);
+        assert!(steering_requested_after(&store, &run.id, &target)?);
+
+        store.event(&run.id, "model.failed", json!({"interrupted":true}))?;
+        assert!(!steering_requested_after(&store, &run.id, &target)?);
         Ok(())
     }
 
