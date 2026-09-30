@@ -683,6 +683,9 @@ fn parse(provider: Provider, credentials: &Credentials, bytes: &[u8]) -> Result<
 
 fn assistant_text(items: &[Value]) -> Result<String> {
     let mut text = String::new();
+    let has_final = items.iter().any(|item| {
+        item["type"] == "message" && item["role"] == "assistant" && item["channel"] == "final"
+    });
     for item in items {
         if item["status"]
             .as_str()
@@ -693,6 +696,13 @@ fn assistant_text(items: &[Value]) -> Result<String> {
         match item["type"].as_str() {
             Some("reasoning") => {}
             Some("message") if item["role"] == "assistant" => {
+                let include = !has_final || item["channel"] == "final";
+                if item["channel"]
+                    .as_str()
+                    .is_some_and(|channel| !matches!(channel, "final" | "commentary"))
+                {
+                    bail!("Provider returned an unsupported assistant channel");
+                }
                 for content in item["content"]
                     .as_array()
                     .context("Provider message has no content")?
@@ -700,11 +710,12 @@ fn assistant_text(items: &[Value]) -> Result<String> {
                     if content["type"] != "output_text" {
                         bail!("Provider returned non-text or refused output");
                     }
-                    text.push_str(
-                        content["text"]
-                            .as_str()
-                            .context("Provider returned no text")?,
-                    );
+                    let value = content["text"]
+                        .as_str()
+                        .context("Provider returned no text")?;
+                    if include {
+                        text.push_str(value);
+                    }
                 }
             }
             _ => bail!("Provider returned an unsupported native tool action"),
@@ -719,6 +730,38 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::time::Instant;
+
+    #[test]
+    fn final_action_is_separate_from_commentary_and_native_actions_still_fail_closed() -> Result<()>
+    {
+        let action = json!({"kind":"blocked","reason":"test"}).to_string();
+        let message = |channel: &str, text: &str| json!({"type":"message","role":"assistant","channel":channel,"content":[{"type":"output_text","text":text}]});
+        let items = vec![
+            message("commentary", "I will inspect the files."),
+            message("final", &action),
+        ];
+        assert_eq!(assistant_text(&items)?, action);
+        let credentials = credentials();
+        let response = json!({"type":"response.completed","response":{"status":"completed","output":items,"usage":{"input_tokens":20,"output_tokens":10}}});
+        let parsed = parse(
+            Provider::ChatGpt,
+            &credentials,
+            format!("data: {response}\n\n").as_bytes(),
+        )?;
+        assert!(matches!(
+            parsed.action,
+            crate::model::Action::Blocked { .. }
+        ));
+        assert_eq!(parsed.usage.unwrap().input_tokens, 20);
+        let mut unsafe_items = items.clone();
+        unsafe_items.insert(0, json!({"type":"function_call","name":"native_tool"}));
+        assert!(assistant_text(&unsafe_items).is_err());
+        unsafe_items = items;
+        unsafe_items[0]["content"][0]["type"] = json!("refusal");
+        assert!(assistant_text(&unsafe_items).is_err());
+        assert!(assistant_text(&[message("unknown", &action)]).is_err());
+        Ok(())
+    }
 
     fn server(
         status: &str,
