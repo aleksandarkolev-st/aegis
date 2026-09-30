@@ -1,0 +1,47 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: aegis_relay
+      POSTGRES_USER: relay
+      POSTGRES_PASSWORD: local-development-password
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - relay-postgres:/var/lib/postgresql/data
+    networks:
+      - relay-private
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relay -d aegis_relay"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  nats:
+    image: nats:2-alpine
+    command: ["-c", "/etc/nats/nats-server.conf"]
+    environment:
+      NATS_AUTH_TOKEN: local-development-nats-token-not-for-production
+    ports:
+      - "127.0.0.1:4422:4222"
+    volumes:
+      - ./dev/nats-server.conf:/etc/nats/nats-server.conf:ro
+      - ./dev/certs/nats.crt:/run/certs/nats.crt:ro
+      - ./dev/certs/nats.key:/run/certs/nats.key:ro
+      - relay-jetstream:/data/jetstream
+    networks:
+      - relay-private
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 4222"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+networks:
+  relay-private:
+    internal: true
+
+volumes:
+  relay-postgres:
+  relay-jetstream:

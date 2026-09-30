@@ -1,0 +1,1 @@
+{"event":"messages.upsert","instance":"fixture","data":{"key":{"id":"wamid.fixture.001","remoteJid":"4915112345678@s.whatsapp.net","fromMe":false},"message":{"conversation":"/approve_once request-123"}}}
