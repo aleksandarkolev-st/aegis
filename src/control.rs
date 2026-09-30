@@ -119,6 +119,12 @@ pub fn evidence(store: &Store, run_id: &str, id: i64) -> Result<Value> {
 use rusqlite::OptionalExtension;
 
 pub fn view(store: &Store, run_id: &str, command: &str, argument: Option<&str>) -> Result<Value> {
+    if argument.is_some() && !matches!(command, "goal" | "contract" | "provider" | "evidence") {
+        bail!("This view takes no additional arguments");
+    }
+    if matches!(command, "goal" | "contract") && argument.is_some_and(|value| value != "history") {
+        bail!("Use /goal, /goal history, /goal add, or /goal replace O2");
+    }
     let run = store.run(run_id)?;
     let obligations = store.obligations(run_id)?;
     let revision = store.workspace_revision(run_id)?;

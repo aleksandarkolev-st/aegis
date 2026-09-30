@@ -1628,6 +1628,17 @@ fn help(terminal: &Terminal) -> Result<()> {
         "Continue",
         "F3 saved tasks and recovery · F5 new conversation · F8 checkpoint · Up recalls previous requests",
     )?;
+    terminal.message(
+        Tone::Quiet,
+        "Task contract",
+        "/goal (/contract) · /goal add · /goal replace O2 · /goal history",
+    )?;
+    terminal.message(
+        Tone::Quiet,
+        "Inspect",
+        "/status · /why · /evidence O3 · /verify · /provider history · /budget · /handoff",
+    )?;
+    terminal.message(Tone::Quiet, "Pause", "Type / while following a task to inspect it or request /pause. /resume continues the selected task. F2 or /providers selects a provider for new tasks.")?;
     terminal.message(Tone::Quiet, "Control", "Ctrl+C interrupts an operation; twice quickly interrupts the model turn. Ctrl+D detaches. F9 asks before cancelling the entire task. No shell commands needed.")
 }
 
@@ -3029,6 +3040,35 @@ fn edit_goal(
     )
 }
 
+fn review_start_contract(root: &Path, id: &str, terminal: &mut Terminal) -> Result<bool> {
+    loop {
+        let store = Store::open(root)?;
+        let value = crate::control::view(&store, id, "goal", None)?;
+        terminal.message(
+            Tone::Accent,
+            "Detected requirements",
+            &crate::control::display("goal", &value),
+        )?;
+        match terminal.select(
+            "Review this task before starting",
+            &[
+                "Start task".into(),
+                "Edit requirements".into(),
+                "Add requirement".into(),
+                "Leave task paused".into(),
+            ],
+        )? {
+            Some(0) => return Ok(true),
+            Some(1) => edit_goal(root, id, "replace", None, terminal)?,
+            Some(2) => edit_goal(root, id, "add", None, terminal)?,
+            _ => {
+                crate::pause::request(root, id)?;
+                return Ok(false);
+            }
+        }
+    }
+}
+
 fn chat_heads(runs: Vec<crate::storage::Run>) -> Vec<crate::storage::Run> {
     let parents: std::collections::HashSet<_> = runs
         .iter()
@@ -3208,6 +3248,9 @@ fn task(
     drop(store);
     profile.previous_run = Some(run.id.clone());
     save(root, profile)?;
+    if obligations.len() > 1 && !review_start_contract(root, &run.id, terminal)? {
+        return Ok(());
+    }
     kernel::spawn(root, &run.id, secret_reference(profile).zip(secret))?;
     follow(root, &run.id, terminal)?;
     recover_auth_after_follow(root, &run.id, terminal)

@@ -24,6 +24,9 @@ fn usage() {
     );
     println!("arun interrupt <run-id> operation|model");
     println!(
+        "arun goal|contract|status|why|verify|budget|handoff <run-id> | evidence <run-id> [O3] | provider <run-id> [history] | goal <run-id> history | pause <run-id> | models <provider>"
+    );
+    println!(
         "Provider capture budget: --model-response-bytes <1024..33554432> (default 8388608); also available in F7 custom budgets."
     );
     println!(
