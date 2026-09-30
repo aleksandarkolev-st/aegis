@@ -223,7 +223,39 @@ pub(crate) fn invalidate_workspace(
 }
 
 pub(crate) fn validate_completion(store: &Store, run_id: &str) -> Result<()> {
+    for item in store
+        .obligations(run_id)?
+        .iter()
+        .filter(|item| item.id > 0 && item.state == "verified")
+    {
+        for hash in &item.evidence {
+            store.artifact(hash)?;
+        }
+    }
     validate_connection(&store.connection, run_id)
+}
+
+pub(crate) fn validate_finish_evidence(
+    connection: &rusqlite::Connection,
+    run_id: &str,
+    evidence: &[String],
+) -> Result<()> {
+    let revision: Option<i64> = connection
+        .query_row(
+            "SELECT revision FROM workspace_revisions WHERE run_id=?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(revision) = revision else {
+        return Ok(());
+    };
+    for hash in evidence {
+        if current_evidence(connection, run_id, revision, hash)? {
+            return Ok(());
+        }
+    }
+    bail!("Completion needs successful evidence from the current workspace revision")
 }
 
 pub(crate) fn validate_connection(connection: &rusqlite::Connection, run_id: &str) -> Result<()> {
@@ -456,6 +488,11 @@ impl Store {
         }
         if self.run(run_id)?.state != "running" {
             bail!("only a running task can verify obligations");
+        }
+        for proof in proofs {
+            for hash in &proof.evidence {
+                self.artifact(hash)?;
+            }
         }
         let transaction = self
             .connection

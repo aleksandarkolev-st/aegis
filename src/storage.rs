@@ -994,7 +994,9 @@ impl Store {
             if !self.has_evidence(run_id, hash)? {
                 bail!("completion evidence is not a successful operation artifact: {hash}");
             }
+            self.artifact(hash)?;
         }
+        crate::obligations::validate_finish_evidence(&self.connection, run_id, evidence)?;
         crate::obligations::validate_completion(self, run_id)?;
         let milestones = self.milestones(run_id)?;
         if self.run(run_id)?.state != "running" {
@@ -1097,6 +1099,7 @@ impl Store {
             bail!("operations changed before completion; finish or reconcile them first");
         }
         crate::obligations::validate_connection(&transaction, run_id)?;
+        crate::obligations::validate_finish_evidence(&transaction, run_id, evidence)?;
         if milestones.len() == 1 && milestones[0].title == "Task request" {
             transaction.execute(
                 "UPDATE milestones SET state = 'completed', evidence = ?2 WHERE run_id = ?1",

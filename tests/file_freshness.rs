@@ -63,3 +63,44 @@ fn external_edits_and_deletion_cannot_reuse_observed_file_proofs_after_restart()
     assert_eq!(store.run(&run.id)?.state, "completed");
     Ok(())
 }
+
+#[test]
+fn corrupt_proof_artifacts_and_stale_generic_finish_evidence_are_rejected() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join(".arun");
+    let mut store = Store::open(&root)?;
+    let run = store.create_run(
+        "work",
+        directory.path(),
+        "custom",
+        json!(["workspace.write"]),
+        json!({}),
+        "",
+    )?;
+    store.state(&run.id, "running", json!({}))?;
+    let old_op = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
+    let old = store.put_artifact(b"before edit")?;
+    store.operation_state(&old_op, "succeeded", Some(&old), json!({}))?;
+    let edit = store.begin_operation(&run.id, "workspace.write", json!({}), false)?;
+    store.operation_state(&edit, "dispatched", None, json!({}))?;
+    store.operation_state(&edit, "failed", None, json!({}))?;
+    assert!(store.complete_run(&run.id, "done", &[old.clone()]).is_err());
+    let fresh_op = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
+    let fresh = store.put_artifact(b"after edit")?;
+    store.operation_state(&fresh_op, "succeeded", Some(&fresh), json!({}))?;
+    let id = store.add_obligation(&run.id, "Read source", "Approved coverage")?;
+    store.verify_obligation(&run.id, id, &[fresh.clone()])?;
+    fs::write(root.join("artifacts").join(&fresh), b"corrupted")?;
+    assert!(
+        store
+            .verify_obligation(&run.id, id, &[fresh.clone()])
+            .is_err()
+    );
+    assert!(
+        store
+            .complete_run(&run.id, "done", &[fresh.clone()])
+            .is_err()
+    );
+    assert_eq!(store.run(&run.id)?.state, "running");
+    Ok(())
+}
