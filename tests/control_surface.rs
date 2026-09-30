@@ -192,6 +192,57 @@ fn views_inspect_open_verified_and_stale_obligations_without_inference() -> Resu
 }
 
 #[test]
+fn usage_view_keeps_metrics_without_turn_or_token_caps() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let mut store = Store::open(directory.path())?;
+    let run = store.create_run(
+        "Read the marker",
+        directory.path(),
+        "codex",
+        json!([]),
+        json!({
+            "actions":1,
+            "model_tokens":1,
+            "tool_result_tokens":1,
+            "wall_seconds":120
+        }),
+        "",
+    )?;
+    assert!(run.budgets.get("actions").is_none());
+    assert!(run.budgets.get("model_tokens").is_none());
+    assert!(run.budgets.get("tool_result_tokens").is_none());
+    store.state(&run.id, "running", json!({}))?;
+    store.event(
+        &run.id,
+        "model.started",
+        json!({
+            "context_tokenizer":"o200k_base",
+            "tool_result_tokens":4,
+            "schema_tokens":2,
+            "raw_prompt_tokens":10
+        }),
+    )?;
+    store.event(
+        &run.id,
+        "model.response",
+        json!({"usage":{"input_tokens":10,"output_tokens":2,"source":"provider"}}),
+    )?;
+    let usage = control::view(&store, &run.id, "budget", None)?;
+    assert_eq!(usage["actions"]["used"], 1);
+    assert!(usage["actions"]["limit"].is_null());
+    assert_eq!(usage["model_tokens"]["used"], 12);
+    assert!(usage["model_tokens"]["limit"].is_null());
+    assert_eq!(usage["tool_result_tokens"]["used"], 4);
+    assert!(usage["tool_result_tokens"]["limit"].is_null());
+    assert_eq!(usage["wall_seconds"]["limit"], 120);
+    let display = control::display("budget", &usage);
+    assert!(display.contains("no turn cap"), "{display}");
+    assert!(display.contains("no token cap"), "{display}");
+    assert!(display.contains("12"), "{display}");
+    Ok(())
+}
+
+#[test]
 fn completion_explanation_is_saved_with_the_terminal_event() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let mut store = Store::open(directory.path())?;

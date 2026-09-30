@@ -3,8 +3,6 @@ use serde::Serialize;
 use serde_json::Value;
 
 pub const ENCODING: &str = "o200k_base";
-pub const DEFAULT_TOOL_TOKENS: u64 = 800_000;
-
 #[derive(Debug, Clone, Serialize)]
 pub struct Exposure {
     pub encoding: &'static str,
@@ -17,21 +15,7 @@ pub fn count(text: &str) -> u64 {
     tiktoken_rs::o200k_base_singleton().count_ordinary(text) as u64
 }
 
-pub fn limit(configuration: &Value) -> Result<Option<u64>> {
-    let Some(value) = configuration.get("tool_result_tokens") else {
-        return Ok(None);
-    };
-    let limit = value
-        .as_u64()
-        .context("tool-result token limit must be an unsigned count")?;
-    if !(1..=100_000_000).contains(&limit) {
-        bail!("tool-result token limit must be 1..100000000 o200k_base units");
-    }
-    Ok(Some(limit))
-}
-
 pub fn validate(configuration: &Value) -> Result<()> {
-    limit(configuration)?;
     if configuration
         .get("context_tokenizer")
         .is_some_and(|encoding| encoding.as_str() != Some(ENCODING))
@@ -103,11 +87,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_contracts_have_no_retroactive_limit_and_new_limits_are_explicit() -> Result<()> {
-        assert_eq!(limit(&json!({}))?, None);
-        assert_eq!(limit(&json!({"tool_result_tokens":128}))?, Some(128));
-        for value in [json!(0), json!(null), json!("128"), json!(100000001)] {
-            assert!(limit(&json!({"tool_result_tokens":value})).is_err());
+    fn legacy_token_usage_values_are_not_treated_as_limits() -> Result<()> {
+        for value in [json!(0), json!(null), json!("legacy"), json!(100000001)] {
+            validate(&json!({"context_tokenizer":ENCODING,"tool_result_tokens":value}))?;
         }
         assert!(validate(&json!({"context_tokenizer":"bytes"})).is_err());
         assert!(measure("unstructured input").is_err());

@@ -996,16 +996,6 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
         store.answer_run(run_id, &reply)?;
         return Ok(());
     }
-    let max_actions = run
-        .budgets
-        .get("actions")
-        .and_then(Value::as_u64)
-        .unwrap_or(40);
-    let max_tokens = run
-        .budgets
-        .get("model_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(400_000);
     let wall_seconds = run
         .budgets
         .get("wall_seconds")
@@ -1022,22 +1012,11 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
         if store.run(run_id)?.state != "running" {
             break;
         }
-        let actions = store.event_count(run_id, "model.response")? as u64;
-        if actions >= max_actions {
+        if crate::storage::unix_time().saturating_sub(started_at) as u64 >= wall_seconds {
             store.state(
                 run_id,
                 "waiting_recovery",
-                json!({"reason": "action budget exhausted"}),
-            )?;
-            break;
-        }
-        if store.model_tokens(run_id)? >= max_tokens
-            || crate::storage::unix_time().saturating_sub(started_at) as u64 >= wall_seconds
-        {
-            store.state(
-                run_id,
-                "waiting_recovery",
-                json!({"reason": "token or wall-clock budget exhausted"}),
+                json!({"reason": "wall-clock budget exhausted"}),
             )?;
             break;
         }
@@ -1065,23 +1044,12 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
             break;
         }
         let exposure = crate::tokenization::measure(&prompt)?;
-        let used = store.tool_result_tokens(run_id)?;
-        if crate::tokenization::limit(&run.budgets)?
-            .is_some_and(|limit| used.saturating_add(exposure.tool_result_tokens) > limit)
-        {
-            store.event(run_id, "context.tool_limit", json!({"used":used,"requested":exposure.tool_result_tokens,"limit":run.budgets["tool_result_tokens"],"context_tokenizer":exposure.encoding}))?;
-            store.state(
-                run_id,
-                "waiting_recovery",
-                json!({"reason":"tool-result token budget exhausted before model request"}),
-            )?;
-            break;
-        }
+        let turn = store.event_count(run_id, "model.response")? as u64 + 1;
         let route = store.current_route(run_id)?;
         let start_result = store.event(
             run_id,
             "model.started",
-            json!({"turn": actions + 1, "prompt_chars": prompt_chars,
+            json!({"turn": turn, "prompt_chars": prompt_chars,
                 "route":route,
                 "context_tokenizer":exposure.encoding,"schema_tokens":exposure.schema_tokens,
                 "tool_result_tokens":exposure.tool_result_tokens,"raw_prompt_tokens":exposure.raw_prompt_tokens,
@@ -1161,7 +1129,6 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
                             response.usage.is_some() && response.shape["json"].is_boolean()
                         })
                     && !format_retry_state(&store.recent_events(run_id, 12)?).0
-                    && store.model_tokens(run_id)? < max_tokens
                     && (crate::storage::unix_time().saturating_sub(started_at) as u64)
                         < wall_seconds;
                 if format_retry {
@@ -1189,11 +1156,6 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
                 "elapsed_ms": model_started.elapsed().as_millis()}),
         )?;
         store.acknowledge_interrupt(run_id, crate::interrupt::Scope::Model, &model_target)?;
-        if store.model_tokens(run_id)? > max_tokens {
-            store.state(run_id, "waiting_recovery",
-                json!({"reason":"model token budget exceeded before applying response", "limit":max_tokens, "recorded_tokens":store.model_tokens(run_id)?}))?;
-            break;
-        }
         if let Err(error) = apply(&mut store, root, &run, action) {
             store.event(
                 run_id,
@@ -1600,7 +1562,7 @@ mod tests {
         drive(directory.path(), &run.id)?;
         let store = Store::open(directory.path())?;
         assert_eq!(store.run(&run.id)?.state, "waiting_recovery");
-        assert_eq!(store.event_count(&run.id, "model.started")?, 0);
+        assert_eq!(store.event_count(&run.id, "model.started")?, 1);
         assert_eq!(store.model_tokens(&run.id)?, 12);
         assert!(store.operations(&run.id)?.is_empty());
         Ok(())
@@ -2160,7 +2122,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_reads_map_once_without_inspection_and_budget_before_provider_calls() -> Result<()> {
+    fn selected_reads_map_once_and_record_usage_without_a_tool_token_cap() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let root = directory.path().join(".arun");
         std::fs::write(
@@ -2176,6 +2138,7 @@ mod tests {
             json!({"tool_result_tokens":1}),
             "",
         )?;
+        assert!(run.budgets.get("tool_result_tokens").is_none());
         store.state(&run.id, "running", json!({}))?;
         store.activate(&run.id, "workspace.read_batch", 1)?;
         let arguments = json!({"files":[{"path":"selected.txt","length":100}]});
@@ -2209,9 +2172,10 @@ mod tests {
         drop(store);
         drive(&root, &run.id)?;
         let store = Store::open(&root)?;
-        assert_eq!(store.event_count(&run.id, "model.started")?, 0);
-        assert_eq!(store.event_count(&run.id, "context.tool_limit")?, 1);
-        assert_eq!(store.operations(&run.id)?.len(), 1);
+        assert_eq!(store.event_count(&run.id, "model.started")?, 1);
+        assert_eq!(store.event_count(&run.id, "context.tool_limit")?, 0);
+        assert!(store.tool_result_tokens(&run.id)? > 1);
+        assert_eq!(store.event_count(&run.id, "model.failed")?, 1);
         assert_eq!(store.run(&run.id)?.state, "waiting_recovery");
         Ok(())
     }
@@ -2662,7 +2626,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_token_overflow_pauses_before_provider_or_reservation() -> Result<()> {
+    fn legacy_tool_token_limit_does_not_block_inference_or_usage_metering() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let mut store = Store::open(directory.path())?;
         let run = store.create_run(
@@ -2673,6 +2637,7 @@ mod tests {
             json!({"mode":"durable","tool_result_tokens":1}),
             "",
         )?;
+        assert!(run.budgets.get("tool_result_tokens").is_none());
         store.event(
             &run.id,
             "artifact.inspected",
@@ -2682,9 +2647,9 @@ mod tests {
         drive(directory.path(), &run.id)?;
         let store = Store::open(directory.path())?;
         assert_eq!(store.run(&run.id)?.state, "waiting_recovery");
-        assert_eq!(store.event_count(&run.id, "context.tool_limit")?, 1);
-        assert_eq!(store.event_count(&run.id, "model.started")?, 0);
-        assert_eq!(store.tool_result_tokens(&run.id)?, 0);
+        assert_eq!(store.event_count(&run.id, "context.tool_limit")?, 0);
+        assert_eq!(store.event_count(&run.id, "model.started")?, 1);
+        assert!(store.tool_result_tokens(&run.id)? > 1);
         Ok(())
     }
 

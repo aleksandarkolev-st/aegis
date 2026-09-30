@@ -24,8 +24,11 @@ pub fn response_bytes(configuration: &serde_json::Value) -> Result<u64> {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
+    #[serde(skip_serializing)]
     pub actions: u64,
+    #[serde(skip_serializing)]
     pub model_tokens: u64,
+    #[serde(skip_serializing)]
     pub tool_result_tokens: u64,
     pub wall_seconds: u64,
     pub model_seconds: u64,
@@ -37,9 +40,9 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            actions: 200,
-            model_tokens: 800_000,
-            tool_result_tokens: crate::tokenization::DEFAULT_TOOL_TOKENS,
+            actions: 0,
+            model_tokens: 0,
+            tool_result_tokens: 0,
             wall_seconds: 14_400,
             model_seconds: 180,
             process_seconds: 600,
@@ -52,7 +55,6 @@ impl Default for Limits {
 impl Limits {
     pub fn quick() -> Self {
         Self {
-            actions: 80,
             wall_seconds: 3600,
             process_seconds: 60,
             ..Self::default()
@@ -61,15 +63,6 @@ impl Limits {
 
     pub fn validate(&self) -> Result<()> {
         validate_response_bytes(self.model_response_bytes)?;
-        crate::tokenization::limit(
-            &serde_json::json!({"tool_result_tokens":self.tool_result_tokens}),
-        )?;
-        if !(1..=1000).contains(&self.actions) {
-            bail!("action limit must be 1..1000");
-        }
-        if !(1..=100_000_000).contains(&self.model_tokens) {
-            bail!("model token limit must be 1..100000000");
-        }
         if !(1..=86_400).contains(&self.wall_seconds) {
             bail!("task duration must be 1..86400 seconds");
         }
@@ -121,7 +114,6 @@ mod tests {
         assert_eq!(Limits::quick().wall_seconds, 3600);
         let limits: Limits = serde_json::from_str(r#"{"process_seconds":7200}"#)?;
         limits.validate()?;
-        assert_eq!(limits.actions, 200);
         Ok(())
     }
 
@@ -134,16 +126,31 @@ mod tests {
                 ..Limits::default()
             },
             Limits {
-                actions: 1001,
-                ..Limits::default()
-            },
-            Limits {
                 process_seconds: 7201,
                 ..Limits::default()
             },
         ] {
             assert!(limits.validate().is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_task_caps_load_but_are_not_written_to_new_profiles() -> Result<()> {
+        let legacy: Limits = serde_json::from_value(serde_json::json!({
+            "actions": 99,
+            "model_tokens": 123456,
+            "tool_result_tokens": 800000,
+            "wall_seconds": 10800,
+        }))?;
+        assert_eq!(legacy.actions, 99);
+        assert_eq!(legacy.model_tokens, 123456);
+        assert_eq!(legacy.tool_result_tokens, 800000);
+        let saved = serde_json::to_value(legacy)?;
+        for removed in ["actions", "model_tokens", "tool_result_tokens"] {
+            assert!(saved.get(removed).is_none(), "{removed} persisted");
+        }
+        assert_eq!(saved["wall_seconds"], 10800);
         Ok(())
     }
 }

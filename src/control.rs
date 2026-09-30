@@ -75,17 +75,13 @@ fn usage(store: &Store, run: &Run) -> Result<Value> {
         (
             "actions",
             Some(store.event_count(&run.id, "model.response")? as u64),
-            run.budgets["actions"].as_u64().or(Some(40)),
+            None,
         ),
-        (
-            "model_tokens",
-            Some(store.model_tokens(&run.id)?),
-            run.budgets["model_tokens"].as_u64().or(Some(400_000)),
-        ),
+        ("model_tokens", Some(store.model_tokens(&run.id)?), None),
         (
             "tool_result_tokens",
             Some(store.tool_result_tokens(&run.id)?),
-            crate::tokenization::limit(&run.budgets)?,
+            None,
         ),
         (
             "wall_seconds",
@@ -448,18 +444,26 @@ pub fn display(command: &str, value: &Value) -> String {
             }
         }
         "budget" => {
-            for name in [
-                "actions",
-                "model_tokens",
-                "tool_result_tokens",
-                "wall_seconds",
-            ] {
-                let metric = &value[name];
-                lines.push(format!(
-                    "{name}: {} used / {} limit / {} remaining",
-                    metric["used"], metric["limit"], metric["remaining"]
-                ));
-            }
+            let turns = &value["actions"];
+            let model_tokens = &value["model_tokens"];
+            let tool_tokens = &value["tool_result_tokens"];
+            let wall = &value["wall_seconds"];
+            lines.push(format!(
+                "Model responses: {} recorded · no turn cap",
+                turns["used"]
+            ));
+            lines.push(format!(
+                "Model tokens: {} recorded · no token cap",
+                model_tokens["used"]
+            ));
+            lines.push(format!(
+                "Tool-result tokens: {} recorded · no token cap",
+                tool_tokens["used"]
+            ));
+            lines.push(format!(
+                "Wall time: {}s elapsed / {}s limit / {}s remaining",
+                wall["used"], wall["limit"], wall["remaining"]
+            ));
             lines.push(format!(
                 "Provider input {} · cached {} · output {}",
                 value["provider_usage"]["input"],

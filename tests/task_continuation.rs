@@ -109,7 +109,7 @@ fn declining_review_keeps_task_profile_history_and_permissions_unchanged() -> Re
             assert_eq!(&saved[key], value);
         }
     }
-    assert_eq!(saved["limits"]["actions"], profile["limits"]["actions"]);
+    assert_eq!(saved["limits"], profile["limits"]);
     assert!(!directory.path().join("native-started.txt").exists());
     Ok(())
 }
@@ -155,8 +155,9 @@ fn confirmed_continuation_is_saved_even_when_sign_in_is_cancelled() -> Result<()
         );
         assert_eq!(child.state, "ready");
         assert_eq!(child.grants, source.grants);
-        assert_eq!(child.budgets["actions"], 11);
-        assert_eq!(child.budgets["model_tokens"], 5000);
+        for removed in ["actions", "model_tokens", "tool_result_tokens"] {
+            assert!(child.budgets.get(removed).is_none(), "{removed} persisted");
+        }
         assert_eq!(
             child.budgets["filesystem_scopes"],
             source.budgets["filesystem_scopes"]

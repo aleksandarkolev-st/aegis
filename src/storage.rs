@@ -75,6 +75,14 @@ pub(crate) fn now() -> i64 {
         .as_secs() as i64
 }
 
+fn remove_task_caps(configuration: &mut Value) {
+    if let Some(configuration) = configuration.as_object_mut() {
+        for key in ["actions", "model_tokens", "tool_result_tokens"] {
+            configuration.remove(key);
+        }
+    }
+}
+
 pub fn unix_time() -> i64 {
     now()
 }
@@ -103,11 +111,6 @@ pub(crate) fn append_event(
         let charge = payload["tool_result_tokens"]
             .as_u64()
             .context("model attempt is missing measured tool-result tokens")?;
-        let configuration: String =
-            transaction.query_row("SELECT budgets FROM runs WHERE id=?1", [run_id], |row| {
-                row.get(0)
-            })?;
-        let configuration: Value = serde_json::from_str(&configuration)?;
         let used: u64 = transaction.query_row(
             "SELECT COALESCE((SELECT tokens FROM tool_token_projection WHERE run_id=?1),0)",
             [run_id],
@@ -116,10 +119,8 @@ pub(crate) fn append_event(
         let total = used
             .checked_add(charge)
             .context("tool-result token accounting overflow")?;
-        if total > i64::MAX as u64
-            || crate::tokenization::limit(&configuration)?.is_some_and(|limit| total > limit)
-        {
-            bail!("tool-result token budget exhausted before model attempt");
+        if total > i64::MAX as u64 {
+            bail!("tool-result token usage exceeds the storage bound");
         }
         transaction.execute(
             "INSERT INTO tool_token_projection(run_id,tokens) VALUES (?1,?2) ON CONFLICT(run_id) DO UPDATE SET tokens=excluded.tokens",
@@ -159,6 +160,8 @@ pub(crate) fn append_event(
 }
 
 pub(crate) fn insert_run(transaction: &Transaction<'_>, run: &Run) -> Result<()> {
+    let mut budgets = run.budgets.clone();
+    remove_task_caps(&mut budgets);
     transaction.execute(
         "INSERT INTO runs VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
@@ -167,7 +170,7 @@ pub(crate) fn insert_run(transaction: &Transaction<'_>, run: &Run) -> Result<()>
             run.workspace,
             run.provider,
             run.grants.to_string(),
-            run.budgets.to_string(),
+            budgets.to_string(),
             run.acceptance,
             run.state,
             run.created_at
@@ -409,6 +412,14 @@ impl Store {
                 COMMIT;",
             )?;
         }
+        if schema_version < 11 {
+            store.connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                UPDATE runs SET budgets = json_remove(budgets, '$.actions', '$.model_tokens', '$.tool_result_tokens');
+                PRAGMA user_version=11;
+                COMMIT;",
+            )?;
+        }
         store.connection.execute_batch("CREATE TABLE IF NOT EXISTS pause_requests (run_id TEXT PRIMARY KEY REFERENCES runs(id), pending INTEGER NOT NULL)")?;
         store.connection.execute_batch("CREATE TABLE IF NOT EXISTS observed_files (run_id TEXT NOT NULL REFERENCES runs(id), path TEXT NOT NULL, hash TEXT NOT NULL, PRIMARY KEY(run_id,path))")?;
         Ok(store)
@@ -427,10 +438,8 @@ impl Store {
         if !budgets.is_object() {
             bail!("run configuration must be an object");
         }
+        remove_task_caps(&mut budgets);
         crate::obligations::freeze_requirements(task, &mut budgets)?;
-        if budgets.get("tool_result_tokens").is_none() {
-            budgets["tool_result_tokens"] = json!(crate::tokenization::DEFAULT_TOOL_TOKENS);
-        }
         if budgets.get("context_tokenizer").is_none() {
             budgets["context_tokenizer"] = json!(crate::tokenization::ENCODING);
         }
@@ -1620,6 +1629,34 @@ mod tests {
         store.state(&run.id, "waiting_recovery", json!({}))?;
         store.state(&run.id, "running", json!({}))?;
         assert_eq!(store.run_started_at(&run.id)?, Some(100));
+        Ok(())
+    }
+
+    #[test]
+    fn migration_removes_obsolete_task_turn_and_token_caps_from_saved_runs() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "legacy task",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({"wall_seconds":120}),
+            "",
+        )?;
+        store.connection.execute(
+            "UPDATE runs SET budgets = json_set(budgets, '$.actions', 20, '$.model_tokens', 5000, '$.tool_result_tokens', 9000) WHERE id = ?1",
+            [&run.id],
+        )?;
+        store.connection.execute_batch("PRAGMA user_version=10")?;
+        drop(store);
+
+        let store = Store::open(directory.path())?;
+        let migrated = store.run(&run.id)?;
+        for key in ["actions", "model_tokens", "tool_result_tokens"] {
+            assert!(migrated.budgets.get(key).is_none(), "{key} remained saved");
+        }
+        assert_eq!(migrated.budgets["wall_seconds"], 120);
         Ok(())
     }
 

@@ -511,13 +511,14 @@ fn selected_multi_file_reads_reach_the_next_decision_without_an_inspection_turn(
 }
 
 #[test]
-fn an_over_budget_response_is_recorded_but_cannot_write_the_workspace() -> Result<()> {
+fn legacy_turn_and_token_caps_are_ignored_while_usage_remains_metered() -> Result<()> {
     let directory = tempfile::tempdir()?;
+    let root = directory.path().join(".arun");
     let listener = TcpListener::bind("127.0.0.1:0")?;
     listener.set_nonblocking(true)?;
     let address = listener.local_addr()?;
     let server = thread::spawn(move || -> Result<()> {
-        for turn in 0..2 {
+        for turn in 0..3 {
             let started = Instant::now();
             let mut stream = loop {
                 match listener.accept() {
@@ -531,11 +532,13 @@ fn an_over_budget_response_is_recorded_but_cannot_write_the_workspace() -> Resul
                     Err(error) => return Err(error.into()),
                 }
             };
-            request(&mut stream)?;
-            let action = if turn == 0 {
-                json!({"kind":"search_capabilities","query":"write workspace file"})
-            } else {
-                json!({"kind":"invoke","capability":"workspace.write","args":{"path":"must-not-exist.txt","content":"over budget"}})
+            let (_, _) = request(&mut stream)?;
+            let action = match turn {
+                0 => {
+                    json!({"kind":"checkpoint","checkpoint":{"decisions":[],"unresolved":[],"next_action":"Search available capabilities","milestones":[]}})
+                }
+                1 => json!({"kind":"search_capabilities","query":"read workspace file"}),
+                _ => json!({"kind":"blocked","reason":"Fixture reached its third model turn"}),
             };
             let response = json!({"choices":[{"message":{"content":action.to_string()}}],"usage":{"prompt_tokens":10,"completion_tokens":2}}).to_string();
             write!(
@@ -547,36 +550,46 @@ fn an_over_budget_response_is_recorded_but_cannot_write_the_workspace() -> Resul
         }
         Ok(())
     });
-    let output = Command::new(env!("CARGO_BIN_EXE_arun"))
-        .current_dir(directory.path())
-        .args([
-            "run",
-            "write the fixture",
-            "--provider",
-            "custom",
-            "--endpoint",
-            &format!("http://{address}/v1"),
-            "--model",
-            "fixture-model",
-            "--model-tokens",
-            "20",
-            "--allow-write",
-            "--foreground",
-        ])
-        .output()?;
+    let mut store = Store::open(&root)?;
+    let run = store.create_run(
+        "Inspect the workspace marker",
+        directory.path(),
+        "custom",
+        json!(["workspace.read"]),
+        json!({
+            "provider_transport":"aegis-direct-v1",
+            "model":"fixture-model",
+            "endpoint":{"base_url":format!("http://{address}/v1"),"api_key_env":null,"response_format":"schema","allow_insecure":false},
+            "mode":"durable",
+            "wall_seconds":120
+        }),
+        "",
+    )?;
+    let mut legacy = run.budgets.clone();
+    legacy["actions"] = json!(1);
+    legacy["model_tokens"] = json!(1);
+    legacy["tool_result_tokens"] = json!(1);
+    assert!(run.budgets.get("actions").is_none());
+    drop(store);
+    let database = rusqlite::Connection::open(root.join("runs.sqlite"))?;
+    database.execute(
+        "UPDATE runs SET budgets=?2 WHERE id=?1",
+        rusqlite::params![run.id, legacy.to_string()],
+    )?;
+    drop(database);
+    arun::kernel::drive(&root, &run.id)?;
     server.join().unwrap()?;
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let store = Store::open(&directory.path().join(".arun"))?;
-    let run = store.runs()?.remove(0);
+    let store = Store::open(&root)?;
+    let run = store.run(&run.id)?;
     assert_eq!(run.state, "waiting_recovery");
-    assert_eq!(store.model_tokens(&run.id)?, 24);
-    assert_eq!(store.event_count(&run.id, "model.response")?, 2);
-    assert!(store.operations(&run.id)?.is_empty());
-    assert!(!directory.path().join("must-not-exist.txt").exists());
+    assert_eq!(run.budgets["actions"], 1);
+    assert_eq!(run.budgets["model_tokens"], 1);
+    assert_eq!(run.budgets["tool_result_tokens"], 1);
+    assert_eq!(store.event_count(&run.id, "model.started")?, 3);
+    assert_eq!(store.event_count(&run.id, "model.response")?, 3);
+    assert_eq!(store.model_tokens(&run.id)?, 36);
+    assert!(store.tool_result_tokens(&run.id)? > 1);
+    assert_eq!(store.event_count(&run.id, "context.tool_limit")?, 0);
     Ok(())
 }
 

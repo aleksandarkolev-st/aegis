@@ -105,7 +105,7 @@ assert.match(baseline.stderr, /Invalid expression|AssertionError/, 'Starter must
 receipt.phase = 'starter-rejected'; await save();
 console.log(`Prepared functional check: ${directory}`);
 
-const running = start(binary, ['run', task, '--provider', 'chatgpt', '--model', receipt.model, '--reasoning', 'low', '--allow-write', '--allow-process', 'node', '--command-scopes', commandScopes, '--image', 'node:22-alpine', '--acceptance', acceptanceFile, '--actions', '60', '--model-tokens', '180000', '--wall-seconds', '14400', '--foreground'], 'first-run');
+const running = start(binary, ['run', task, '--provider', 'chatgpt', '--model', receipt.model, '--reasoning', 'low', '--allow-write', '--allow-process', 'node', '--command-scopes', commandScopes, '--image', 'node:22-alpine', '--acceptance', acceptanceFile, '--wall-seconds', '14400', '--foreground'], 'first-run');
 const started = Date.now();
 while (!receipt.run_id) {
   const match = running.text().match(/run: ([0-9a-f-]{36})/);

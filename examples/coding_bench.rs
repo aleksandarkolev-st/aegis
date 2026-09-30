@@ -482,15 +482,7 @@ fn main() -> Result<()> {
                             .arg(&command_scopes)
                             .arg("--filesystem-scopes")
                             .arg(&file_scopes)
-                            .args([
-                                "--actions",
-                                "80",
-                                "--model-tokens",
-                                "400000",
-                                "--wall-seconds",
-                                &seconds.to_string(),
-                                "--foreground",
-                            ]);
+                            .args(["--wall-seconds", &seconds.to_string(), "--foreground"]);
                     }
                     let previous_runs = Store::open(&state)?
                         .runs()?

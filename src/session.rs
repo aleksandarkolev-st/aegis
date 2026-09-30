@@ -320,7 +320,7 @@ fn switch_provider(
         save(root, profile)?;
         remember_selection(terminal, profile)?;
         show_selection(terminal, profile)?;
-        terminal.message(Tone::Quiet, "Settings kept", "Workspace permissions, budgets and saved tasks are unchanged. This selection applies to new tasks; saved tasks retain their original provider.")?;
+        terminal.message(Tone::Quiet, "Settings kept", "Workspace permissions, time limits, safety caps and saved tasks are unchanged. This selection applies to new tasks; saved tasks retain their original provider.")?;
     }
     Ok(())
 }
@@ -643,7 +643,7 @@ fn configure(terminal: &Terminal) -> Result<Option<(Profile, Option<String>)>> {
     if !configure_environment(terminal, &mut profile)? {
         return Ok(None);
     }
-    terminal.message(Tone::Success, "You're set", "Describe what you want to build. Sensible budgets and evidence checks are already on; F7 is there if you want to customize them.")?;
+    terminal.message(Tone::Success, "You're set", "Describe what you want to build. Time limits and evidence checks are ready; model and tool usage stays uncapped. Use F7 to adjust time and safety limits.")?;
     Ok(Some((profile, secret)))
 }
 
@@ -728,7 +728,7 @@ fn settings(
 ) -> Result<()> {
     let choices = [
         "Workspace permissions and command environment",
-        "Task budgets",
+        "Time and safety limits",
         "Completion checks",
         "Exact command scopes",
         "Appearance · mascot, colors and motion",
@@ -772,7 +772,7 @@ fn settings(
         terminal.message(
             Tone::Success,
             "Settings saved",
-            "Applies to new tasks. Existing tasks retain their approved permissions and budgets.",
+            "Applies to new tasks. Existing tasks retain their saved settings and approved permissions.",
         )?;
     }
     Ok(())
@@ -1640,7 +1640,7 @@ fn help(terminal: &Terminal) -> Result<()> {
     terminal.message(
         Tone::Quiet,
         "Choose",
-        "F2 provider · F4 sign in · F6 searchable model picker · F7 permissions and budgets",
+        "F2 provider · F4 sign in · F6 searchable model picker · F7 permissions and safety limits",
     )?;
     terminal.message(
         Tone::Quiet,
@@ -1747,12 +1747,12 @@ fn download_image(terminal: &Terminal, docker: &Path) -> Result<Option<String>> 
 
 fn configure_limits(terminal: &Terminal) -> Result<Option<crate::budget::Limits>> {
     let choices = [
-        "Standard — 4 hours, 200 turns, 800k tokens, 10-minute commands",
-        "Quick — 1 hour, 80 turns, 800k tokens, 1-minute commands",
-        "Custom limits",
+        "Standard — 4 hours, 10-minute commands",
+        "Quick — 1 hour, 1-minute commands",
+        "Custom time and safety limits",
     ]
     .map(str::to_owned);
-    let Some(choice) = terminal.select("Task budget", &choices)? else {
+    let Some(choice) = terminal.select("Task limits", &choices)? else {
         return Ok(None);
     };
     let mut limits = if choice == 1 {
@@ -1761,14 +1761,8 @@ fn configure_limits(terminal: &Terminal) -> Result<Option<crate::budget::Limits>
         crate::budget::Limits::default()
     };
     if choice == 2 {
-        terminal.message(Tone::Quiet, "Custom budget", "Deadlines apply. Model tokens are counted after each turn; tool context is reserved before calls. Press Enter to keep a default.")?;
+        terminal.message(Tone::Quiet, "Custom limits", "Time deadlines and local resource-safety limits apply. Model and tool usage is reported without task caps. Press Enter to keep a default.")?;
         for (label, value) in [
-            ("Action limit", &mut limits.actions),
-            ("Model token limit", &mut limits.model_tokens),
-            (
-                "Tool-context token limit (o200k_base)",
-                &mut limits.tool_result_tokens,
-            ),
             ("Task duration in seconds", &mut limits.wall_seconds),
             ("Command deadline in seconds", &mut limits.process_seconds),
             ("Model-turn deadline in seconds", &mut limits.model_seconds),
@@ -1788,7 +1782,7 @@ fn configure_limits(terminal: &Terminal) -> Result<Option<crate::budget::Limits>
                     Err(_) => {
                         terminal.message(
                             Tone::Warning,
-                            "Invalid budget",
+                            "Invalid limit",
                             "Use a positive whole number.",
                         )?;
                         return Ok(None);
@@ -1798,7 +1792,7 @@ fn configure_limits(terminal: &Terminal) -> Result<Option<crate::budget::Limits>
         }
     }
     if let Err(error) = limits.validate() {
-        terminal.message(Tone::Warning, "Invalid budget", &error.to_string())?;
+        terminal.message(Tone::Warning, "Invalid limit", &error.to_string())?;
         return Ok(None);
     }
     Ok(Some(limits))
@@ -2263,13 +2257,11 @@ fn continue_legacy(
         },
     )?;
     terminal.message(Tone::Quiet, "Frozen guidance", "Original rules, memory, command/file/network scopes and acceptance checks are retained. No current settings or new permissions are substituted.")?;
-    let limits = ["actions", "model_tokens", "wall_seconds"].map(|key| {
-        source.budgets[key]
-            .as_u64()
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "runtime default".into())
-    });
-    terminal.message(Tone::Warning, "Fresh task budget", &format!("Same limits: {} turns · {} tokens · {} seconds. Usage and time restart for this NEW task; the original accounting stays untouched.",limits[0],limits[1],limits[2]))?;
+    let wall_seconds = source.budgets["wall_seconds"]
+        .as_u64()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "runtime default".into());
+    terminal.message(Tone::Warning, "Fresh task limits", &format!("Wall clock: {wall_seconds} seconds. Usage and time restart for this NEW task; turn and token usage have no task cap. The original accounting stays untouched."))?;
     terminal.message(Tone::Quiet, "Fresh evidence", "Old operations, evidence and completed milestones are not copied. Aegis will inspect current files and verify again, not replay old calls.")?;
     if let Some(next) = review.handoff()["next_action"].as_str() {
         terminal.message(Tone::Quiet, "Old next step · context only", next)?;

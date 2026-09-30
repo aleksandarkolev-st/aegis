@@ -26,8 +26,6 @@ pub struct Options {
     pub modes: Vec<String>,
     pub tasks: Vec<String>,
     pub repeats: usize,
-    pub actions: u64,
-    pub model_tokens: u64,
     pub context_chars: u64,
     pub wall_seconds: u64,
     pub image: String,
@@ -46,8 +44,6 @@ impl Default for Options {
                 .to_vec(),
             tasks: ["read", "log", "repair"].map(str::to_owned).to_vec(),
             repeats: 1,
-            actions: 12,
-            model_tokens: 400_000,
             context_chars: 256_000,
             wall_seconds: 600,
             image: "node:22-alpine".into(),
@@ -97,8 +93,6 @@ impl Options {
                 "--modes" => options.modes = value.split(',').map(str::to_owned).collect(),
                 "--tasks" => options.tasks = value.split(',').map(str::to_owned).collect(),
                 "--repeats" => options.repeats = value.parse()?,
-                "--actions" => options.actions = value.parse()?,
-                "--model-tokens" => options.model_tokens = value.parse()?,
                 "--context-chars" => options.context_chars = value.parse()?,
                 "--wall-seconds" => options.wall_seconds = value.parse()?,
                 "--image" => options.image = value.clone(),
@@ -145,12 +139,10 @@ impl Options {
             bail!("tasks must be drawn from read,log,repair");
         }
         if !(1..=100).contains(&options.repeats)
-            || !(1..=1000).contains(&options.actions)
-            || options.model_tokens == 0
             || options.context_chars == 0
             || options.wall_seconds == 0
         {
-            bail!("evaluation budgets and repeat count must be positive and bounded");
+            bail!("repeat count, context size, and wall time must be positive");
         }
         if options
             .sizes
@@ -272,7 +264,7 @@ fn prepare(root: &Path, options: &Options) -> Result<Vec<Case>> {
                         "export function sum(left, right) { return left - right; }\n",
                     )?;
                     let run = store.create_run(prompt(task), &workspace, &options.provider, json!(grants),
-                        json!({"provider_transport":"aegis-direct-v1", "model":options.model, "mode": mode, "actions": options.actions, "model_tokens":options.model_tokens,
+                        json!({"provider_transport":"aegis-direct-v1", "model":options.model, "mode": mode,
                             "context_chars":options.context_chars, "wall_seconds":options.wall_seconds,
                             "model_seconds":180, "process_seconds":60}),
                         "Independent fixture evidence checks; repair uses containerized Node assertions")?;
@@ -496,7 +488,8 @@ mod tests {
             ["--sizes", "51"],
             ["--modes", "unknown"],
             ["--tasks", "read,read"],
-            ["--actions", "0"],
+            ["--actions", "12"],
+            ["--model-tokens", "400000"],
         ] {
             assert!(Options::parse(&args.map(str::to_owned)).is_err());
         }
