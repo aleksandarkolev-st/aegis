@@ -684,7 +684,9 @@ fn parse(provider: Provider, credentials: &Credentials, bytes: &[u8]) -> Result<
 fn assistant_text(items: &[Value]) -> Result<String> {
     let mut text = String::new();
     let has_final = items.iter().any(|item| {
-        item["type"] == "message" && item["role"] == "assistant" && item["channel"] == "final"
+        item["type"] == "message"
+            && item["role"] == "assistant"
+            && (item["channel"] == "final" || item["phase"] == "final_answer")
     });
     for item in items {
         if item["status"]
@@ -696,7 +698,17 @@ fn assistant_text(items: &[Value]) -> Result<String> {
         match item["type"].as_str() {
             Some("reasoning") => {}
             Some("message") if item["role"] == "assistant" => {
-                let include = !has_final || item["channel"] == "final";
+                let include =
+                    !has_final || item["channel"] == "final" || item["phase"] == "final_answer";
+                if item["phase"]
+                    .as_str()
+                    .is_some_and(|phase| !matches!(phase, "commentary" | "final_answer"))
+                {
+                    bail!("Provider returned an unsupported assistant phase");
+                }
+                if item["phase"] == "commentary" && !has_final {
+                    bail!("Provider returned commentary without a final action");
+                }
                 if item["channel"]
                     .as_str()
                     .is_some_and(|channel| !matches!(channel, "final" | "commentary"))
@@ -760,6 +772,27 @@ mod tests {
         unsafe_items[0]["content"][0]["type"] = json!("refusal");
         assert!(assistant_text(&unsafe_items).is_err());
         assert!(assistant_text(&[message("unknown", &action)]).is_err());
+        let phased_message = |phase: &str, text: &str| json!({"type":"message","role":"assistant","phase":phase,"content":[{"type":"output_text","text":text}]});
+        let phased = vec![
+            phased_message(
+                "commentary",
+                r#"{"kind":"blocked","reason":"intermediate"}"#,
+            ),
+            phased_message("final_answer", &action),
+        ];
+        assert_eq!(assistant_text(&phased)?, action);
+        let response = json!({"type":"response.completed","response":{"status":"completed","output":phased,"usage":{"input_tokens":20,"output_tokens":10}}});
+        assert_eq!(
+            parse(
+                Provider::ChatGpt,
+                &credentials,
+                format!("data: {response}\n\n").as_bytes()
+            )?
+            .raw,
+            action
+        );
+        assert!(assistant_text(&[phased_message("commentary", &action)]).is_err());
+        assert!(assistant_text(&[phased_message("unknown", &action)]).is_err());
         Ok(())
     }
 
