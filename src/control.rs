@@ -20,6 +20,49 @@ pub fn obligation_id(text: &str) -> Result<i64> {
     Ok(id)
 }
 
+pub fn recent_operation_outcomes(store: &Store, run_id: &str) -> Result<Value> {
+    let current = store.workspace_revision(run_id)?;
+    let mut outcomes = std::collections::BTreeMap::new();
+    // Keep eight latest receipts plus four process receipts, so reads cannot hide a test failure.
+    for process_only in [false, true] {
+        let mut query = store.connection.prepare("SELECT operation.rowid,operation.id,operation.capability,operation.arguments,operation.state,operation.artifact,revision.revision FROM operations AS operation LEFT JOIN operation_revisions AS revision ON revision.operation_id=operation.id WHERE operation.run_id=?1 AND operation.artifact IS NOT NULL AND (?2=0 OR operation.capability='process.run') ORDER BY operation.rowid DESC LIMIT ?3")?;
+        let rows = query
+            .query_map(
+                params![run_id, process_only, if process_only { 4 } else { 8 }],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (position, id, capability, args, state, hash, revision) in rows {
+            let args: Value = serde_json::from_str(&args)?;
+            let target = args["path"]
+                .as_str()
+                .or_else(|| args["program"].as_str())
+                .map(|value| value.chars().take(200).collect::<String>());
+            let receipt = if capability == "process.run" {
+                let value = store
+                    .artifact(&hash)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+                value.map(|value|json!({"exit_code":value["exit_code"],"output_artifact":value["output_artifact"],"bytes":value["bytes"]}))
+            } else {
+                None
+            };
+            outcomes.insert(position,json!({"operation":id,"capability":capability,"target":target,"state":state,"artifact":hash,"revision":revision,"current":revision.is_some() && revision==current,"successful_current_evidence":state=="succeeded" && revision.is_some() && revision==current,"receipt":receipt}));
+        }
+    }
+    Ok(json!(outcomes.into_values().rev().collect::<Vec<_>>()))
+}
+
 fn usage(store: &Store, run: &Run) -> Result<Value> {
     let elapsed = store.run_started_at(&run.id)?.map(|start| {
         let end: Option<i64> = store.connection.query_row(

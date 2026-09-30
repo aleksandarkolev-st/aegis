@@ -863,6 +863,11 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn has_operation_artifact(&self, run_id: &str, hash: &str) -> Result<bool> {
+        let count: i64 = self.connection.query_row("SELECT COUNT(*) FROM operations AS operation WHERE operation.run_id = ?1 AND (operation.artifact = ?2 OR EXISTS (SELECT 1 FROM operation_artifacts AS linked WHERE linked.operation_id = operation.id AND linked.hash = ?2))",params![run_id,hash],|row|row.get(0))?;
+        Ok(count > 0)
+    }
+
     pub fn has_evidence(&self, run_id: &str, hash: &str) -> Result<bool> {
         let count: i64 = self.connection.query_row(
             "SELECT COUNT(*) FROM operations AS operation WHERE operation.run_id = ?1 AND operation.state = 'succeeded' AND (operation.artifact = ?2 OR EXISTS (SELECT 1 FROM operation_artifacts AS linked WHERE linked.operation_id = operation.id AND linked.hash = ?2))",
@@ -1391,6 +1396,13 @@ impl Store {
 
     pub fn unresolved(&self, run_id: &str) -> Result<Vec<Operation>> {
         self.selected_operations(run_id, true)
+    }
+
+    pub fn inspectable_artifacts(&self, run_id: &str) -> Result<Vec<(String, String)>> {
+        let mut query = self.connection.prepare("SELECT capability || ' [' || state || ']', artifact FROM operations WHERE run_id=?1 AND artifact IS NOT NULL UNION SELECT operation.capability || ' [' || operation.state || '] ' || linked.kind,linked.hash FROM operations AS operation JOIN operation_artifacts AS linked ON linked.operation_id=operation.id WHERE operation.run_id=?1 ORDER BY 1,2")?;
+        Ok(query
+            .query_map([run_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn evidence_artifacts(&self, run_id: &str) -> Result<Vec<(String, String)>> {

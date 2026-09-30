@@ -2494,9 +2494,13 @@ fn inspection_number(
 
 fn artifacts(root: &Path, id: &str, terminal: &Terminal) -> Result<()> {
     let store = Store::open(root)?;
-    let artifacts = store.evidence_artifacts(id)?;
+    let artifacts = store.inspectable_artifacts(id)?;
     if artifacts.is_empty() {
-        return terminal.message(Tone::Quiet, "Artifacts", "No successful tool evidence yet.");
+        return terminal.message(
+            Tone::Quiet,
+            "Artifacts",
+            "No recorded operation artifacts yet.",
+        );
     }
     let mut choices: Vec<_> = artifacts
         .iter()

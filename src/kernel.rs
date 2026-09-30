@@ -192,6 +192,8 @@ fn context(store: &Store, run: &Run) -> Result<String> {
         "permission_policy": "Discovery returns only granted capabilities; invoke only supplied schemas. Non-eager modes retain at most eight recently discovered capability schemas. Search again to reactivate an evicted schema; discovery never removes recorded operations or evidence.",
         "result_policy": if matches!(mode, "eager" | "lazy") { "Tool results are inline; inspect_result is unavailable." } else { "Artifact-backed: mapped read content is ready to use; inspect_result retrieves missing text." },
         "recent_events": recent, "active_capabilities": manifests,
+        "recent_operation_outcomes": crate::control::recent_operation_outcomes(store,&run.id)?,
+        "recovery_policy": "Recorded failed operations and their output artifacts are available for inspection, but cannot prove completion. Missing evidence is work remaining: inspect the failure, discover permitted capabilities and rerun tests after correction. Block only when progress actually needs an unavailable permission, external input or environment.",
         "milestones": store.milestones(&run.id)?, "handoff": handoff,
         "obligations": store.obligations(&run.id)?.into_iter().filter(|item| item.state != "superseded").collect::<Vec<_>>(),
         "current_route": store.current_route(&run.id)?,
@@ -821,7 +823,7 @@ fn apply(store: &mut Store, root: &Path, run: &Run, action: Action) -> Result<bo
             if matches!(mode(run), "eager" | "lazy") {
                 bail!("inline mode has no artifact inspection; use the inline result");
             }
-            if !store.has_evidence(&run.id, &artifact)? {
+            if !store.has_operation_artifact(&run.id, &artifact)? {
                 bail!("artifact does not belong to this run");
             }
             let bytes = store.artifact(&artifact)?;

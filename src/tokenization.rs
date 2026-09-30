@@ -68,6 +68,9 @@ pub fn measure(prompt: &str) -> Result<Exposure> {
             tools = tools.saturating_add(count(&event.to_string()));
         }
     }
+    if let Some(outcomes) = state["recent_operation_outcomes"].as_array() {
+        tools = tools.saturating_add(count(&serde_json::to_string(outcomes)?));
+    }
     Ok(Exposure {
         encoding: ENCODING,
         schema_tokens: count(&schemas.to_string()),
