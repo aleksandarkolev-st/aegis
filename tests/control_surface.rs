@@ -188,3 +188,60 @@ fn goal_add_and_targeted_replace_require_review_and_retain_original_contract() -
     }
     Ok(())
 }
+
+#[test]
+fn archived_receipts_and_provider_turns_survive_completion() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let mut store = Store::open(directory.path())?;
+    let run = store.create_run("Check API\nRequirements:\n- preserve API",directory.path(),"codex",json!([]),json!({"provider_transport":"aegis-direct-v1","model":"primary","fallback_routes":[{"provider":"grok","model":"fallback"}]}),"")?;
+    store.state(&run.id, "running", json!({}))?;
+    let op = store.begin_operation(
+        &run.id,
+        "process.run",
+        json!({"program":"node","args":["--test"]}),
+        true,
+    )?;
+    let hash = store.put_artifact(&serde_json::to_vec(&json!({"exit_code":0}))?)?;
+    store.operation_state(&op, "succeeded", Some(&hash), json!({"exit_code":0}))?;
+    store.verify_obligation(&run.id, 1, &[hash.clone()])?;
+    store.event(&run.id, "model.started", json!({"turn":84}))?;
+    store.event(
+        &run.id,
+        "model.failed",
+        json!({"recoverable_reason":"usage_limit"}),
+    )?;
+    assert!(
+        store
+            .transition_provider(&run.id, arun::routing::Reason::UsageLimit)?
+            .is_some()
+    );
+    for _ in 0..180 {
+        store.event(&run.id, "telemetry", json!({}))?;
+    }
+    store.save_snapshot(&run.id)?;
+    assert!(store.archive_history(&run.id)? > 0);
+    drop(store);
+    let mut store = Store::open(directory.path())?;
+    let proof = control::view(&store, &run.id, "evidence", Some("O1"))?;
+    assert_eq!(
+        proof["artifacts"][0]["operations"][0]["receipt"]["exit_code"],
+        0
+    );
+    let providers = control::view(&store, &run.id, "provider", Some("history"))?;
+    assert!(control::display("provider", &providers).contains("turn 84"));
+    store.complete_run(&run.id, "API checked", &[hash])?;
+    let completed = store
+        .events(&run.id)?
+        .into_iter()
+        .find(|event| event.kind == "run.completed")
+        .unwrap();
+    let report = &completed.payload["completion"];
+    assert_eq!(report["provider_transitions"].as_array().unwrap().len(), 1);
+    assert_eq!(report["artifacts"][0]["receipt"]["exit_code"], 0);
+    let text = control::display_completion(report);
+    assert!(
+        text.contains("turn 84") && text.contains("node") && text.contains("exit 0"),
+        "{text}"
+    );
+    Ok(())
+}

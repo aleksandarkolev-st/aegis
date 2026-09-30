@@ -239,6 +239,16 @@ impl Store {
             [run_id],
             |row| row.get(0),
         )?;
+        let turn = if attempt > 0 {
+            let payload: String = transaction.query_row(
+                "SELECT payload FROM events WHERE run_id = ?1 AND seq = ?2",
+                params![run_id, attempt],
+                |row| row.get(0),
+            )?;
+            serde_json::from_str::<Value>(&payload)?["turn"].as_u64()
+        } else {
+            None
+        };
         transaction.execute(
             "INSERT INTO provider_routes(run_id, route) VALUES (?1, ?2) ON CONFLICT(run_id) DO UPDATE SET route = excluded.route",
             params![run_id, serde_json::to_string(&next)?],
@@ -247,7 +257,7 @@ impl Store {
             &transaction,
             run_id,
             "provider.transition",
-            json!({"from":current,"to":next,"reason":reason.name(),"attempt_seq":attempt,"workspace_revision":revision,"model_tokens":tokens}),
+            json!({"from":current,"to":next,"reason":reason.name(),"attempt_seq":attempt,"turn":turn,"workspace_revision":revision,"model_tokens":tokens}),
         )?;
         transaction.commit()?;
         Ok(Some(next))

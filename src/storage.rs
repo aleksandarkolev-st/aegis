@@ -1080,6 +1080,41 @@ impl Store {
         let acceptance = crate::acceptance::verified_result(self, &run, summary, evidence)?;
         let proposal = self.completion_proposal(run_id)?;
         let milestones = self.milestones(run_id)?;
+        let prior_transitions = self
+            .events(run_id)?
+            .into_iter()
+            .filter(|event| event.kind == "provider.transition")
+            .map(|event| (event.seq, event.payload))
+            .collect::<Vec<_>>();
+        let mut hashes = std::collections::BTreeSet::new();
+        hashes.extend(evidence.iter().cloned());
+        for item in self
+            .obligations(run_id)?
+            .iter()
+            .filter(|item| item.state == "verified")
+        {
+            hashes.extend(item.evidence.iter().cloned());
+        }
+        hashes.extend(acceptance.iter().cloned());
+        let mut receipts = std::collections::BTreeMap::new();
+        for hash in hashes {
+            let bytes = self.artifact(&hash)?;
+            let result = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
+            let mut receipt = json!({});
+            for key in [
+                "path",
+                "sha256",
+                "bytes",
+                "exit_code",
+                "elapsed_ms",
+                "output_artifact",
+            ] {
+                if let Some(value) = result.get(key) {
+                    receipt[key] = value.clone();
+                }
+            }
+            receipts.insert(hash, receipt);
+        }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1141,7 +1176,7 @@ impl Store {
             run_id,
             "run.completed",
             json!({"summary": summary, "evidence": evidence, "acceptance":acceptance,
-                "completion":crate::control::completion_report(&transaction, run_id, acceptance.as_deref())?}),
+                "completion":crate::control::completion_report(&transaction, run_id, acceptance.as_deref(),&prior_transitions,&receipts)?}),
         )?;
         if let Some(verified) = acceptance.as_deref() {
             crate::learning::record(&transaction, &run, verified)?;

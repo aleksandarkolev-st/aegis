@@ -86,6 +86,7 @@ pub fn evidence(store: &Store, run_id: &str, id: i64) -> Result<Value> {
         .find(|item| item.id == id)
         .context("Obligation not found")?;
     let revision = store.workspace_revision(run_id)?;
+    let events = store.events(run_id)?;
     let mut artifacts = Vec::new();
     for hash in &obligation.evidence {
         let mut statement = store.connection.prepare(
@@ -104,10 +105,16 @@ pub fn evidence(store: &Store, run_id: &str, id: i64) -> Result<Value> {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut operations = Vec::new();
         for (op, capability, arguments, state, recorded_revision) in sources {
-            let detail: Option<String> = store.connection.query_row(
-                "SELECT json_extract(payload,'$.detail') FROM events WHERE run_id = ?1 AND kind LIKE 'operation.%' AND json_extract(payload,'$.id') = ?2 AND json_extract(payload,'$.detail') IS NOT NULL ORDER BY seq DESC LIMIT 1", params![run_id,op], |row| row.get(0),
-            ).optional()?;
-            operations.push(json!({"operation":op,"capability":capability,"arguments":serde_json::from_str::<Value>(&arguments)?,"state":state,"revision":recorded_revision,"current":state == "succeeded" && recorded_revision.is_some() && recorded_revision == revision,"receipt":detail.map(|text|serde_json::from_str::<Value>(&text)).transpose()?}));
+            let detail = events
+                .iter()
+                .rev()
+                .find(|event| {
+                    event.kind.starts_with("operation.")
+                        && event.payload["id"] == op
+                        && event.payload["detail"].is_object()
+                })
+                .map(|event| event.payload["detail"].clone());
+            operations.push(json!({"operation":op,"capability":capability,"arguments":safe_arguments(&capability,serde_json::from_str::<Value>(&arguments)?),"state":state,"revision":recorded_revision,"current":state == "succeeded" && recorded_revision.is_some() && recorded_revision == revision,"receipt":detail}));
         }
         artifacts.push(json!({"artifact":hash,"operations":operations,"integrity":match store.artifact(hash) {Ok(_)=>"verified".to_owned(),Err(error)=>error.to_string()}}));
     }
@@ -117,6 +124,16 @@ pub fn evidence(store: &Store, run_id: &str, id: i64) -> Result<Value> {
 }
 
 use rusqlite::OptionalExtension;
+
+fn safe_arguments(capability: &str, mut arguments: Value) -> Value {
+    if matches!(capability, "workspace.write" | "workspace.patch") {
+        if let Some(object) = arguments.as_object_mut() {
+            object.remove("content");
+            object.remove("edits");
+        }
+    }
+    arguments
+}
 
 pub fn view(store: &Store, run_id: &str, command: &str, argument: Option<&str>) -> Result<Value> {
     if argument.is_some() && !matches!(command, "goal" | "contract" | "provider" | "evidence") {
@@ -241,6 +258,8 @@ pub(crate) fn completion_report(
     connection: &rusqlite::Connection,
     run_id: &str,
     acceptance: Option<&str>,
+    prior_transitions: &[(i64, Value)],
+    receipts: &std::collections::BTreeMap<String, Value>,
 ) -> Result<Value> {
     let mut statement = connection.prepare("SELECT id,title,state,evidence,verified_revision,superseded_by,reason FROM obligations WHERE run_id=?1 ORDER BY id")?;
     let items = statement.query_map([run_id],|row| Ok(json!({"id":row.get::<_,i64>(0)?,"title":row.get::<_,String>(1)?,"state":row.get::<_,String>(2)?,"evidence":serde_json::from_str::<Value>(&row.get::<_,String>(3)?).unwrap_or(Value::Null),"revision":row.get::<_,Option<i64>>(4)?,"superseded_by":row.get::<_,Option<i64>>(5)?,"reason":row.get::<_,Option<String>>(6)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -251,17 +270,37 @@ pub(crate) fn completion_report(
             |row| row.get(0),
         )
         .optional()?;
-    let mut statement = connection.prepare(
-        "SELECT payload FROM events WHERE run_id=?1 AND kind='provider.transition' ORDER BY seq",
-    )?;
-    let transitions = statement
-        .query_map([run_id], |row| row.get::<_, String>(0))?
+    let mut transitions: std::collections::BTreeMap<i64, Value> =
+        prior_transitions.iter().cloned().collect();
+    // Preserve archived history and include transitions committed since the snapshot.
+    let mut statement=connection.prepare("SELECT seq,payload FROM events WHERE run_id=?1 AND kind='provider.transition' ORDER BY seq")?;
+    for (seq, text) in statement
+        .query_map([run_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?
-        .into_iter()
-        .map(|text| serde_json::from_str::<Value>(&text))
-        .collect::<serde_json::Result<Vec<_>>>()?;
+    {
+        transitions.insert(seq, serde_json::from_str(&text)?);
+    }
+    let mut artifacts = Vec::new();
+    for (hash, receipt) in receipts {
+        let mut statement=connection.prepare("SELECT operation.id,operation.capability,operation.arguments,operation.state,revision.revision FROM operations AS operation LEFT JOIN operation_revisions AS revision ON revision.operation_id=operation.id WHERE operation.run_id=?1 AND (operation.artifact=?2 OR EXISTS(SELECT 1 FROM operation_artifacts AS linked WHERE linked.operation_id=operation.id AND linked.hash=?2)) ORDER BY operation.rowid")?;
+        let sources = statement
+            .query_map(params![run_id, hash], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let operations=sources.into_iter().map(|(id,capability,args,state,revision)|Ok(json!({"id":id,"capability":capability,"arguments":safe_arguments(&capability,serde_json::from_str::<Value>(&args)?),"state":state,"revision":revision}))).collect::<Result<Vec<Value>>>()?;
+        artifacts.push(json!({"artifact":hash,"operations":operations,"receipt":receipt}));
+    }
     Ok(
-        json!({"requirements":items,"workspace_revision":revision,"acceptance":acceptance,"provider_transitions":transitions,"verification_scope":"Successful operation provenance at the recorded revision; configured independent acceptance when present."}),
+        json!({"requirements":items,"workspace_revision":revision,"acceptance":acceptance,"provider_transitions":transitions.into_values().collect::<Vec<_>>(),"artifacts":artifacts,"verification_scope":"Successful operation provenance at the recorded revision; configured independent acceptance when present."}),
     )
 }
 
@@ -307,6 +346,9 @@ pub fn display(command: &str, value: &Value) -> String {
                 "Provider: {}",
                 route_label(&value["current_provider"])
             ));
+            for route in value["fallbacks"].as_array().into_iter().flatten() {
+                lines.push(format!("Fallback: {}", route_label(route)));
+            }
             if let Some(next) = value["checkpoint"]["next_action"].as_str() {
                 lines.push(format!("Next action: {next}"));
             }
@@ -338,6 +380,9 @@ pub fn display(command: &str, value: &Value) -> String {
                 "Provider: {}",
                 route_label(&value["current_provider"])
             ));
+            for route in value["fallbacks"].as_array().into_iter().flatten() {
+                lines.push(format!("Fallback: {}", route_label(route)));
+            }
             lines.push(format!(
                 "Revision {} · requirements {} open / {} verified / {} stale",
                 value["workspace_revision"],
@@ -427,17 +472,24 @@ pub fn display(command: &str, value: &Value) -> String {
             for event in value["history"].as_array().into_iter().flatten() {
                 let transition = &event["payload"];
                 lines.push(format!(
-                    "{} -> {} · {} · attempt event {}",
+                    "{} -> {} · {} · {}",
                     route_label(&transition["from"]),
                     route_label(&transition["to"]),
                     transition["reason"].as_str().unwrap_or_default(),
-                    transition["attempt_seq"]
+                    transition_position(transition)
                 ));
             }
         }
         _ => return serde_json::to_string_pretty(value).unwrap_or_default(),
     }
     lines.join("\n")
+}
+
+fn transition_position(value: &Value) -> String {
+    value["turn"]
+        .as_u64()
+        .map(|turn| format!("turn {turn}"))
+        .unwrap_or_else(|| format!("attempt event {}", value["attempt_seq"]))
 }
 
 pub fn display_completion(value: &Value) -> String {
@@ -453,6 +505,20 @@ pub fn display_completion(value: &Value) -> String {
         for hash in item["evidence"].as_array().into_iter().flatten() {
             if let Some(hash) = hash.as_str() {
                 lines.push(format!("  artifact {hash}"));
+                if let Some(artifact) = value["artifacts"]
+                    .as_array()
+                    .and_then(|items| items.iter().find(|item| item["artifact"] == hash))
+                {
+                    for source in artifact["operations"].as_array().into_iter().flatten() {
+                        lines.push(format!(
+                            "  {} {} · {} · exit {}",
+                            source["capability"].as_str().unwrap_or("operation"),
+                            source["arguments"],
+                            source["state"].as_str().unwrap_or("unknown"),
+                            artifact["receipt"]["exit_code"]
+                        ));
+                    }
+                }
             }
         }
         if let Some(next) = item["superseded_by"].as_i64() {
@@ -478,10 +544,11 @@ pub fn display_completion(value: &Value) -> String {
         .flatten()
     {
         lines.push(format!(
-            "{} -> {} · {}",
+            "{} -> {} · {} · {}",
             route_label(&transition["from"]),
             route_label(&transition["to"]),
-            transition["reason"].as_str().unwrap_or_default()
+            transition["reason"].as_str().unwrap_or_default(),
+            transition_position(transition)
         ));
     }
     lines.join("\n")
