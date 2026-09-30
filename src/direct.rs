@@ -568,6 +568,7 @@ fn parse(provider: Provider, credentials: &Credentials, bytes: &[u8]) -> Result<
             let normalized = text.replace("\r\n", "\n");
             let mut completed = None;
             let mut done_items = Vec::new();
+            let mut invalid_items = false;
             for frame in normalized.split("\n\n") {
                 let data = frame
                     .lines()
@@ -585,8 +586,9 @@ fn parse(provider: Provider, credentials: &Credentials, bytes: &[u8]) -> Result<
                 match event["type"].as_str() {
                     Some("response.output_item.done") => {
                         let item = &event["item"];
-                        if completed.is_some() || !item.is_object() || done_items.len() >= 32 {
-                            bail!("Provider output-item sequence is invalid or exceeds its bound");
+                        if !item.is_object() || done_items.len() >= 32 {
+                            invalid_items = true;
+                            continue;
                         }
                         if done_items.iter().any(|previous: &Value| {
                             previous == item
@@ -594,7 +596,8 @@ fn parse(provider: Provider, credentials: &Credentials, bytes: &[u8]) -> Result<
                                     .as_str()
                                     .is_some_and(|id| !id.is_empty() && previous["id"] == id)
                         }) {
-                            bail!("Provider returned duplicate completed output items");
+                            invalid_items = true;
+                            continue;
                         }
                         done_items.push(item.clone());
                     }
@@ -630,9 +633,18 @@ fn parse(provider: Provider, credentials: &Credentials, bytes: &[u8]) -> Result<
                 .as_array()
                 .context("Provider returned no output")?;
             let validation = || -> Result<String> {
+                if invalid_items || output.len() > 32 {
+                    bail!("Provider output items are invalid or exceed their bound");
+                }
                 let text = assistant_text(output)?;
-                if !done_items.is_empty() && assistant_text(&done_items)? != text {
-                    bail!("Provider output items disagree with the completion receipt");
+                if !done_items.is_empty() {
+                    let observed = checked_assistant_text(&done_items)?;
+                    if !observed.is_empty()
+                        && observed != text
+                        && model::parse_action(&observed)? != model::parse_action(&text)?
+                    {
+                        bail!("Provider output items disagree with the completion receipt");
+                    }
                 }
                 Ok(text)
             };
@@ -682,6 +694,14 @@ fn parse(provider: Provider, credentials: &Credentials, bytes: &[u8]) -> Result<
 }
 
 fn assistant_text(items: &[Value]) -> Result<String> {
+    let text = checked_assistant_text(items)?;
+    if text.is_empty() {
+        bail!("Provider returned no final action text");
+    }
+    Ok(text)
+}
+
+fn checked_assistant_text(items: &[Value]) -> Result<String> {
     let mut text = String::new();
     let has_final = items.iter().any(|item| {
         item["type"] == "message"
@@ -699,15 +719,14 @@ fn assistant_text(items: &[Value]) -> Result<String> {
             Some("reasoning") => {}
             Some("message") if item["role"] == "assistant" => {
                 let include =
-                    !has_final || item["channel"] == "final" || item["phase"] == "final_answer";
+                    (!has_final || item["channel"] == "final" || item["phase"] == "final_answer")
+                        && item["phase"] != "commentary"
+                        && item["channel"] != "commentary";
                 if item["phase"]
                     .as_str()
                     .is_some_and(|phase| !matches!(phase, "commentary" | "final_answer"))
                 {
                     bail!("Provider returned an unsupported assistant phase");
-                }
-                if item["phase"] == "commentary" && !has_final {
-                    bail!("Provider returned commentary without a final action");
                 }
                 if item["channel"]
                     .as_str()
@@ -742,6 +761,87 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::time::Instant;
+
+    #[test]
+    fn late_output_items_and_partial_commentary_agree_with_authoritative_final_action() -> Result<()>
+    {
+        let credentials = credentials();
+        let final_item = json!({"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":r#"{"kind":"blocked","reason":"complete"}"#}]});
+        let commentary = json!({"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"Working."}]});
+        let completed = json!({"type":"response.completed","response":{"status":"completed","output":[commentary,final_item],"usage":{"input_tokens":20,"output_tokens":10}}});
+        let frame = |item: &Value| {
+            format!(
+                "data: {}\n\n",
+                json!({"type":"response.output_item.done","item":item})
+            )
+        };
+        let receipt = format!("data: {completed}\n\n");
+        assert!(
+            parse(
+                Provider::ChatGpt,
+                &credentials,
+                format!("{}{receipt}", frame(&commentary)).as_bytes()
+            )
+            .is_ok()
+        );
+        assert!(
+            parse(
+                Provider::ChatGpt,
+                &credentials,
+                format!("{receipt}{}", frame(&final_item)).as_bytes()
+            )
+            .is_ok()
+        );
+        let mut reordered = final_item.clone();
+        reordered["content"][0]["text"] = json!(r#"{"reason":"complete","kind":"blocked"}"#);
+        assert!(
+            parse(
+                Provider::ChatGpt,
+                &credentials,
+                format!("{receipt}{}", frame(&reordered)).as_bytes()
+            )
+            .is_ok()
+        );
+        let mut conflicting = final_item;
+        conflicting["content"][0]["text"] = json!(r#"{"kind":"blocked","reason":"different"}"#);
+        assert!(
+            parse(
+                Provider::ChatGpt,
+                &credentials,
+                format!("{receipt}{}", frame(&conflicting)).as_bytes()
+            )
+            .is_err()
+        );
+        assert!(
+            parse(
+                Provider::ChatGpt,
+                &credentials,
+                format!(
+                    "{receipt}{}",
+                    frame(&json!({"type":"function_call","name":"native"}))
+                )
+                .as_bytes()
+            )
+            .is_err()
+        );
+        let rejected = parse(
+            Provider::ChatGpt,
+            &credentials,
+            format!("{}{}{receipt}", frame(&reordered), frame(&reordered)).as_bytes(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            rejected
+                .downcast_ref::<RejectedResponse>()
+                .unwrap()
+                .usage
+                .as_ref()
+                .unwrap()
+                .input_tokens,
+            20
+        );
+        Ok(())
+    }
 
     #[test]
     fn final_action_is_separate_from_commentary_and_native_actions_still_fail_closed() -> Result<()>
@@ -1469,7 +1569,7 @@ mod tests {
                 &credentials(),
                 format!("data: {event}\n\ndata: {output}\n\n").as_bytes()
             )
-            .is_err()
+            .is_ok()
         );
         let mut invalid = completed(json!({"input_tokens":751,"output_tokens":41}));
         invalid["response"]["output"][0]["content"][0]["text"] =
