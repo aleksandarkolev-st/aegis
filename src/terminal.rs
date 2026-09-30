@@ -700,6 +700,24 @@ impl Terminal {
             if io::stdin().read_line(&mut text)? == 0 {
                 return Ok(Input::Exit);
             }
+            if !secret && text.starts_with("\u{1b}[200~") {
+                text.drain(..6);
+                while !text.contains("\u{1b}[201~") {
+                    if text.len() > 65536 {
+                        anyhow::bail!("Pasted input exceeds 65536 bytes");
+                    }
+                    let mut line = String::new();
+                    if io::stdin().read_line(&mut line)? == 0 {
+                        anyhow::bail!("Pasted input ended before its closing marker");
+                    }
+                    text.push_str(&line);
+                }
+                let (paste, tail) = text.split_once("\u{1b}[201~").unwrap();
+                if !tail.trim().is_empty() || paste.len() > 65536 {
+                    anyhow::bail!("Pasted input has trailing data or exceeds its limit");
+                }
+                return Ok(Input::Submit(clean(paste)));
+            }
             return Ok(Input::Submit(text.trim_end_matches(['\r', '\n']).into()));
         }
         let _raw = RawMode::enter(true)?;
