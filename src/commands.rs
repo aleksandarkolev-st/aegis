@@ -1,13 +1,7 @@
 /// Commands exposed by the guided terminal, including aliases and contract subcommands.
 pub const COMMANDS: &[(&str, &str)] = &[
-    (
-        "/goal",
-        "Show the task, or paste task text after it to start",
-    ),
-    (
-        "/contract",
-        "Alias for /goal; paste task text after it to start",
-    ),
+    ("/goal", "View task or start from pasted text"),
+    ("/contract", "Alias for /goal"),
     ("/goal add", "Review and add a requirement"),
     ("/goal replace", "Review a requirement replacement"),
     ("/goal history", "Inspect requirement changes"),
@@ -46,3 +40,23 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/exit", "Exit this terminal session"),
     ("/quit", "Alias for /exit"),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::COMMANDS;
+
+    #[test]
+    fn goal_and_contract_descriptions_fit_narrow_menu() {
+        for command in ["/goal", "/contract"] {
+            let description = COMMANDS
+                .iter()
+                .find(|(name, _)| *name == command)
+                .expect("command must remain in the catalog")
+                .1;
+            assert!(
+                description.chars().count() < 36,
+                "{command} description must be shorter than 36 characters"
+            );
+        }
+    }
+}
