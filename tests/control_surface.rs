@@ -58,6 +58,55 @@ fn explicit_requirements_preview_can_pause_before_any_inference() -> Result<()> 
 }
 
 #[test]
+fn goal_prefix_preserves_a_multiline_paste_and_opens_the_task_review() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join(".arun");
+    fs::create_dir(&root)?;
+    fs::write(
+        root.join("profile.json"),
+        serde_json::to_vec(
+            &json!({"provider":"custom","model":"fixture","endpoint":{"base_url":"http://127.0.0.1:9/v1","api_key_env":null},"write":false,"image":null,"previous_run":null}),
+        )?,
+    )?;
+    let task =
+        "Repair the command picker.\nRequirements:\n- preserve pasted text\n- keep goal history";
+    let paste = format!("/goal\n{task}");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_arun"))
+        .current_dir(directory.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("\u{1b}[200~{paste}\u{1b}[201~\n4\n/goal\n/quit\n").as_bytes())?;
+    let output = child.wait_with_output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    for label in [
+        "Detected requirements",
+        "Start task",
+        "Edit requirements",
+        "Leave task paused",
+    ] {
+        assert!(text.contains(label), "{text}");
+    }
+    let store = Store::open(&root)?;
+    let run = store.runs()?.remove(0);
+    assert_eq!(run.task, task);
+    assert_eq!(run.state, "paused");
+    assert_eq!(store.obligations(&run.id)?.len(), 3);
+    assert_eq!(store.event_count(&run.id, "model.started")?, 0);
+    Ok(())
+}
+
+#[test]
 fn views_inspect_open_verified_and_stale_obligations_without_inference() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let root = directory.path().join(".arun");

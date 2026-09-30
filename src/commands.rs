@@ -1,7 +1,13 @@
 /// Commands exposed by the guided terminal, including aliases and contract subcommands.
 pub const COMMANDS: &[(&str, &str)] = &[
-    ("/goal", "Show the original task and requirements"),
-    ("/contract", "Alias for /goal"),
+    (
+        "/goal",
+        "Show the task, or paste task text after it to start",
+    ),
+    (
+        "/contract",
+        "Alias for /goal; paste task text after it to start",
+    ),
     ("/goal add", "Review and add a requirement"),
     ("/goal replace", "Review a requirement replacement"),
     ("/goal history", "Inspect requirement changes"),

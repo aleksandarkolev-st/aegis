@@ -113,6 +113,25 @@ fn field(terminal: &Terminal, label: &str, secret: bool) -> Result<Option<String
     }
 }
 
+fn goal_task_submission(request: &str) -> Option<&str> {
+    let rest = request
+        .strip_prefix("/goal")
+        .or_else(|| request.strip_prefix("/contract"))?;
+    if !rest.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let task = rest.trim_start();
+    if task.is_empty()
+        || matches!(
+            task.split_whitespace().next()?,
+            "add" | "replace" | "history"
+        )
+    {
+        return None;
+    }
+    Some(task)
+}
+
 fn load_catalog(
     terminal: &Terminal,
     profile: &Profile,
@@ -1631,7 +1650,7 @@ fn help(terminal: &Terminal) -> Result<()> {
     terminal.message(
         Tone::Quiet,
         "Task contract",
-        "/goal (/contract) · /goal add · /goal replace O2 · /goal history",
+        "/goal then pasted task text starts a task · /goal (/contract) views it · /goal add · /goal replace O2 · /goal history",
     )?;
     terminal.message(
         Tone::Quiet,
@@ -3482,6 +3501,7 @@ pub fn interactive(root: &Path) -> Result<()> {
                 if request.is_empty() {
                     continue;
                 }
+                let request = goal_task_submission(request).unwrap_or(request);
                 if let Some((prefix, text)) = request.split_once(':') {
                     if prefix.eq_ignore_ascii_case("remember") {
                         remember(root, &terminal, text, None)?;
@@ -3650,6 +3670,32 @@ pub fn interactive(root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn goal_prefix_preserves_pasted_task_text_and_control_commands() {
+        assert_eq!(
+            goal_task_submission("/goal Repair the model picker"),
+            Some("Repair the model picker")
+        );
+        assert_eq!(
+            goal_task_submission(
+                "/contract\nRepair the picker\nRequirements:\n- show current models"
+            ),
+            Some("Repair the picker\nRequirements:\n- show current models")
+        );
+        for command in [
+            "/goal",
+            "/goal ",
+            "/goal add",
+            "/goal add tests",
+            "/goal replace O2",
+            "/goal history",
+            "/contract history",
+            "/goalkeeper repair the picker",
+        ] {
+            assert_eq!(goal_task_submission(command), None, "{command}");
+        }
+    }
 
     #[test]
     fn auth_recovery_targets_the_switched_route_not_the_primary_profile() -> Result<()> {
