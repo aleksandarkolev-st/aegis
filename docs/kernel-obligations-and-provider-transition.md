@@ -14,7 +14,9 @@ Implemented in current source:
 - If the active route later returns an authentication error, the terminal offers sign-in for that route (not the original provider) or a hidden replacement custom key, then resumes the same run once. Declining keeps it paused. This is guided recovery after an observed failure, not silent credential sharing or automatic account reauthorization.
 - A persisted current route must still exactly match one of the run's frozen reviewed fallbacks after restart. Changing its endpoint, model, provider, or reasoning level outside the contract fails closed before another model request.
 
-Still open: semantic verification of each obligation beyond artifact provenance; robust extraction/review for arbitrary prose; out-of-band workspace-change detection and precise workspace-diff tracking rather than conservative write-capable staleness; owned live failover trials and expiring fallback-session recovery; Claude subscription route; other release-platform verification. A local integration test completes the same run after an injected classified primary failure, but it does not exercise a real hosted quota response. Benchmarks remain deferred until end-to-end readiness.
+The [task control surface](control-surface.md) now exposes this state, reviewed additions/replacements, deterministic completion explanations, and durable pause/resume. Explicit requirement lists are previewed before interactive execution. Bounded digests detect external edits to file-tool-observed paths; edits by other unfinished tasks sharing the workspace stale peer proofs. Corrupt artifacts, changed operation states and stale generic completion evidence are rejected.
+
+Still open: semantic verification beyond artifact provenance; robust extraction for arbitrary prose; external edits to unobserved dependencies and precise filesystem diffs; owned live cross-provider failover trials and expiring fallback-session recovery; Claude subscription route; other release-platform verification. The local failover integration test uses an injected failure rather than a real hosted quota response. Benchmarks remain deferred.
 
 ## Obligations
 
