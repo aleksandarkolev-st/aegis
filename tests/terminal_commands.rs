@@ -7,6 +7,46 @@ use arun::storage::Store;
 use serde_json::json;
 
 #[test]
+fn slash_menu_lists_every_command_and_selection_does_not_execute_a_task() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join(".arun");
+    fs::create_dir(&root)?;
+    fs::write(
+        root.join("profile.json"),
+        serde_json::to_vec(
+            &json!({"provider":"custom","model":"fixture","endpoint":{"base_url":"http://127.0.0.1:9/v1","api_key_env":null},"write":false,"image":null,"previous_run":null}),
+        )?,
+    )?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_arun"))
+        .current_dir(directory.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"/\n1\n/goal\n/quit\n")?;
+    let output = child.wait_with_output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    for (command, description) in arun::commands::COMMANDS {
+        assert!(
+            text.contains(command) && text.contains(description),
+            "Missing {command}: {text}"
+        );
+    }
+    assert!(text.contains("Command selected"));
+    assert!(Store::open(&root)?.runs()?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn checkpoint_view_and_cancel_confirmation_preserve_unknown_operations() -> Result<()> {
     for cancel in [false, true] {
         let directory = tempfile::tempdir()?;

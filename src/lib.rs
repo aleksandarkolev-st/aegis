@@ -5,6 +5,7 @@ pub mod budget;
 pub mod capability;
 pub mod catalog;
 pub mod claude_api;
+pub mod commands;
 pub mod continuation;
 pub mod control;
 pub mod direct;

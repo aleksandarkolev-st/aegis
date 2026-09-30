@@ -1639,6 +1639,7 @@ fn help(terminal: &Terminal) -> Result<()> {
         "/status · /why · /evidence O3 · /verify · /provider history · /budget · /handoff",
     )?;
     terminal.message(Tone::Quiet, "Pause", "Type / while following a task to inspect it or request /pause. /resume continues the selected task. F2 or /providers selects a provider for new tasks.")?;
+    terminal.message(Tone::Quiet,"Commands","Type / to open all shortcuts; search or scroll, select to fill the prompt, then Enter to run.")?;
     terminal.message(Tone::Quiet, "Control", "Ctrl+C interrupts an operation; twice quickly interrupts the model turn. Ctrl+D detaches. F9 asks before cancelling the entire task. No shell commands needed.")
 }
 
@@ -2083,7 +2084,8 @@ fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
                 if key.code == KeyCode::Char('/') && !key.modifiers.contains(KeyModifiers::CONTROL)
                 {
                     terminal.clear_activity()?;
-                    if let Input::Submit(command) = terminal.input("/", false, &[])? {
+                    let selected = terminal.command_menu()?;
+                    if let Some(command) = selected {
                         let mut words = command.split_whitespace();
                         let command = words.next().unwrap_or_default().trim_start_matches('/');
                         if command == "pause" {
@@ -3525,6 +3527,12 @@ pub fn interactive(root: &Path) -> Result<()> {
                     continue;
                 }
                 match request {
+                    "/" => {
+                        if let Some(command) = terminal.command_menu()? {
+                            terminal.set_command_draft(&command);
+                            if !terminal.interactive { terminal.message(Tone::Quiet,"Command selected",&command)?; }
+                        }
+                    }
                     "/providers" => {
                         switch_provider(root, &terminal, &mut profile, &mut secret)?;
                     }

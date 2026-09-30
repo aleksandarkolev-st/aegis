@@ -672,6 +672,26 @@ impl Terminal {
         (Vec::new(), 0)
     }
 
+    pub fn command_menu(&self) -> Result<Option<String>> {
+        let choices = crate::commands::COMMANDS
+            .iter()
+            .map(|(command, description)| format!("{command:<24} {description}"))
+            .collect::<Vec<_>>();
+        Ok(self
+            .select(
+                "Slash commands · search or scroll · selection fills the prompt",
+                &choices,
+            )?
+            .map(|index| crate::commands::COMMANDS[index].0.to_owned()))
+    }
+
+    pub fn set_command_draft(&self, command: &str) {
+        let text: Vec<_> = command.chars().collect();
+        let caret = text.len();
+        self.input_draft
+            .replace(Some((self.input_prefix(), text, caret)));
+    }
+
     pub fn input(&self, label: &str, secret: bool, history: &[String]) -> Result<Input> {
         if !self.interactive {
             print!("{label}");
@@ -853,6 +873,21 @@ impl Terminal {
                         }
                         KeyCode::Up | KeyCode::Down if !secret => {
                             input_history.navigate(key.code, &mut text, &mut caret);
+                        }
+                        KeyCode::Char('/')
+                            if !control
+                                && !secret
+                                && text.is_empty()
+                                && draft_label == self.input_prefix() =>
+                        {
+                            self.finish_input(composer, None)?;
+                            let selected = self.command_menu()?.unwrap_or_else(|| "/".into());
+                            text = selected.chars().collect();
+                            caret = text.len();
+                            if composer {
+                                write!(io::stdout(), "\r\n\r\n")?;
+                                queue!(io::stdout(), cursor::MoveUp(1))?;
+                            }
                         }
                         KeyCode::Char(character) if !control => {
                             text.insert(caret, character);
