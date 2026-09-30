@@ -1137,7 +1137,7 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
                     && error
                         .downcast_ref::<crate::direct::RejectedResponse>()
                         .is_some_and(|response| {
-                            response.usage.is_some() && response.shape["json"] == false
+                            response.usage.is_some() && response.shape["json"].is_boolean()
                         })
                     && !format_retry_state(&store.recent_events(run_id, 12)?).0
                     && store.model_tokens(run_id)? < max_tokens

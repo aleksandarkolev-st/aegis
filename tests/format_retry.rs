@@ -95,6 +95,53 @@ fn exercise(second_valid: bool) -> Result<()> {
 }
 
 #[test]
+fn malformed_json_action_arguments_get_one_accounted_retry_without_tool_dispatch() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&requests);
+    let endpoint = http::Endpoint::start(move |_| {
+        let request = observed.fetch_add(1, Ordering::SeqCst);
+        assert!(request < 2);
+        let content = if request == 0 {
+            json!({"kind":"invoke","capability":"workspace.read","args":"not JSON"}).to_string()
+        } else {
+            json!({"kind":"blocked","reason":"fixture finished"}).to_string()
+        };
+        Ok((
+            200,
+            json!({"choices":[{"message":{"content":content}}],"usage":{"prompt_tokens":10,"completion_tokens":2}}),
+        ))
+    })?;
+    let output = Command::new(env!("CARGO_BIN_EXE_arun"))
+        .current_dir(directory.path())
+        .args([
+            "run",
+            "Check bounded format recovery",
+            "--provider",
+            "custom",
+            "--endpoint",
+            &endpoint.url,
+            "--model",
+            "fixture",
+            "--foreground",
+        ])
+        .output()?;
+    endpoint.finish()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let store = Store::open(&directory.path().join(".arun"))?;
+    let run = store.runs()?.remove(0);
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    assert_eq!(store.event_count(&run.id, "model.format_retry")?, 1);
+    assert_eq!(store.model_tokens(&run.id)?, 24);
+    assert!(store.operations(&run.id)?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn one_invalid_format_is_retried_with_accounted_usage_and_no_raw_text() -> Result<()> {
     exercise(true)
 }
