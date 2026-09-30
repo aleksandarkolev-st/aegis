@@ -33,7 +33,12 @@ pub(crate) fn record(
         vec![result]
     };
     for entry in entries {
-        let (Some(path), Some(hash)) = (entry["path"].as_str(), entry["sha256"].as_str()) else {
+        let path = entry["path"].as_str().or_else(|| {
+            (operation.capability != "workspace.read_batch")
+                .then(|| operation.arguments["path"].as_str())
+                .flatten()
+        });
+        let (Some(path), Some(hash)) = (path, entry["sha256"].as_str()) else {
             continue;
         };
         let path = crate::filesystem::path_name(path)?;

@@ -3,10 +3,14 @@ use arun::storage::Store;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::fs;
+#[path = "support/http.rs"]
+mod http;
 
 fn read_receipt(store: &mut Store, id: &str, source: &str) -> Result<String> {
     let op = store.begin_operation(id, "workspace.read", json!({"path":"source.txt"}), true)?;
-    let hash=store.put_artifact(&serde_json::to_vec(&json!({"path":"source.txt","sha256":hex::encode(Sha256::digest(source.as_bytes())),"content":source}))?)?;
+    let hash = store.put_artifact(&serde_json::to_vec(
+        &json!({"sha256":hex::encode(Sha256::digest(source.as_bytes())),"content":source}),
+    )?)?;
     store.operation_state(&op, "succeeded", Some(&hash), json!({}))?;
     Ok(hash)
 }
@@ -102,5 +106,83 @@ fn corrupt_proof_artifacts_and_stale_generic_finish_evidence_are_rejected() -> R
             .is_err()
     );
     assert_eq!(store.run(&run.id)?.state, "running");
+    Ok(())
+}
+
+#[test]
+fn actual_file_read_and_external_edit_force_fresh_proof_before_binary_completion() -> Result<()> {
+    use std::{
+        process::Command,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join(".arun");
+    let source = directory.path().join("source.txt");
+    fs::write(&source, "before")?;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let observed = requests.clone();
+    let endpoint = http::Endpoint::start(move |body| {
+        let state = http::state(body)?;
+        let store = Store::open(&root)?;
+        let run = store.runs()?.remove(0);
+        let action = match observed.fetch_add(1, Ordering::SeqCst) {
+            0 | 2 => {
+                if store.event_count(&run.id, "model.response")? > 1 {
+                    assert_eq!(state["workspace_revision"], 1);
+                    assert!(store.event_count(&run.id, "action.rejected")? > 0);
+                }
+                json!({"kind":"invoke","capability":"workspace.read","args":{"path":"source.txt"}})
+            }
+            call @ (1 | 3) => {
+                if call == 1 {
+                    fs::write(&source, "after external edit")?;
+                }
+                let hash = store
+                    .operations(&run.id)?
+                    .last()
+                    .unwrap()
+                    .artifact
+                    .clone()
+                    .unwrap();
+                json!({"kind":"finish","summary":"Source verified","evidence":[hash],"obligations":[{"id":1,"evidence":[hash]}]})
+            }
+            _ => anyhow::bail!("Unexpected extra inference"),
+        };
+        Ok((
+            200,
+            json!({"choices":[{"message":{"content":action.to_string()}}],"usage":{"prompt_tokens":10,"completion_tokens":2}}),
+        ))
+    })?;
+    let output = Command::new(env!("CARGO_BIN_EXE_arun"))
+        .current_dir(directory.path())
+        .args([
+            "run",
+            "Read source\nRequirements:\n- read current source",
+            "--provider",
+            "custom",
+            "--endpoint",
+            &endpoint.url,
+            "--model",
+            "fixture",
+            "--mode",
+            "eager",
+            "--foreground",
+        ])
+        .output()?;
+    endpoint.finish()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 4);
+    let store = Store::open(&directory.path().join(".arun"))?;
+    let run = store.runs()?.remove(0);
+    assert_eq!(run.state, "completed");
+    assert_eq!(store.obligations(&run.id)?[1].verified_revision, Some(1));
+    assert_eq!(store.event_count(&run.id, "action.rejected")?, 1);
     Ok(())
 }
