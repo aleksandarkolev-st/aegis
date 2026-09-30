@@ -34,6 +34,7 @@ pub mod provider;
 pub mod provider_catalog;
 pub mod read_batch;
 pub mod recall;
+pub mod remote;
 pub mod repository_rules;
 pub mod restart;
 pub mod routing;

@@ -47,6 +47,7 @@ fn usage() {
     println!(
         "arun eval [--provider chatgpt|claude|grok] [--sizes 50,100,250,500] [--modes eager,lazy,artifact,durable] [--tasks read,log,repair] [--repeats 1] [--restart-at operation.executing|operation.succeeded|checkpoint.created] [--prepare-only] | eval-report <results.jsonl>"
     );
+    println!("arun remote pair [options] | status | run");
 }
 
 fn view(root: &Path, command: &str, id: &str) -> Result<()> {
@@ -439,6 +440,7 @@ fn execute() -> Result<()> {
     match arguments.first().map(String::as_str) {
         None => interactive(&root),
         Some("run") => run(&root, &arguments[1..]),
+        Some("remote") => arun::remote::daemon::command(&root, &arguments[1..]),
         Some("eval") => arun::evaluation::command(&root, &arguments[1..]),
         Some("eval-report") => {
             println!(
