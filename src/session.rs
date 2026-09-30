@@ -1819,6 +1819,120 @@ fn save(root: &Path, profile: &Profile) -> Result<()> {
     Ok(())
 }
 
+/// Creates a remote-started task from the profile already saved locally.
+/// The phone supplies only task text; the workspace, model, limits, scopes and
+/// grants all come from this installation's configuration.
+pub(crate) fn create_remote_task(
+    root: &Path,
+    workspace: &Path,
+    task: &str,
+    run_id: &str,
+) -> Result<crate::storage::Run> {
+    use anyhow::{Context, bail};
+
+    if task.trim().is_empty()
+        || task.len() > 65_536
+        || crate::text::clean(task) != task
+        || task
+            .chars()
+            .any(|character| character.is_control() && character != '\n' && character != '\t')
+    {
+        bail!("remote task text is empty or contains unsupported characters");
+    }
+    let canonical_workspace = dunce::canonicalize(workspace)
+        .context("the locally approved Aegis workspace is unavailable")?;
+    let install_workspace = root
+        .parent()
+        .context("Aegis data directory has no workspace parent")?;
+    let install_workspace = dunce::canonicalize(install_workspace)
+        .context("the local Aegis installation workspace is unavailable")?;
+    if canonical_workspace != install_workspace {
+        bail!("remote tasks are restricted to this Aegis installation's workspace");
+    }
+
+    let profile_path = root.join("profile.json");
+    let metadata = std::fs::symlink_metadata(&profile_path)
+        .context("configure Aegis locally before starting remote tasks")?;
+    if metadata.file_type().is_symlink() {
+        bail!("Aegis profile cannot be a symbolic link");
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            bail!("Aegis profile cannot be a reparse point");
+        }
+    }
+    if !metadata.is_file() {
+        bail!("Aegis profile must be a regular file");
+    }
+    let profile: Profile = serde_json::from_slice(
+        &std::fs::read(&profile_path).context("could not read the local Aegis profile")?,
+    )
+    .context("the local Aegis profile is invalid")?;
+
+    let mut grants = vec!["workspace.read".to_owned()];
+    if profile.write {
+        grants.push("workspace.write".into());
+    }
+    if profile.image.is_some() {
+        grants.extend(["process.run".into(), "process:*".into()]);
+    }
+    if profile
+        .network_scopes
+        .as_ref()
+        .is_some_and(|scopes| !scopes.domains.is_empty())
+    {
+        grants.push("network.fetch".into());
+    }
+    let acceptance = profile
+        .acceptance_check
+        .as_ref()
+        .map(|check| check.name.as_str())
+        .unwrap_or("Reply directly to conversation; verify requested tool work with successful-operation evidence");
+    let mut budgets = serde_json::to_value(&profile.limits)?;
+    budgets["provider_transport"] = json!(if profile.provider == "claude-api" {
+        "aegis-claude-api-v1"
+    } else {
+        "aegis-direct-v1"
+    });
+    budgets["model"] = json!(profile.model);
+    budgets["api_key_env"] = json!(profile.api_key_env);
+    budgets["reasoning_effort"] = json!(profile.reasoning_effort);
+    budgets["fallback_routes"] = json!(profile.fallback_routes);
+    budgets["endpoint"] = json!(profile.endpoint);
+    budgets["container_image"] = json!(profile.image);
+    budgets["previous_run"] = serde_json::Value::Null;
+    budgets["acceptance_check"] = json!(profile.acceptance_check);
+    budgets["command_scopes"] = json!(profile.command_scopes);
+    budgets["filesystem_scopes"] = json!(profile.filesystem_scopes);
+    budgets["network_scopes"] = json!(profile.network_scopes);
+    budgets["remote_origin"] = json!(true);
+    budgets["remote_policy_version"] = json!(1);
+
+    let mut store = Store::open(root)?;
+    let workspace_text = canonical_workspace.to_string_lossy();
+    match store.create_run_with_id(
+        run_id,
+        task,
+        &canonical_workspace,
+        &profile.provider,
+        json!(grants),
+        budgets,
+        acceptance,
+    ) {
+        Ok(run) => Ok(run),
+        Err(create_error) => match store.run(run_id) {
+            Ok(existing)
+                if existing.task == task && existing.workspace == workspace_text.as_ref() =>
+            {
+                Ok(existing)
+            }
+            _ => Err(create_error),
+        },
+    }
+}
+
 fn remember_selection(terminal: &Terminal, profile: &Profile) -> Result<()> {
     if !terminal.interactive {
         return Ok(());
@@ -3736,6 +3850,54 @@ pub fn interactive(root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_tasks_use_only_the_local_profile_and_stable_run_id() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let root = workspace.path().join(".arun");
+        std::fs::create_dir_all(&root)?;
+        let mut profile = blank_profile("codex".into());
+        profile.model = Some("local-model-selection".into());
+        profile.write = true;
+        profile.previous_run = Some(uuid::Uuid::new_v4().to_string());
+        save(&root, &profile)?;
+
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let first = create_remote_task(&root, workspace.path(), "Review the parser", &run_id)?;
+        let repeated = create_remote_task(&root, workspace.path(), "Review the parser", &run_id)?;
+        assert_eq!(first.id, run_id);
+        assert_eq!(first.id, repeated.id);
+        assert_eq!(
+            first.workspace,
+            dunce::canonicalize(workspace.path())?.to_string_lossy()
+        );
+        assert_eq!(first.budgets["remote_origin"], true);
+        assert_eq!(first.budgets["previous_run"], serde_json::Value::Null);
+        assert_eq!(first.budgets["model"], "local-model-selection");
+        assert_eq!(first.grants, json!(["workspace.read", "workspace.write"]));
+        assert_eq!(Store::open(&root)?.runs()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn remote_tasks_cannot_choose_another_workspace() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let other_workspace = tempfile::tempdir()?;
+        let root = workspace.path().join(".arun");
+        std::fs::create_dir_all(&root)?;
+        save(&root, &blank_profile("codex".into()))?;
+        assert!(
+            create_remote_task(
+                &root,
+                other_workspace.path(),
+                "Inspect files",
+                &uuid::Uuid::new_v4().to_string()
+            )
+            .is_err()
+        );
+        assert!(Store::open(&root)?.runs()?.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn goal_prefix_preserves_pasted_task_text_and_control_commands() {

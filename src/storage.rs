@@ -431,9 +431,34 @@ impl Store {
         workspace: &Path,
         provider: &str,
         grants: Value,
+        budgets: Value,
+        acceptance: &str,
+    ) -> Result<Run> {
+        self.create_run_with_id(
+            &Uuid::new_v4().to_string(),
+            task,
+            workspace,
+            provider,
+            grants,
+            budgets,
+            acceptance,
+        )
+    }
+
+    /// Creates a run with a caller supplied, validated ID. Remote task creation
+    /// uses a stable ID derived from the relay request so a crash after run
+    /// insertion but before its remote receipt cannot create a duplicate run.
+    pub(crate) fn create_run_with_id(
+        &mut self,
+        id: &str,
+        task: &str,
+        workspace: &Path,
+        provider: &str,
+        grants: Value,
         mut budgets: Value,
         acceptance: &str,
     ) -> Result<Run> {
+        Uuid::parse_str(id).context("invalid run ID")?;
         let workspace = dunce::canonicalize(workspace).context("workspace does not exist")?;
         if !budgets.is_object() {
             bail!("run configuration must be an object");
@@ -454,7 +479,7 @@ impl Store {
         budgets["workflow_patterns"] =
             json!(self.learned_patterns(&workspace, task, &budgets, &grants)?);
         let run = Run {
-            id: Uuid::new_v4().to_string(),
+            id: id.to_owned(),
             task: task.to_owned(),
             workspace: workspace.to_string_lossy().into_owned(),
             provider: crate::provider::canonical(provider).to_owned(),
