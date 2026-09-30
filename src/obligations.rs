@@ -176,20 +176,34 @@ pub(crate) fn record_operation(
         current
     };
     if invalidates {
-        transaction.execute(
-            "UPDATE workspace_revisions SET revision = ?2 WHERE run_id = ?1",
-            params![operation.run_id, revision],
-        )?;
-        transaction.execute(
-            "UPDATE obligations SET state = 'stale' WHERE run_id = ?1 AND state = 'verified'",
-            [&operation.run_id],
-        )?;
-        append_event(
-            transaction,
-            &operation.run_id,
-            "workspace.revision",
-            serde_json::json!({"revision":revision,"operation":operation.id,"capability":operation.capability}),
-        )?;
+        // Another task in this workspace can invalidate these proofs too.
+        let affected = {
+            let mut statement=transaction.prepare("SELECT run.id, revision.revision FROM runs AS run JOIN workspace_revisions AS revision ON revision.run_id=run.id WHERE run.workspace=(SELECT workspace FROM runs WHERE id=?1) AND (run.id=?1 OR run.state NOT IN ('completed','answered','cancelled','failed'))")?;
+            statement
+                .query_map([&operation.run_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (id, previous) in affected {
+            let next = previous
+                .checked_add(1)
+                .context("workspace revision overflow")?;
+            transaction.execute(
+                "UPDATE workspace_revisions SET revision=?2 WHERE run_id=?1",
+                params![id, next],
+            )?;
+            transaction.execute(
+                "UPDATE obligations SET state='stale' WHERE run_id=?1 AND state='verified'",
+                [&id],
+            )?;
+            append_event(
+                transaction,
+                &id,
+                "workspace.revision",
+                serde_json::json!({"revision":next,"operation":operation.id,"source_run":operation.run_id,"capability":operation.capability}),
+            )?;
+        }
     }
     transaction.execute(
         "INSERT OR REPLACE INTO operation_revisions(operation_id, run_id, revision) VALUES (?1, ?2, ?3)",
@@ -530,6 +544,57 @@ impl Store {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn edits_in_another_task_stale_live_peer_proofs_but_preserve_completed_history() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let mut runs = Vec::new();
+        let mut hashes = Vec::new();
+        for _ in 0..3 {
+            let run = store.create_run(
+                "work",
+                directory.path(),
+                "custom",
+                serde_json::json!(["workspace.write"]),
+                serde_json::json!({"obligations":["API passes"]}),
+                "",
+            )?;
+            store.state(&run.id, "running", serde_json::json!({}))?;
+            let op =
+                store.begin_operation(&run.id, "workspace.read", serde_json::json!({}), true)?;
+            let hash = store.put_artifact(run.id.as_bytes())?;
+            store.operation_state(&op, "succeeded", Some(&hash), serde_json::json!({}))?;
+            store.verify_obligation(&run.id, 1, &[hash.clone()])?;
+            hashes.push(hash);
+            runs.push(run);
+        }
+        store.complete_run(&runs[2].id, "done", &[hashes[2].clone()])?;
+        let history = store.obligations(&runs[2].id)?;
+        store.request_pause(&runs[1].id)?;
+        crate::pause::boundary(&mut store, &runs[1].id)?;
+        let edit =
+            store.begin_operation(&runs[0].id, "workspace.write", serde_json::json!({}), false)?;
+        let hash = store.put_artifact(b"edit")?;
+        store.operation_state(&edit, "succeeded", Some(&hash), serde_json::json!({}))?;
+        assert_eq!(store.workspace_revision(&runs[0].id)?, Some(1));
+        assert_eq!(store.workspace_revision(&runs[1].id)?, Some(1));
+        assert_eq!(store.obligations(&runs[1].id)?[1].state, "stale");
+        assert_eq!(store.obligations(&runs[2].id)?, history);
+        store.resume_paused(&runs[1].id)?;
+        store.state(&runs[1].id, "running", serde_json::json!({}))?;
+        assert!(
+            store
+                .verify_obligation(&runs[1].id, 1, &[hashes[1].clone()])
+                .is_err()
+        );
+        assert!(
+            store
+                .complete_run(&runs[1].id, "done", &[hashes[1].clone()])
+                .is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn configured_requirements_cannot_suppress_task_requirements() -> Result<()> {
