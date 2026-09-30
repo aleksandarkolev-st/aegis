@@ -461,7 +461,14 @@ pub fn saved_only_for_selection(provider: &str) -> Result<Option<Catalog>> {
         return Ok(None);
     };
     let vault = crate::auth_store::Vault::user()?;
-    saved_catalog(&vault, selected, false, || false)
+    fresh_picker_catalog(&vault, selected)
+}
+
+fn fresh_picker_catalog(
+    vault: &crate::auth_store::Vault,
+    provider: crate::direct::Provider,
+) -> Result<Option<Catalog>> {
+    Ok(crate::provider_catalog::cached(vault, provider, || false)?.map(owned_models))
 }
 
 pub fn refresh_for_selection(provider: &str, cancelled: impl Fn() -> bool) -> Result<Catalog> {
@@ -587,6 +594,16 @@ mod tests {
             .expect("same-account models should be immediately selectable");
         assert_eq!(immediate.models[0].id, "fixture-model");
         assert!(immediate.source.starts_with("Saved Aegis model list"));
+        assert!(fresh_picker_catalog(&vault, provider)?.is_some());
+        let mut saved: Value = serde_json::from_slice(&vault.load_catalog("chatgpt")?.unwrap())?;
+        saved["fetched_at"] = json!(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs()
+                - 901
+        );
+        vault.save_catalog("chatgpt", serde_json::to_vec(&saved)?)?;
+        assert!(fresh_picker_catalog(&vault, provider)?.is_none());
         let catalog = saved_selection(&vault, provider, || false, anyhow::anyhow!("offline"))?;
         assert_eq!(catalog.models[0].id, "fixture-model");
         assert!(catalog.source.contains("access may have changed"));

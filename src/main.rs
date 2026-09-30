@@ -24,7 +24,7 @@ fn usage() {
     );
     println!("arun interrupt <run-id> operation|model");
     println!(
-        "arun goal|contract|status|why|verify|budget|handoff <run-id> | evidence <run-id> [O3] | provider <run-id> [history] | goal <run-id> history | pause <run-id> | models <provider>"
+        "arun goal|contract|status|why|verify|budget|handoff <run-id> | evidence <run-id> [O3] | provider <run-id> [history] | goal <run-id> history | pause <run-id> | models <provider> [--refresh]"
     );
     println!(
         "Provider capture budget: --model-response-bytes <1024..33554432> (default 8388608); also available in F7 custom budgets."
@@ -649,7 +649,16 @@ fn execute() -> Result<()> {
         Some("login") => login(required(1)?),
         Some("models") => {
             let provider = required(1)?;
-            let catalog = arun::catalog::for_selection(provider, || false)?;
+            let refresh = match arguments.get(2).map(String::as_str) {
+                None => false,
+                Some("--refresh") if arguments.len() == 3 => true,
+                _ => bail!("Use models <provider> [--refresh]"),
+            };
+            let catalog = if refresh {
+                arun::catalog::refresh_for_selection(provider, || false)?
+            } else {
+                arun::catalog::for_selection(provider, || false)?
+            };
             println!("{}", catalog.source);
             for model in catalog.models {
                 println!(
