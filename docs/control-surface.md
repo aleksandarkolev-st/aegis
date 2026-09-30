@@ -22,6 +22,8 @@ F2 or `/providers` selects the provider for new tasks. `/provider` inspects the 
 
 The native CLI exposes the same inspection through `aegis <view> <run-id> [argument]`, plus `aegis pause <run-id>` and `aegis resume <run-id> --foreground`. `aegis models chatgpt` queries the account catalog and lists the supported reasoning levels.
 
+Tool discovery returns at most three ranked granted schemas. Its saved result reports whether more matches were omitted. A focused search can activate another granted tool; missing from one search result does not establish that the tool is unavailable.
+
 Simple identity questions such as `what model are u` are answered from the persisted active route without inference. The answer names Aegis, the configured model, provider and reasoning level. A fallback's current model is reported, rather than the original primary or a model's guessed identity. These replies remain conversational `answered` records; they cannot bypass explicit obligations or configured acceptance.
 
 Aegis owns its agent loop and tool execution. ChatGPT subscription inference uses direct HTTP transport; it does not launch a Codex CLI or agent harness. The internal `codex` provider alias remains in existing immutable contracts for compatibility.
