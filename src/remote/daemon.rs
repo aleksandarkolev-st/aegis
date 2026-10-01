@@ -1,6 +1,11 @@
 //! Pairing and the outbound-only NATS daemon for remote Aegis control.
 
-use std::{path::Path, time::Duration};
+use std::{
+    future::Future,
+    path::{Path, PathBuf},
+    pin::Pin,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use async_nats::{HeaderMap, jetstream};
@@ -21,6 +26,8 @@ use crate::storage::{Event, Run, Store};
 
 const COMMAND_STREAM: &str = "AEGIS_COMMANDS";
 const MAX_ADMIN_RESPONSE_BYTES: usize = 16 * 1024;
+const RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct Transport {
@@ -284,10 +291,118 @@ async fn run_loop(
     root: std::path::PathBuf,
     config: Config,
     nats_token: String,
-    mut authority: Authority,
+    authority: Authority,
+) -> Result<()> {
+    let mut session = DaemonSession {
+        root,
+        config,
+        nats_token,
+        authority,
+    };
+    supervise_sessions(
+        &mut session,
+        async {
+            tokio::signal::ctrl_c()
+                .await
+                .context("could not listen for shutdown signal")
+        },
+        ReconnectBackoff::new(RECONNECT_INITIAL_DELAY, RECONNECT_MAX_DELAY),
+    )
+    .await
+}
+
+type SessionFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
+
+trait SessionRunner {
+    fn run_once(&mut self) -> SessionFuture<'_>;
+}
+
+struct DaemonSession {
+    root: PathBuf,
+    config: Config,
+    nats_token: String,
+    authority: Authority,
+}
+
+impl SessionRunner for DaemonSession {
+    fn run_once(&mut self) -> SessionFuture<'_> {
+        Box::pin(run_nats_session(
+            &self.root,
+            &self.config,
+            &self.nats_token,
+            &mut self.authority,
+        ))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ReconnectBackoff {
+    next: Duration,
+    max: Duration,
+}
+
+impl ReconnectBackoff {
+    fn new(initial: Duration, max: Duration) -> Self {
+        Self {
+            next: initial,
+            max: max.max(initial),
+        }
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        let delay = self.next;
+        self.next = self.next.saturating_mul(2).min(self.max);
+        delay
+    }
+}
+
+async fn supervise_sessions<R, S>(
+    session: &mut R,
+    shutdown: S,
+    mut backoff: ReconnectBackoff,
+) -> Result<()>
+where
+    R: SessionRunner,
+    S: Future<Output = Result<()>>,
+{
+    let mut shutdown = Box::pin(shutdown);
+    loop {
+        let result = tokio::select! {
+            biased;
+            signal = &mut shutdown => {
+                signal?;
+                return Ok(());
+            }
+            result = session.run_once() => result,
+        };
+        if result.is_ok() {
+            return Ok(());
+        }
+
+        let delay = backoff.next_delay();
+        eprintln!(
+            "Aegis remote connection ended; retrying in {} seconds.",
+            delay.as_secs_f64()
+        );
+        tokio::select! {
+            biased;
+            signal = &mut shutdown => {
+                signal?;
+                return Ok(());
+            }
+            _ = tokio::time::sleep(delay) => {}
+        }
+    }
+}
+
+async fn run_nats_session(
+    root: &Path,
+    config: &Config,
+    nats_token: &str,
+    authority: &mut Authority,
 ) -> Result<()> {
     let mut options = async_nats::ConnectOptions::new()
-        .token(nats_token)
+        .token(nats_token.to_owned())
         .require_tls(true);
     if let Some(root_certificate) = &config.nats_root_certificate {
         options = options.add_root_certificates(root_certificate.clone());
@@ -330,32 +445,26 @@ async fn run_loop(
 
     loop {
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                signal.context("could not listen for shutdown signal")?;
-                break;
-            }
             next = messages.next() => {
-                let Some(message) = next else { break };
-                let message = match message {
-                    Ok(message) => message,
-                    Err(_) => continue,
+                let Some(message) = next else {
+                    bail!("NATS command consumer ended");
                 };
-                if let Err(error) = process_command(&root, &config, &transport, &mut authority, message).await {
+                let message = message.map_err(|_| anyhow::anyhow!("NATS command consumer failed"))?;
+                if let Err(error) = process_command(root, config, &transport, authority, message).await {
                     let _ = error;
                     eprintln!("Aegis remote command was deferred for retry.");
                 }
             }
             _ = maintenance.tick() => {
-                if let Err(error) = maintain_remote_gates(&root, &mut authority) {
-                    eprintln!("Aegis remote approval maintenance will retry: {error:#}");
+                if maintain_remote_gates(root, authority).is_err() {
+                    eprintln!("Aegis remote approval maintenance failed; retrying.");
                 }
-                if let Err(error) = publish_local_events(&mut authority, &transport).await {
-                    eprintln!("Aegis remote event delivery will retry: {error:#}");
+                if publish_local_events(authority, &transport).await.is_err() {
+                    eprintln!("Aegis remote event delivery failed; retrying.");
                 }
             }
         }
     }
-    Ok(())
 }
 
 async fn process_command(
@@ -846,6 +955,72 @@ fn ensure_cursor_schema(authority: &Authority) -> Result<()> {
 mod tests {
     use super::*;
     use chrono::Duration as ChronoDuration;
+    use std::collections::VecDeque;
+
+    struct ScriptedSession {
+        outcomes: VecDeque<bool>,
+        attempts: usize,
+    }
+
+    impl ScriptedSession {
+        fn new(outcomes: impl IntoIterator<Item = bool>) -> Self {
+            Self {
+                outcomes: outcomes.into_iter().collect(),
+                attempts: 0,
+            }
+        }
+    }
+
+    impl SessionRunner for ScriptedSession {
+        fn run_once(&mut self) -> SessionFuture<'_> {
+            self.attempts += 1;
+            let succeeds = self.outcomes.pop_front().unwrap_or(false);
+            Box::pin(async move {
+                if succeeds {
+                    Ok(())
+                } else {
+                    anyhow::bail!("fixture failure token=must-not-be-logged");
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnect_supervisor_recovers_after_a_failed_session() -> Result<()> {
+        let mut session = ScriptedSession::new([false, true]);
+        let result = supervise_sessions(
+            &mut session,
+            std::future::pending::<Result<()>>(),
+            ReconnectBackoff::new(Duration::from_millis(1), Duration::from_millis(4)),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(session.attempts, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconnect_backoff_is_capped_and_shutdown_interrupts_the_wait() -> Result<()> {
+        let mut backoff = ReconnectBackoff::new(Duration::from_millis(1), Duration::from_millis(4));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(1));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(2));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(4));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(4));
+
+        let mut session = ScriptedSession::new([false]);
+        let shutdown = async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            Ok(())
+        };
+        supervise_sessions(
+            &mut session,
+            shutdown,
+            ReconnectBackoff::new(Duration::from_secs(30), Duration::from_secs(30)),
+        )
+        .await?;
+        assert_eq!(session.attempts, 1);
+        Ok(())
+    }
 
     fn fixture(root: &Path) -> Result<(Config, Authority, RelayCommandEnvelope)> {
         std::fs::create_dir_all(root)?;
