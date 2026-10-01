@@ -264,6 +264,35 @@ impl PgRepository {
         .await?;
         Ok(())
     }
+
+    pub async fn revoke_channel_binding(
+        &self,
+        installation_id: Uuid,
+        actor_id: &str,
+        sender_id: &str,
+    ) -> Result<bool, RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        // Pair redemption locks its token before the binding. Keep that lock order
+        // here so a simultaneous redemption and revocation cannot deadlock.
+        sqlx::query(
+            "UPDATE pairing_tokens SET used_at = now() WHERE installation_id = $1 AND actor_id = $2 AND used_at IS NULL AND EXISTS (SELECT 1 FROM channel_bindings WHERE installation_id = $1 AND actor_id = $2 AND channel = 'whatsapp' AND sender_id = $3)",
+        )
+        .bind(installation_id)
+        .bind(actor_id)
+        .bind(sender_id)
+        .execute(&mut *tx)
+        .await?;
+        let binding_id = sqlx::query_scalar::<_, Uuid>(
+            "UPDATE channel_bindings SET active = FALSE WHERE installation_id = $1 AND actor_id = $2 AND channel = 'whatsapp' AND sender_id = $3 RETURNING id",
+        )
+        .bind(installation_id)
+        .bind(actor_id)
+        .bind(sender_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(binding_id.is_some())
+    }
 }
 
 pub fn valid_actor_id(value: &str) -> bool {

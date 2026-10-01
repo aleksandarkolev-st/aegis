@@ -32,6 +32,10 @@ pub fn router(state: HttpState) -> Router {
             "/admin/v1/installations/{installation_id}/notifications/{event_kind}",
             post(set_notification_preference),
         )
+        .route(
+            "/admin/v1/installations/{installation_id}/bindings/revoke",
+            post(revoke_channel_binding),
+        )
         .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(state)
 }
@@ -149,6 +153,39 @@ async fn set_notification_preference(
         Ok(()) => (StatusCode::NO_CONTENT, ""),
         Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable"),
     }
+}
+
+async fn revoke_channel_binding(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path(installation_id): Path<Uuid>,
+    Json(request): Json<RevokeBindingRequest>,
+) -> impl IntoResponse {
+    if !authorized(&headers, &state.admin_token) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    if !crate::repository::valid_actor_id(&request.actor_id) {
+        return (StatusCode::BAD_REQUEST, "invalid actor id");
+    }
+    let Some(sender_id) = crate::provider::normalize_phone(&request.sender_id) else {
+        return (StatusCode::BAD_REQUEST, "invalid sender id");
+    };
+    match state
+        .repository
+        .revoke_channel_binding(installation_id, &request.actor_id, &sender_id)
+        .await
+    {
+        Ok(true) => (StatusCode::NO_CONTENT, ""),
+        Ok(false) => (StatusCode::NOT_FOUND, "binding not found"),
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable"),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevokeBindingRequest {
+    actor_id: String,
+    sender_id: String,
 }
 
 fn authorized(headers: &HeaderMap, expected: &str) -> bool {

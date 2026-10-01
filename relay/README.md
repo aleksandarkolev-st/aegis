@@ -21,6 +21,8 @@ The AegisEvent schema accepts only task_started, progress, approval_required, bl
 
 Only direct inbound user text is accepted. The provider adapter rejects groups, messages sent by the relay's WhatsApp account, status events, media-only messages, malformed sender IDs, and unauthenticated webhooks. Message text is line-ending normalized and capped at 8 KiB. It is never logged.
 
+An unpaired number can redeem a one-time code with either exact form: `/pair <code>` or `AEGIS <code>`. The command name is case-insensitive for the `AEGIS` form; the code must be one exact 43-character token with no trailing text. Pairing codes are consumed once. These prefixes are reserved for pairing and are not forwarded as ordinary messages.
+
 | WhatsApp text | Typed command |
 | --- | --- |
 | Ordinary text or /message <text> | message |
@@ -54,6 +56,7 @@ Outbound WhatsApp delivery is **at-least-once**, not exactly-once. Aegis event I
 
   The relay creates the user and installation if needed, then returns a 10-minute pairing code once. Under the trusted admin bearer principal, an existing installation UUID identifies that installation's user; additional actor IDs can be provisioned under the same installation. Re-provisioning the same installation/actor pair rotates its one-time code and keeps the user, installation, and actor binding scope. An actor ID already owned by another installation is rejected with 409. The relay admin bearer is the trusted bootstrap authority for this single deployment; it is not an end-user credential.
 - POST /admin/v1/installations/{installation_id}/notifications/{event_kind} requires the admin bearer token and JSON {"enabled":false} (or true).
+- POST /admin/v1/installations/{installation_id}/bindings/revoke requires the admin bearer token and JSON {"actor_id":"local-actor-id","sender_id":"+4915112345678"}. It deactivates only the WhatsApp binding that matches all three values. It also consumes any unused pairing code for that actor on the installation. The revoked number can no longer submit commands or receive notifications; a later message receives the pairing prompt. Other actors and installations remain paired. To pair that actor again, provision the installation/actor to issue a fresh code.
 - POST /v1/webhooks/whatsapp/evolution authenticates before interpreting the message JSON. It accepts either a dedicated x-aegis-webhook-token header, or an HMAC signature in x-aegis-timestamp and x-aegis-signature. The signature is v1= plus base64url-no-pad HMAC-SHA256 over timestamp, a period, and the raw body; it expires after five minutes. Use a dedicated webhook secret separate from the Evolution API key.
 
 Configure Evolution's webhook to send x-aegis-webhook-token. If it cannot set custom webhook headers, place a trusted HTTPS ingress adapter in front that validates provider authentication and adds this dedicated header. Do not expose the webhook route without authentication.
