@@ -761,8 +761,95 @@ fn result_detail(operation: &Operation, result: &Value, bytes: usize, elapsed_ms
         "exit_code":result["exit_code"],
         "matches":result["matches"].as_array().map(Vec::len),
         "output_artifact":result["output_artifact"], "elapsed_ms":elapsed_ms,
+        "output_preview":operation_output_preview_data(operation, result),
         "preview":result.to_string().chars().take(300).collect::<String>(),
     })
+}
+
+const OPERATION_PREVIEW_CHARACTERS: usize = 1200;
+const OPERATION_PREVIEW_ITEMS: usize = 8;
+
+fn preview_text(text: &str, limit: usize, source_truncated: bool) -> Value {
+    let cleaned = crate::text::clean(text);
+    let mut characters = cleaned.chars();
+    let preview = characters.by_ref().take(limit).collect::<String>();
+    json!({
+        "text":preview,
+        "truncated":source_truncated || characters.next().is_some(),
+    })
+}
+
+fn operation_output_preview_data(operation: &Operation, result: &Value) -> Option<Value> {
+    match operation.capability.as_str() {
+        "workspace.read" => {
+            let content = result["content"].as_str()?;
+            let preview = preview_text(content, OPERATION_PREVIEW_CHARACTERS, false);
+            Some(json!({"kind":"text","source":"file","preview":preview}))
+        }
+        "workspace.read_batch" => {
+            let selected = result["selected"].as_array()?;
+            let mut remaining = OPERATION_PREVIEW_CHARACTERS;
+            let mut truncated = selected.len() > OPERATION_PREVIEW_ITEMS;
+            let files = selected
+                .iter()
+                .take(OPERATION_PREVIEW_ITEMS)
+                .map(|file| {
+                    let text = file["text"].as_str().unwrap_or_default();
+                    let preview = preview_text(text, remaining, false);
+                    let excerpt = preview["text"].as_str().unwrap_or_default();
+                    remaining = remaining.saturating_sub(excerpt.chars().count());
+                    truncated |= preview["truncated"] == true;
+                    json!({
+                        "path":crate::text::clean(file["path"].as_str().unwrap_or("file")),
+                        "offset":file["offset"],
+                        "total_characters":file["total_characters"],
+                        "preview":preview,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Some(json!({"kind":"read_batch","files":files,"truncated":truncated}))
+        }
+        "workspace.search" => {
+            let matches = result["matches"].as_array()?;
+            let mut remaining = OPERATION_PREVIEW_CHARACTERS;
+            let mut truncated =
+                result["truncated"] == true || matches.len() > OPERATION_PREVIEW_ITEMS;
+            let matches = matches
+                .iter()
+                .take(OPERATION_PREVIEW_ITEMS)
+                .map(|item| {
+                    let preview =
+                        preview_text(item["text"].as_str().unwrap_or_default(), remaining, false);
+                    let excerpt = preview["text"].as_str().unwrap_or_default();
+                    remaining = remaining.saturating_sub(excerpt.chars().count());
+                    truncated |= preview["truncated"] == true;
+                    json!({
+                        "path":crate::text::clean(item["path"].as_str().unwrap_or("file")),
+                        "line":item["line"],
+                        "preview":preview,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Some(json!({"kind":"search","matches":matches,"truncated":truncated}))
+        }
+        "process.run" => {
+            let output = result["preview"].as_str()?;
+            let source_truncated = result["bytes"]
+                .as_u64()
+                .is_some_and(|bytes| bytes > output.len() as u64);
+            let preview = preview_text(output, OPERATION_PREVIEW_CHARACTERS, source_truncated);
+            Some(json!({"kind":"text","source":"command","preview":preview}))
+        }
+        "workspace.write" | "workspace.patch" => Some(json!({
+            "kind":"edit_summary",
+            "action":if operation.capability == "workspace.patch" { "patched" } else { "wrote" },
+            "path":crate::text::clean(result["path"].as_str().or_else(|| operation.arguments["path"].as_str()).unwrap_or("file")),
+            "bytes":result["bytes"],
+            "edits":result["edits"],
+            "sha256":result["sha256"],
+        })),
+        _ => None,
+    }
 }
 
 pub fn spawn(root: &Path, id: &str, secret: Option<(&str, &str)>) -> Result<()> {
@@ -2069,6 +2156,46 @@ mod tests {
         assert_eq!(detail["exit_code"], 1);
         assert_eq!(detail["matches"], 2);
         assert_eq!(detail["output_bytes"], 2048);
+        Ok(())
+    }
+
+    #[test]
+    fn structured_process_preview_survives_truncated_legacy_metadata() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "inspect command output",
+            directory.path(),
+            "unused",
+            json!(["process.run"]),
+            json!({}),
+            "",
+        )?;
+        let operation = store.begin_operation(
+            &run.id,
+            "process.run",
+            json!({"program":"node","args":[]}),
+            true,
+        )?;
+        let output = format!("build passed\n{}", "x".repeat(1400));
+        let result = json!({
+            "exit_code":0,
+            "output_artifact":"output-hash",
+            "bytes":output.len() + 1,
+            "preview":output,
+        });
+        let detail = result_detail(&operation, &result, 2048, 25);
+        assert!(serde_json::to_string(&detail)?.chars().count() > 300);
+        assert!(serde_json::from_str::<Value>(detail["preview"].as_str().unwrap()).is_err());
+
+        let (label, excerpt) = crate::terminal::operation_output_preview(&json!({"detail":detail}))
+            .expect("the structured output preview should be renderable");
+        assert_eq!(label, "Command output");
+        assert!(excerpt.starts_with("build passed\n"));
+        assert!(excerpt.contains("output preview truncated"));
+        assert!(
+            excerpt.chars().count() <= 1200 + "\n…\n… output preview truncated".chars().count()
+        );
         Ok(())
     }
 

@@ -1545,8 +1545,8 @@ impl Terminal {
             "operation.succeeded" => {
                 let (tone, label, text) = result_summary(payload);
                 self.message(tone, label, &text)?;
-                if let Some(preview) = operation_output_preview(payload) {
-                    self.message(Tone::Quiet, "Output excerpt", &preview)?;
+                if let Some((label, preview)) = operation_output_preview(payload) {
+                    self.message(Tone::Quiet, &label, &preview)?;
                 }
                 Ok(())
             }
@@ -1739,22 +1739,90 @@ fn result_summary(payload: &serde_json::Value) -> (Tone, &'static str, String) {
     (Tone::Success, label, text)
 }
 
-fn operation_output_preview(payload: &serde_json::Value) -> Option<String> {
-    if payload["detail"]["capability"].as_str() != Some("process.run") {
+pub(crate) fn operation_output_preview(payload: &serde_json::Value) -> Option<(String, String)> {
+    const MAX_DISPLAY_CHARACTERS: usize = 2400;
+    let preview = &payload["detail"]["output_preview"];
+    let preview_text = |value: &serde_json::Value| {
+        let mut text = clean(value["text"].as_str().unwrap_or_default());
+        if value["truncated"] == true {
+            text.push_str("\n…");
+        }
+        text
+    };
+    let (label, text, truncated) = match preview["kind"].as_str()? {
+        "text" => (
+            if preview["source"] == "command" {
+                "Command output"
+            } else {
+                "File excerpt"
+            },
+            preview_text(&preview["preview"]),
+            preview["preview"]["truncated"] == true,
+        ),
+        "read_batch" => {
+            let files = preview["files"].as_array()?;
+            let text = files
+                .iter()
+                .map(|file| {
+                    format!(
+                        "{} · offset {}\n{}",
+                        clean(file["path"].as_str().unwrap_or("file")),
+                        file["offset"].as_u64().unwrap_or(0),
+                        preview_text(&file["preview"])
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            ("Read excerpts", text, preview["truncated"] == true)
+        }
+        "search" => {
+            let matches = preview["matches"].as_array()?;
+            let text = matches
+                .iter()
+                .map(|item| {
+                    format!(
+                        "{}:{}  {}",
+                        clean(item["path"].as_str().unwrap_or("file")),
+                        item["line"].as_u64().unwrap_or(0),
+                        preview_text(&item["preview"])
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            ("Search matches", text, preview["truncated"] == true)
+        }
+        "edit_summary" => {
+            let mut details = vec![format!(
+                "{} {}",
+                preview["action"].as_str().unwrap_or("updated"),
+                clean(preview["path"].as_str().unwrap_or("file"))
+            )];
+            if let Some(bytes) = preview["bytes"].as_u64() {
+                details.push(format!("{bytes} bytes"));
+            }
+            if let Some(edits) = preview["edits"].as_u64() {
+                details.push(format!("{edits} edits"));
+            }
+            if let Some(hash) = preview["sha256"].as_str() {
+                details.push(format!("SHA256 {}", fit(hash, 12)));
+            }
+            ("Edit summary", details.join(" · "), false)
+        }
+        _ => return None,
+    };
+    if text.trim().is_empty() {
         return None;
     }
-    let serialized = payload["detail"]["preview"].as_str()?;
-    let result: serde_json::Value = serde_json::from_str(serialized).ok()?;
-    let preview = clean(result["preview"].as_str()?).trim().to_owned();
-    if preview.is_empty() {
-        return None;
+    let cleaned = clean(&text);
+    let mut characters = cleaned.chars();
+    let mut bounded = characters
+        .by_ref()
+        .take(MAX_DISPLAY_CHARACTERS)
+        .collect::<String>();
+    if truncated || characters.next().is_some() {
+        bounded.push_str("\n… output preview truncated");
     }
-    let mut characters = preview.chars();
-    let mut bounded = characters.by_ref().take(300).collect::<String>();
-    if characters.next().is_some() {
-        bounded.push('…');
-    }
-    Some(bounded)
+    Some((label.to_owned(), bounded))
 }
 
 fn menu_move(selected: usize, count: usize, key: KeyCode) -> usize {
@@ -2033,24 +2101,41 @@ mod tests {
     }
 
     #[test]
-    fn command_output_preview_shows_a_bounded_clean_excerpt() {
-        let serialized = serde_json::json!({
-            "preview": format!("build passed\n{}\u{1b}[2J\u{202e}tail", "x".repeat(400))
-        })
-        .to_string();
-        let payload = serde_json::json!({
-            "detail": {"capability":"process.run", "preview":serialized}
+    fn structured_operation_previews_render_clean_bounded_content_and_edit_summaries() {
+        let output = serde_json::json!({
+            "detail": {"output_preview": {
+                "kind":"text",
+                "source":"command",
+                "preview":{"text":format!("build passed\n{}\u{1b}[2J\u{202e}tail", "x".repeat(400)),"truncated":true}
+            }}
         });
-        let preview = operation_output_preview(&payload).unwrap();
+        let (label, preview) = operation_output_preview(&output).unwrap();
+        assert_eq!(label, "Command output");
         assert!(preview.starts_with("build passed\n"));
         assert!(!preview.contains('\u{1b}') && !preview.contains('\u{202e}'));
-        assert!(preview.chars().count() <= 301);
-        assert!(preview.ends_with('…'));
+        assert!(preview.chars().count() <= 2400 + "\n… output preview truncated".chars().count());
+        assert!(preview.ends_with("output preview truncated"));
 
-        let other_tool = serde_json::json!({
-            "detail": {"capability":"workspace.read", "preview":serialized}
-        });
-        assert!(operation_output_preview(&other_tool).is_none());
+        let batch = serde_json::json!({"detail":{"output_preview":{"kind":"read_batch","files":[
+            {"path":"src/a.rs","offset":10,"preview":{"text":"first file","truncated":false}},
+            {"path":"src/b.rs","offset":20,"preview":{"text":"second file","truncated":false}}
+        ],"truncated":false}}});
+        let (label, preview) = operation_output_preview(&batch).unwrap();
+        assert_eq!(label, "Read excerpts");
+        assert!(preview.contains("src/a.rs · offset 10") && preview.contains("second file"));
+
+        let matches = serde_json::json!({"detail":{"output_preview":{"kind":"search","matches":[
+            {"path":"src/main.rs","line":7,"preview":{"text":"matched line","truncated":false}}
+        ],"truncated":false}}});
+        let (label, preview) = operation_output_preview(&matches).unwrap();
+        assert_eq!(label, "Search matches");
+        assert!(preview.contains("src/main.rs:7  matched line"));
+
+        let edit = serde_json::json!({"detail":{"output_preview":{"kind":"edit_summary","action":"patched","path":"src/main.rs","bytes":256,"edits":2,"sha256":"0123456789abcdef0123456789abcdef"}}});
+        let (label, preview) = operation_output_preview(&edit).unwrap();
+        assert_eq!(label, "Edit summary");
+        assert!(preview.contains("patched src/main.rs") && preview.contains("2 edits"));
+        assert!(preview.contains("SHA256 0123456789ab"));
     }
 
     #[test]
