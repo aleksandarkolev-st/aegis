@@ -29,12 +29,17 @@ An unpaired number can redeem a one-time code with either exact form: `/pair <co
 | Ordinary text or /message <text> | message |
 | /tasks or /list_tasks | list_tasks |
 | /status | status |
+| /result [task-id] | result |
+| /evidence [task-id] | evidence |
+| /details [task-id] | details |
 | /pause | pause |
 | /resume | resume |
 | /cancel [task-id] | cancel |
 | /select_task <task-id> or /use <task-id> | select_task |
 | /approve_once <challenge-id> | approve_once |
 | /deny <challenge-id> | deny |
+
+`/result [alias]` is available only after a task reaches a terminal state. It returns the saved final summary, bounded to 2 KiB and marked as verified, unverified, or not verified based on the recorded task state. `/evidence [alias]` returns at most eight receipts that are referenced by verified explicit obligations and belong to the current workspace revision. Each row contains only a safe capability name, a 12-character hash prefix, and byte count; artifact contents, paths, command arguments, stdout, and previews are never returned. Conversational answers have no evidence receipts.
 
 Approval commands carry the challenge ID. There is no /approve alias. IDs are restricted to 128 ASCII letters, digits, underscores, hyphens, or periods.
 
