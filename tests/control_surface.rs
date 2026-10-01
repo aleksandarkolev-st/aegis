@@ -294,6 +294,7 @@ fn goal_add_and_targeted_replace_require_review_and_retain_original_contract() -
             json!({}),
             "",
         )?;
+        store.state(&run.id, "paused", json!({}))?;
         fs::write(
             root.join("profile.json"),
             serde_json::to_vec(
