@@ -874,6 +874,7 @@ fn outbound_events(
         kind,
         task_id: task_id.clone(),
         challenge_id: None,
+        expires_at: None,
         display_detail: None,
         reply_text: None,
     };
@@ -883,11 +884,18 @@ fn outbound_events(
         "approval.required" => {
             let challenge_id = event.payload["challenge_id"].as_str();
             let descriptor = event.payload["descriptor"].as_str();
-            let (Some(challenge_id), Some(descriptor)) = (challenge_id, descriptor) else {
+            let expires_at = event.payload["expires_at"].as_i64();
+            let (Some(challenge_id), Some(descriptor), Some(expires_at)) =
+                (challenge_id, descriptor, expires_at)
+            else {
                 return Vec::new();
             };
+            if expires_at <= crate::storage::unix_time() {
+                return Vec::new();
+            }
             let mut event = make("approval", EventKind::ApprovalRequired);
             event.challenge_id = Some(challenge_id.to_owned());
+            event.expires_at = Some(expires_at);
             let descriptor = crate::text::clean(descriptor)
                 .replace(['\r', '\n', '\t'], " ")
                 .chars()
@@ -1333,21 +1341,38 @@ mod tests {
         );
         assert_eq!(answered.len(), 1);
         assert!(answered[0].reply_text.is_none());
-        let approval = Event {
+        let mut approval = Event {
             seq: 10,
             kind: "approval.required".into(),
             payload: json!({"challenge_id":Uuid::new_v4().to_string(),"descriptor":"workspace.write · file.txt"}),
             created_at: 3,
         };
+        let challenge_expires_at = crate::storage::unix_time() + 300;
+        approval.payload["expires_at"] = json!(challenge_expires_at);
+        let approval_source = approval.clone();
         let approval = outbound_events(&run, &approval, &installation_id, "actor-1");
         assert_eq!(approval.len(), 1);
         assert!(approval[0].challenge_id.is_some());
+        assert_eq!(approval[0].expires_at, Some(challenge_expires_at));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&approval[0].to_json().unwrap()).unwrap()["expires_at"],
+            challenge_expires_at
+        );
         assert!(
             approval[0]
                 .display_detail
                 .as_deref()
                 .is_some_and(|detail| !detail.contains('\n'))
         );
+        let expired_approval = Event {
+            payload: json!({
+                "challenge_id":approval_source.payload["challenge_id"],
+                "descriptor":"workspace.write · file.txt",
+                "expires_at":crate::storage::unix_time() - 1,
+            }),
+            ..approval_source
+        };
+        assert!(outbound_events(&run, &expired_approval, &installation_id, "actor-1").is_empty());
         assert!(
             outbound_events(
                 &run,

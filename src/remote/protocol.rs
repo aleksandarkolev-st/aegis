@@ -143,6 +143,9 @@ pub struct AegisEvent {
     pub kind: EventKind,
     pub task_id: Option<String>,
     pub challenge_id: Option<String>,
+    /// Unix timestamp at which an approval challenge stops accepting decisions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
     pub display_detail: Option<String>,
     pub reply_text: Option<String>,
 }
@@ -178,6 +181,7 @@ impl AegisEvent {
             kind: EventKind::Reply,
             task_id: None,
             challenge_id: None,
+            expires_at: None,
             display_detail: None,
             reply_text: Some(reply),
         })
