@@ -191,6 +191,28 @@ pub(crate) fn insert_run(transaction: &Transaction<'_>, run: &Run) -> Result<()>
     Ok(())
 }
 
+fn artifact_bytes(connection: &Connection, artifacts: &Path, hash: &str) -> Result<Vec<u8>> {
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("invalid artifact handle");
+    }
+    let exists: Option<i64> = connection
+        .query_row(
+            "SELECT bytes FROM artifacts WHERE hash = ?1",
+            [hash],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if exists.is_none() {
+        bail!("artifact not recorded");
+    }
+    let mut bytes = Vec::new();
+    File::open(artifacts.join(hash))?.read_to_end(&mut bytes)?;
+    if hex::encode(Sha256::digest(&bytes)) != hash {
+        bail!("artifact integrity check failed");
+    }
+    Ok(bytes)
+}
+
 fn validate_completed_milestone_evidence(
     connection: &Connection,
     run_id: &str,
@@ -216,6 +238,19 @@ fn validate_completed_milestone_evidence(
                     "completed milestone evidence is no longer successful and current for this run"
                 );
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_completed_milestone_artifacts(
+    connection: &Connection,
+    artifacts: &Path,
+    milestones: &[Milestone],
+) -> Result<()> {
+    for milestone in milestones.iter().filter(|item| item.state == "completed") {
+        for hash in &milestone.evidence {
+            artifact_bytes(connection, artifacts, hash)?;
         }
     }
     Ok(())
@@ -1031,6 +1066,11 @@ impl Store {
                 }
             }
         }
+        validate_completed_milestone_artifacts(
+            &self.connection,
+            &self.artifacts,
+            &checkpoint.milestones,
+        )?;
         self.refresh_observed_files(run_id)?;
         let hash = self.put_artifact(&serde_json::to_vec(checkpoint)?)?;
         let transaction = self
@@ -1094,6 +1134,7 @@ impl Store {
         crate::obligations::validate_completion(self, run_id)?;
         let milestones = self.milestones(run_id)?;
         validate_completed_milestone_evidence(&self.connection, run_id, &milestones)?;
+        validate_completed_milestone_artifacts(&self.connection, &self.artifacts, &milestones)?;
         if self.run(run_id)?.state != "running" {
             bail!("only a running run can complete");
         }
@@ -1174,6 +1215,7 @@ impl Store {
         let run = self.run(run_id)?;
         let acceptance = crate::acceptance::verified_result(self, &run, summary, evidence)?;
         let proposal = self.completion_proposal(run_id)?;
+        let receipt_milestones = self.milestones(run_id)?;
         let prior_transitions = self
             .events(run_id)?
             .into_iter()
@@ -1190,6 +1232,12 @@ impl Store {
             hashes.extend(item.evidence.iter().cloned());
         }
         hashes.extend(acceptance.iter().cloned());
+        for milestone in receipt_milestones
+            .iter()
+            .filter(|milestone| milestone.state == "completed")
+        {
+            hashes.extend(milestone.evidence.iter().cloned());
+        }
         let mut receipts = std::collections::BTreeMap::new();
         for hash in hashes {
             let bytes = self.artifact(&hash)?;
@@ -1209,6 +1257,7 @@ impl Store {
             }
             receipts.insert(hash, receipt);
         }
+        let artifact_directory = self.artifacts.clone();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1229,7 +1278,7 @@ impl Store {
         }
         crate::obligations::validate_connection(&transaction, run_id)?;
         crate::obligations::validate_finish_evidence(&transaction, run_id, evidence)?;
-        let milestones = {
+        let mut milestones = {
             let mut statement = transaction.prepare(
                 "SELECT title, state, evidence FROM milestones WHERE run_id = ?1 ORDER BY position",
             )?;
@@ -1254,6 +1303,8 @@ impl Store {
                 "UPDATE milestones SET state = 'completed', evidence = ?2 WHERE run_id = ?1",
                 params![run_id, serde_json::to_string(evidence)?],
             )?;
+            milestones[0].state = "completed".into();
+            milestones[0].evidence = evidence.to_vec();
         } else if milestones
             .iter()
             .any(|milestone| milestone.state != "completed")
@@ -1261,6 +1312,11 @@ impl Store {
             bail!("all planned milestones must have evidence before completion");
         }
         validate_completed_milestone_evidence(&transaction, run_id, &milestones)?;
+        validate_completed_milestone_artifacts(
+            &transaction,
+            &artifact_directory,
+            &milestones,
+        )?;
         let revision: Option<i64> = transaction
             .query_row(
                 "SELECT revision FROM workspace_revisions WHERE run_id = ?1",
@@ -1626,26 +1682,7 @@ impl Store {
     }
 
     pub fn artifact(&self, hash: &str) -> Result<Vec<u8>> {
-        if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            bail!("invalid artifact handle");
-        }
-        let exists: Option<i64> = self
-            .connection
-            .query_row(
-                "SELECT bytes FROM artifacts WHERE hash = ?1",
-                [hash],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if exists.is_none() {
-            bail!("artifact not recorded");
-        }
-        let mut bytes = Vec::new();
-        File::open(self.artifacts.join(hash))?.read_to_end(&mut bytes)?;
-        if hex::encode(Sha256::digest(&bytes)) != hash {
-            bail!("artifact integrity check failed");
-        }
-        Ok(bytes)
+        artifact_bytes(&self.connection, &self.artifacts, hash)
     }
 }
 
@@ -2051,6 +2088,106 @@ mod tests {
         store.save_checkpoint(&run.id, &checkpoint)?;
         store.complete_run(&run.id, "done", &[unrelated_fresh_evidence])?;
         assert_eq!(store.run(&run.id)?.state, "completed");
+        Ok(())
+    }
+
+    #[test]
+    fn completed_milestone_evidence_is_integrity_checked() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "repair",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let milestone_operation =
+            store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
+        let milestone_evidence = store.put_artifact(b"milestone proof")?;
+        store.operation_state(
+            &milestone_operation,
+            "succeeded",
+            Some(&milestone_evidence),
+            json!({}),
+        )?;
+        let final_operation = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
+        let final_evidence = store.put_artifact(b"final proof")?;
+        store.operation_state(
+            &final_operation,
+            "succeeded",
+            Some(&final_evidence),
+            json!({}),
+        )?;
+        let checkpoint = Handoff {
+            decisions: vec![],
+            unresolved: vec![],
+            next_action: "finish repair".into(),
+            milestones: vec![Milestone {
+                title: "Repair is verified".into(),
+                state: "completed".into(),
+                evidence: vec![milestone_evidence.clone()],
+            }],
+        };
+        store.save_checkpoint(&run.id, &checkpoint)?;
+
+        std::fs::write(
+            directory
+                .path()
+                .join("artifacts")
+                .join(&milestone_evidence),
+            b"tampered milestone proof",
+        )?;
+        assert!(store.save_checkpoint(&run.id, &checkpoint).is_err());
+        assert!(store.validate_completion(&run.id, &[final_evidence.clone()]).is_err());
+        assert!(store
+            .complete_run(&run.id, "done", &[final_evidence])
+            .is_err());
+        assert_eq!(store.run(&run.id)?.state, "running");
+        Ok(())
+    }
+
+    #[test]
+    fn default_task_milestone_rejects_mixed_stale_and_current_completion_proof() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "repair",
+            directory.path(),
+            "codex",
+            json!(["workspace.write"]),
+            json!({}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let initial_read = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
+        let old_evidence = store.put_artifact(b"revision zero proof")?;
+        store.operation_state(&initial_read, "succeeded", Some(&old_evidence), json!({}))?;
+
+        let mutation = store.begin_operation(&run.id, "workspace.write", json!({}), true)?;
+        store.operation_state(&mutation, "dispatched", None, json!({}))?;
+        let mutation_receipt = store.put_artifact(b"workspace changed")?;
+        store.operation_state(&mutation, "succeeded", Some(&mutation_receipt), json!({}))?;
+        assert_eq!(store.workspace_revision(&run.id)?, Some(1));
+
+        let final_read = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
+        let current_evidence = store.put_artifact(b"revision one proof")?;
+        store.operation_state(&final_read, "succeeded", Some(&current_evidence), json!({}))?;
+        assert!(store
+            .complete_run(
+                &run.id,
+                "done",
+                &[old_evidence.clone(), current_evidence.clone()],
+            )
+            .is_err());
+        assert_eq!(store.milestones(&run.id)?[0].state, "active");
+
+        store.complete_run(&run.id, "done", &[current_evidence.clone()])?;
+        assert_eq!(store.run(&run.id)?.state, "completed");
+        assert_eq!(store.milestones(&run.id)?[0].state, "completed");
+        assert_eq!(store.milestones(&run.id)?[0].evidence, vec![current_evidence]);
         Ok(())
     }
 }
