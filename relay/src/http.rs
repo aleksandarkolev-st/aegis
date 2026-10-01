@@ -84,6 +84,7 @@ async fn provision_installation(
     headers: HeaderMap,
     Json(request): Json<ProvisionRequest>,
 ) -> impl IntoResponse {
+    tracing::info!("remote installation provisioning request received");
     if !authorized(&headers, &state.admin_token) {
         return (
             StatusCode::UNAUTHORIZED,
@@ -107,7 +108,10 @@ async fn provision_installation(
         .provision_installation(&request.actor_id, installation_id)
         .await
     {
-        Ok(provisioned) => (StatusCode::CREATED, Json(serde_json::json!(provisioned))),
+        Ok(provisioned) => {
+            tracing::info!("remote installation provisioning completed");
+            (StatusCode::CREATED, Json(serde_json::json!(provisioned)))
+        }
         Err(crate::repository::RepositoryError::ActorCollision) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({"error":"actor id already belongs to another installation"})),
@@ -116,10 +120,13 @@ async fn provision_installation(
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error":"invalid actor id"})),
         ),
-        Err(_) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error":"temporarily unavailable"})),
-        ),
+        Err(error) => {
+            tracing::warn!(%error, "remote installation provisioning failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error":"temporarily unavailable"})),
+            )
+        }
     }
 }
 

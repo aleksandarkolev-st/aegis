@@ -46,7 +46,10 @@ impl JetStreamTransport {
         if let Some(path) = root_certificate {
             options = options.add_root_certificates(path.to_path_buf());
         }
-        let client = options.connect(url).await.map_err(|_| TransportError)?;
+        let client = options.connect(url).await.map_err(|error| {
+            tracing::warn!(%error, "could not connect relay NATS client");
+            TransportError
+        })?;
         let context = jetstream::new(client);
         context
             .create_or_update_stream(stream_config(
@@ -55,7 +58,10 @@ impl JetStreamTransport {
                 COMMAND_MAX_STREAM_AGE,
             ))
             .await
-            .map_err(|_| TransportError)?;
+            .map_err(|error| {
+                tracing::warn!(%error, "could not create or update the command stream");
+                TransportError
+            })?;
         context
             .create_or_update_stream(stream_config(
                 EVENT_STREAM,
@@ -63,7 +69,10 @@ impl JetStreamTransport {
                 EVENT_MAX_STREAM_AGE,
             ))
             .await
-            .map_err(|_| TransportError)?;
+            .map_err(|error| {
+                tracing::warn!(%error, "could not create or update the event stream");
+                TransportError
+            })?;
         Ok(Self { context })
     }
 
