@@ -47,7 +47,7 @@ fn usage() {
     println!(
         "arun eval [--provider chatgpt|claude|grok] [--sizes 50,100,250,500] [--modes eager,lazy,artifact,durable] [--tasks read,log,repair] [--repeats 1] [--restart-at operation.executing|operation.succeeded|checkpoint.created] [--prepare-only] | eval-report <results.jsonl>"
     );
-    println!("arun remote pair [options] | status | run");
+    println!("arun remote pair [options] | status | revoke | run");
 }
 
 fn view(root: &Path, command: &str, id: &str) -> Result<()> {
