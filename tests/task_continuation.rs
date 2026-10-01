@@ -5,6 +5,8 @@ use std::process::{Command, Stdio};
 use anyhow::Result;
 use arun::storage::Store;
 use serde_json::{Value, json};
+#[path = "support/operation.rs"]
+mod operation_fixture;
 
 fn run_menu(directory: &std::path::Path, input: &str) -> Result<std::process::Output> {
     let home = directory.join("home");
@@ -203,9 +205,15 @@ fn unresolved_outcomes_do_not_open_sign_in_or_create_new_work() -> Result<()> {
         &source.id,
         "workspace.read",
         json!({"path":"src/parser.rs"}),
-        true,
+        false,
     )?;
+    operation_fixture::claim_fixture_operation(&mut store, &operation.id)?;
     store.operation_state(&operation, "outcome_unknown", None, json!({}))?;
+    store.state(
+        &source.id,
+        "waiting_recovery",
+        json!({"operation":operation.id}),
+    )?;
     let original = serde_json::to_value(store.events(&source.id)?)?;
     drop(store);
     let output = run_menu(directory.path(), "/sessions\n1\n6\n/quit\n")?;
