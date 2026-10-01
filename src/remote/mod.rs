@@ -25,6 +25,29 @@ const MAX_COMMAND_TTL_SECONDS: i64 = 5 * 60;
 const CLOCK_SKEW_SECONDS: i64 = 30;
 const MAX_MESSAGE_BYTES: usize = 65_536;
 
+#[derive(Debug)]
+struct CommandRejected(String);
+
+impl std::fmt::Display for CommandRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CommandRejected {}
+
+fn reject_command(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(CommandRejected(message.into()))
+}
+
+fn reject_command_error(error: anyhow::Error) -> anyhow::Error {
+    reject_command(error.to_string())
+}
+
+pub(crate) fn is_command_rejection(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<CommandRejected>().is_some()
+}
+
 /// Fixed, closed set of commands accepted from remote actors.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -81,6 +104,33 @@ impl CommandEnvelope {
             bail!("remote command exceeds the protocol size limit");
         }
         Ok(bytes)
+    }
+
+    /// Hashes the immutable request identity and command payload. Freshness
+    /// timestamps are checked for first acceptance but excluded so relay retries
+    /// can refresh their delivery window without changing command meaning.
+    fn idempotency_hash(&self) -> Result<String> {
+        #[derive(Serialize)]
+        struct RequestIdentity<'a> {
+            version: u32,
+            installation_id: &'a str,
+            actor_id: &'a str,
+            request_id: &'a str,
+            command: &'a Command,
+        }
+
+        let material = RequestIdentity {
+            version: self.version,
+            installation_id: &self.installation_id,
+            actor_id: &self.actor_id,
+            request_id: &self.request_id,
+            command: &self.command,
+        };
+        let bytes = serde_json::to_vec(&material)?;
+        if bytes.len() > MAX_ENVELOPE_BYTES {
+            bail!("remote command exceeds the protocol size limit");
+        }
+        Ok(hex::encode(Sha256::digest(bytes)))
     }
 }
 
@@ -308,16 +358,20 @@ impl Authority {
         request: &CommandEnvelope,
         now: i64,
     ) -> Result<Receipt> {
-        validate_actor_id(authenticated_actor_id)?;
+        validate_actor_id(authenticated_actor_id).map_err(reject_command_error)?;
         if request.actor_id != authenticated_actor_id {
-            bail!("relay-authenticated actor does not match the command actor");
+            return Err(reject_command(
+                "relay-authenticated actor does not match the command actor",
+            ));
         }
-        validate_request(request, now)?;
+        validate_request_shape(request).map_err(reject_command_error)?;
         if request.installation_id != self.installation_id {
-            bail!("remote command targets a different Aegis installation");
+            return Err(reject_command(
+                "remote command targets a different Aegis installation",
+            ));
         }
-        let canonical = request.canonical_bytes()?;
-        let request_hash = hex::encode(Sha256::digest(&canonical));
+        request.canonical_bytes()?;
+        let request_hash = request.idempotency_hash()?;
 
         let transaction = self
             .store
@@ -331,10 +385,10 @@ impl Authority {
             )
             .optional()?;
         let Some(enabled) = enabled else {
-            bail!("remote actor is not paired");
+            return Err(reject_command("remote actor is not paired"));
         };
         if !enabled {
-            bail!("remote actor is revoked");
+            return Err(reject_command("remote actor is revoked"));
         }
         let prior: Option<(String, String, Option<String>)> = transaction
             .query_row(
@@ -345,7 +399,9 @@ impl Authority {
             .optional()?;
         if let Some((prior_hash, prior_result, task_id)) = prior {
             if prior_hash != request_hash {
-                bail!("remote request ID was already used for different content");
+                return Err(reject_command(
+                    "remote request ID was already used for different content",
+                ));
             }
             if let Some(task_id) = task_id.as_deref() {
                 require_actor_run(&transaction, &request.actor_id, task_id)?;
@@ -359,6 +415,7 @@ impl Authority {
             });
         }
 
+        validate_request_time(request, now).map_err(reject_command_error)?;
         let applied = apply_command(
             &transaction,
             &request.actor_id,
@@ -855,14 +912,24 @@ fn apply_command(
             else {
                 return Ok(CommandApply::NeedsTaskCreation);
             };
+            let state = run_state(transaction, &run_id)?;
+            if task_id.is_none() && is_terminal(&state) {
+                // A chat bound to a finished task starts a fresh local task on
+                // the next ordinary message. Explicit task targets still fail
+                // below, and status can continue to inspect the old task.
+                return Ok(CommandApply::NeedsTaskCreation);
+            }
             let text = text.replace("\r\n", "\n").replace('\r', "\n");
             let text = crate::text::clean(&text).trim().to_owned();
             if text.is_empty() || text.len() > MAX_MESSAGE_BYTES {
-                bail!("remote message must be nonempty and at most 65536 UTF-8 bytes");
+                return Err(reject_command(
+                    "remote message must be nonempty and at most 65536 UTF-8 bytes",
+                ));
             }
-            let state = run_state(transaction, &run_id)?;
             if !matches!(state.as_str(), "ready" | "running") {
-                bail!("task is no longer active; message was not queued");
+                return Err(reject_command(
+                    "task is no longer active; message was not queued",
+                ));
             }
             append_event(
                 transaction,
@@ -936,7 +1003,7 @@ fn apply_command(
             let run_id = require_resolved_task(transaction, actor_id, task_id.as_deref())?;
             let state = run_state(transaction, &run_id)?;
             if is_terminal(&state) {
-                bail!("ended tasks cannot pause");
+                return Err(reject_command("ended tasks cannot pause"));
             }
             let pending: bool = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pause_requests WHERE run_id=?1 AND pending=1)",
@@ -964,7 +1031,7 @@ fn apply_command(
             let run_id = require_resolved_task(transaction, actor_id, task_id.as_deref())?;
             let state = run_state(transaction, &run_id)?;
             if is_terminal(&state) {
-                bail!("ended tasks cannot resume");
+                return Err(reject_command("ended tasks cannot resume"));
             }
             let unknown: i64 = transaction.query_row(
                 "SELECT COUNT(*) FROM operations WHERE run_id=?1 AND state='outcome_unknown'",
@@ -972,7 +1039,9 @@ fn apply_command(
                 |row| row.get(0),
             )?;
             if unknown > 0 {
-                bail!("uncertain operation outcomes need local reconciliation before resume");
+                return Err(reject_command(
+                    "uncertain operation outcomes need local reconciliation before resume",
+                ));
             }
             append_event(
                 transaction,
@@ -1003,7 +1072,7 @@ fn apply_command(
             let run_id = require_resolved_task(transaction, actor_id, task_id.as_deref())?;
             let state = run_state(transaction, &run_id)?;
             if is_terminal(&state) {
-                bail!("ended tasks cannot be cancelled");
+                return Err(reject_command("ended tasks cannot be cancelled"));
             }
             transaction.execute("UPDATE runs SET state='cancelled' WHERE id=?1", [&run_id])?;
             transaction.execute(
@@ -1040,28 +1109,36 @@ fn apply_command(
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             ).optional()?;
             let Some((run_id, operation_id, intent_hash, gate_state, expires_at)) = current else {
-                bail!("approval challenge is unknown");
+                return Err(reject_command("approval challenge is unknown"));
             };
             require_actor_run(transaction, actor_id, &run_id)?;
             if expires_at <= now {
-                bail!("approval challenge has expired");
+                return Err(reject_command("approval challenge has expired"));
             }
             if gate_state != "pending" {
-                bail!("approval challenge has already been resolved");
+                return Err(reject_command(
+                    "approval challenge has already been resolved",
+                ));
             }
             let operation = operation_in_transaction(transaction, &run_id, &operation_id)?;
             if operation.state != "pending" {
-                bail!("approval challenge no longer refers to a pending operation");
+                return Err(reject_command(
+                    "approval challenge no longer refers to a pending operation",
+                ));
             }
             if operation_intent_hash(&operation)? != intent_hash {
-                bail!("the pending operation changed after the local approval gate was created");
+                return Err(reject_command(
+                    "the pending operation changed after the local approval gate was created",
+                ));
             }
             let changed = transaction.execute(
                 "UPDATE remote_operation_gates SET state=?2,decision_actor=?3,decision_request=?4,decided_at=?5 WHERE challenge_id=?1 AND state='pending'",
                 params![challenge_id, wanted, actor_id, request_id, now],
             )?;
             if changed != 1 {
-                bail!("approval challenge was concurrently resolved");
+                return Err(reject_command(
+                    "approval challenge was concurrently resolved",
+                ));
             }
             append_event(
                 transaction,
@@ -1097,7 +1174,7 @@ fn require_resolved_task(
     requested: Option<&str>,
 ) -> Result<String> {
     resolve_actor_task(transaction, actor_id, requested)?
-        .ok_or_else(|| anyhow::anyhow!("select or specify a task first"))
+        .ok_or_else(|| reject_command("select or specify a task first"))
 }
 
 fn resolve_actor_task(
@@ -1133,7 +1210,9 @@ fn require_actor_run(transaction: &Transaction<'_>, actor_id: &str, run_id: &str
         |row| row.get(0),
     )?;
     if !allowed {
-        bail!("remote actor is not authorized for this task");
+        return Err(reject_command(
+            "remote actor is not authorized for this task",
+        ));
     }
     Ok(())
 }
@@ -1210,21 +1289,13 @@ fn operation_intent_hash(operation: &crate::storage::Operation) -> Result<String
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(&material)?)))
 }
 
-fn validate_request(request: &CommandEnvelope, now: i64) -> Result<()> {
+fn validate_request_shape(request: &CommandEnvelope) -> Result<()> {
     if request.version != PROTOCOL_VERSION {
         bail!("unsupported remote command protocol version");
     }
     validate_uuid(&request.installation_id, "installation ID")?;
     validate_actor_id(&request.actor_id)?;
     validate_uuid(&request.request_id, "request ID")?;
-    if request.issued_at <= 0
-        || request.expires_at <= now
-        || request.issued_at > now.saturating_add(CLOCK_SKEW_SECONDS)
-        || request.expires_at <= request.issued_at
-        || request.expires_at.saturating_sub(request.issued_at) > MAX_COMMAND_TTL_SECONDS
-    {
-        bail!("remote command is expired or has an invalid time window");
-    }
     if let Command::Message { text, task_id } = &request.command {
         if let Some(task_id) = task_id {
             validate_uuid(task_id, "task ID")?;
@@ -1250,6 +1321,18 @@ fn validate_request(request: &CommandEnvelope, now: i64) -> Result<()> {
         validate_uuid(challenge_id, "approval challenge ID")?;
     }
     request.canonical_bytes()?;
+    Ok(())
+}
+
+fn validate_request_time(request: &CommandEnvelope, now: i64) -> Result<()> {
+    if request.issued_at <= 0
+        || request.expires_at <= now
+        || request.issued_at > now.saturating_add(CLOCK_SKEW_SECONDS)
+        || request.expires_at <= request.issued_at
+        || request.expires_at.saturating_sub(request.issued_at) > MAX_COMMAND_TTL_SECONDS
+    {
+        bail!("remote command is expired or has an invalid time window");
+    }
     Ok(())
 }
 
@@ -1348,6 +1431,19 @@ mod tests {
         )?;
         assert!(second.duplicate);
         assert_eq!(first.result, second.result);
+        let retry_now = test_now();
+        let retried_after_delivery_window = CommandEnvelope {
+            issued_at: retry_now - 600,
+            expires_at: retry_now - 1,
+            ..request.clone()
+        };
+        let stale_duplicate = fixture.authority.apply_from_authenticated_relay(
+            &fixture.actor_id,
+            &retried_after_delivery_window,
+            retry_now,
+        )?;
+        assert!(stale_duplicate.duplicate);
+        assert_eq!(first.result, stale_duplicate.result);
         let events = fixture
             .authority
             .store
@@ -1498,6 +1594,49 @@ mod tests {
                 .apply_from_authenticated_relay("new-phone", &rebound, test_now())?;
         assert_eq!(applied.result["task_id"], task.id);
         assert!(!applied.duplicate);
+        Ok(())
+    }
+
+    #[test]
+    fn message_after_selected_task_ends_hands_off_to_a_new_task() -> Result<()> {
+        let mut fixture = Fixture::new()?;
+        fixture
+            .authority
+            .bind_selected_task(&fixture.actor_id, &fixture.run_id)?;
+        fixture.authority.store.connection.execute(
+            "UPDATE runs SET state='completed' WHERE id=?1",
+            [&fixture.run_id],
+        )?;
+
+        let status = fixture.apply(Command::Status { task_id: None })?;
+        assert_eq!(status.result["state"], "completed");
+
+        let message = fixture.apply(Command::Message {
+            text: "Start another task".into(),
+            task_id: None,
+        })?;
+        assert_eq!(message.result["needs_task_creation"], true);
+        assert_eq!(
+            fixture
+                .authority
+                .store
+                .events(&fixture.run_id)?
+                .iter()
+                .filter(|event| event.kind == "user.steering")
+                .count(),
+            0
+        );
+
+        let explicit = fixture.request(Command::Message {
+            text: "Try to steer the completed run".into(),
+            task_id: Some(fixture.run_id.clone()),
+        });
+        assert!(
+            fixture
+                .authority
+                .apply_from_authenticated_relay(&fixture.actor_id, &explicit, test_now())
+                .is_err()
+        );
         Ok(())
     }
 

@@ -389,7 +389,7 @@ async fn process_command(
                 apply_command_effects(root, authority, &envelope, &receipt)?;
                 format_receipt(&envelope.command, &receipt)
             }
-            Err(_) => rejection_reply(&envelope.command),
+            Err(error) => command_failure_reply(&envelope.command, error)?,
         };
     let event_id = stable_uuid(&format!(
         "reply\0{}\0{}\0{}",
@@ -558,6 +558,16 @@ fn rejection_reply(command: &RelayCommand) -> String {
         }
         RelayCommand::SelectTask { .. } => "Aegis could not select that task. Use /tasks to see tasks shared with this phone.".into(),
         RelayCommand::ApproveOnce { .. } | RelayCommand::Deny { .. } => "Aegis could not resolve that approval. It may have expired or already been decided.".into(),
+    }
+}
+
+fn command_failure_reply(command: &RelayCommand, error: anyhow::Error) -> Result<String> {
+    if super::is_command_rejection(&error) {
+        Ok(rejection_reply(command))
+    } else {
+        // Internal SQLite, filesystem, profile, or process failures must leave
+        // the JetStream message unacknowledged so the command can be retried.
+        Err(error)
     }
 }
 
@@ -804,6 +814,17 @@ mod tests {
     }
 
     #[test]
+    fn only_expected_rejections_become_replies_while_internal_errors_retry() {
+        let rejection = super::super::reject_command("task is no longer active");
+        let reply = command_failure_reply(&RelayCommand::Status, rejection).unwrap();
+        assert!(reply.contains("could not apply"));
+
+        let transient = anyhow::anyhow!("temporary SQLite failure");
+        let error = command_failure_reply(&RelayCommand::Status, transient).unwrap_err();
+        assert!(error.to_string().contains("temporary SQLite failure"));
+    }
+
+    #[test]
     fn first_message_creates_one_stable_local_task_and_receipt() -> Result<()> {
         let workspace = tempfile::tempdir()?;
         let root = workspace.path().join(".arun");
@@ -811,7 +832,19 @@ mod tests {
         let now = Utc::now().timestamp();
 
         let first = apply_relay_command(&root, &config, &mut authority, &relay, now)?;
-        let second = apply_relay_command(&root, &config, &mut authority, &relay, now)?;
+        let retry_now = Utc::now();
+        let retried_envelope = RelayCommandEnvelope {
+            issued_at: retry_now,
+            expires_at: retry_now + ChronoDuration::minutes(5),
+            ..relay.clone()
+        };
+        let second = apply_relay_command(
+            &root,
+            &config,
+            &mut authority,
+            &retried_envelope,
+            retry_now.timestamp(),
+        )?;
         assert!(!first.duplicate);
         assert!(second.duplicate);
         assert_eq!(first.result["task_id"], second.result["task_id"]);
@@ -826,6 +859,42 @@ mod tests {
         assert_eq!(
             authority.store.run(task_id)?.budgets["model"],
             "gpt-6.1-sol"
+        );
+
+        authority
+            .store
+            .connection
+            .execute("UPDATE runs SET state='completed' WHERE id=?1", [task_id])?;
+        let next_now = Utc::now();
+        let next_task_envelope = RelayCommandEnvelope {
+            envelope_id: Uuid::new_v4().to_string(),
+            request_id: Uuid::new_v4().to_string(),
+            external_message_id: "provider-message-id-2".into(),
+            issued_at: next_now,
+            expires_at: next_now + ChronoDuration::minutes(5),
+            command: RelayCommand::Message {
+                text: "Start another task".into(),
+            },
+            ..relay.clone()
+        };
+        let next_task = apply_relay_command(
+            &root,
+            &config,
+            &mut authority,
+            &next_task_envelope,
+            next_now.timestamp(),
+        )?;
+        assert!(!next_task.duplicate);
+        let next_task_id = next_task.result["task_id"].as_str().unwrap();
+        assert_ne!(next_task_id, task_id);
+        assert_eq!(authority.store.runs()?.len(), 2);
+        assert_eq!(
+            authority.selected_task(&relay.actor_id)?.as_deref(),
+            Some(next_task_id)
+        );
+        assert_eq!(
+            authority.store.event_count(next_task_id, "user.steering")?,
+            1
         );
         Ok(())
     }
