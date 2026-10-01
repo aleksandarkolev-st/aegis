@@ -22,7 +22,23 @@ services:
     image: nats:2-alpine
     command: ["-c", "/etc/nats/nats-server.conf"]
     environment:
-      NATS_AUTH_TOKEN: local-development-nats-token-not-for-production
+      NATS_AUTH_TOKEN: ${NATS_AUTH_TOKEN:?Set the aegis-relay principal password}
+      AEGIS_NATS_DEVICE_USERNAME: ${AEGIS_NATS_DEVICE_USERNAME:?Set the first canonical installation principal}
+      AEGIS_NATS_DEVICE_PASSWORD: ${AEGIS_NATS_DEVICE_PASSWORD:?Set the first device password}
+      AEGIS_NATS_DEVICE_EVENT_SUBJECT: ${AEGIS_NATS_DEVICE_EVENT_SUBJECT:?Set the exact first device event subject}
+      AEGIS_NATS_DEVICE_CONSUMER_INFO: ${AEGIS_NATS_DEVICE_CONSUMER_INFO:?Set the exact first device consumer info API}
+      AEGIS_NATS_DEVICE_CONSUMER_CREATE: ${AEGIS_NATS_DEVICE_CONSUMER_CREATE:?Set the exact first device filtered create API}
+      AEGIS_NATS_DEVICE_CONSUMER_NEXT: ${AEGIS_NATS_DEVICE_CONSUMER_NEXT:?Set the exact first device pull API}
+      AEGIS_NATS_DEVICE_ACK: ${AEGIS_NATS_DEVICE_ACK:?Set the exact first device consumer ACK pattern}
+      AEGIS_NATS_DEVICE_INBOX: ${AEGIS_NATS_DEVICE_INBOX:?Set the private first device inbox pattern}
+      AEGIS_NATS_DEVICE2_USERNAME: ${AEGIS_NATS_DEVICE2_USERNAME:?Set the second canonical installation principal}
+      AEGIS_NATS_DEVICE2_PASSWORD: ${AEGIS_NATS_DEVICE2_PASSWORD:?Set the second device password}
+      AEGIS_NATS_DEVICE2_EVENT_SUBJECT: ${AEGIS_NATS_DEVICE2_EVENT_SUBJECT:?Set the exact second device event subject}
+      AEGIS_NATS_DEVICE2_CONSUMER_INFO: ${AEGIS_NATS_DEVICE2_CONSUMER_INFO:?Set the exact second device consumer info API}
+      AEGIS_NATS_DEVICE2_CONSUMER_CREATE: ${AEGIS_NATS_DEVICE2_CONSUMER_CREATE:?Set the exact second device filtered create API}
+      AEGIS_NATS_DEVICE2_CONSUMER_NEXT: ${AEGIS_NATS_DEVICE2_CONSUMER_NEXT:?Set the exact second device pull API}
+      AEGIS_NATS_DEVICE2_ACK: ${AEGIS_NATS_DEVICE2_ACK:?Set the exact second device consumer ACK pattern}
+      AEGIS_NATS_DEVICE2_INBOX: ${AEGIS_NATS_DEVICE2_INBOX:?Set the private second device inbox pattern}
     ports:
       - "127.0.0.1:${RELAY_NATS_PORT:-4422}:4222"
     volumes:

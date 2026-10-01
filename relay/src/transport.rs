@@ -18,6 +18,8 @@ use crate::{
 
 const COMMAND_STREAM: &str = "AEGIS_COMMANDS";
 const EVENT_STREAM: &str = "AEGIS_EVENTS";
+const RELAY_NATS_PRINCIPAL: &str = "aegis-relay";
+const EVENT_CONSUMER: &str = "relay-whatsapp-delivery";
 const MAX_STREAM_BYTES: i64 = 64 * 1024 * 1024;
 const COMMAND_MAX_STREAM_AGE: Duration = Duration::from_secs(15 * 60);
 const EVENT_MAX_STREAM_AGE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -34,11 +36,12 @@ pub struct JetStreamTransport {
 impl JetStreamTransport {
     pub async fn connect(
         url: &str,
-        auth_token: &str,
+        password: &str,
         root_certificate: Option<&Path>,
     ) -> Result<Self, TransportError> {
         let mut options = async_nats::ConnectOptions::new()
-            .token(auth_token.to_owned())
+            .user_and_password(RELAY_NATS_PRINCIPAL.to_owned(), password.to_owned())
+            .custom_inbox_prefix("_INBOX.aegis.relay")
             .require_tls(true);
         if let Some(path) = root_certificate {
             options = options.add_root_certificates(path.to_path_buf());
@@ -95,16 +98,19 @@ impl JetStreamTransport {
             .map_err(|_| TransportError)?;
         let consumer = stream
             .get_or_create_consumer(
-                "relay-whatsapp-delivery",
+                EVENT_CONSUMER,
                 jetstream::consumer::pull::Config {
-                    durable_name: Some("relay-whatsapp-delivery".to_owned()),
+                    durable_name: Some(EVENT_CONSUMER.to_owned()),
+                    name: Some(EVENT_CONSUMER.to_owned()),
                     filter_subject: "aegis.events.*".to_owned(),
+                    ack_policy: jetstream::consumer::AckPolicy::Explicit,
                     ack_wait: Duration::from_secs(45),
                     ..Default::default()
                 },
             )
             .await
             .map_err(|_| TransportError)?;
+        validate_event_consumer(consumer.cached_info())?;
         let mut messages = consumer.messages().await.map_err(|_| TransportError)?;
         while let Some(message) = messages.next().await {
             let message = message.map_err(|_| TransportError)?;
@@ -141,6 +147,22 @@ impl JetStreamTransport {
         }
         Ok(())
     }
+}
+
+fn validate_event_consumer(info: &jetstream::consumer::Info) -> Result<(), TransportError> {
+    let config = &info.config;
+    if info.stream_name != EVENT_STREAM
+        || info.name != EVENT_CONSUMER
+        || config.durable_name.as_deref() != Some(EVENT_CONSUMER)
+        || config.name.as_deref() != Some(EVENT_CONSUMER)
+        || config.filter_subject != "aegis.events.*"
+        || config.deliver_subject.is_some()
+        || config.deliver_group.is_some()
+        || config.ack_policy != jetstream::consumer::AckPolicy::Explicit
+    {
+        return Err(TransportError);
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -232,6 +254,52 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn nats_event_consumer_rejects_existing_authority_mismatches() {
+        let valid = serde_json::json!({
+            "stream_name": EVENT_STREAM,
+            "name": EVENT_CONSUMER,
+            "created": "2026-10-01T00:00:00Z",
+            "config": jetstream::consumer::Config {
+                name: Some(EVENT_CONSUMER.to_owned()),
+                durable_name: Some(EVENT_CONSUMER.to_owned()),
+                filter_subject: "aegis.events.*".to_owned(),
+                ack_policy: jetstream::consumer::AckPolicy::Explicit,
+                ..Default::default()
+            },
+            "delivered": {"consumer_seq": 0, "stream_seq": 0},
+            "ack_floor": {"consumer_seq": 0, "stream_seq": 0},
+            "num_ack_pending": 0, "num_redelivered": 0,
+            "num_waiting": 0, "num_pending": 0
+        });
+        let info = serde_json::from_value(valid.clone()).unwrap();
+        assert!(validate_event_consumer(&info).is_ok());
+        for (field, value) in [
+            ("name", serde_json::json!("other")),
+            ("durable_name", serde_json::json!(null)),
+            ("filter_subject", serde_json::json!("aegis.>")),
+            ("filter_subject", serde_json::json!("")),
+            ("deliver_subject", serde_json::json!("_INBOX.other")),
+            ("deliver_group", serde_json::json!("other")),
+            ("ack_policy", serde_json::json!("all")),
+            ("ack_policy", serde_json::json!("none")),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["config"][field] = value;
+            let info = serde_json::from_value(invalid).unwrap();
+            assert!(validate_event_consumer(&info).is_err());
+        }
+        for (field, value) in [
+            ("name", serde_json::json!("other")),
+            ("stream_name", serde_json::json!("AEGIS_COMMANDS")),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            let info = serde_json::from_value(invalid).unwrap();
+            assert!(validate_event_consumer(&info).is_err());
+        }
+    }
 
     #[test]
     fn event_stream_retains_for_a_day_with_a_hard_byte_cap() {

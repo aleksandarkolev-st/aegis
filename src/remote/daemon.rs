@@ -564,7 +564,8 @@ async fn run_nats_session(
     authority: &mut Authority,
 ) -> Result<()> {
     let mut options = async_nats::ConnectOptions::new()
-        .token(nats_token.to_owned())
+        .user_and_password(config.nats_username()?, nats_token.to_owned())
+        .custom_inbox_prefix(format!("_INBOX.aegis.device.{}", config.installation_id))
         .require_tls(true);
     if let Some(root_certificate) = &config.nats_root_certificate {
         options = options.add_root_certificates(root_certificate.clone());
@@ -575,7 +576,7 @@ async fn run_nats_session(
         .context("could not connect to the authenticated TLS NATS endpoint")?;
     let context = jetstream::new(client);
     let stream = context
-        .get_stream(COMMAND_STREAM)
+        .get_stream_no_info(COMMAND_STREAM)
         .await
         .context("Aegis command stream is unavailable")?;
     let durable_name = format!("aegis-{}", config.installation_id);
@@ -584,13 +585,16 @@ async fn run_nats_session(
             &durable_name,
             jetstream::consumer::pull::Config {
                 durable_name: Some(durable_name.clone()),
+                name: Some(durable_name.clone()),
                 filter_subject: format!("aegis.commands.{}", config.installation_id),
+                ack_policy: jetstream::consumer::AckPolicy::Explicit,
                 ack_wait: Duration::from_secs(45),
                 ..Default::default()
             },
         )
         .await
         .context("could not create the installation-scoped command consumer")?;
+    validate_command_consumer(consumer.cached_info(), &config.installation_id)?;
     let transport = Transport {
         context,
         installation_id: config.installation_id.clone(),
@@ -627,6 +631,27 @@ async fn run_nats_session(
             }
         }
     }
+}
+
+fn validate_command_consumer(
+    info: &jetstream::consumer::Info,
+    installation_id: &str,
+) -> Result<()> {
+    let durable_name = format!("aegis-{installation_id}");
+    let expected_subject = format!("aegis.commands.{installation_id}");
+    let config = &info.config;
+    if info.stream_name != COMMAND_STREAM
+        || info.name != durable_name
+        || config.durable_name.as_deref() != Some(durable_name.as_str())
+        || config.name.as_deref() != Some(durable_name.as_str())
+        || config.filter_subject != expected_subject
+        || config.deliver_subject.is_some()
+        || config.deliver_group.is_some()
+        || config.ack_policy != jetstream::consumer::AckPolicy::Explicit
+    {
+        bail!("NATS command consumer does not match this installation's authority");
+    }
+    Ok(())
 }
 
 async fn process_command(
@@ -1176,6 +1201,56 @@ mod tests {
     use super::*;
     use chrono::Duration as ChronoDuration;
     use std::collections::VecDeque;
+
+    #[test]
+    fn nats_command_consumer_rejects_existing_authority_mismatches() -> Result<()> {
+        let installation_id = "12345678-abcd-4321-8765-123456789abc";
+        let name = format!("aegis-{installation_id}");
+        let valid = json!({
+            "stream_name": COMMAND_STREAM,
+            "name": name,
+            "created": "2026-10-01T00:00:00Z",
+            "config": jetstream::consumer::Config {
+                name: Some(name.clone()),
+                durable_name: Some(name.clone()),
+                filter_subject: format!("aegis.commands.{installation_id}"),
+                ack_policy: jetstream::consumer::AckPolicy::Explicit,
+                ..Default::default()
+            },
+            "delivered": {"consumer_seq": 0, "stream_seq": 0},
+            "ack_floor": {"consumer_seq": 0, "stream_seq": 0},
+            "num_ack_pending": 0, "num_redelivered": 0,
+            "num_waiting": 0, "num_pending": 0
+        });
+        let info = serde_json::from_value(valid.clone())?;
+        validate_command_consumer(&info, installation_id)?;
+        for (field, value) in [
+            ("name", json!("aegis-other")),
+            ("durable_name", json!("aegis-other")),
+            ("durable_name", json!(null)),
+            ("filter_subject", json!("aegis.commands.*")),
+            ("filter_subject", json!("")),
+            ("deliver_subject", json!("_INBOX.aegis.relay.inject")),
+            ("deliver_group", json!("other")),
+            ("ack_policy", json!("all")),
+            ("ack_policy", json!("none")),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["config"][field] = value;
+            let info = serde_json::from_value(invalid)?;
+            assert!(validate_command_consumer(&info, installation_id).is_err());
+        }
+        for (field, value) in [
+            ("name", json!("aegis-other")),
+            ("stream_name", json!("AEGIS_EVENTS")),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            let info = serde_json::from_value(invalid)?;
+            assert!(validate_command_consumer(&info, installation_id).is_err());
+        }
+        Ok(())
+    }
 
     struct ScriptedSession {
         outcomes: VecDeque<bool>,

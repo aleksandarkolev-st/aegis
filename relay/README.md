@@ -45,9 +45,48 @@ Approval commands carry the challenge ID. There is no /approve alias. IDs are re
 
 Each command envelope includes installation_id, actor_id, stable envelope_id and request_id, issued/expiry timestamps, source channel/sender/message IDs, and the typed command. Commands expire after five minutes. Retries reuse stable IDs and set JetStream's Nats-Msg-Id. Event envelopes include installation_id, actor_id, challenge_id, display_detail, and reply_text; nullable event-specific fields are null when unused. The relay restricts fan-out to the matching paired destination.
 
-Relay-to-Aegis authentication uses TLS and NATS principal/subject ACLs. Give the relay service principal permission to publish `aegis.commands.*`, consume `aegis.events.*`, and create or inspect only the two named streams and the event-delivery consumer. Give each Aegis device permission to consume only `aegis.commands.<its-installation-uuid>` and publish only `aegis.events.<its-installation-uuid>`. Its NATS principal also needs the JetStream API requests and replies used to inspect the command stream, create or inspect its named durable pull consumer, pull messages, and acknowledge them; scope those to that stream and consumer instead of allowing all of `$JS.API.>` or `$JS.ACK.>`. Aegis validates the installation, expiry, typed command, and envelope actor_id against its local actor-to-run mapping before dispatch. No actor HMAC key is sent to or shared with the relay. Each Aegis event carries actor_id from the local actor-to-run scope; before delivery, the relay selects only active bindings for the same installation, actor, and active channel adapter. A phone paired to another actor on the same installation cannot receive that event.
+Relay-to-Aegis authentication uses TLS and separate NATS users with subject permissions. The relay authenticates as `aegis-relay`; each device authenticates as `aegis-<canonical lowercase installation UUID>` with its own password. Aegis validates the installation, expiry, typed command, and envelope actor_id against its local actor-to-run mapping before dispatch. No actor HMAC key is sent to or shared with the relay. Each Aegis event carries actor_id from the local actor-to-run scope; before delivery, the relay selects only active bindings for the same installation, actor, and active channel adapter. A phone paired to another actor on the same installation cannot receive that event.
 
 The relay's `relay-whatsapp-delivery` durable pull consumer is supervised independently from HTTP serving. A JetStream pull error or end-of-stream drops the current pull stream, waits with exponential backoff from 1 to 30 seconds, then gets or creates the same durable consumer and resumes pending events. The backoff resets after a consumer stays connected for at least a minute. Unacknowledged events remain eligible for redelivery until acknowledged or removed by the event stream's one-day/64 MiB limits.
+
+## NATS principal provisioning
+
+Provision NATS users separately from HTTP channel pairing. The admin pairing route does not issue NATS credentials. Use a current supported NATS server with the named, single-filter consumer create API (introduced in 2.9). Replace any server-wide `authorization.token` configuration with an explicit user list. Generate a distinct random password for the relay and for every installation, and store production server passwords as bcrypt hashes or use an equivalent external provisioning system. Retain TLS. Rotate or revoke an installation's NATS user independently of channel pairing when its device credential is compromised.
+
+The legacy names `NATS_AUTH_TOKEN` and `--nats-token-env` now identify **user passwords**, not NATS token authentication. The relay reads its password from `NATS_AUTH_TOKEN`. Aegis stores only the environment variable name in `remote.json`; its daemon reads the installation password from that variable. Neither client accepts a username override or falls back to shared token authentication.
+
+For installation `I`, substitute its canonical lowercase hyphenated UUID and set `C` to `aegis-I`. Its NATS user is `C`. Give it precisely these publish permissions:
+
+```text
+aegis.events.I
+$JS.API.CONSUMER.INFO.AEGIS_COMMANDS.C
+$JS.API.CONSUMER.CREATE.AEGIS_COMMANDS.C.aegis.commands.I
+$JS.API.CONSUMER.MSG.NEXT.AEGIS_COMMANDS.C
+$JS.ACK.AEGIS_COMMANDS.C.*.*.*.*.*
+```
+
+Give it only `_INBOX.aegis.device.I.>` as a subscribe permission. Aegis sets `_INBOX.aegis.device.I` as its custom inbox prefix. Pull messages and API/publish replies arrive through those inboxes; no direct subscription to the command subject or stream-info permission is needed. Before pulling, the daemon checks the returned consumer's stream, name, durable name, exact command filter, pull mode, and explicit acknowledgement policy. An existing consumer with different authority fails closed.
+
+Give `aegis-relay` precisely these publish permissions:
+
+```text
+aegis.commands.*
+$JS.API.STREAM.CREATE.AEGIS_COMMANDS
+$JS.API.STREAM.UPDATE.AEGIS_COMMANDS
+$JS.API.STREAM.CREATE.AEGIS_EVENTS
+$JS.API.STREAM.UPDATE.AEGIS_EVENTS
+$JS.API.STREAM.INFO.AEGIS_EVENTS
+$JS.API.CONSUMER.INFO.AEGIS_EVENTS.relay-whatsapp-delivery
+$JS.API.CONSUMER.CREATE.AEGIS_EVENTS.relay-whatsapp-delivery.aegis.events.*
+$JS.API.CONSUMER.MSG.NEXT.AEGIS_EVENTS.relay-whatsapp-delivery
+$JS.ACK.AEGIS_EVENTS.relay-whatsapp-delivery.*.*.*.*.*
+```
+
+Give the relay only `_INBOX.aegis.relay.>` as a subscribe permission; its custom inbox prefix is `_INBOX.aegis.relay`. The relay also checks the returned durable consumer's scope and acknowledgement policy before pulling. Allow lists deny subjects outside the list. Do not add unrestricted users, broad `$JS.API.>` or `$JS.ACK.>` grants, shared `_INBOX.>` subscriptions, `allow_responses`, unfiltered `CONSUMER.CREATE` endpoints, or legacy `CONSUMER.DURABLE.CREATE` endpoints. In particular, a device grant for a consumer name without the exact filter suffix would let it request a different filter in the payload. The filtered endpoint checks the payload against the filter in its subject and rejects multiple filters. See the [NATS consumer API implementation](https://github.com/nats-io/nats-server/blob/v2.12.0/server/jetstream_api.go#L4286) and [authentication documentation](https://docs.nats.io/learn/security/authentication-basics).
+
+These ACK grants cover the standalone server configuration here. If deploying JetStream domains or cross-account routing that changes ACK subjects, scope the additional emitted ACK format to the same stream and consumer, and configure the matching API prefix as required by that topology. Do not broaden an ACK grant to compensate for a topology mismatch. Administrative inspection, cleanup, and credential provisioning should use a separate trusted operator principal; devices and the relay are not granted consumer-delete permissions.
+
+The shared `AEGIS_COMMANDS` and `AEGIS_EVENTS` streams isolate message access through these permissions, but **do not isolate availability or storage quotas**. One device's event flood can fill the shared 64 MiB event stream and evict another device's pending events. Deploy per-installation streams with exact subjects and separate limits, or per-installation JetStream accounts, when that boundary is required; those deployments also need corresponding relay consumer lifecycle changes.
 
 ## WhatsApp delivery guarantee
 
@@ -78,7 +117,7 @@ Required variables:
 | --- | --- |
 | DATABASE_URL | PostgreSQL URL. Production should use sslmode=verify-full. |
 | NATS_URL | tls://host:port; plaintext NATS is rejected. |
-| NATS_AUTH_TOKEN | Relay service credential, at least 32 characters. Keep it in a secret manager. |
+| NATS_AUTH_TOKEN | Password for the fixed `aegis-relay` NATS user, at least 32 characters. Keep it in a secret manager. |
 | NATS_TLS_ROOT_CERT | Optional PEM CA path for a private NATS certificate authority. |
 | RELAY_ADMIN_TOKEN | Admin API bearer secret, at least 32 characters. |
 | EVOLUTION_BASE_URL | HTTPS Evolution API base URL. HTTP is allowed only for localhost development. |
@@ -91,7 +130,22 @@ In production, bind the process to a private interface and expose the webhook th
 
 ## Local services and smoke test
 
-Local Compose binds PostgreSQL and NATS to loopback only. NATS uses TLS and a development token; its test certificate is generated locally and is not committed. PostgreSQL plaintext is allowed only with RELAY_ALLOW_INSECURE_LOCAL_DATABASE=true and a localhost or Compose-service database host.
+Local Compose binds PostgreSQL and NATS to loopback only. NATS uses TLS, the relay user, and two devices with exact installation permissions; its test certificate is generated locally and is not committed. PostgreSQL plaintext is allowed only with RELAY_ALLOW_INSECURE_LOCAL_DATABASE=true and a localhost or Compose-service database host.
+
+Compose requires `NATS_AUTH_TOKEN` for the relay password and the following complete values for each device. Use prefix `AEGIS_NATS_DEVICE_` for the first device and `AEGIS_NATS_DEVICE2_` for the second; substitute `I` and `C` as described above. NATS config variables do not interpolate UUIDs inside subject strings, so provide each full subject rather than a UUID placeholder. There are no shared-token or wildcard-device defaults.
+
+| Variable suffix | Value |
+| --- | --- |
+| USERNAME | `aegis-I` |
+| PASSWORD | Unique device password, separate from `NATS_AUTH_TOKEN` |
+| EVENT_SUBJECT | `aegis.events.I` |
+| CONSUMER_INFO | `$JS.API.CONSUMER.INFO.AEGIS_COMMANDS.C` |
+| CONSUMER_CREATE | `$JS.API.CONSUMER.CREATE.AEGIS_COMMANDS.C.aegis.commands.I` |
+| CONSUMER_NEXT | `$JS.API.CONSUMER.MSG.NEXT.AEGIS_COMMANDS.C` |
+| ACK | `$JS.ACK.AEGIS_COMMANDS.C.*.*.*.*.*` |
+| INBOX | `_INBOX.aegis.device.I.>` |
+
+Derive these values from the installation identity before starting NATS. Supply the first device's password to its daemon under the environment variable named by `--nats-token-env`. Treat the inputs as operator configuration: setting a wildcard where an exact subject is specified would weaken the boundary.
 
 From the repository root in PowerShell, run:
 
@@ -110,10 +164,10 @@ Or run .\relay\scripts\smoke.ps1. Provider parsing and webhook authentication ha
 After the relay is running and Aegis has a locally saved provider/model profile, set the local development credentials in a separate PowerShell session and pair the installation:
 
     $env:AEGIS_RELAY_ADMIN_TOKEN = "local-development-admin-token-not-for-production"
-    $env:AEGIS_NATS_TOKEN = "local-development-nats-token-not-for-production"
+    $env:AEGIS_NATS_TOKEN = $env:AEGIS_NATS_DEVICE_PASSWORD
     aegis remote pair --relay-admin-url http://127.0.0.1:8787 --admin-token-env AEGIS_RELAY_ADMIN_TOKEN --nats-url tls://localhost:4422 --nats-token-env AEGIS_NATS_TOKEN --nats-root-cert .\relay\dev\certs\nats.crt
 
-Send the one-time `/pair <code>` command printed by Aegis from the WhatsApp number to bind. Then check `aegis remote status` and keep `aegis remote run` running while you use the relay. Pairing stores no credential values; Aegis reads them from the named environment variables. These sample credentials are for local development only. Configure Evolution with a valid account, HTTPS endpoint, API key, and webhook authentication before expecting WhatsApp messages to reach the local relay.
+Send the one-time `/pair <code>` command printed by Aegis from the WhatsApp number to bind. Then check `aegis remote status` and keep `aegis remote run` running while you use the relay. Pairing stores no credential values; Aegis reads them from the named environment variables. Supply the device password in this session before running the daemon. These sample credentials are for local development only. Configure Evolution with a valid account, HTTPS endpoint, API key, and webhook authentication before expecting WhatsApp messages to reach the local relay.
 
 To exercise PostgreSQL pairing rotation, actor-scoped binding lookup, and durable inbound dedupe against the local database, run .\relay\scripts\db-smoke.ps1. It starts only the loopback-bound Postgres service and runs the optional integration test.
 

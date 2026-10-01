@@ -16,6 +16,8 @@ pub struct Config {
     pub bind_addr: SocketAddr,
     pub database_url: String,
     pub nats_url: String,
+    /// Password for the fixed aegis-relay NATS user, read from NATS_AUTH_TOKEN.
+    /// The environment variable name is retained for compatibility.
     pub nats_auth_token: String,
     pub nats_tls_root_cert: Option<PathBuf>,
     pub admin_token: String,

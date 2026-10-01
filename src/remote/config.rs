@@ -20,6 +20,8 @@ pub struct Config {
     pub relay_admin_url: String,
     pub admin_token_env: String,
     pub nats_url: String,
+    /// Environment variable holding this installation principal's NATS password.
+    /// The field name is retained for compatibility; this is not a server-wide token.
     pub nats_token_env: String,
     #[serde(default)]
     pub nats_root_certificate: Option<PathBuf>,
@@ -74,8 +76,7 @@ impl Config {
     }
 
     pub fn validate(&self, root: &Path) -> Result<()> {
-        uuid::Uuid::parse_str(&self.installation_id)
-            .context("invalid Aegis remote installation ID")?;
+        self.nats_username()?;
         uuid::Uuid::parse_str(&self.actor_id).context("invalid Aegis remote actor ID")?;
         let expected_workspace = root
             .parent()
@@ -105,6 +106,15 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    pub fn nats_username(&self) -> Result<String> {
+        let installation_id = uuid::Uuid::parse_str(&self.installation_id)
+            .context("invalid Aegis remote installation ID")?;
+        if installation_id.to_string() != self.installation_id {
+            bail!("Aegis remote installation ID must be a canonical lowercase UUID");
+        }
+        Ok(format!("aegis-{installation_id}"))
     }
 }
 
@@ -180,6 +190,26 @@ mod tests {
         assert!(config.validate(&root).is_err());
         config.relay_admin_url = "http://127.0.0.1:8787".into();
         assert!(config.validate(&root).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn nats_principal_requires_a_canonical_installation_uuid() -> Result<()> {
+        let mut config = fixture(Path::new("workspace/.arun"));
+        config.installation_id = "12345678-abcd-4321-8765-123456789abc".into();
+        assert_eq!(
+            config.nats_username()?,
+            "aegis-12345678-abcd-4321-8765-123456789abc"
+        );
+        for invalid in [
+            "12345678-ABCD-4321-8765-123456789ABC",
+            "12345678abcd43218765123456789abc",
+            "{12345678-abcd-4321-8765-123456789abc}",
+            "*",
+        ] {
+            config.installation_id = invalid.into();
+            assert!(config.nats_username().is_err());
+        }
         Ok(())
     }
 }
