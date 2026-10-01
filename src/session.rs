@@ -3091,7 +3091,7 @@ fn chat_details(
         Some(2) => context_view(root, &run.id, terminal)?,
         Some(3) => tools_view(root, &run.id, terminal)?,
         Some(4) => review_operations(root, &run.id, terminal)?,
-        Some(5) => supersede_obligation(root, run, terminal, None)?,
+        Some(5) => edit_goal(root, &run.id, "replace", None, terminal)?,
         _ => {}
     }
     Ok(())

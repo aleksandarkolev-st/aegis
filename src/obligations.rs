@@ -341,6 +341,9 @@ impl Store {
             transaction.query_row("SELECT state FROM runs WHERE id=?1", [run_id], |row| {
                 row.get(0)
             })?;
+        if state == "running" {
+            bail!("pause running tasks before changing obligations");
+        }
         if matches!(
             state.as_str(),
             "completed" | "answered" | "cancelled" | "failed"
@@ -410,6 +413,9 @@ impl Store {
             transaction.query_row("SELECT state FROM runs WHERE id = ?1", [run_id], |row| {
                 row.get(0)
             })?;
+        if state == "running" {
+            bail!("pause running tasks before changing obligations");
+        }
         if matches!(
             state.as_str(),
             "completed" | "answered" | "cancelled" | "failed"
@@ -1002,6 +1008,42 @@ mod tests {
         store.verify_obligation(&run.id, 2, &[evidence.clone()])?;
         store.complete_run(&run.id, "done", &[evidence])?;
         assert_eq!(store.run(&run.id)?.state, "completed");
+        Ok(())
+    }
+
+    #[test]
+    fn obligation_edits_are_rejected_while_running_and_allowed_after_pause() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "Refactor parser",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({"obligations":["Preserve public API"]}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let original = store.obligations(&run.id)?;
+
+        assert!(store
+            .add_obligation(&run.id, "Add regression tests", "User approved")
+            .is_err());
+        assert!(store
+            .supersede_obligation(&run.id, 1, "Allow a v2 API", "User approved")
+            .is_err());
+        assert_eq!(store.obligations(&run.id)?, original);
+        assert_eq!(store.event_count(&run.id, "obligation.added")?, 0);
+        assert_eq!(store.event_count(&run.id, "obligation.superseded")?, 0);
+
+        store.request_pause(&run.id)?;
+        assert!(crate::pause::boundary(&mut store, &run.id)?);
+        assert_eq!(store.run(&run.id)?.state, "paused");
+
+        store.add_obligation(&run.id, "Add regression tests", "User approved")?;
+        store.supersede_obligation(&run.id, 1, "Allow a v2 API", "User approved")?;
+        assert_eq!(store.event_count(&run.id, "obligation.added")?, 1);
+        assert_eq!(store.event_count(&run.id, "obligation.superseded")?, 1);
         Ok(())
     }
 
