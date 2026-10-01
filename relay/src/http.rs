@@ -12,6 +12,7 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::{
+    channel::ChannelId,
     repository::PgRepository,
     service::{InboundDisposition, RelayError, RelayService},
 };
@@ -30,11 +31,23 @@ pub fn router(state: HttpState) -> Router {
         .route("/admin/v1/installations", post(provision_installation))
         .route(
             "/admin/v1/installations/{installation_id}/notifications/{event_kind}",
-            post(set_notification_preference),
+            post(set_whatsapp_notification_preference),
+        )
+        .route(
+            "/admin/v1/installations/{installation_id}/channels/{channel}/notifications/{event_kind}",
+            post(set_channel_notification_preference),
         )
         .route(
             "/admin/v1/installations/{installation_id}/bindings/revoke",
             post(revoke_channel_binding),
+        )
+        .route(
+            "/admin/v1/installations/{installation_id}/channels/{channel}/bindings/revoke",
+            post(revoke_scoped_channel_binding),
+        )
+        .route(
+            "/admin/v1/installations/{installation_id}/actors/{actor_id}/bindings/revoke",
+            post(revoke_actor_bindings),
         )
         .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(state)
@@ -59,7 +72,7 @@ async fn evolution_webhook(
         Err(RelayError::Authentication) => (StatusCode::UNAUTHORIZED, "unauthorized"),
         Err(RelayError::InvalidMessage) => (StatusCode::BAD_REQUEST, "invalid message"),
         Err(RelayError::InProgress) => (StatusCode::SERVICE_UNAVAILABLE, "retry later"),
-        Err(RelayError::Provider(crate::provider::ProviderError::Authentication)) => {
+        Err(RelayError::Channel(crate::channel::ChannelError::Authentication)) => {
             (StatusCode::UNAUTHORIZED, "unauthorized")
         }
         Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable"),
@@ -124,17 +137,56 @@ struct PreferenceUpdate {
     enabled: bool,
 }
 
-async fn set_notification_preference(
+async fn set_whatsapp_notification_preference(
     State(state): State<HttpState>,
     headers: HeaderMap,
     Path((installation_id, event_kind)): Path<(Uuid, String)>,
     Json(update): Json<PreferenceUpdate>,
 ) -> impl IntoResponse {
-    if !authorized(&headers, &state.admin_token) {
+    set_channel_preference(
+        state,
+        &headers,
+        installation_id,
+        "whatsapp",
+        &event_kind,
+        update.enabled,
+    )
+    .await
+}
+
+async fn set_channel_notification_preference(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path((installation_id, channel, event_kind)): Path<(Uuid, String, String)>,
+    Json(update): Json<PreferenceUpdate>,
+) -> impl IntoResponse {
+    set_channel_preference(
+        state,
+        &headers,
+        installation_id,
+        &channel,
+        &event_kind,
+        update.enabled,
+    )
+    .await
+}
+
+async fn set_channel_preference(
+    state: HttpState,
+    headers: &HeaderMap,
+    installation_id: Uuid,
+    channel: &str,
+    event_kind: &str,
+    enabled: bool,
+) -> (StatusCode, &'static str) {
+    if !authorized(headers, &state.admin_token) {
         return (StatusCode::UNAUTHORIZED, "unauthorized");
     }
+    if ChannelId::parse(channel).is_none() {
+        return (StatusCode::BAD_REQUEST, "invalid channel");
+    }
     if !matches!(
-        event_kind.as_str(),
+        event_kind,
         "task_started"
             | "progress"
             | "approval_required"
@@ -147,7 +199,7 @@ async fn set_notification_preference(
     }
     match state
         .repository
-        .set_notification_preference(installation_id, "whatsapp", &event_kind, update.enabled)
+        .set_notification_preference(installation_id, channel, event_kind, enabled)
         .await
     {
         Ok(()) => (StatusCode::NO_CONTENT, ""),
@@ -161,23 +213,92 @@ async fn revoke_channel_binding(
     Path(installation_id): Path<Uuid>,
     Json(request): Json<RevokeBindingRequest>,
 ) -> impl IntoResponse {
+    revoke_binding(
+        state,
+        &headers,
+        installation_id,
+        ChannelId::WhatsApp,
+        request,
+    )
+    .await
+}
+
+async fn revoke_scoped_channel_binding(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path((installation_id, channel)): Path<(Uuid, String)>,
+    Json(request): Json<RevokeBindingRequest>,
+) -> impl IntoResponse {
+    let Some(channel) = ChannelId::parse(&channel) else {
+        return (StatusCode::BAD_REQUEST, "invalid channel");
+    };
+    revoke_binding(state, &headers, installation_id, channel, request).await
+}
+
+async fn revoke_actor_bindings(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path((installation_id, actor_id)): Path<(Uuid, String)>,
+) -> impl IntoResponse {
     if !authorized(&headers, &state.admin_token) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    if !crate::repository::valid_actor_id(&actor_id) {
+        return (StatusCode::BAD_REQUEST, "invalid actor id");
+    }
+    match state
+        .repository
+        .revoke_actor_bindings(installation_id, &actor_id)
+        .await
+    {
+        Ok(_) => (StatusCode::NO_CONTENT, ""),
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable"),
+    }
+}
+
+async fn revoke_binding(
+    state: HttpState,
+    headers: &HeaderMap,
+    installation_id: Uuid,
+    channel: ChannelId,
+    request: RevokeBindingRequest,
+) -> (StatusCode, &'static str) {
+    if !authorized(headers, &state.admin_token) {
         return (StatusCode::UNAUTHORIZED, "unauthorized");
     }
     if !crate::repository::valid_actor_id(&request.actor_id) {
         return (StatusCode::BAD_REQUEST, "invalid actor id");
     }
-    let Some(sender_id) = crate::provider::normalize_phone(&request.sender_id) else {
+    let Some(sender_id) = normalize_channel_sender(channel, &request.sender_id) else {
         return (StatusCode::BAD_REQUEST, "invalid sender id");
     };
     match state
         .repository
-        .revoke_channel_binding(installation_id, &request.actor_id, &sender_id)
+        .revoke_channel_binding(
+            installation_id,
+            channel.as_str(),
+            &request.actor_id,
+            &sender_id,
+        )
         .await
     {
         Ok(true) => (StatusCode::NO_CONTENT, ""),
         Ok(false) => (StatusCode::NOT_FOUND, "binding not found"),
         Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable"),
+    }
+}
+
+fn normalize_channel_sender(channel: ChannelId, sender_id: &str) -> Option<String> {
+    match channel {
+        ChannelId::WhatsApp => crate::provider::normalize_phone(sender_id),
+        ChannelId::IMessage
+            if !sender_id.is_empty()
+                && sender_id.len() <= 200
+                && sender_id.bytes().all(|byte| byte.is_ascii_graphic()) =>
+        {
+            Some(sender_id.to_owned())
+        }
+        ChannelId::IMessage => None,
     }
 }
 
@@ -215,5 +336,18 @@ mod tests {
         assert_eq!(canonical_uuid(&canonical), Some(uuid));
         assert!(canonical_uuid(&canonical.to_uppercase()).is_none());
         assert!(canonical_uuid(&uuid.simple().to_string()).is_none());
+    }
+
+    #[test]
+    fn sender_identity_validation_is_channel_specific() {
+        assert_eq!(
+            normalize_channel_sender(ChannelId::WhatsApp, "4915112345678"),
+            Some("+4915112345678".into())
+        );
+        assert_eq!(
+            normalize_channel_sender(ChannelId::IMessage, "person@example.test"),
+            Some("person@example.test".into())
+        );
+        assert!(normalize_channel_sender(ChannelId::IMessage, "bad identity\n").is_none());
     }
 }

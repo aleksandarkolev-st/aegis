@@ -1,5 +1,8 @@
 use std::time::Duration;
 
+use crate::channel::{
+    ChannelCapabilities, ChannelError, ChannelId, ChannelMessage, MessagingChannel,
+};
 use async_trait::async_trait;
 use axum::http::HeaderMap;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -10,45 +13,10 @@ use serde::Serialize;
 use serde_json::Value;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
-use thiserror::Error;
 
 type HmacSha256 = Hmac<Sha256>;
 const MAX_PROVIDER_RESPONSE_BYTES: usize = 32 * 1024;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InboundWhatsAppMessage {
-    pub sender_id: String,
-    pub external_message_id: String,
-    pub text: String,
-}
-
-#[derive(Debug, Error)]
-pub enum ProviderError {
-    #[error("provider authentication failed")]
-    Authentication,
-    #[error("provider request is invalid")]
-    InvalidRequest,
-    #[error("provider delivery failed")]
-    Delivery,
-    #[error("provider configuration is invalid")]
-    Configuration,
-}
-
-#[async_trait]
-pub trait WhatsAppProvider: Send + Sync {
-    fn parse_inbound(
-        &self,
-        headers: &HeaderMap,
-        raw_body: &[u8],
-    ) -> Result<Option<InboundWhatsAppMessage>, ProviderError>;
-
-    async fn send_text(
-        &self,
-        destination: &str,
-        text: &str,
-        idempotency_key: &str,
-    ) -> Result<Option<String>, ProviderError>;
-}
+pub use crate::channel::ChannelError as ProviderError;
 
 #[derive(Clone)]
 pub struct EvolutionAdapter {
@@ -132,12 +100,24 @@ impl EvolutionAdapter {
 }
 
 #[async_trait]
-impl WhatsAppProvider for EvolutionAdapter {
+impl MessagingChannel for EvolutionAdapter {
+    fn id(&self) -> ChannelId {
+        ChannelId::WhatsApp
+    }
+
+    fn capabilities(&self) -> ChannelCapabilities {
+        ChannelCapabilities {
+            text: true,
+            attachments: false,
+            idempotency_keys: false,
+        }
+    }
+
     fn parse_inbound(
         &self,
         headers: &HeaderMap,
         raw_body: &[u8],
-    ) -> Result<Option<InboundWhatsAppMessage>, ProviderError> {
+    ) -> Result<Option<ChannelMessage>, ChannelError> {
         if !self.verify_signature(headers, raw_body) {
             return Err(ProviderError::Authentication);
         }
@@ -189,7 +169,7 @@ impl WhatsAppProvider for EvolutionAdapter {
         let Some(text) = message else {
             return Ok(None);
         };
-        Ok(Some(InboundWhatsAppMessage {
+        Ok(Some(ChannelMessage {
             sender_id,
             external_message_id,
             text: text.to_owned(),
@@ -201,7 +181,7 @@ impl WhatsAppProvider for EvolutionAdapter {
         destination: &str,
         text: &str,
         _idempotency_key: &str,
-    ) -> Result<Option<String>, ProviderError> {
+    ) -> Result<Option<String>, ChannelError> {
         // Evolution's current sendText DTO has no idempotency-key field. The key is
         // therefore only useful to provider adapters whose APIs support deduplication.
         let digits = normalize_phone(destination).ok_or(ProviderError::InvalidRequest)?;
@@ -318,6 +298,40 @@ mod tests {
         assert_eq!(message.sender_id, "+4915112345678");
         assert_eq!(message.external_message_id, "wamid.fixture.001");
         assert_eq!(message.text, "/approve_once request-123");
+    }
+
+    #[tokio::test]
+    async fn evolution_advertises_only_the_provider_capabilities_it_implements() {
+        let adapter = EvolutionAdapter::new(
+            "https://evolution.example",
+            "instance-a",
+            "not-a-real-provider-key",
+            SECRET.to_vec(),
+        )
+        .unwrap();
+        assert_eq!(adapter.id(), ChannelId::WhatsApp);
+        assert_eq!(
+            adapter.capabilities(),
+            ChannelCapabilities {
+                text: true,
+                attachments: false,
+                idempotency_keys: false,
+            }
+        );
+        assert!(matches!(
+            adapter
+                .send_attachment(
+                    "+4915112345678",
+                    &crate::channel::ChannelAttachment {
+                        file_name: "test.txt".into(),
+                        content_type: "text/plain".into(),
+                        data: b"fixture".to_vec(),
+                    },
+                    "event-1",
+                )
+                .await,
+            Err(ChannelError::Unsupported)
+        ));
     }
 
     #[test]

@@ -5,8 +5,8 @@ use std::{
 
 use aegis_relay::{
     CommandEnvelope, InboundDisposition, RelayService,
+    channel::{ChannelCapabilities, ChannelError, ChannelId, ChannelMessage, MessagingChannel},
     http::{HttpState, router},
-    provider::{InboundWhatsAppMessage, ProviderError, WhatsAppProvider},
     repository::{PgRepository, RelayRepository},
     service::{CommandTransport, TransportError},
 };
@@ -22,18 +22,30 @@ struct TestProvider {
 }
 
 #[async_trait]
-impl WhatsAppProvider for TestProvider {
+impl MessagingChannel for TestProvider {
+    fn id(&self) -> ChannelId {
+        ChannelId::WhatsApp
+    }
+
+    fn capabilities(&self) -> ChannelCapabilities {
+        ChannelCapabilities {
+            text: true,
+            attachments: false,
+            idempotency_keys: false,
+        }
+    }
+
     fn parse_inbound(
         &self,
         headers: &axum::http::HeaderMap,
         raw_body: &[u8],
-    ) -> Result<Option<InboundWhatsAppMessage>, ProviderError> {
+    ) -> Result<Option<ChannelMessage>, ChannelError> {
         if headers
             .get("x-test-auth")
             .and_then(|value| value.to_str().ok())
             != Some("fixture")
         {
-            return Err(ProviderError::Authentication);
+            return Err(ChannelError::Authentication);
         }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -43,8 +55,8 @@ impl WhatsAppProvider for TestProvider {
             text: String,
         }
         let fixture: Fixture =
-            serde_json::from_slice(raw_body).map_err(|_| ProviderError::InvalidRequest)?;
-        Ok(Some(InboundWhatsAppMessage {
+            serde_json::from_slice(raw_body).map_err(|_| ChannelError::InvalidRequest)?;
+        Ok(Some(ChannelMessage {
             sender_id: fixture.sender_id,
             external_message_id: fixture.external_message_id,
             text: fixture.text,
@@ -56,7 +68,7 @@ impl WhatsAppProvider for TestProvider {
         destination: &str,
         text: &str,
         _idempotency_key: &str,
-    ) -> Result<Option<String>, ProviderError> {
+    ) -> Result<Option<String>, ChannelError> {
         self.sends
             .lock()
             .unwrap()
@@ -305,7 +317,8 @@ async fn admin_revoke_is_scoped_and_blocks_commands_from_the_revoked_phone() {
         provider.sends.lock().unwrap().as_slice(),
         &[(
             sender_id.clone(),
-            "Pair with Aegis using AEGIS <one-time-code> or /pair <one-time-code>.".into()
+            "Pair this account with Aegis using AEGIS <one-time-code> or /pair <one-time-code>."
+                .into()
         )]
     );
 
@@ -323,5 +336,160 @@ async fn admin_revoke_is_scoped_and_blocks_commands_from_the_revoked_phone() {
         binding.id,
         other_actor_binding.id,
         other_installation_binding.id,
+    );
+}
+
+#[tokio::test]
+async fn actor_wide_revoke_disables_every_channel_and_is_idempotent() {
+    let Ok(database_url) = env::var("RELAY_TEST_DATABASE_URL") else {
+        eprintln!("skipping actor-wide revoke integration test: RELAY_TEST_DATABASE_URL is unset");
+        return;
+    };
+    let repository = PgRepository::connect(&database_url).await.unwrap();
+    let installation_id = Uuid::new_v4();
+    let external_installation_id = Uuid::new_v4();
+    let actor_id = format!("owner-{}", Uuid::new_v4().simple());
+    let sibling_actor_id = format!("owner-{}", Uuid::new_v4().simple());
+    let external_actor_id = format!("owner-{}", Uuid::new_v4().simple());
+    let whatsapp_sender = format!("+4915{}", Uuid::new_v4().as_u128() % 10_000_000_000);
+    let imessage_sender = format!("actor-{}@example.test", Uuid::new_v4().simple());
+    let sibling_sender = format!("+4916{}", Uuid::new_v4().as_u128() % 10_000_000_000);
+    let external_sender = format!("+4917{}", Uuid::new_v4().as_u128() % 10_000_000_000);
+
+    let whatsapp_code = repository
+        .provision_installation(&actor_id, Some(installation_id))
+        .await
+        .unwrap();
+    let whatsapp_binding = repository
+        .redeem_pairing("whatsapp", &whatsapp_sender, &whatsapp_code.pairing_code)
+        .await
+        .unwrap()
+        .unwrap();
+    let imessage_code = repository
+        .provision_installation(&actor_id, Some(installation_id))
+        .await
+        .unwrap();
+    let imessage_binding = repository
+        .redeem_pairing("imessage", &imessage_sender, &imessage_code.pairing_code)
+        .await
+        .unwrap()
+        .unwrap();
+    let sibling_code = repository
+        .provision_installation(&sibling_actor_id, Some(installation_id))
+        .await
+        .unwrap();
+    let sibling_binding = repository
+        .redeem_pairing("whatsapp", &sibling_sender, &sibling_code.pairing_code)
+        .await
+        .unwrap()
+        .unwrap();
+    let external_code = repository
+        .provision_installation(&external_actor_id, Some(external_installation_id))
+        .await
+        .unwrap();
+    let external_binding = repository
+        .redeem_pairing("whatsapp", &external_sender, &external_code.pairing_code)
+        .await
+        .unwrap()
+        .unwrap();
+    let pending_code = repository
+        .provision_installation(&actor_id, Some(installation_id))
+        .await
+        .unwrap();
+
+    let provider = Arc::new(TestProvider::default());
+    let service = Arc::new(RelayService::new(
+        Arc::new(repository.clone()),
+        Arc::new(TestTransport::default()),
+        provider,
+    ));
+    let admin_token = "actor-wide-revoke-admin-token-long-enough".to_owned();
+    let app = router(HttpState {
+        service,
+        repository: repository.clone(),
+        admin_token: Arc::new(admin_token.clone()),
+    });
+    let uri =
+        format!("/admin/v1/installations/{installation_id}/actors/{actor_id}/bindings/revoke");
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .header("authorization", format!("Bearer {admin_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+    }
+
+    assert!(
+        repository
+            .lookup_binding("whatsapp", &whatsapp_sender)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        repository
+            .lookup_binding("imessage", &imessage_sender)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        repository
+            .lookup_binding("whatsapp", &sibling_sender)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        repository
+            .lookup_binding("whatsapp", &external_sender)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        repository
+            .redeem_pairing("imessage", "new@example.test", &pending_code.pairing_code)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(whatsapp_code.user_id)
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(external_code.user_id)
+        .execute(repository.pool())
+        .await
+        .unwrap();
+    let _ = (
+        whatsapp_binding.id,
+        imessage_binding.id,
+        sibling_binding.id,
+        external_binding.id,
     );
 }

@@ -101,6 +101,7 @@ pub trait RelayRepository: Send + Sync {
         &self,
         installation_id: Uuid,
         actor_id: &str,
+        channel: &str,
     ) -> Result<Vec<DeliveryTarget>, RepositoryError>;
 
     async fn notifications_enabled(
@@ -112,18 +113,21 @@ pub trait RelayRepository: Send + Sync {
 
     async fn was_delivered(
         &self,
+        channel: &str,
         event_id: Uuid,
         binding_id: Uuid,
     ) -> Result<bool, RepositoryError>;
 
     async fn record_delivery_attempt(
         &self,
+        channel: &str,
         event_id: Uuid,
         binding_id: Uuid,
     ) -> Result<(), RepositoryError>;
 
     async fn mark_delivered(
         &self,
+        channel: &str,
         event_id: Uuid,
         binding_id: Uuid,
         provider_message_id: Option<&str>,
@@ -131,6 +135,7 @@ pub trait RelayRepository: Send + Sync {
 
     async fn mark_delivery_failed(
         &self,
+        channel: &str,
         event_id: Uuid,
         binding_id: Uuid,
     ) -> Result<(), RepositoryError>;
@@ -157,6 +162,37 @@ impl PgRepository {
         let ddl = include_str!("../migrations/0001_metadata.sql");
         for statement in ddl.split(';').map(str::trim).filter(|s| !s.is_empty()) {
             sqlx::query(statement).execute(&self.pool).await?;
+        }
+        let channel_constraints = [
+            ("channel_bindings", "channel_bindings_channel_check"),
+            ("delivery_receipts", "delivery_receipts_channel_check"),
+            (
+                "notification_preferences",
+                "notification_preferences_channel_check",
+            ),
+        ];
+        for (table, constraint) in channel_constraints {
+            let definition = sqlx::query_scalar::<_, String>(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = $1::regclass AND conname = $2",
+            )
+            .bind(table)
+            .bind(constraint)
+            .fetch_optional(&self.pool)
+            .await?;
+            if !definition
+                .as_deref()
+                .is_some_and(|definition| definition.contains("imessage"))
+            {
+                let migration = include_str!("../migrations/0002_channel_identity.sql");
+                for statement in migration
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    sqlx::query(statement).execute(&self.pool).await?;
+                }
+                break;
+            }
         }
         Ok(())
     }
@@ -268,6 +304,7 @@ impl PgRepository {
     pub async fn revoke_channel_binding(
         &self,
         installation_id: Uuid,
+        channel: &str,
         actor_id: &str,
         sender_id: &str,
     ) -> Result<bool, RepositoryError> {
@@ -275,23 +312,50 @@ impl PgRepository {
         // Pair redemption locks its token before the binding. Keep that lock order
         // here so a simultaneous redemption and revocation cannot deadlock.
         sqlx::query(
-            "UPDATE pairing_tokens SET used_at = now() WHERE installation_id = $1 AND actor_id = $2 AND used_at IS NULL AND EXISTS (SELECT 1 FROM channel_bindings WHERE installation_id = $1 AND actor_id = $2 AND channel = 'whatsapp' AND sender_id = $3)",
+            "UPDATE pairing_tokens SET used_at = now() WHERE installation_id = $1 AND actor_id = $2 AND used_at IS NULL AND EXISTS (SELECT 1 FROM channel_bindings WHERE installation_id = $1 AND actor_id = $2 AND channel = $3 AND sender_id = $4)",
         )
         .bind(installation_id)
         .bind(actor_id)
+        .bind(channel)
         .bind(sender_id)
         .execute(&mut *tx)
         .await?;
         let binding_id = sqlx::query_scalar::<_, Uuid>(
-            "UPDATE channel_bindings SET active = FALSE WHERE installation_id = $1 AND actor_id = $2 AND channel = 'whatsapp' AND sender_id = $3 RETURNING id",
+            "UPDATE channel_bindings SET active = FALSE WHERE installation_id = $1 AND actor_id = $2 AND channel = $3 AND sender_id = $4 RETURNING id",
         )
         .bind(installation_id)
         .bind(actor_id)
+        .bind(channel)
         .bind(sender_id)
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
         Ok(binding_id.is_some())
+    }
+
+    pub async fn revoke_actor_bindings(
+        &self,
+        installation_id: Uuid,
+        actor_id: &str,
+    ) -> Result<u64, RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE pairing_tokens SET used_at = now() WHERE installation_id = $1 AND actor_id = $2 AND used_at IS NULL",
+        )
+        .bind(installation_id)
+        .bind(actor_id)
+        .execute(&mut *tx)
+        .await?;
+        let revoked = sqlx::query(
+            "UPDATE channel_bindings SET active = FALSE WHERE installation_id = $1 AND actor_id = $2 AND active = TRUE",
+        )
+        .bind(installation_id)
+        .bind(actor_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(revoked)
     }
 }
 
@@ -301,6 +365,37 @@ pub fn valid_actor_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn default_notification_enabled(event_kind: &str) -> bool {
+    matches!(
+        event_kind,
+        "task_started" | "approval_required" | "blocked" | "completed" | "failed" | "reply"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_notification_enabled;
+
+    #[test]
+    fn notification_defaults_keep_state_changes_and_suppress_routine_progress() {
+        for event in [
+            "task_started",
+            "approval_required",
+            "blocked",
+            "completed",
+            "failed",
+            "reply",
+        ] {
+            assert!(
+                default_notification_enabled(event),
+                "{event} should notify by default"
+            );
+        }
+        assert!(!default_notification_enabled("progress"));
+        assert!(!default_notification_enabled("unknown_future_event"));
+    }
 }
 
 #[async_trait]
@@ -455,7 +550,7 @@ impl RelayRepository for PgRepository {
         sender_id: &str,
         code: &str,
     ) -> Result<Option<ChannelBinding>, RepositoryError> {
-        if channel != "whatsapp" || code.len() != 43 || !code.is_ascii() {
+        if code.len() != 43 || !code.is_ascii() {
             return Ok(None);
         }
         let token_hash = Sha256::digest(code.as_bytes()).to_vec();
@@ -544,12 +639,14 @@ impl RelayRepository for PgRepository {
         &self,
         installation_id: Uuid,
         actor_id: &str,
+        channel: &str,
     ) -> Result<Vec<DeliveryTarget>, RepositoryError> {
         let rows = sqlx::query_as::<_, (Uuid, String)>(
-            "SELECT id, destination_id FROM channel_bindings WHERE installation_id = $1 AND actor_id = $2 AND active = TRUE AND channel = 'whatsapp'",
+            "SELECT id, destination_id FROM channel_bindings WHERE installation_id = $1 AND actor_id = $2 AND active = TRUE AND channel = $3",
         )
         .bind(installation_id)
         .bind(actor_id)
+        .bind(channel)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -575,17 +672,19 @@ impl RelayRepository for PgRepository {
         .bind(event_kind)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(enabled.unwrap_or(true))
+        Ok(enabled.unwrap_or_else(|| default_notification_enabled(event_kind)))
     }
 
     async fn was_delivered(
         &self,
+        channel: &str,
         event_id: Uuid,
         binding_id: Uuid,
     ) -> Result<bool, RepositoryError> {
         let state = sqlx::query_scalar::<_, String>(
-            "SELECT state FROM delivery_receipts WHERE direction = 'outbound' AND event_id = $1 AND binding_id = $2",
+            "SELECT state FROM delivery_receipts WHERE direction = 'outbound' AND channel = $1 AND event_id = $2 AND binding_id = $3",
         )
+        .bind(channel)
         .bind(event_id)
         .bind(binding_id)
         .fetch_optional(&self.pool)
@@ -595,15 +694,17 @@ impl RelayRepository for PgRepository {
 
     async fn record_delivery_attempt(
         &self,
+        channel: &str,
         event_id: Uuid,
         binding_id: Uuid,
     ) -> Result<(), RepositoryError> {
         sqlx::query(
-            "INSERT INTO delivery_receipts (receipt_id, direction, event_id, binding_id, channel, state, attempts, expires_at) VALUES ($1, 'outbound', $2, $3, 'whatsapp', 'pending', 1, now() + interval '90 days') ON CONFLICT (event_id, binding_id) WHERE direction = 'outbound' DO UPDATE SET state = 'pending', attempts = delivery_receipts.attempts + 1, expires_at = now() + interval '90 days', updated_at = now()",
+            "INSERT INTO delivery_receipts (receipt_id, direction, event_id, binding_id, channel, state, attempts, expires_at) VALUES ($1, 'outbound', $2, $3, $4, 'pending', 1, now() + interval '90 days') ON CONFLICT (event_id, binding_id) WHERE direction = 'outbound' DO UPDATE SET channel = EXCLUDED.channel, state = 'pending', attempts = delivery_receipts.attempts + 1, expires_at = now() + interval '90 days', updated_at = now()",
         )
         .bind(Uuid::new_v4())
         .bind(event_id)
         .bind(binding_id)
+        .bind(channel)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -611,13 +712,15 @@ impl RelayRepository for PgRepository {
 
     async fn mark_delivered(
         &self,
+        channel: &str,
         event_id: Uuid,
         binding_id: Uuid,
         provider_message_id: Option<&str>,
     ) -> Result<(), RepositoryError> {
         sqlx::query(
-            "UPDATE delivery_receipts SET state = 'delivered', provider_message_id = $3, updated_at = now() WHERE direction = 'outbound' AND event_id = $1 AND binding_id = $2",
+            "UPDATE delivery_receipts SET state = 'delivered', provider_message_id = $4, updated_at = now() WHERE direction = 'outbound' AND channel = $1 AND event_id = $2 AND binding_id = $3",
         )
+        .bind(channel)
         .bind(event_id)
         .bind(binding_id)
         .bind(provider_message_id)
@@ -628,12 +731,14 @@ impl RelayRepository for PgRepository {
 
     async fn mark_delivery_failed(
         &self,
+        channel: &str,
         event_id: Uuid,
         binding_id: Uuid,
     ) -> Result<(), RepositoryError> {
         sqlx::query(
-            "UPDATE delivery_receipts SET state = 'failed', updated_at = now() WHERE direction = 'outbound' AND event_id = $1 AND binding_id = $2",
+            "UPDATE delivery_receipts SET state = 'failed', updated_at = now() WHERE direction = 'outbound' AND channel = $1 AND event_id = $2 AND binding_id = $3",
         )
+        .bind(channel)
         .bind(event_id)
         .bind(binding_id)
         .execute(&self.pool)

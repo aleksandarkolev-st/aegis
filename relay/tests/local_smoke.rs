@@ -2,13 +2,16 @@ use std::{collections::HashSet, sync::Mutex};
 
 use aegis_relay::{
     AegisEvent, AgentCommand, CommandEnvelope, InboundDisposition, RelayService, RemoteEventKind,
-    provider::{InboundWhatsAppMessage, ProviderError, WhatsAppProvider},
+    channel::{ChannelCapabilities, ChannelError, ChannelId, ChannelMessage, MessagingChannel},
     repository::{
         ChannelBinding, DeliveryTarget, InboundReceiptClaim, RelayRepository, RepositoryError,
     },
     service::{CommandTransport, TransportError},
 };
-use arun::remote::{Authority, Command as AegisCommand, CommandEnvelope as AegisCommandEnvelope};
+use arun::remote::{
+    Authority, Command as AegisCommand, CommandEnvelope as AegisCommandEnvelope,
+    DispatchAuthorization, ensure_remote_approval_gate,
+};
 use arun::storage::Store;
 use async_trait::async_trait;
 use axum::http::{HeaderMap, HeaderValue};
@@ -20,19 +23,72 @@ struct FakeProvider {
     ambiguous_first_send: Mutex<bool>,
 }
 
+#[derive(Default)]
+struct MockIMessageChannel {
+    sends: Mutex<Vec<(String, String)>>,
+}
+
 #[async_trait]
-impl WhatsAppProvider for FakeProvider {
+impl MessagingChannel for MockIMessageChannel {
+    fn id(&self) -> ChannelId {
+        ChannelId::IMessage
+    }
+
+    fn capabilities(&self) -> ChannelCapabilities {
+        ChannelCapabilities {
+            text: true,
+            attachments: false,
+            idempotency_keys: false,
+        }
+    }
+
+    fn parse_inbound(
+        &self,
+        _headers: &HeaderMap,
+        _raw_body: &[u8],
+    ) -> Result<Option<ChannelMessage>, ChannelError> {
+        Ok(None)
+    }
+
+    async fn send_text(
+        &self,
+        destination: &str,
+        text: &str,
+        _idempotency_key: &str,
+    ) -> Result<Option<String>, ChannelError> {
+        self.sends
+            .lock()
+            .unwrap()
+            .push((destination.to_owned(), text.to_owned()));
+        Ok(None)
+    }
+}
+
+#[async_trait]
+impl MessagingChannel for FakeProvider {
+    fn id(&self) -> ChannelId {
+        ChannelId::WhatsApp
+    }
+
+    fn capabilities(&self) -> ChannelCapabilities {
+        ChannelCapabilities {
+            text: true,
+            attachments: false,
+            idempotency_keys: false,
+        }
+    }
+
     fn parse_inbound(
         &self,
         headers: &HeaderMap,
         raw_body: &[u8],
-    ) -> Result<Option<InboundWhatsAppMessage>, ProviderError> {
+    ) -> Result<Option<ChannelMessage>, ChannelError> {
         if headers
             .get("x-fake-auth")
             .and_then(|value| value.to_str().ok())
             != Some("local-fixture")
         {
-            return Err(ProviderError::Authentication);
+            return Err(ChannelError::Authentication);
         }
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -42,8 +98,8 @@ impl WhatsAppProvider for FakeProvider {
             text: String,
         }
         let fixture: Fixture =
-            serde_json::from_slice(raw_body).map_err(|_| ProviderError::InvalidRequest)?;
-        Ok(Some(InboundWhatsAppMessage {
+            serde_json::from_slice(raw_body).map_err(|_| ChannelError::InvalidRequest)?;
+        Ok(Some(ChannelMessage {
             sender_id: fixture.sender_id,
             external_message_id: fixture.external_message_id,
             text: fixture.text,
@@ -55,7 +111,7 @@ impl WhatsAppProvider for FakeProvider {
         destination: &str,
         text: &str,
         idempotency_key: &str,
-    ) -> Result<Option<String>, ProviderError> {
+    ) -> Result<Option<String>, ChannelError> {
         self.sends.lock().unwrap().push((
             destination.to_owned(),
             text.to_owned(),
@@ -63,7 +119,7 @@ impl WhatsAppProvider for FakeProvider {
         ));
         if std::mem::take(&mut *self.ambiguous_first_send.lock().unwrap()) {
             // Model the provider accepting the send while the response is lost.
-            return Err(ProviderError::Delivery);
+            return Err(ChannelError::Delivery);
         }
         Ok(Some(format!(
             "provider-{}",
@@ -101,6 +157,7 @@ async fn ambiguous_provider_send_retries_at_least_once_then_receipt_deduplicates
         kind: RemoteEventKind::Reply,
         task_id: None,
         challenge_id: None,
+        expires_at: None,
         display_detail: None,
         reply_text: Some("The task completed.".into()),
     };
@@ -113,6 +170,50 @@ async fn ambiguous_provider_send_retries_at_least_once_then_receipt_deduplicates
     assert_eq!(sends.len(), 2);
     assert_eq!(sends[0].2, event.event_id.to_string());
     assert_eq!(sends[1].2, event.event_id.to_string());
+}
+
+#[tokio::test]
+async fn generic_core_routes_state_notifications_through_a_mock_channel_contract() {
+    let installation_id = Uuid::new_v4();
+    let binding = ChannelBinding {
+        id: Uuid::new_v4(),
+        user_id: Uuid::new_v4(),
+        installation_id,
+        channel: "imessage".into(),
+        actor_id: "owner-1".into(),
+        sender_id: "person@example.test".into(),
+        destination_id: "person@example.test".into(),
+    };
+    let repository = std::sync::Arc::new(FakeRepository::default());
+    *repository.binding.lock().unwrap() = Some(binding);
+    *repository.notifications.lock().unwrap() = true;
+    let channel = std::sync::Arc::new(MockIMessageChannel::default());
+    let service = RelayService::new(
+        repository,
+        std::sync::Arc::new(FakeTransport::default()),
+        channel.clone(),
+    );
+    let event = AegisEvent {
+        event_id: Uuid::new_v4(),
+        installation_id,
+        actor_id: "owner-1".into(),
+        kind: RemoteEventKind::Completed,
+        task_id: Some("task-8".into()),
+        challenge_id: None,
+        expires_at: None,
+        display_detail: None,
+        reply_text: None,
+    };
+
+    service.deliver_event(&event).await.unwrap();
+
+    assert_eq!(
+        channel.sends.lock().unwrap().as_slice(),
+        &[(
+            "person@example.test".into(),
+            "Aegis task task-8 completed.".into()
+        )]
+    );
 }
 
 #[derive(Default)]
@@ -204,9 +305,6 @@ impl RelayRepository for FakeRepository {
         sender_id: &str,
         code: &str,
     ) -> Result<Option<ChannelBinding>, RepositoryError> {
-        if channel != "whatsapp" {
-            return Ok(None);
-        }
         let mut pairing = self.pairing.lock().unwrap();
         let Some((expected_code, installation_id, actor_id)) = pairing.as_ref() else {
             return Ok(None);
@@ -232,6 +330,7 @@ impl RelayRepository for FakeRepository {
         &self,
         installation_id: Uuid,
         actor_id: &str,
+        channel: &str,
     ) -> Result<Vec<DeliveryTarget>, RepositoryError> {
         let mut bindings = self
             .binding
@@ -244,7 +343,9 @@ impl RelayRepository for FakeRepository {
         Ok(bindings
             .into_iter()
             .filter(|binding| {
-                binding.installation_id == installation_id && binding.actor_id == actor_id
+                binding.installation_id == installation_id
+                    && binding.actor_id == actor_id
+                    && binding.channel == channel
             })
             .map(|binding| DeliveryTarget {
                 binding_id: binding.id,
@@ -264,6 +365,7 @@ impl RelayRepository for FakeRepository {
 
     async fn was_delivered(
         &self,
+        _channel: &str,
         event_id: Uuid,
         binding_id: Uuid,
     ) -> Result<bool, RepositoryError> {
@@ -276,6 +378,7 @@ impl RelayRepository for FakeRepository {
 
     async fn record_delivery_attempt(
         &self,
+        _channel: &str,
         event_id: Uuid,
         binding_id: Uuid,
     ) -> Result<(), RepositoryError> {
@@ -285,6 +388,7 @@ impl RelayRepository for FakeRepository {
 
     async fn mark_delivered(
         &self,
+        _channel: &str,
         event_id: Uuid,
         binding_id: Uuid,
         _provider_message_id: Option<&str>,
@@ -295,6 +399,7 @@ impl RelayRepository for FakeRepository {
 
     async fn mark_delivery_failed(
         &self,
+        _channel: &str,
         _event_id: Uuid,
         _binding_id: Uuid,
     ) -> Result<(), RepositoryError> {
@@ -362,6 +467,7 @@ async fn local_whatsapp_to_aegis_and_reply_delivery_smoke() {
         kind: RemoteEventKind::Reply,
         task_id: None,
         challenge_id: None,
+        expires_at: None,
         display_detail: None,
         reply_text: Some("The task completed.".into()),
     };
@@ -380,6 +486,7 @@ async fn local_whatsapp_to_aegis_and_reply_delivery_smoke() {
         kind: RemoteEventKind::Reply,
         task_id: None,
         challenge_id: None,
+        expires_at: None,
         display_detail: None,
         reply_text: Some("Private to the second actor.".into()),
     };
@@ -402,8 +509,8 @@ async fn local_fake_rejects_unauthenticated_sender_before_publish() {
     let body = br#"{"sender_id":"+4915112345678","external_message_id":"x","text":"/status"}"#;
     assert!(matches!(
         service.handle_webhook(&HeaderMap::new(), body).await,
-        Err(aegis_relay::service::RelayError::Provider(
-            ProviderError::Authentication
+        Err(aegis_relay::service::RelayError::Channel(
+            ChannelError::Authentication
         ))
     ));
 }
@@ -458,6 +565,12 @@ fn aegis_request(envelope: &CommandEnvelope) -> AegisCommandEnvelope {
         },
         AgentCommand::Status { task_id } => AegisCommand::Status {
             task_id: task_id.clone(),
+        },
+        AgentCommand::ApproveOnce { challenge_id } => AegisCommand::ApproveOnce {
+            challenge_id: challenge_id.clone(),
+        },
+        AgentCommand::Deny { challenge_id } => AegisCommand::Deny {
+            challenge_id: challenge_id.clone(),
         },
         unsupported => panic!("unexpected fixture command: {unsupported:?}"),
     };
@@ -599,6 +712,175 @@ async fn relay_messages_use_aegis_local_authority_and_safe_events_return_to_the_
             .all(|task| task["task_id"].as_str() != Some(private_run.id.as_str()))
     );
 
+    let now = chrono::Utc::now().timestamp();
+    let approved_operation = store.begin_operation(
+        &selected_run.id,
+        "workspace.write",
+        serde_json::json!({"path":"src/approved.txt"}),
+        true,
+    )?;
+    let approved_challenge =
+        ensure_remote_approval_gate(&mut store, &selected_run.id, &approved_operation.id, now)?;
+    let approval_source = store
+        .events(&selected_run.id)?
+        .into_iter()
+        .find(|event| {
+            event.kind == "approval.required"
+                && event.payload["challenge_id"] == approved_challenge.challenge_id
+        })
+        .expect("local approval gate records its challenge event");
+    let approval_notification = AegisEvent {
+        event_id: Uuid::new_v4(),
+        installation_id,
+        actor_id: actor_id.into(),
+        kind: RemoteEventKind::ApprovalRequired,
+        task_id: Some(selected_run.id.clone()),
+        challenge_id: Some(approved_challenge.challenge_id.clone()),
+        expires_at: Some(approval_source.payload["expires_at"].as_i64().unwrap()),
+        display_detail: Some(
+            approval_source.payload["descriptor"]
+                .as_str()
+                .unwrap()
+                .into(),
+        ),
+        reply_text: None,
+    };
+    service.deliver_event(&approval_notification).await?;
+    {
+        let sends = provider.sends.lock().unwrap();
+        assert_eq!(sends.len(), 1);
+        assert!(sends[0].1.contains(&format!(
+            "/approve_once {}",
+            approved_challenge.challenge_id
+        )));
+        assert!(sends[0].1.contains("expires at"));
+        assert!(!sends[0].1.contains("model-authored fixture secret"));
+    }
+    provider.sends.lock().unwrap().clear();
+
+    let approve_inbound = serde_json::to_vec(&serde_json::json!({
+        "sender_id":binding.sender_id.clone(),
+        "external_message_id":"wamid.approve-exact-challenge",
+        "text":format!("/approve_once {}", approved_challenge.challenge_id)
+    }))?;
+    assert_eq!(
+        service.handle_webhook(&headers, &approve_inbound).await?,
+        InboundDisposition::Published
+    );
+    let approve_envelope = transport.commands.lock().unwrap()[2].clone();
+    assert_eq!(
+        approve_envelope.command,
+        AgentCommand::ApproveOnce {
+            challenge_id: approved_challenge.challenge_id.clone()
+        }
+    );
+    let approved = authority.apply_from_authenticated_relay(
+        actor_id,
+        &aegis_request(&approve_envelope),
+        approve_envelope.issued_at.timestamp(),
+    )?;
+    assert_eq!(approved.result["decision"], "approved_once");
+    assert_eq!(
+        authority.authorize_operation_dispatch(&selected_run.id, &approved_operation.id)?,
+        DispatchAuthorization::ApprovedOnce
+    );
+
+    let denied_operation = store.begin_operation(
+        &selected_run.id,
+        "workspace.write",
+        serde_json::json!({"path":"src/denied.txt"}),
+        true,
+    )?;
+    let denied_challenge = ensure_remote_approval_gate(
+        &mut store,
+        &selected_run.id,
+        &denied_operation.id,
+        chrono::Utc::now().timestamp(),
+    )?;
+    let deny_inbound = serde_json::to_vec(&serde_json::json!({
+        "sender_id":binding.sender_id.clone(),
+        "external_message_id":"wamid.deny-exact-challenge",
+        "text":format!("/deny {}", denied_challenge.challenge_id)
+    }))?;
+    assert_eq!(
+        service.handle_webhook(&headers, &deny_inbound).await?,
+        InboundDisposition::Published
+    );
+    let deny_envelope = transport.commands.lock().unwrap()[3].clone();
+    assert_eq!(
+        deny_envelope.command,
+        AgentCommand::Deny {
+            challenge_id: denied_challenge.challenge_id.clone()
+        }
+    );
+    let denied = authority.apply_from_authenticated_relay(
+        actor_id,
+        &aegis_request(&deny_envelope),
+        deny_envelope.issued_at.timestamp(),
+    )?;
+    assert_eq!(denied.result["decision"], "denied");
+    assert_eq!(
+        authority.authorize_operation_dispatch(&selected_run.id, &denied_operation.id)?,
+        DispatchAuthorization::Denied
+    );
+
+    let expired_operation = store.begin_operation(
+        &selected_run.id,
+        "workspace.write",
+        serde_json::json!({"path":"src/expired.txt"}),
+        true,
+    )?;
+    let expired_challenge = ensure_remote_approval_gate(
+        &mut store,
+        &selected_run.id,
+        &expired_operation.id,
+        now.saturating_sub(600),
+    )?;
+    let expired_source = store
+        .events(&selected_run.id)?
+        .into_iter()
+        .find(|event| {
+            event.kind == "approval.required"
+                && event.payload["challenge_id"] == expired_challenge.challenge_id
+        })
+        .expect("expired local challenge retains its event for relay validation");
+    let expired_notification = AegisEvent {
+        event_id: Uuid::new_v4(),
+        installation_id,
+        actor_id: actor_id.into(),
+        kind: RemoteEventKind::ApprovalRequired,
+        task_id: Some(selected_run.id.clone()),
+        challenge_id: Some(expired_challenge.challenge_id.clone()),
+        expires_at: Some(expired_source.payload["expires_at"].as_i64().unwrap()),
+        display_detail: Some(
+            expired_source.payload["descriptor"]
+                .as_str()
+                .unwrap()
+                .into(),
+        ),
+        reply_text: None,
+    };
+    service.deliver_event(&expired_notification).await?;
+    assert!(provider.sends.lock().unwrap().is_empty());
+    let expired_inbound = serde_json::to_vec(&serde_json::json!({
+        "sender_id":binding.sender_id.clone(),
+        "external_message_id":"wamid.expired-challenge",
+        "text":format!("/approve_once {}", expired_challenge.challenge_id)
+    }))?;
+    assert_eq!(
+        service.handle_webhook(&headers, &expired_inbound).await?,
+        InboundDisposition::Published
+    );
+    let expired_envelope = transport.commands.lock().unwrap()[4].clone();
+    let expired = authority
+        .apply_from_authenticated_relay(
+            actor_id,
+            &aegis_request(&expired_envelope),
+            expired_envelope.issued_at.timestamp(),
+        )
+        .unwrap_err();
+    assert!(expired.to_string().contains("expired"));
+
     store.state(
         &selected_run.id,
         "completed",
@@ -620,6 +902,7 @@ async fn relay_messages_use_aegis_local_authority_and_safe_events_return_to_the_
         kind: RemoteEventKind::Completed,
         task_id: Some(selected_run.id.clone()),
         challenge_id: None,
+        expires_at: None,
         display_detail: None,
         reply_text: None,
     };

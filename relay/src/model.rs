@@ -59,6 +59,8 @@ pub struct AegisEvent {
     pub kind: RemoteEventKind,
     pub task_id: Option<String>,
     pub challenge_id: Option<String>,
+    /// Unix deadline of an approval challenge. Present only for approval events.
+    pub expires_at: Option<i64>,
     /// Short capability plus bounded target for approval prompts. This value is
     /// delivered transiently and is never written to PostgreSQL or service logs.
     pub display_detail: Option<String>,
@@ -199,6 +201,17 @@ impl AegisEvent {
         if matches!(self.kind, RemoteEventKind::ApprovalRequired) != self.challenge_id.is_some() {
             return Err("event challenge_id does not match its type");
         }
+        if matches!(self.kind, RemoteEventKind::ApprovalRequired) != self.expires_at.is_some() {
+            return Err("event expires_at does not match its type");
+        }
+        if self.expires_at.is_some_and(|timestamp| timestamp <= 0) {
+            return Err("event approval expiry is invalid");
+        }
+        if self.expires_at.is_some_and(|timestamp| {
+            chrono::DateTime::<Utc>::from_timestamp(timestamp, 0).is_none()
+        }) {
+            return Err("event approval expiry is outside the supported range");
+        }
         if self
             .challenge_id
             .as_deref()
@@ -234,7 +247,7 @@ impl AegisEvent {
         Ok(())
     }
 
-    pub fn whatsapp_text(&self) -> Result<String, &'static str> {
+    pub fn notification_text(&self) -> Result<String, &'static str> {
         self.validate()?;
         let task = self.task_id.as_deref().unwrap_or_default();
         Ok(match self.kind {
@@ -243,8 +256,15 @@ impl AegisEvent {
             RemoteEventKind::ApprovalRequired => {
                 let challenge = self.challenge_id.as_deref().unwrap_or_default();
                 let detail = self.display_detail.as_deref().unwrap_or_default();
+                let expiry = self
+                    .expires_at
+                    .and_then(|timestamp| chrono::DateTime::<Utc>::from_timestamp(timestamp, 0))
+                    .map(|timestamp| {
+                        format!(" It expires at {} UTC.", timestamp.format("%Y-%m-%d %H:%M"))
+                    })
+                    .unwrap_or_default();
                 format!(
-                    "Aegis needs approval for task {task}: {detail}. Reply /approve_once {challenge} or /deny {challenge}."
+                    "Aegis needs approval for task {task}: {detail}. Reply /approve_once {challenge} or /deny {challenge}.{expiry}"
                 )
             }
             RemoteEventKind::Blocked => format!("Aegis task {task} is blocked."),
@@ -404,16 +424,20 @@ mod tests {
             kind: RemoteEventKind::ApprovalRequired,
             task_id: Some("task-8".into()),
             challenge_id: Some("challenge-2".into()),
+            expires_at: Some(1_800_000_000),
             display_detail: Some("shell: C:\\work\\repo".into()),
             reply_text: None,
         };
         assert_eq!(
-            event.whatsapp_text().unwrap(),
-            "Aegis needs approval for task task-8: shell: C:\\work\\repo. Reply /approve_once challenge-2 or /deny challenge-2."
+            event.notification_text().unwrap(),
+            "Aegis needs approval for task task-8: shell: C:\\work\\repo. Reply /approve_once challenge-2 or /deny challenge-2. It expires at 2027-01-15 08:00 UTC."
         );
         let mut missing_detail = event.clone();
         missing_detail.display_detail = None;
         assert!(missing_detail.validate().is_err());
+        let mut missing_expiry = event.clone();
+        missing_expiry.expires_at = None;
+        assert!(missing_expiry.validate().is_err());
         let mut oversized_detail = event.clone();
         oversized_detail.display_detail = Some("x".repeat(MAX_DISPLAY_DETAIL_BYTES + 1));
         assert!(oversized_detail.validate().is_err());
@@ -435,10 +459,11 @@ mod tests {
             kind: RemoteEventKind::Reply,
             task_id: None,
             challenge_id: None,
+            expires_at: None,
             display_detail: None,
             reply_text: Some("Ready".into()),
         };
-        assert_eq!(event.whatsapp_text().unwrap(), "Ready");
+        assert_eq!(event.notification_text().unwrap(), "Ready");
         event.reply_text = Some("x".repeat(MAX_REPLY_BYTES + 1));
         assert!(event.validate().is_err());
     }
@@ -452,6 +477,7 @@ mod tests {
             kind: RemoteEventKind::Reply,
             task_id: None,
             challenge_id: None,
+            expires_at: None,
             display_detail: None,
             reply_text: Some("Ready".into()),
         };

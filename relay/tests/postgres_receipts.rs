@@ -35,6 +35,28 @@ async fn postgres_pairing_rotation_and_inbound_receipts_are_idempotent() {
         .unwrap();
     assert_eq!(second_actor.user_id, first.user_id);
     assert_eq!(second_actor.installation_id, installation_id);
+    assert!(
+        repository
+            .notifications_enabled(installation_id, "whatsapp", "completed")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !repository
+            .notifications_enabled(installation_id, "whatsapp", "progress")
+            .await
+            .unwrap()
+    );
+    repository
+        .set_notification_preference(installation_id, "whatsapp", "progress", true)
+        .await
+        .unwrap();
+    assert!(
+        repository
+            .notifications_enabled(installation_id, "whatsapp", "progress")
+            .await
+            .unwrap()
+    );
     let colliding_installation_id = Uuid::new_v4();
     assert!(matches!(
         repository
@@ -79,7 +101,7 @@ async fn postgres_pairing_rotation_and_inbound_receipts_are_idempotent() {
     assert_eq!(second_binding.actor_id, "second-actor");
     assert_eq!(
         repository
-            .targets_for_installation(installation_id, &actor_id)
+            .targets_for_installation(installation_id, &actor_id, "whatsapp")
             .await
             .unwrap()
             .len(),
@@ -87,7 +109,7 @@ async fn postgres_pairing_rotation_and_inbound_receipts_are_idempotent() {
     );
     assert_eq!(
         repository
-            .targets_for_installation(installation_id, "second-actor")
+            .targets_for_installation(installation_id, "second-actor", "whatsapp")
             .await
             .unwrap()
             .len(),
@@ -95,7 +117,7 @@ async fn postgres_pairing_rotation_and_inbound_receipts_are_idempotent() {
     );
     assert!(
         repository
-            .targets_for_installation(installation_id, "unpaired-actor")
+            .targets_for_installation(installation_id, "unpaired-actor", "whatsapp")
             .await
             .unwrap()
             .is_empty()
