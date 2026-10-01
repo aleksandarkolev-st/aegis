@@ -3880,6 +3880,30 @@ mod tests {
     }
 
     #[test]
+    fn remote_task_requirements_are_frozen_from_the_user_message() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let root = workspace.path().join(".arun");
+        std::fs::create_dir_all(&root)?;
+        save(&root, &blank_profile("codex".into()))?;
+        let task = "Improve the parser.\n\nRequirements:\n- support nested expressions\n- preserve public API compatibility";
+        let run = create_remote_task(
+            &root,
+            workspace.path(),
+            task,
+            &uuid::Uuid::new_v4().to_string(),
+        )?;
+        let store = Store::open(&root)?;
+        let requirements = store.obligations(&run.id)?;
+        assert_eq!(requirements.len(), 3);
+        assert_eq!(requirements[0].title, "Task request");
+        assert_eq!(requirements[1].title, "support nested expressions");
+        assert_eq!(requirements[2].title, "preserve public API compatibility");
+        assert!(requirements.iter().all(|item| item.state == "open"));
+        assert_eq!(run.budgets["obligations"].as_array().unwrap().len(), 2);
+        Ok(())
+    }
+
+    #[test]
     fn remote_tasks_cannot_choose_another_workspace() -> Result<()> {
         let workspace = tempfile::tempdir()?;
         let other_workspace = tempfile::tempdir()?;
@@ -3922,6 +3946,19 @@ mod tests {
             "/goalkeeper repair the picker",
         ] {
             assert_eq!(goal_task_submission(command), None, "{command}");
+        }
+    }
+
+    #[test]
+    fn selected_goal_command_accepts_a_plain_multiline_paste_and_enter_still_views() {
+        let paste = "Repair the command picker\nRequirements:\n- preserve pasted text";
+        for command in ["/goal", "/contract"] {
+            let draft = crate::terminal::selected_command_draft(command);
+            assert_eq!(goal_task_submission(draft.trim()), None);
+            assert_eq!(
+                goal_task_submission(&format!("{draft}{paste}")),
+                Some(paste)
+            );
         }
     }
 

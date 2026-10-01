@@ -919,7 +919,7 @@ impl Terminal {
     }
 
     pub fn set_command_draft(&self, command: &str) {
-        self.set_input_draft(command);
+        self.set_input_draft(&selected_command_draft(command));
     }
 
     pub fn set_input_draft(&self, draft: &str) {
@@ -1233,7 +1233,7 @@ impl Terminal {
                         {
                             self.finish_input(composer, None)?;
                             let selected = self.command_menu()?.unwrap_or_else(|| "/".into());
-                            text = selected.chars().collect();
+                            text = selected_command_draft(&selected).chars().collect();
                             caret = text.len();
                             rendered_composer = false;
                             previous_draw_rows = 0;
@@ -1668,6 +1668,14 @@ fn menu_matches(choices: &[String], query: &str) -> Vec<usize> {
         .filter(|(_, choice)| choice.to_lowercase().contains(&query))
         .map(|(index, _)| index)
         .collect()
+}
+
+pub(crate) fn selected_command_draft(command: &str) -> String {
+    if matches!(command, "/goal" | "/contract") {
+        format!("{command} ")
+    } else {
+        command.to_owned()
+    }
 }
 
 fn menu_rows(terminal_height: usize, choices: usize) -> usize {
@@ -2294,6 +2302,20 @@ mod tests {
             .input_draft
             .replace(Some(("task › ".into(), vec!['🦊'], 99)));
         assert_eq!(terminal.take_input_draft("task › ", false), (vec!['🦊'], 1));
+    }
+
+    #[test]
+    fn selecting_a_root_goal_command_leaves_space_for_followup_text() {
+        for command in ["/goal", "/contract"] {
+            assert_eq!(selected_command_draft(command), format!("{command} "));
+        }
+        assert_eq!(selected_command_draft("/goal add"), "/goal add");
+
+        let terminal = Terminal::default();
+        terminal.set_command_draft("/goal");
+        let (draft, caret) = terminal.take_input_draft(&terminal.input_prefix(), false);
+        assert_eq!(draft.iter().collect::<String>(), "/goal ");
+        assert_eq!(caret, draft.len());
     }
 
     #[test]
