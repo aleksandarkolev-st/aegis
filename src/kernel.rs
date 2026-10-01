@@ -848,8 +848,58 @@ fn operation_output_preview_data(operation: &Operation, result: &Value) -> Optio
             "edits":result["edits"],
             "sha256":result["sha256"],
         })),
+        capability if capability.starts_with("mcp.") => mcp_output_preview_data(result),
         _ => None,
     }
+}
+
+fn mcp_output_preview_data(result: &Value) -> Option<Value> {
+    let blocks = result["content"].as_array()?;
+    let mut text = String::new();
+    let mut characters = 0usize;
+    let mut truncated = false;
+    let mut has_text = false;
+
+    for block in blocks {
+        if block["type"] != "text" {
+            continue;
+        }
+        let Some(source) = block["text"].as_str() else {
+            continue;
+        };
+        let source = crate::text::clean(source);
+        if source.is_empty() {
+            continue;
+        }
+        if has_text {
+            if characters == OPERATION_PREVIEW_CHARACTERS {
+                truncated = true;
+                break;
+            }
+            text.push('\n');
+            characters += 1;
+        }
+        has_text = true;
+        for character in source.chars() {
+            if characters == OPERATION_PREVIEW_CHARACTERS {
+                truncated = true;
+                break;
+            }
+            text.push(character);
+            characters += 1;
+        }
+        if truncated {
+            break;
+        }
+    }
+
+    has_text.then(|| {
+        json!({
+            "kind":"text",
+            "source":"tool",
+            "preview":{"text":text,"truncated":truncated},
+        })
+    })
 }
 
 pub fn spawn(root: &Path, id: &str, secret: Option<(&str, &str)>) -> Result<()> {
@@ -2124,6 +2174,25 @@ mod tests {
         );
         assert_eq!(store.event_count(&run.id, "operation.failed")?, 1);
         assert_eq!(store.event_count(&run.id, "operation.succeeded")?, 0);
+        let failed = store
+            .events(&run.id)?
+            .into_iter()
+            .find(|event| event.kind == "operation.failed")
+            .unwrap();
+        assert_eq!(
+            failed.payload["detail"]["output_preview"],
+            json!({
+                "kind":"text",
+                "source":"tool",
+                "preview":{"text":"move unavailable","truncated":false},
+            })
+        );
+        assert_eq!(
+            crate::terminal::operation_output_preview(&failed.payload)
+                .unwrap()
+                .1,
+            "move unavailable"
+        );
         assert!(store.evidence_artifacts(&run.id)?.is_empty());
         assert!(
             store
@@ -2131,6 +2200,80 @@ mod tests {
                 .is_err()
         );
         assert_eq!(store.run(&run.id)?.state, "running");
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_success_output_preview_is_safe_bounded_and_keeps_the_full_artifact() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "fixture",
+            directory.path(),
+            "fixture",
+            json!([]),
+            json!({}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let operation = store.begin_operation(&run.id, "mcp.fixture.inspect", json!({}), false)?;
+        store.operation_state(&operation, "dispatched", None, json!({}))?;
+        store.claim_operation(&operation)?;
+        let long_text = format!(
+            "ready\n{}\u{1b}[2J\u{202e}tail",
+            "x".repeat(OPERATION_PREVIEW_CHARACTERS + 100)
+        );
+        let result = json!({
+            "isError":false,
+            "content":[
+                {"type":"image","data":"not rendered"},
+                {"type":"text","text":long_text},
+                {"type":"text","text":"second block"}
+            ]
+        });
+
+        commit_result(&mut store, &operation, result.clone(), 10)?;
+
+        let saved = store.operation(&operation.id)?;
+        assert_eq!(saved.state, "succeeded");
+        let artifact = saved.artifact.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&store.artifact(&artifact)?)?,
+            result
+        );
+        let succeeded = store
+            .events(&run.id)?
+            .into_iter()
+            .find(|event| event.kind == "operation.succeeded")
+            .unwrap();
+        let preview = &succeeded.payload["detail"]["output_preview"];
+        assert_eq!(preview["kind"], "text");
+        assert_eq!(preview["source"], "tool");
+        assert_eq!(
+            preview["preview"]["text"].as_str().unwrap().chars().count(),
+            OPERATION_PREVIEW_CHARACTERS
+        );
+        assert!(
+            preview["preview"]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("ready\n")
+        );
+        assert_eq!(preview["preview"]["truncated"], true);
+        assert!(
+            !preview["preview"]["text"]
+                .as_str()
+                .unwrap()
+                .contains(['\u{1b}', '\u{202e}'])
+        );
+        let rendered = crate::terminal::operation_output_preview(&succeeded.payload)
+            .expect("MCP output should use the established TUI text preview")
+            .1;
+        assert!(rendered.ends_with("output preview truncated"));
+        assert!(
+            rendered.chars().count()
+                <= OPERATION_PREVIEW_CHARACTERS + "\n… output preview truncated".chars().count()
+        );
         Ok(())
     }
 
