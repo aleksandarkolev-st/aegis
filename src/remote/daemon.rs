@@ -797,22 +797,10 @@ fn outbound_events(
             vec![make("blocked", EventKind::Blocked)]
         }
         "run.waiting_recovery" => Vec::new(),
-        "run.completed" | "run.answered" => {
-            let mut events = vec![make("completed", EventKind::Completed)];
-            let summary = event.payload["summary"].as_str().unwrap_or_default();
-            let summary = crate::text::clean(summary);
-            if !summary.trim().is_empty() {
-                let reply_id = stable_uuid(&format!(
-                    "local-event\0{}\0{}\0{}\0{}\0reply",
-                    installation_id, actor_id, run.id, event.seq
-                ));
-                if let Ok(reply) = AegisEvent::reply(installation_id, actor_id, &reply_id, &summary)
-                {
-                    events.push(reply);
-                }
-            }
-            events
-        }
+        // Completion payload summaries are model-authored and may quote
+        // workspace content. Push only the state transition; the actor can
+        // request bounded task details separately.
+        "run.completed" | "run.answered" => vec![make("completed", EventKind::Completed)],
         "run.failed" => vec![make("failed", EventKind::Failed)],
         _ => Vec::new(),
     }
@@ -1140,15 +1128,36 @@ mod tests {
         let event = Event {
             seq: 9,
             kind: "run.completed".into(),
-            payload: json!({"summary":"done","raw_output":"not sent"}),
+            payload: json!({
+                "summary":"fixture-secret-token api_key=private-value",
+                "raw_output":"not sent"
+            }),
             created_at: 2,
         };
         let first = outbound_events(&run, &event, &installation_id, "actor-1");
         let second = outbound_events(&run, &event, &installation_id, "actor-1");
-        assert_eq!(first.len(), 2);
+        assert_eq!(first.len(), 1);
         assert_eq!(first[0].event_id, second[0].event_id);
-        assert_eq!(first[1].reply_text.as_deref(), Some("done"));
+        assert!(first[0].reply_text.is_none());
         assert_eq!(first[0].actor_id, "actor-1");
+        assert!(
+            !first[0]
+                .to_json()
+                .unwrap()
+                .windows(b"fixture-secret-token".len())
+                .any(|window| window == b"fixture-secret-token")
+        );
+        let answered = outbound_events(
+            &run,
+            &Event {
+                kind: "run.answered".into(),
+                ..event.clone()
+            },
+            &installation_id,
+            "actor-1",
+        );
+        assert_eq!(answered.len(), 1);
+        assert!(answered[0].reply_text.is_none());
         let approval = Event {
             seq: 10,
             kind: "approval.required".into(),
@@ -1169,7 +1178,7 @@ mod tests {
                 &run,
                 &Event {
                     kind: "model.response".into(),
-                    ..event
+                    ..event.clone()
                 },
                 &installation_id,
                 "actor-1"
