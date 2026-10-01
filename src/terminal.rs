@@ -50,6 +50,7 @@ pub struct Terminal {
     task_started_at: std::cell::Cell<Option<i64>>,
     input_draft: std::cell::RefCell<Option<(String, Vec<char>, usize)>>,
     input_status: std::cell::RefCell<String>,
+    home_snapshot: std::cell::RefCell<Option<HomeSnapshot>>,
     skin: Box<dyn crate::ui::Skin>,
 }
 
@@ -143,6 +144,27 @@ struct InputLayout {
     available: usize,
 }
 
+#[derive(Clone, Debug)]
+struct HomeSnapshot {
+    provider: String,
+    workspace: String,
+    selection: String,
+    recent: Vec<String>,
+    anchor_row: u16,
+    prompt_row_offset: usize,
+    shortcuts: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HomeGeometry {
+    render_width: usize,
+    prompt_row_offset: usize,
+    composer_row: usize,
+}
+
+const HOME_SHORTCUTS: &str =
+    "F2 provider  F4 sign in  F6 model/reasoning  F3 chats  F7 style  F1 help";
+
 fn activity_view_key(
     width: usize,
     height: usize,
@@ -180,6 +202,69 @@ fn input_layout(size: TerminalSize, label: &str, composer: bool) -> InputLayout 
         max_input_rows,
         available,
     }
+}
+
+fn home_render_width(columns: usize) -> usize {
+    columns.saturating_sub(4).max(12)
+}
+
+fn home_shortcut_rows(columns: usize, visible: bool) -> usize {
+    if !visible {
+        return 0;
+    }
+    let width = columns.saturating_sub(5).max(1);
+    wrap_text(HOME_SHORTCUTS, width, width).len().max(1)
+}
+
+fn home_prompt_row_offset(panel_rows: usize, shortcut_rows: usize) -> usize {
+    panel_rows
+        .saturating_add(2)
+        .saturating_add(if shortcut_rows > 0 {
+            shortcut_rows.saturating_add(1)
+        } else {
+            0
+        })
+}
+
+fn home_geometry(
+    size: TerminalSize,
+    anchor_row: usize,
+    panel_rows: usize,
+    shortcut_rows: usize,
+    composer_rows: usize,
+) -> Option<HomeGeometry> {
+    let render_width = home_render_width(size.columns);
+    let composer_width = size.columns.saturating_sub(4).max(4);
+    if render_width.saturating_add(4) > size.columns
+        || composer_width.saturating_add(2) > size.columns
+    {
+        return None;
+    }
+    let prompt_row_offset = home_prompt_row_offset(panel_rows, shortcut_rows);
+    let composer_row = anchor_row.checked_add(prompt_row_offset)?;
+    let bottom_exclusive = composer_row.checked_add(composer_rows.max(1))?;
+    (bottom_exclusive <= size.rows).then_some(HomeGeometry {
+        render_width,
+        prompt_row_offset,
+        composer_row,
+    })
+}
+
+fn home_cursor_matches(
+    cursor_row: usize,
+    anchor_row: usize,
+    prompt_row_offset: usize,
+    caret_row: usize,
+) -> bool {
+    anchor_row
+        .checked_add(prompt_row_offset)
+        .and_then(|row| row.checked_add(caret_row))
+        == Some(cursor_row)
+}
+
+fn query_cursor_position() -> Option<(u16, u16)> {
+    let _raw = RawMode::enter(true).ok()?;
+    cursor::position().ok()
 }
 
 fn composer_draw_rows(previous: usize, current: usize) -> usize {
@@ -520,12 +605,17 @@ impl Default for Terminal {
             task_started_at: std::cell::Cell::new(None),
             input_draft: std::cell::RefCell::new(None),
             input_status: std::cell::RefCell::new(String::new()),
+            home_snapshot: std::cell::RefCell::new(None),
             skin: Box::new(crate::ui::UiOptions::default()),
         }
     }
 }
 
 impl Terminal {
+    fn invalidate_home_snapshot(&self) {
+        self.home_snapshot.replace(None);
+    }
+
     fn color(&self, tone: Tone) -> Color {
         let palette = self.skin.palette();
         let [r, g, b] = match tone {
@@ -540,6 +630,7 @@ impl Terminal {
     fn set_skin(&mut self, skin: Box<dyn crate::ui::Skin>) {
         let previous_prefix = self.input_prefix();
         self.activity_view.replace(None);
+        self.invalidate_home_snapshot();
         self.skin = skin;
         let next_prefix = self.input_prefix();
         if let Some((label, _, _)) = self.input_draft.borrow_mut().as_mut() {
@@ -556,6 +647,7 @@ impl Terminal {
 
     pub fn apply_ui(&mut self, options: crate::ui::UiOptions) -> Result<()> {
         self.activity_view.replace(None);
+        self.invalidate_home_snapshot();
         options.validate()?;
         if self.activity_rows.get() > 0 {
             self.clear_activity()?;
@@ -593,6 +685,7 @@ impl Terminal {
     }
 
     pub fn message(&self, tone: Tone, label: &str, text: &str) -> Result<()> {
+        self.invalidate_home_snapshot();
         let mut output = io::stdout();
         let width = terminal::size()
             .map(|(width, _)| width as usize)
@@ -647,40 +740,148 @@ impl Terminal {
         selection: &str,
         recent: &[String],
     ) -> Result<()> {
-        let width = terminal::size()
-            .map(|(width, _)| width as usize)
-            .unwrap_or(80)
-            .saturating_sub(4)
-            .max(12);
-        let mut output = io::stdout();
-        write!(output, "\r\n")?;
+        self.invalidate_home_snapshot();
+        let size = TerminalSize::current();
+        let anchor = self.interactive.then(query_cursor_position).flatten();
+        write!(io::stdout(), "\r\n")?;
+        let anchor_row = anchor.and_then(|(_, row)| row.checked_add(1));
+        let (panel_rows, shortcut_rows) =
+            self.render_home_panel(provider, workspace, selection, recent, size)?;
+        io::stdout().flush()?;
+
+        if let Some(anchor_row) = anchor_row {
+            let anchor_row = anchor_row as usize;
+            if home_geometry(size, anchor_row, panel_rows, shortcut_rows, 3).is_some() {
+                self.home_snapshot.replace(Some(HomeSnapshot {
+                    provider: provider.to_owned(),
+                    workspace: workspace.to_owned(),
+                    selection: selection.to_owned(),
+                    recent: recent.to_vec(),
+                    anchor_row: anchor_row as u16,
+                    prompt_row_offset: home_prompt_row_offset(panel_rows, shortcut_rows),
+                    shortcuts: shortcut_rows > 0,
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    fn render_home_panel(
+        &self,
+        provider: &str,
+        workspace: &str,
+        selection: &str,
+        recent: &[String],
+        size: TerminalSize,
+    ) -> Result<(usize, usize)> {
+        let width = home_render_width(size.columns);
         let buffer = self.home_buffer(provider, workspace, selection, recent, width);
         for row in 0..buffer.area.height {
             if self.interactive {
                 self.paint_widget_row(&buffer, row, 2)?;
             } else {
-                write!(output, "  {}", crate::widgets::row_text(&buffer, row))?;
+                write!(io::stdout(), "  {}", crate::widgets::row_text(&buffer, row))?;
             }
-            write!(output, "\r\n")?;
+            write!(io::stdout(), "\r\n")?;
         }
+        let mut output = io::stdout();
         if self.colors {
             queue!(output, ResetColor)?;
         }
         write!(output, "\r\n")?;
-        if self
+        let show_shortcuts = self
             .skin
             .blocks()
-            .contains(&crate::ui::WelcomeBlock::Shortcuts)
-        {
-            self.message(
-                Tone::Quiet,
-                "",
-                "F2 provider  F4 sign in  F6 model/reasoning  F3 chats  F7 style  F1 help",
-            )?;
+            .contains(&crate::ui::WelcomeBlock::Shortcuts);
+        let shortcut_rows = home_shortcut_rows(size.columns, show_shortcuts);
+        if show_shortcuts {
+            self.render_home_shortcuts(size.columns)?;
             write!(output, "\r\n")?;
         }
         output.flush()?;
+        Ok((buffer.area.height as usize, shortcut_rows))
+    }
+
+    fn render_home_shortcuts(&self, columns: usize) -> Result<()> {
+        if !self.interactive {
+            return self.message(Tone::Quiet, "", HOME_SHORTCUTS);
+        }
+        let width = columns.saturating_sub(5).max(1);
+        let text = wrap_text(HOME_SHORTCUTS, width, width).join("\r\n    ");
+        if self.colors {
+            queue!(io::stdout(), SetForegroundColor(self.color(Tone::Quiet)))?;
+        }
+        write!(io::stdout(), "    {text}\r\n")?;
+        if self.colors {
+            queue!(io::stdout(), ResetColor)?;
+        }
         Ok(())
+    }
+
+    fn redraw_home_for_resize(
+        &self,
+        size: TerminalSize,
+        caret_row: usize,
+        composer_rows: usize,
+    ) -> Result<bool> {
+        let Some(snapshot) = self.home_snapshot.borrow().clone() else {
+            return Ok(false);
+        };
+        let Some((_, cursor_row)) = cursor::position().ok() else {
+            self.invalidate_home_snapshot();
+            return Ok(false);
+        };
+        if !home_cursor_matches(
+            cursor_row as usize,
+            snapshot.anchor_row as usize,
+            snapshot.prompt_row_offset,
+            caret_row,
+        ) {
+            self.invalidate_home_snapshot();
+            return Ok(false);
+        }
+
+        let width = home_render_width(size.columns);
+        let buffer = self.home_buffer(
+            &snapshot.provider,
+            &snapshot.workspace,
+            &snapshot.selection,
+            &snapshot.recent,
+            width,
+        );
+        let shortcut_rows = home_shortcut_rows(size.columns, snapshot.shortcuts);
+        let Some(_geometry) = home_geometry(
+            size,
+            snapshot.anchor_row as usize,
+            buffer.area.height as usize,
+            shortcut_rows,
+            composer_rows,
+        ) else {
+            self.invalidate_home_snapshot();
+            return Ok(false);
+        };
+
+        // The snapshot stays eligible only while Home is immediately above this prompt.
+        // Clearing from its anchor therefore cannot reach prior messages or shell scrollback.
+        queue!(
+            io::stdout(),
+            cursor::MoveTo(0, snapshot.anchor_row),
+            Clear(ClearType::FromCursorDown)
+        )?;
+        let (panel_rows, shortcut_rows) = self.render_home_panel(
+            &snapshot.provider,
+            &snapshot.workspace,
+            &snapshot.selection,
+            &snapshot.recent,
+            size,
+        )?;
+        write!(io::stdout(), "\r\n")?;
+        io::stdout().flush()?;
+        self.home_snapshot.replace(Some(HomeSnapshot {
+            prompt_row_offset: home_prompt_row_offset(panel_rows, shortcut_rows),
+            ..snapshot
+        }));
+        Ok(true)
     }
 
     fn home_buffer(
@@ -802,6 +1003,7 @@ impl Terminal {
     }
 
     pub fn clear_activity(&self) -> Result<()> {
+        self.invalidate_home_snapshot();
         self.activity_view.replace(None);
         if self.interactive {
             let rows = self.activity_rows.replace(0);
@@ -858,6 +1060,7 @@ impl Terminal {
         tokens: u64,
         context: &ContextStatus,
     ) -> Result<()> {
+        self.invalidate_home_snapshot();
         if !self.interactive {
             return Ok(());
         }
@@ -913,6 +1116,7 @@ impl Terminal {
     }
 
     pub fn loading_activity(&self, label: &str, elapsed: Duration, hint: &str) -> Result<()> {
+        self.invalidate_home_snapshot();
         if !self.interactive {
             return Ok(());
         }
@@ -933,6 +1137,7 @@ impl Terminal {
     }
 
     fn paint_activity(&self, width: usize, text: String, footer: Option<String>) -> Result<()> {
+        self.invalidate_home_snapshot();
         let view = activity_view_key(width, TerminalSize::current().rows, text, footer);
         if self.activity_view.borrow().as_ref() == Some(&view) {
             return Ok(());
@@ -1042,6 +1247,9 @@ impl Terminal {
         let _raw = RawMode::enter(true)?;
         let composer =
             !secret && label == self.input_prefix() && !self.input_status.borrow().is_empty();
+        if !composer {
+            self.invalidate_home_snapshot();
+        }
         let draft_label = label.to_owned();
         let (mut text, mut caret) = self.take_input_draft(label, secret);
         let mut draft_bytes = input_bytes(&text);
@@ -1167,13 +1375,28 @@ impl Terminal {
                     screen_size = TerminalSize::from_event(&event).unwrap_or(screen_size);
                     pending_resize = Some(screen_size);
                     if composer && rendered_composer {
-                        queue!(
-                            io::stdout(),
-                            cursor::MoveUp(previous_caret_row as u16),
-                            cursor::MoveToColumn(0),
-                            Clear(ClearType::FromCursorDown)
+                        let resized_layout = input_layout(screen_size, &draft_label, true);
+                        let resized_editor = editor_view(
+                            &displayed,
+                            caret,
+                            resized_layout.available,
+                            resized_layout.max_input_rows,
+                        );
+                        let composer_rows = resized_editor.rows.len() + 2;
+                        let home_redrawn = self.redraw_home_for_resize(
+                            screen_size,
+                            previous_caret_row,
+                            composer_rows,
                         )?;
-                        io::stdout().flush()?;
+                        if !home_redrawn {
+                            queue!(
+                                io::stdout(),
+                                cursor::MoveUp(previous_caret_row as u16),
+                                cursor::MoveToColumn(0),
+                                Clear(ClearType::FromCursorDown)
+                            )?;
+                            io::stdout().flush()?;
+                        }
                         rendered_composer = false;
                         previous_draw_rows = 0;
                         redraw_from_current_line = true;
@@ -1350,6 +1573,7 @@ impl Terminal {
     }
 
     fn finish_input(&self, composer: bool, submitted: Option<&str>) -> Result<()> {
+        self.invalidate_home_snapshot();
         if !composer {
             write!(io::stdout(), "\r\n")?;
             return Ok(());
@@ -1416,6 +1640,7 @@ impl Terminal {
     }
 
     fn menu(&self, title: &str, choices: &[String], initial: usize) -> Result<Option<usize>> {
+        self.invalidate_home_snapshot();
         let _raw = RawMode::enter(true)?;
         let mut selected = initial.min(choices.len() - 1);
         let mut digits = String::new();
@@ -1562,6 +1787,7 @@ impl Terminal {
     }
 
     pub fn render_event(&self, event: &RunEvent) -> Result<()> {
+        self.invalidate_home_snapshot();
         let payload = &event.payload;
         match event.kind.as_str() {
             "run.running" => {
@@ -2351,6 +2577,63 @@ mod tests {
                 .iter()
                 .all(|row| row.width() <= wide.available)
         );
+    }
+
+    #[test]
+    fn home_resize_geometry_requires_panel_and_composer_to_fit() {
+        assert_eq!(home_render_width(132), 128);
+        assert_eq!(home_render_width(80), 76);
+        assert_eq!(home_render_width(15), 12);
+
+        let wide = TerminalSize {
+            columns: 80,
+            rows: 24,
+        };
+        let geometry = home_geometry(wide, 2, 10, 0, 3).unwrap();
+        assert_eq!(geometry.render_width, 76);
+        assert_eq!(geometry.prompt_row_offset, 12);
+        assert_eq!(geometry.composer_row, 14);
+
+        let with_shortcuts = home_geometry(wide, 2, 10, 2, 3).unwrap();
+        assert_eq!(with_shortcuts.prompt_row_offset, 15);
+        assert_eq!(with_shortcuts.composer_row, 17);
+        assert!(
+            home_geometry(
+                TerminalSize {
+                    columns: 80,
+                    rows: 19,
+                },
+                2,
+                10,
+                2,
+                3,
+            )
+            .is_none()
+        );
+        assert!(
+            home_geometry(
+                TerminalSize {
+                    columns: 15,
+                    rows: 24,
+                },
+                2,
+                10,
+                0,
+                3,
+            )
+            .is_none()
+        );
+        assert!(home_geometry(wide, 2, 10, 0, 12).is_none());
+    }
+
+    #[test]
+    fn home_resize_redraw_requires_the_untouched_prompt_anchor() {
+        assert!(home_cursor_matches(15, 2, 12, 1));
+        assert!(!home_cursor_matches(16, 2, 12, 1));
+        assert!(!home_cursor_matches(15, 2, 13, 1));
+        assert_eq!(home_shortcut_rows(80, false), 0);
+        assert_eq!(home_shortcut_rows(80, true), 1);
+        assert!(home_shortcut_rows(24, true) > 1);
     }
 
     #[test]
