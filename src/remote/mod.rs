@@ -337,6 +337,37 @@ impl Authority {
         Ok(())
     }
 
+    /// Removes one actor's access to a run and clears its selection when it
+    /// points at that run. A later share must be explicit again.
+    pub fn revoke_run(&mut self, actor_id: &str, run_id: &str) -> Result<bool> {
+        validate_actor_id(actor_id)?;
+        validate_uuid(run_id, "run ID")?;
+        self.store.run(run_id)?;
+        let transaction = self
+            .store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE remote_actor_runs SET enabled=0
+             WHERE actor_id=?1 AND run_id=?2 AND enabled=1",
+            params![actor_id, run_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM remote_selected_tasks WHERE actor_id=?1 AND run_id=?2",
+            params![actor_id, run_id],
+        )?;
+        // A ListTasks receipt has no task_id. Invalidate these read-only
+        // snapshots so a retried request cannot return a task after unsharing.
+        if changed != 0 {
+            transaction.execute(
+                "DELETE FROM remote_requests WHERE actor_id=?1 AND task_id IS NULL",
+                [actor_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed == 1)
+    }
+
     /// Revokes a principal and clears its active run scopes and task selection.
     /// A later pairing must explicitly grant tasks again.
     pub fn revoke_actor(&mut self, actor_id: &str) -> Result<bool> {

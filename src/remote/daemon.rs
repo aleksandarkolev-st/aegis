@@ -40,6 +40,10 @@ pub fn command(root: &Path, args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("pair") => pair_command(root, &args[1..]),
         Some("status") if args.len() == 1 => status(root),
+        Some("share") if args.len() == 2 => share_task(root, &args[1]),
+        Some("share") => bail!("usage: aegis remote share <run-id>"),
+        Some("unshare") if args.len() == 2 => unshare_task(root, &args[1]),
+        Some("unshare") => bail!("usage: aegis remote unshare <run-id>"),
         Some("revoke") if args.len() == 1 => revoke(root),
         Some("run") if args.len() == 1 => run_daemon(root),
         Some("help" | "--help") | None => {
@@ -54,6 +58,7 @@ fn usage() {
     println!(
         "aegis remote pair [--relay-admin-url <url> --admin-token-env <name> --nats-url <tls-url> --nats-token-env <name> [--nats-root-cert <path>]]"
     );
+    println!("aegis remote share <run-id> | unshare <run-id>");
     println!("aegis remote status | revoke | run");
     println!(
         "Pair stores only endpoint settings and environment variable names in .arun/remote.json."
@@ -273,6 +278,40 @@ fn status(root: &Path) -> Result<()> {
     );
     println!("Relay: {}", config.relay_admin_url);
     println!("NATS: {}", config.nats_url);
+    Ok(())
+}
+
+fn share_task(root: &Path, run_id: &str) -> Result<()> {
+    let config = Config::load(root)?;
+    let mut authority = Authority::open(root)?;
+    if authority.installation_id() != config.installation_id {
+        bail!("remote configuration does not match the local installation identity");
+    }
+    authority.grant_run(&config.actor_id, run_id)?;
+    println!(
+        "Shared task {run_id} with remote actor {}.",
+        config.actor_id
+    );
+    Ok(())
+}
+
+fn unshare_task(root: &Path, run_id: &str) -> Result<()> {
+    let config = Config::load(root)?;
+    let mut authority = Authority::open(root)?;
+    if authority.installation_id() != config.installation_id {
+        bail!("remote configuration does not match the local installation identity");
+    }
+    if authority.revoke_run(&config.actor_id, run_id)? {
+        println!(
+            "Unshared task {run_id} from remote actor {}.",
+            config.actor_id
+        );
+    } else {
+        println!(
+            "Task {run_id} was not shared with remote actor {}.",
+            config.actor_id
+        );
+    }
     Ok(())
 }
 
@@ -1311,6 +1350,100 @@ mod tests {
                 "https://relay.example/admin/v1/installations/{}/actors/{}/bindings/revoke",
                 config.installation_id, config.actor_id
             )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn local_share_and_unshare_scope_the_configured_actor() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let root = workspace.path().join(".arun");
+        let (config, mut authority, _) = fixture(workspace.path())?;
+        let run = authority.store.create_run(
+            "task available only after explicit sharing",
+            workspace.path(),
+            "codex",
+            json!(["workspace.read"]),
+            json!({}),
+            "",
+        )?;
+        authority.store.state(&run.id, "running", json!({}))?;
+        let other_actor = Uuid::new_v4().to_string();
+        authority.register_actor(&other_actor)?;
+        authority.grant_run(&other_actor, &run.id)?;
+        config.save(&root)?;
+        drop(authority);
+
+        let share_args = vec!["share".to_owned(), run.id.clone()];
+        command(&root, &share_args)?;
+        let mut authority = Authority::open(&root)?;
+        assert_eq!(authority.authorized_runs(&config.actor_id)?.len(), 1);
+        assert_eq!(authority.authorized_runs(&other_actor)?.len(), 1);
+
+        let now = Utc::now().timestamp();
+        let list_request = super::super::CommandEnvelope {
+            version: 1,
+            installation_id: config.installation_id.clone(),
+            actor_id: config.actor_id.clone(),
+            request_id: Uuid::new_v4().to_string(),
+            issued_at: now,
+            expires_at: now + 60,
+            command: Command::ListTasks,
+        };
+        let listed =
+            authority.apply_from_authenticated_relay(&config.actor_id, &list_request, now)?;
+        let tasks = listed.result["tasks"]
+            .as_array()
+            .context("missing task list")?;
+        assert_eq!(tasks.len(), 1);
+        let alias = tasks[0]["alias"].as_str().context("missing task alias")?;
+        assert!(format_receipt(&RelayCommand::ListTasks, &listed).contains(alias));
+        authority.bind_selected_task(&config.actor_id, &run.id)?;
+        assert_eq!(
+            authority.selected_task(&config.actor_id)?.as_deref(),
+            Some(run.id.as_str())
+        );
+        drop(authority);
+
+        let unshare_args = vec!["unshare".to_owned(), run.id.clone()];
+        command(&root, &unshare_args)?;
+        let mut authority = Authority::open(&root)?;
+        assert!(authority.authorized_runs(&config.actor_id)?.is_empty());
+        assert_eq!(authority.selected_task(&config.actor_id)?, None);
+        assert_eq!(authority.resolve_task(&config.actor_id, None)?, None);
+        assert!(
+            authority
+                .resolve_task(&config.actor_id, Some(&run.id))
+                .is_err()
+        );
+        assert_eq!(authority.authorized_runs(&other_actor)?.len(), 1);
+
+        // An idempotent retry of an earlier /tasks request must not replay its
+        // now-stale task snapshot after unsharing.
+        let refreshed =
+            authority.apply_from_authenticated_relay(&config.actor_id, &list_request, now + 1)?;
+        assert!(!refreshed.duplicate);
+        assert!(refreshed.result["tasks"].as_array().unwrap().is_empty());
+        assert!(
+            format_receipt(&RelayCommand::ListTasks, &refreshed)
+                .contains("No tasks are currently shared")
+        );
+
+        let status_request = super::super::CommandEnvelope {
+            version: 1,
+            installation_id: config.installation_id,
+            actor_id: config.actor_id.clone(),
+            request_id: Uuid::new_v4().to_string(),
+            issued_at: now + 1,
+            expires_at: now + 61,
+            command: Command::Status {
+                task_id: Some(run.id),
+            },
+        };
+        assert!(
+            authority
+                .apply_from_authenticated_relay(&config.actor_id, &status_request, now + 1)
+                .is_err()
         );
         Ok(())
     }
