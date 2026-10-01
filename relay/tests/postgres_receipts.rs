@@ -147,7 +147,7 @@ async fn postgres_pairing_rotation_and_inbound_receipts_are_idempotent() {
         InboundReceiptClaim::InProgress
     );
     sqlx::query(
-        "UPDATE delivery_receipts SET updated_at = now() - interval '31 seconds' WHERE direction = 'inbound' AND channel = 'whatsapp' AND sender_id = $1 AND external_message_id = $2",
+        "UPDATE delivery_receipts SET updated_at = now() - interval '2 minutes' WHERE direction = 'inbound' AND channel = 'whatsapp' AND sender_id = $1 AND external_message_id = $2",
     )
     .bind(&sender_id)
     .bind(&external_message_id)
