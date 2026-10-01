@@ -159,6 +159,75 @@ pub(crate) fn append_event(
     Ok(())
 }
 
+fn terminal_operation_state(state: &str) -> bool {
+    matches!(
+        state,
+        "succeeded" | "failed" | "cancelled" | "outcome_unknown"
+    )
+}
+
+fn validate_operation_transition(
+    operation: &Operation,
+    next: &str,
+    allow_unknown_resolution: bool,
+) -> Result<()> {
+    if !matches!(
+        next,
+        "dispatched" | "succeeded" | "failed" | "cancelled" | "outcome_unknown"
+    ) {
+        bail!("invalid operation state");
+    }
+
+    if allow_unknown_resolution
+        && operation.state == "outcome_unknown"
+        && matches!(next, "succeeded" | "failed")
+    {
+        return Ok(());
+    }
+
+    match operation.state.as_str() {
+        "pending" => {
+            if !matches!(next, "dispatched" | "succeeded" | "failed" | "cancelled") {
+                bail!("invalid operation state transition from pending");
+            }
+        }
+        "dispatched" => {
+            if !matches!(
+                next,
+                "dispatched" | "succeeded" | "failed" | "cancelled" | "outcome_unknown"
+            ) || (next == "dispatched" && !operation.retry_safe)
+            {
+                bail!("invalid operation state transition from dispatched");
+            }
+        }
+        "executing" => {
+            if !matches!(
+                next,
+                "dispatched" | "succeeded" | "failed" | "cancelled" | "outcome_unknown"
+            ) || (next == "dispatched" && !operation.retry_safe)
+            {
+                bail!("invalid operation state transition from executing");
+            }
+        }
+        _ => bail!("operation is already terminal"),
+    }
+
+    let needs_claim = !operation.retry_safe
+        || matches!(
+            operation.capability.as_str(),
+            "workspace.write" | "workspace.patch"
+        );
+    if next == "succeeded" && needs_claim && operation.state != "executing" {
+        bail!("a side-effecting operation must be claimed before it can succeed");
+    }
+    if next == "outcome_unknown"
+        && (operation.retry_safe || !matches!(operation.state.as_str(), "dispatched" | "executing"))
+    {
+        bail!("only a dispatched, non-retry-safe operation can have an unknown outcome");
+    }
+    Ok(())
+}
+
 pub(crate) fn insert_run(transaction: &Transaction<'_>, run: &Run) -> Result<()> {
     let mut budgets = run.budgets.clone();
     remove_task_caps(&mut budgets);
@@ -1446,47 +1515,92 @@ impl Store {
         artifact: Option<&str>,
         detail: Value,
     ) -> Result<()> {
+        self.update_operation_state(operation, state, artifact, detail, false)
+    }
+
+    fn update_operation_state(
+        &mut self,
+        operation: &Operation,
+        state: &str,
+        artifact: Option<&str>,
+        detail: Value,
+        allow_unknown_resolution: bool,
+    ) -> Result<()> {
+        let artifact_directory = self.artifacts.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut canonical: Operation = transaction.query_row(
+            "SELECT capability, capability_version, arguments, idempotency_key, retry_safe, state, artifact
+             FROM operations WHERE id = ?1 AND run_id = ?2",
+            params![operation.id, operation.run_id],
+            |row| {
+                let arguments: String = row.get(2)?;
+                Ok(Operation {
+                    id: operation.id.clone(),
+                    run_id: operation.run_id.clone(),
+                    capability: row.get(0)?,
+                    capability_version: row.get(1)?,
+                    arguments: serde_json::from_str(&arguments).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    idempotency_key: row.get(3)?,
+                    retry_safe: row.get(4)?,
+                    state: row.get(5)?,
+                    artifact: row.get(6)?,
+                })
+            },
+        )?;
+        let resolving_unknown = allow_unknown_resolution
+            && canonical.state == "outcome_unknown"
+            && matches!(state, "succeeded" | "failed");
+        if terminal_operation_state(&canonical.state) && !resolving_unknown {
+            if canonical.state == state
+                && artifact.is_none_or(|hash| canonical.artifact.as_deref() == Some(hash))
+            {
+                return Ok(());
+            }
+            bail!("terminal operation states cannot be rewritten");
+        }
+        validate_operation_transition(&canonical, state, allow_unknown_resolution)?;
+
+        let result_artifact = artifact.or(canonical.artifact.as_deref());
         let observed_result = if state == "succeeded"
             && matches!(
-                operation.capability.as_str(),
+                canonical.capability.as_str(),
                 "workspace.read" | "workspace.read_batch" | "workspace.write" | "workspace.patch"
             ) {
-            artifact
-                .map(|hash| self.artifact(hash))
+            result_artifact
+                .map(|hash| artifact_bytes(&transaction, &artifact_directory, hash))
                 .transpose()?
                 .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
         } else {
             None
         };
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let previous: String = transaction.query_row(
-            "SELECT state FROM operations WHERE id = ?1 AND run_id = ?2",
-            params![operation.id, operation.run_id],
-            |row| row.get(0),
-        )?;
+        let previous = canonical.state.clone();
         transaction.execute(
             "UPDATE operations SET state = ?2, artifact = COALESCE(?3, artifact) WHERE id = ?1",
-            params![operation.id, state, artifact],
+            params![canonical.id, state, artifact],
         )?;
-        if matches!(
-            state,
-            "succeeded" | "failed" | "cancelled" | "outcome_unknown"
-        ) && !matches!(
-            previous.as_str(),
-            "succeeded" | "failed" | "cancelled" | "outcome_unknown"
-        ) {
-            crate::freshness::record(&transaction, operation, observed_result.as_ref())?;
+        canonical.state = state.to_owned();
+        if let Some(artifact) = artifact {
+            canonical.artifact = Some(artifact.to_owned());
+        }
+        if terminal_operation_state(state) {
+            crate::freshness::record(&transaction, &canonical, observed_result.as_ref())?;
             let may_have_run =
                 state == "succeeded" || matches!(previous.as_str(), "dispatched" | "executing");
-            crate::obligations::record_operation(&transaction, operation, may_have_run)?;
+            crate::obligations::record_operation(&transaction, &canonical, may_have_run)?;
         }
         append_event(
             &transaction,
-            &operation.run_id,
+            &canonical.run_id,
             &format!("operation.{state}"),
-            json!({"id": operation.id, "artifact": artifact, "detail": detail}),
+            json!({"id": canonical.id, "artifact": artifact, "detail": detail}),
         )?;
         transaction.commit()?;
         Ok(())
@@ -1591,11 +1705,12 @@ impl Store {
             bail!("reconciliation requires a note or external receipt");
         }
         let artifact = self.put_artifact(note.as_bytes())?;
-        self.operation_state(
+        self.update_operation_state(
             &operation,
             if succeeded { "succeeded" } else { "failed" },
             Some(&artifact),
             json!({"reconciled_by": "user", "note_artifact": artifact}),
+            true,
         )?;
         if self.unknown_count(run_id)? == 0 && !self.run(run_id)?.is_terminal() {
             self.state(run_id, "ready", json!({"reconciled": operation_id}))?;
@@ -1642,12 +1757,16 @@ impl Store {
                     None,
                     json!({"reason": "interrupted non-idempotent operation"}),
                 )?;
-                self.state(
-                    run_id,
-                    "waiting_recovery",
-                    json!({"operation": operation.id}),
-                )?;
             }
+        }
+        let unknown = self.unknown_count(run_id)?;
+        let run = self.run(run_id)?;
+        if unknown > 0 && run.state != "waiting_recovery" && !run.is_terminal() {
+            self.state(
+                run_id,
+                "waiting_recovery",
+                json!({"unknown_operations": unknown}),
+            )?;
         }
         Ok(unresolved)
     }
@@ -1806,9 +1925,11 @@ mod tests {
             json!({"actions": 10}),
             "tests pass",
         )?;
+        store.state(&run.id, "running", json!({}))?;
         let operation =
             store.begin_operation(&run.id, "workspace.read", json!({"path": "a"}), true)?;
         store.operation_state(&operation, "dispatched", None, json!({}))?;
+        store.claim_operation(&operation)?;
         let hash = store.put_artifact(b"large output")?;
         store.operation_state(&operation, "succeeded", Some(&hash), json!({"bytes": 12}))?;
         drop(store);
@@ -1819,10 +1940,125 @@ mod tests {
                 .iter()
                 .map(|event| event.seq)
                 .collect::<Vec<_>>(),
-            vec![1, 2, 3, 4]
+            vec![1, 2, 3, 4, 5, 6]
         );
         assert_eq!(store.artifact(&hash)?, b"large output");
         assert!(store.unresolved(&run.id)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn operation_state_uses_canonical_row_and_requires_claim_for_side_effects() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "preserve canonical operation identity",
+            directory.path(),
+            "codex",
+            json!(["workspace.write"]),
+            json!({}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+
+        let read = store.begin_operation_versioned(
+            &run.id,
+            "workspace.read",
+            7,
+            json!({"path":"canonical.txt"}),
+            true,
+        )?;
+        store.operation_state(&read, "dispatched", None, json!({}))?;
+        store.claim_operation(&read)?;
+        let forged_artifact = store.put_artifact(
+            br#"{"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+        )?;
+        let mut forged = read.clone();
+        forged.capability = "workspace.write".into();
+        forged.capability_version = 99;
+        forged.arguments = json!({"path":"forged.txt"});
+        forged.retry_safe = false;
+        assert!(
+            store
+                .operation_state(&forged, "outcome_unknown", None, json!({}))
+                .is_err()
+        );
+        assert_eq!(store.operation(&read.id)?.state, "executing");
+        store.operation_state(&forged, "succeeded", Some(&forged_artifact), json!({}))?;
+
+        assert_eq!(store.workspace_revision(&run.id)?, Some(0));
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT path FROM observed_files WHERE run_id=?1",
+                [&run.id],
+                |row| row.get::<_, String>(0),
+            )?,
+            "canonical.txt"
+        );
+        let stored = store.operation(&read.id)?;
+        assert_eq!(stored.capability, "workspace.read");
+        assert_eq!(stored.capability_version, 7);
+        assert_eq!(stored.arguments, json!({"path":"canonical.txt"}));
+        assert!(stored.retry_safe);
+        Ok(())
+    }
+
+    #[test]
+    fn operation_state_rejects_invalid_transitions_and_terminal_rewrites() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "require dispatch and claim before a write succeeds",
+            directory.path(),
+            "codex",
+            json!(["workspace.write"]),
+            json!({}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let write = store.begin_operation(
+            &run.id,
+            "workspace.write",
+            json!({"path":"fixture.txt","content":"verified"}),
+            false,
+        )?;
+        let result = store.put_artifact(
+            br#"{"path":"fixture.txt","bytes":8,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"#,
+        )?;
+
+        assert!(
+            store
+                .operation_state(&write, "unknown", None, json!({}))
+                .is_err()
+        );
+        assert!(
+            store
+                .operation_state(&write, "succeeded", Some(&result), json!({}))
+                .is_err()
+        );
+        assert_eq!(store.operation(&write.id)?.state, "pending");
+
+        store.operation_state(&write, "dispatched", None, json!({}))?;
+        assert!(
+            store
+                .operation_state(&write, "succeeded", Some(&result), json!({}))
+                .is_err()
+        );
+        store.claim_operation(&write)?;
+        store.operation_state(&write, "succeeded", Some(&result), json!({}))?;
+        assert!(
+            store
+                .operation_state(&write, "failed", None, json!({}))
+                .is_err()
+        );
+        store.operation_state(
+            &write,
+            "succeeded",
+            Some(&result),
+            json!({"duplicate":true}),
+        )?;
+        assert_eq!(store.operation(&write.id)?.state, "succeeded");
+        assert_eq!(store.workspace_revision(&run.id)?, Some(1));
         Ok(())
     }
 
@@ -1848,6 +2084,38 @@ mod tests {
         assert_eq!(store.unresolved(&run.id)?.len(), 1);
         assert_eq!(store.unresolved(&run.id)?[0].id, safe.id);
         assert_eq!(store.run(&run.id)?.state, "waiting_recovery");
+        Ok(())
+    }
+
+    #[test]
+    fn reconcile_recovers_idempotently_after_unknown_outcome_is_recorded() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "resume reconciliation",
+            directory.path(),
+            "grok",
+            json!([]),
+            json!({}),
+            "receipt",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let operation = store.begin_operation(&run.id, "external.write", json!({}), false)?;
+        store.operation_state(&operation, "dispatched", None, json!({}))?;
+        store.operation_state(&operation, "outcome_unknown", None, json!({}))?;
+
+        assert_eq!(store.run(&run.id)?.state, "running");
+        assert!(store.reconcile(&run.id)?.is_empty());
+        assert_eq!(store.run(&run.id)?.state, "waiting_recovery");
+        let unknown_events = store.event_count(&run.id, "operation.outcome_unknown")?;
+        let waiting_events = store.event_count(&run.id, "run.waiting_recovery")?;
+        assert_eq!(unknown_events, 1);
+        assert_eq!(waiting_events, 1);
+
+        assert!(store.reconcile(&run.id)?.is_empty());
+        assert_eq!(store.operation(&operation.id)?.state, "outcome_unknown");
+        assert_eq!(store.event_count(&run.id, "operation.outcome_unknown")?, 1);
+        assert_eq!(store.event_count(&run.id, "run.waiting_recovery")?, 1);
         Ok(())
     }
 
@@ -2058,6 +2326,7 @@ mod tests {
 
         let mutation = store.begin_operation(&run.id, "workspace.write", json!({}), true)?;
         store.operation_state(&mutation, "dispatched", None, json!({}))?;
+        store.claim_operation(&mutation)?;
         let mutation_receipt = store.put_artifact(b"workspace changed")?;
         store.operation_state(&mutation, "succeeded", Some(&mutation_receipt), json!({}))?;
         assert_eq!(store.workspace_revision(&run.id)?, Some(1));
@@ -2171,6 +2440,7 @@ mod tests {
 
         let mutation = store.begin_operation(&run.id, "workspace.write", json!({}), true)?;
         store.operation_state(&mutation, "dispatched", None, json!({}))?;
+        store.claim_operation(&mutation)?;
         let mutation_receipt = store.put_artifact(b"workspace changed")?;
         store.operation_state(&mutation, "succeeded", Some(&mutation_receipt), json!({}))?;
         assert_eq!(store.workspace_revision(&run.id)?, Some(1));

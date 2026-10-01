@@ -629,6 +629,8 @@ mod tests {
         crate::pause::boundary(&mut store, &runs[1].id)?;
         let edit =
             store.begin_operation(&runs[0].id, "workspace.write", serde_json::json!({}), false)?;
+        store.operation_state(&edit, "dispatched", None, serde_json::json!({}))?;
+        store.claim_operation(&edit)?;
         let hash = store.put_artifact(b"edit")?;
         store.operation_state(&edit, "succeeded", Some(&hash), serde_json::json!({}))?;
         assert_eq!(store.workspace_revision(&runs[0].id)?, Some(1));
@@ -704,14 +706,22 @@ mod tests {
         let evidence = store.put_artifact(b"test receipt")?;
         store.operation_state(&operation, "succeeded", Some(&evidence), json!({}))?;
         store.verify_obligation(&run.id, 1, &[evidence.clone()])?;
-        store.operation_state(&operation, "failed", None, json!({}))?;
+        // Simulate a corrupted operation row so completion validation proves it
+        // rechecks provenance even when a prior successful receipt is attached.
+        store.connection.execute(
+            "UPDATE operations SET state='failed' WHERE id=?1",
+            [&operation.id],
+        )?;
         assert!(
             store
                 .complete_run(&run.id, "done", &[evidence.clone()])
                 .is_err()
         );
         assert!(validate_connection(&store.connection, &run.id).is_err());
-        store.operation_state(&operation, "succeeded", Some(&evidence), json!({}))?;
+        store.connection.execute(
+            "UPDATE operations SET state='succeeded' WHERE id=?1",
+            [&operation.id],
+        )?;
         store.state(&run.id, "paused", json!({}))?;
         let replacement = store.supersede_obligation(&run.id, 1, "Run all tests", "Approved")?;
         store.state(&run.id, "running", json!({}))?;
@@ -879,6 +889,8 @@ mod tests {
         store.operation_state(&check, "succeeded", Some(&old_evidence), json!({}))?;
         store.verify_obligation(&run.id, 1, &[old_evidence.clone()])?;
         let edit = store.begin_operation(&run.id, "workspace.write", json!({}), false)?;
+        store.operation_state(&edit, "dispatched", None, json!({}))?;
+        store.claim_operation(&edit)?;
         let edit_evidence = store.put_artifact(b"new file result")?;
         store.operation_state(&edit, "succeeded", Some(&edit_evidence), json!({}))?;
         assert_eq!(store.workspace_revision(&run.id)?, Some(1));
