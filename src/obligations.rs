@@ -712,7 +712,9 @@ mod tests {
         );
         assert!(validate_connection(&store.connection, &run.id).is_err());
         store.operation_state(&operation, "succeeded", Some(&evidence), json!({}))?;
+        store.state(&run.id, "paused", json!({}))?;
         let replacement = store.supersede_obligation(&run.id, 1, "Run all tests", "Approved")?;
+        store.state(&run.id, "running", json!({}))?;
         store.verify_obligation(&run.id, replacement, &[evidence.clone()])?;
         store.connection.execute(
             "UPDATE obligations SET reason = '' WHERE run_id = ?1 AND id = 1",
@@ -975,6 +977,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(store.obligations(&run.id)?.len(), 2);
+        store.state(&run.id, "paused", json!({}))?;
         let replacement = store.supersede_obligation(
             &run.id,
             1,
@@ -1002,6 +1005,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(store.event_count(&run.id, "obligation.superseded")?, 1);
+        store.state(&run.id, "running", json!({}))?;
         drop(store);
         let mut store = Store::open(directory.path())?;
         assert_eq!(store.obligations(&run.id)?, ledger);
@@ -1068,6 +1072,7 @@ mod tests {
             json!({"obligations":titles}),
             "",
         )?;
+        store.state(&run.id, "paused", json!({}))?;
         assert_eq!(
             store.supersede_obligation(&run.id, 1, "Updated requirement", "User approved")?,
             21

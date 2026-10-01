@@ -1637,6 +1637,7 @@ mod tests {
             json!({"obligations":["Preserve v1 API"]}),
             "",
         )?;
+        store.state(&run.id, "paused", json!({}))?;
         store.supersede_obligation(&run.id, 1, "Allow v2 API", "User approved")?;
         let prompt = context(&store, &run)?;
         let state: Value = serde_json::from_str(
