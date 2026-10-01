@@ -60,6 +60,9 @@ pub enum Command {
     Status {
         task_id: Option<String>,
     },
+    Details {
+        task_id: Option<String>,
+    },
     Pause {
         task_id: Option<String>,
     },
@@ -263,6 +266,7 @@ impl Authority {
                 "INSERT INTO remote_actor_runs(actor_id,run_id,enabled) VALUES (?1,?2,1)",
                 params![actor_id, run_id],
             )?;
+            ensure_task_alias(&transaction, actor_id, run_id)?;
         }
         transaction.commit()?;
         Ok(())
@@ -272,7 +276,11 @@ impl Authority {
         validate_actor_id(actor_id)?;
         validate_uuid(run_id, "run ID")?;
         self.store.run(run_id)?;
-        let changed = self.store.connection.execute(
+        let transaction = self
+            .store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
             "INSERT INTO remote_actor_runs(actor_id,run_id,enabled)
              SELECT actor_id,?2,1 FROM remote_actors WHERE actor_id=?1 AND enabled=1
              ON CONFLICT(actor_id,run_id) DO UPDATE SET enabled=1",
@@ -281,6 +289,8 @@ impl Authority {
         if changed != 1 {
             bail!("remote actor is not paired or has been revoked");
         }
+        ensure_task_alias(&transaction, actor_id, run_id)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -484,9 +494,11 @@ impl Authority {
         validate_actor_id(actor_id)?;
         let mut statement = self.store.connection.prepare(
             "SELECT run.id,run.task,run.state,run.provider,run.created_at,
+             aliases.alias,
              EXISTS(SELECT 1 FROM remote_selected_tasks AS selected WHERE selected.actor_id=?1 AND selected.run_id=run.id)
              FROM remote_actor_runs AS access JOIN runs AS run ON run.id=access.run_id
              JOIN remote_actors AS actor ON actor.actor_id=access.actor_id
+             JOIN remote_task_aliases AS aliases ON aliases.actor_id=access.actor_id AND aliases.run_id=run.id
              WHERE access.actor_id=?1 AND access.enabled=1 AND actor.enabled=1 ORDER BY run.created_at DESC LIMIT 100",
         )?;
         let rows = statement.query_map([actor_id], |row| {
@@ -496,14 +508,16 @@ impl Authority {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, i64>(4)?,
-                row.get::<_, bool>(5)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, bool>(6)?,
             ))
         })?;
         let mut tasks = Vec::new();
         for row in rows {
-            let (id, task, state, provider, created_at, selected) = row?;
+            let (id, task, state, provider, created_at, alias, selected) = row?;
             tasks.push(json!({
                 "task_id":id,
+                "alias":alias,
                 "task":crate::text::clean(&task).chars().take(300).collect::<String>(),
                 "state":state,
                 "provider":provider,
@@ -860,6 +874,13 @@ fn ensure_schema(connection: &rusqlite::Connection) -> Result<()> {
             enabled INTEGER NOT NULL,
             PRIMARY KEY(actor_id,run_id)
          );
+         CREATE TABLE IF NOT EXISTS remote_task_aliases (
+            actor_id TEXT NOT NULL REFERENCES remote_actors(actor_id),
+            run_id TEXT NOT NULL REFERENCES runs(id),
+            alias TEXT NOT NULL,
+            PRIMARY KEY(actor_id,run_id),
+            UNIQUE(actor_id,alias)
+         );
          CREATE TABLE IF NOT EXISTS remote_requests (
             actor_id TEXT NOT NULL REFERENCES remote_actors(actor_id),
             request_id TEXT NOT NULL,
@@ -889,7 +910,59 @@ fn ensure_schema(connection: &rusqlite::Connection) -> Result<()> {
             PRIMARY KEY(run_id,operation_id)
          );",
     )?;
+    // Backfill aliases for installations that already have authorized remote
+    // tasks. Ordering makes first-time allocation deterministic; thereafter
+    // persisted aliases do not change when the actor receives more tasks.
+    let mut statement = connection.prepare(
+        "SELECT access.actor_id,access.run_id FROM remote_actor_runs AS access
+         LEFT JOIN remote_task_aliases AS aliases
+           ON aliases.actor_id=access.actor_id AND aliases.run_id=access.run_id
+         WHERE aliases.run_id IS NULL ORDER BY access.actor_id,access.run_id",
+    )?;
+    let missing = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    for (actor_id, run_id) in missing {
+        ensure_task_alias(connection, &actor_id, &run_id)?;
+    }
     Ok(())
+}
+
+fn ensure_task_alias(
+    connection: &rusqlite::Connection,
+    actor_id: &str,
+    run_id: &str,
+) -> Result<String> {
+    if let Some(alias) = connection
+        .query_row(
+            "SELECT alias FROM remote_task_aliases WHERE actor_id=?1 AND run_id=?2",
+            params![actor_id, run_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        return Ok(alias);
+    }
+    let compact = uuid::Uuid::parse_str(run_id)?.simple().to_string();
+    for prefix_length in 6..=compact.len() {
+        let alias = format!("t-{}", &compact[..prefix_length]);
+        let used: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM remote_task_aliases WHERE actor_id=?1 AND alias=?2)",
+            params![actor_id, alias],
+            |row| row.get(0),
+        )?;
+        if !used {
+            connection.execute(
+                "INSERT INTO remote_task_aliases(actor_id,run_id,alias) VALUES (?1,?2,?3)",
+                params![actor_id, run_id, alias],
+            )?;
+            return Ok(alias);
+        }
+    }
+    bail!("could not allocate a unique short alias for authorized task")
 }
 
 fn apply_command(
@@ -994,10 +1067,21 @@ fn apply_command(
                     .take(300)
                     .collect::<String>()
             });
+            let alias = task_alias(transaction, actor_id, &run_id)?;
             Ok(applied_for_task(
                 &run_id,
-                json!({"task":task,"provider":provider,"state":state,"created_at":created_at,"started_at":started_at,"summary":summary,"selected":selected}),
+                json!({"alias":alias,"task":task,"provider":provider,"state":state,"created_at":created_at,"started_at":started_at,"summary":summary,"selected":selected}),
             ))
+        }
+        Command::Details { task_id } => {
+            let run_id = if let Some(reference) = task_id.as_deref() {
+                resolve_actor_task_reference(transaction, actor_id, reference)?
+            } else {
+                resolve_actor_task(transaction, actor_id, None)?
+                    .ok_or_else(|| reject_command("select or specify a task first"))?
+            };
+            let details = task_details(transaction, actor_id, &run_id, now)?;
+            Ok(applied_for_task(&run_id, details))
         }
         Command::Pause { task_id } => {
             let run_id = require_resolved_task(transaction, actor_id, task_id.as_deref())?;
@@ -1088,13 +1172,17 @@ fn apply_command(
             Ok(applied_for_task(&run_id, json!({"cancelled":true})))
         }
         Command::SelectTask { task_id } => {
-            require_actor_run(transaction, actor_id, task_id)?;
+            let run_id = resolve_actor_task_reference(transaction, actor_id, task_id)?;
+            let alias = task_alias(transaction, actor_id, &run_id)?;
             transaction.execute(
                 "INSERT INTO remote_selected_tasks(actor_id,run_id,selected_at) VALUES (?1,?2,?3)
                  ON CONFLICT(actor_id) DO UPDATE SET run_id=excluded.run_id,selected_at=excluded.selected_at",
-                params![actor_id, task_id, crate::storage::unix_time()],
+                params![actor_id, run_id, crate::storage::unix_time()],
             )?;
-            Ok(applied_for_task(task_id, json!({"selected":true})))
+            Ok(applied_for_task(
+                &run_id,
+                json!({"selected":true,"alias":alias}),
+            ))
         }
         Command::ApproveOnce { challenge_id } | Command::Deny { challenge_id } => {
             validate_uuid(challenge_id, "approval challenge ID")?;
@@ -1173,7 +1261,10 @@ fn require_resolved_task(
     actor_id: &str,
     requested: Option<&str>,
 ) -> Result<String> {
-    resolve_actor_task(transaction, actor_id, requested)?
+    if let Some(reference) = requested {
+        return resolve_actor_task_reference(transaction, actor_id, reference);
+    }
+    resolve_actor_task(transaction, actor_id, None)?
         .ok_or_else(|| reject_command("select or specify a task first"))
 }
 
@@ -1199,6 +1290,162 @@ fn resolve_actor_task(
     } else {
         Ok(None)
     }
+}
+
+/// Resolve a phone-supplied UUID or short alias only against the authenticated
+/// actor's currently enabled task grants. Aliases are never searched globally.
+fn resolve_actor_task_reference(
+    transaction: &Transaction<'_>,
+    actor_id: &str,
+    reference: &str,
+) -> Result<String> {
+    if let Ok(parsed) = uuid::Uuid::parse_str(reference) {
+        let run_id = parsed.to_string();
+        require_actor_run(transaction, actor_id, &run_id)?;
+        return Ok(run_id);
+    }
+    if reference.is_empty()
+        || reference.len() > 64
+        || !reference
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err(reject_command(
+            "remote actor is not authorized for this task",
+        ));
+    }
+    let run_id: Option<String> = transaction
+        .query_row(
+            "SELECT aliases.run_id FROM remote_task_aliases AS aliases
+             JOIN remote_actor_runs AS access
+               ON access.actor_id=aliases.actor_id AND access.run_id=aliases.run_id
+             JOIN remote_actors AS actor ON actor.actor_id=access.actor_id
+             WHERE aliases.actor_id=?1 AND aliases.alias=?2
+               AND access.enabled=1 AND actor.enabled=1",
+            params![actor_id, reference.to_ascii_lowercase()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(run_id) = run_id else {
+        return Err(reject_command(
+            "remote actor is not authorized for this task",
+        ));
+    };
+    // Re-check the grant before returning the resolved ID so a malformed or
+    // stale alias record cannot bypass the ordinary actor/run guard.
+    require_actor_run(transaction, actor_id, &run_id)?;
+    Ok(run_id)
+}
+
+fn task_alias(transaction: &Transaction<'_>, actor_id: &str, run_id: &str) -> Result<String> {
+    require_actor_run(transaction, actor_id, run_id)?;
+    transaction
+        .query_row(
+            "SELECT alias FROM remote_task_aliases WHERE actor_id=?1 AND run_id=?2",
+            params![actor_id, run_id],
+            |row| row.get(0),
+        )
+        .context("authorized task has no short alias")
+}
+
+/// Build a bounded status report from task metadata and aggregate counters.
+/// Event payloads, artifacts, operation arguments and tool output are excluded.
+fn task_details(
+    transaction: &Transaction<'_>,
+    actor_id: &str,
+    run_id: &str,
+    now: i64,
+) -> Result<Value> {
+    require_actor_run(transaction, actor_id, run_id)?;
+    let row: (
+        String,
+        String,
+        String,
+        i64,
+        Option<String>,
+        Option<i64>,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = transaction.query_row(
+        "SELECT run.task,run.state,run.provider,run.created_at,
+         json_extract(run.budgets,'$.model'),projection.started_at,
+         COALESCE(projection.model_tokens,0),
+         (SELECT COUNT(*) FROM events WHERE run_id=run.id AND kind='model.response'),
+         (SELECT COUNT(*) FROM operations WHERE run_id=run.id AND state='succeeded'),
+         (SELECT COUNT(*) FROM operations WHERE run_id=run.id AND state IN ('pending','dispatched','executing')),
+         (SELECT COUNT(*) FROM operations WHERE run_id=run.id AND state='outcome_unknown'),
+         (SELECT COUNT(*) FROM obligations WHERE run_id=run.id AND id>0 AND state='open'),
+         (SELECT COUNT(*) FROM obligations WHERE run_id=run.id AND id>0 AND state='verified'),
+         (SELECT COUNT(*) FROM obligations WHERE run_id=run.id AND id>0 AND state='stale'),
+         (SELECT COUNT(*) FROM obligations WHERE run_id=run.id AND id>0 AND state='superseded')
+         FROM runs AS run LEFT JOIN run_projection AS projection ON projection.run_id=run.id
+         WHERE run.id=?1",
+        [run_id],
+        |row| {
+            Ok((
+                row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
+                row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?,
+                row.get(10)?,
+                row.get(11)?, row.get(12)?, row.get(13)?, row.get(14)?,
+            ))
+        },
+    )?;
+    let selected: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM remote_selected_tasks WHERE actor_id=?1 AND run_id=?2)",
+        params![actor_id, run_id],
+        |row| row.get(0),
+    )?;
+    let terminal_at: Option<i64> = transaction.query_row(
+        "SELECT MAX(created_at) FROM events WHERE run_id=?1 AND kind IN ('run.completed','run.answered','run.failed','run.cancelled')",
+        [run_id],
+        |row| row.get(0),
+    )?;
+    let elapsed_seconds = row
+        .5
+        .map(|started| terminal_at.unwrap_or(now).saturating_sub(started).max(0));
+    let task = crate::text::clean(&row.0)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(240)
+        .collect::<String>();
+    let model = row.4.filter(|value| !value.trim().is_empty()).map(|value| {
+        crate::text::clean(&value)
+            .chars()
+            .take(100)
+            .collect::<String>()
+    });
+    let alias = task_alias(transaction, actor_id, run_id)?;
+    Ok(json!({
+        "alias":alias,
+        "task":task,
+        "state":row.1,
+        "provider":row.2,
+        "model":model,
+        "created_at":row.3,
+        "started_at":row.5,
+        "elapsed_seconds":elapsed_seconds,
+        "model_tokens":row.6,
+        "model_turns":row.7,
+        "successful_actions":row.8,
+        "pending_actions":row.9,
+        "uncertain_actions":row.10,
+        "obligations":{
+            "open":row.11,
+            "verified":row.12,
+            "stale":row.13,
+            "superseded":row.14,
+        },
+        "selected":selected,
+    }))
 }
 
 fn require_actor_run(transaction: &Transaction<'_>, actor_id: &str, run_id: &str) -> Result<()> {
@@ -1240,10 +1487,11 @@ fn authorized_runs_in_transaction(
     actor_id: &str,
 ) -> Result<Vec<Value>> {
     let mut statement = transaction.prepare(
-        "SELECT run.id,run.task,run.state,run.provider,run.created_at,
+        "SELECT run.id,run.task,run.state,run.provider,run.created_at,aliases.alias,
          EXISTS(SELECT 1 FROM remote_selected_tasks AS selected WHERE selected.actor_id=?1 AND selected.run_id=run.id)
          FROM remote_actor_runs AS access JOIN runs AS run ON run.id=access.run_id
          JOIN remote_actors AS actor ON actor.actor_id=access.actor_id
+         JOIN remote_task_aliases AS aliases ON aliases.actor_id=access.actor_id AND aliases.run_id=run.id
          WHERE access.actor_id=?1 AND access.enabled=1 AND actor.enabled=1 ORDER BY run.created_at DESC LIMIT 100",
     )?;
     let rows = statement.query_map([actor_id], |row| {
@@ -1253,13 +1501,14 @@ fn authorized_runs_in_transaction(
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
             row.get::<_, i64>(4)?,
-            row.get::<_, bool>(5)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, bool>(6)?,
         ))
     })?;
     let mut tasks = Vec::new();
     for row in rows {
-        let (id, task, state, provider, created_at, selected) = row?;
-        tasks.push(json!({"task_id":id,"task":crate::text::clean(&task).chars().take(300).collect::<String>(),"state":state,"provider":provider,"created_at":created_at,"selected":selected}));
+        let (id, task, state, provider, created_at, alias, selected) = row?;
+        tasks.push(json!({"task_id":id,"alias":alias,"task":crate::text::clean(&task).chars().take(300).collect::<String>(),"state":state,"provider":provider,"created_at":created_at,"selected":selected}));
     }
     Ok(tasks)
 }
@@ -1306,15 +1555,16 @@ fn validate_request_shape(request: &CommandEnvelope) -> Result<()> {
     }
     if let Some(task_id) = match &request.command {
         Command::Status { task_id }
+        | Command::Details { task_id }
         | Command::Pause { task_id }
         | Command::Resume { task_id }
         | Command::Cancel { task_id } => task_id.as_deref(),
         _ => None,
     } {
-        validate_uuid(task_id, "task ID")?;
+        validate_task_reference(task_id)?;
     }
     if let Command::SelectTask { task_id } = &request.command {
-        validate_uuid(task_id, "task ID")?;
+        validate_task_reference(task_id)?;
     }
     if let Command::ApproveOnce { challenge_id } | Command::Deny { challenge_id } = &request.command
     {
@@ -1350,6 +1600,21 @@ fn validate_actor_id(actor_id: &str) -> Result<()> {
 
 fn validate_uuid(value: &str, label: &str) -> Result<()> {
     uuid::Uuid::parse_str(value).with_context(|| format!("invalid remote {label}"))?;
+    Ok(())
+}
+
+fn validate_task_reference(reference: &str) -> Result<()> {
+    if uuid::Uuid::parse_str(reference).is_ok() {
+        return Ok(());
+    }
+    if reference.is_empty()
+        || reference.len() > 64
+        || !reference
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        bail!("invalid remote task ID or short alias");
+    }
     Ok(())
 }
 
@@ -1679,6 +1944,271 @@ mod tests {
         assert_eq!(
             fixture.authority.store.run(&fixture.run_id)?.state,
             "cancelled"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn phone_task_aliases_are_stable_unique_and_actor_scoped() -> Result<()> {
+        let mut fixture = Fixture::new()?;
+        let first_id = "aabbcc00-0000-4000-8000-000000000001";
+        let second_id = "aabbcc00-0000-4000-8000-000000000002";
+        for (id, title) in [
+            (first_id, "first collision task"),
+            (second_id, "second collision task"),
+        ] {
+            fixture.authority.store.create_run_with_id(
+                id,
+                title,
+                fixture.directory.path(),
+                "codex",
+                json!(["workspace.read"]),
+                json!({}),
+                "complete",
+            )?;
+        }
+        fixture.authority.grant_run(&fixture.actor_id, first_id)?;
+        let first_alias = fixture
+            .authority
+            .authorized_runs(&fixture.actor_id)?
+            .into_iter()
+            .find(|task| task["task_id"] == first_id)
+            .unwrap()["alias"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        fixture.authority.grant_run(&fixture.actor_id, second_id)?;
+        let tasks = fixture.authority.authorized_runs(&fixture.actor_id)?;
+        let first_after_collision = tasks
+            .iter()
+            .find(|task| task["task_id"] == first_id)
+            .unwrap()["alias"]
+            .as_str()
+            .unwrap();
+        let second_alias = tasks
+            .iter()
+            .find(|task| task["task_id"] == second_id)
+            .unwrap()["alias"]
+            .as_str()
+            .unwrap();
+        assert_eq!(first_after_collision, first_alias);
+        assert_ne!(first_after_collision, second_alias);
+        assert_eq!(first_alias, "t-aabbcc");
+
+        let selected = fixture.apply(Command::SelectTask {
+            task_id: second_alias.to_owned(),
+        })?;
+        assert_eq!(selected.result["task_id"], second_id);
+        assert_eq!(selected.result["alias"], second_alias);
+        assert_eq!(
+            fixture
+                .authority
+                .selected_task(&fixture.actor_id)?
+                .as_deref(),
+            Some(second_id)
+        );
+        let explicit_status = fixture.apply(Command::Status {
+            task_id: Some(first_alias.clone()),
+        })?;
+        assert_eq!(explicit_status.result["task_id"], first_id);
+        fixture.apply(Command::Pause {
+            task_id: Some(first_alias.clone()),
+        })?;
+        assert!(fixture.authority.store.pause_requested(first_id)?);
+        fixture.apply(Command::Resume {
+            task_id: Some(first_alias.clone()),
+        })?;
+        assert!(!fixture.authority.store.pause_requested(first_id)?);
+        fixture.apply(Command::Cancel {
+            task_id: Some(first_alias.clone()),
+        })?;
+        assert_eq!(fixture.authority.store.run(first_id)?.state, "cancelled");
+        assert!(
+            fixture
+                .apply(Command::SelectTask {
+                    task_id: "t-doesnotexist".into(),
+                })
+                .is_err()
+        );
+        assert!(
+            fixture
+                .apply(Command::Details {
+                    task_id: Some("t-doesnotexist".into()),
+                })
+                .is_err()
+        );
+        assert_eq!(
+            fixture
+                .authority
+                .selected_task(&fixture.actor_id)?
+                .as_deref(),
+            Some(second_id)
+        );
+
+        let other_actor = "phone-with-no-task";
+        fixture.authority.register_actor(other_actor)?;
+        let unauthorized = CommandEnvelope {
+            actor_id: other_actor.to_owned(),
+            request_id: uuid::Uuid::new_v4().to_string(),
+            command: Command::SelectTask {
+                task_id: first_alias.clone(),
+            },
+            ..fixture.request(Command::ListTasks)
+        };
+        assert!(
+            fixture
+                .authority
+                .apply_from_authenticated_relay(other_actor, &unauthorized, test_now())
+                .is_err()
+        );
+        let unauthorized_details = CommandEnvelope {
+            actor_id: other_actor.to_owned(),
+            request_id: uuid::Uuid::new_v4().to_string(),
+            command: Command::Details {
+                task_id: Some(first_alias.clone()),
+            },
+            ..fixture.request(Command::ListTasks)
+        };
+        assert!(
+            fixture
+                .authority
+                .apply_from_authenticated_relay(other_actor, &unauthorized_details, test_now())
+                .is_err()
+        );
+
+        fixture.authority = Authority::open(fixture.directory.path())?;
+        assert_eq!(
+            fixture
+                .authority
+                .authorized_runs(&fixture.actor_id)?
+                .into_iter()
+                .find(|task| task["task_id"] == first_id)
+                .unwrap()["alias"],
+            first_alias
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn phone_details_report_bounded_safe_evidence_for_selected_or_explicit_tasks() -> Result<()> {
+        let mut fixture = Fixture::new()?;
+        let alias = fixture.authority.authorized_runs(&fixture.actor_id)?[0]["alias"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let huge_title = "task".repeat(500);
+        fixture.authority.store.connection.execute(
+            "UPDATE runs SET task=?1,budgets=json_set(budgets,'$.model','gpt-6.1-sol') WHERE id=?2",
+            params![huge_title, fixture.run_id],
+        )?;
+        fixture.authority.store.event(
+            &fixture.run_id,
+            "run.running",
+            json!({"message":"running"}),
+        )?;
+        fixture.authority.store.event(
+            &fixture.run_id,
+            "model.response",
+            json!({"usage":{"input_tokens":8,"output_tokens":13},"raw_tool_dump":"SECRET TOOL OUTPUT"}),
+        )?;
+        let completed_operation = fixture.authority.store.begin_operation(
+            &fixture.run_id,
+            "workspace.read",
+            json!({"path":"private-path"}),
+            true,
+        )?;
+        fixture.authority.store.connection.execute(
+            "UPDATE operations SET state='succeeded' WHERE id=?1",
+            [&completed_operation.id],
+        )?;
+        let _pending_operation = fixture.authority.store.begin_operation(
+            &fixture.run_id,
+            "workspace.write",
+            json!({"path":"private-path"}),
+            true,
+        )?;
+        let uncertain_operation = fixture.authority.store.begin_operation(
+            &fixture.run_id,
+            "process.run",
+            json!({"command":"private command"}),
+            false,
+        )?;
+        fixture.authority.store.connection.execute(
+            "UPDATE operations SET state='outcome_unknown' WHERE id=?1",
+            [&uncertain_operation.id],
+        )?;
+
+        let details = fixture.apply(Command::Details {
+            task_id: Some(alias.clone()),
+        })?;
+        assert_eq!(details.result["task_id"], fixture.run_id);
+        assert_eq!(details.result["alias"], alias);
+        assert_eq!(details.result["model"], "gpt-6.1-sol");
+        assert_eq!(details.result["model_turns"], 1);
+        assert_eq!(details.result["model_tokens"], 21);
+        assert_eq!(details.result["successful_actions"], 1);
+        assert_eq!(details.result["pending_actions"], 1);
+        assert_eq!(details.result["uncertain_actions"], 1);
+        assert_eq!(
+            details.result["obligations"],
+            json!({"open":0,"verified":0,"stale":0,"superseded":0})
+        );
+        assert!(details.result["task"].as_str().unwrap().chars().count() <= 240);
+        let serialized = details.result.to_string();
+        assert!(!serialized.contains("SECRET TOOL OUTPUT"));
+        assert!(!serialized.contains("private command"));
+        assert!(!serialized.contains("private-path"));
+
+        fixture
+            .authority
+            .bind_selected_task(&fixture.actor_id, &fixture.run_id)?;
+        let selected_details = fixture.apply(Command::Details { task_id: None })?;
+        assert_eq!(selected_details.result["task_id"], fixture.run_id);
+        assert_eq!(selected_details.result["obligations"]["open"], 0);
+
+        let explicit_run = fixture.authority.store.create_run(
+            "task with explicit requirements",
+            fixture.directory.path(),
+            "codex",
+            json!(["workspace.read"]),
+            json!({"obligations":["open requirement","verified requirement","stale requirement","superseded requirement"]}),
+            "complete",
+        )?;
+        fixture
+            .authority
+            .grant_run(&fixture.actor_id, &explicit_run.id)?;
+        for (id, state) in [
+            (1_i64, "open"),
+            (2, "verified"),
+            (3, "stale"),
+            (4, "superseded"),
+        ] {
+            fixture.authority.store.connection.execute(
+                "UPDATE obligations SET state=?1 WHERE run_id=?2 AND id=?3",
+                params![state, explicit_run.id, id],
+            )?;
+        }
+        let explicit_alias = fixture
+            .authority
+            .authorized_runs(&fixture.actor_id)?
+            .into_iter()
+            .find(|task| task["task_id"] == explicit_run.id)
+            .unwrap()["alias"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let explicit_details = fixture.apply(Command::Details {
+            task_id: Some(explicit_alias),
+        })?;
+        assert_eq!(
+            explicit_details.result["obligations"],
+            json!({"open":1,"verified":1,"stale":1,"superseded":1})
+        );
+        assert!(
+            !explicit_details
+                .result
+                .to_string()
+                .contains("open requirement")
         );
         Ok(())
     }

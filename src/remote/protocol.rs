@@ -12,9 +12,10 @@ const MAX_TEXT_BYTES: usize = 8 * 1024;
 pub enum RelayCommand {
     Message { text: String },
     ListTasks,
-    Status,
-    Pause,
-    Resume,
+    Status { task_id: Option<String> },
+    Details { task_id: Option<String> },
+    Pause { task_id: Option<String> },
+    Resume { task_id: Option<String> },
     Cancel { task_id: Option<String> },
     SelectTask { task_id: String },
     ApproveOnce { challenge_id: String },
@@ -84,9 +85,18 @@ impl RelayCommandEnvelope {
                 task_id: None,
             },
             RelayCommand::ListTasks => LocalCommand::ListTasks,
-            RelayCommand::Status => LocalCommand::Status { task_id: None },
-            RelayCommand::Pause => LocalCommand::Pause { task_id: None },
-            RelayCommand::Resume => LocalCommand::Resume { task_id: None },
+            RelayCommand::Status { task_id } => LocalCommand::Status {
+                task_id: task_id.clone(),
+            },
+            RelayCommand::Details { task_id } => LocalCommand::Details {
+                task_id: task_id.clone(),
+            },
+            RelayCommand::Pause { task_id } => LocalCommand::Pause {
+                task_id: task_id.clone(),
+            },
+            RelayCommand::Resume { task_id } => LocalCommand::Resume {
+                task_id: task_id.clone(),
+            },
             RelayCommand::Cancel { task_id } => LocalCommand::Cancel {
                 task_id: task_id.clone(),
             },
@@ -282,6 +292,39 @@ mod tests {
             &"x".repeat(5 * 1024),
         )?;
         assert_eq!(oversized.reply_text.as_deref().unwrap().len(), 4 * 1024);
+        Ok(())
+    }
+
+    #[test]
+    fn parses_details_and_preserves_an_optional_task_alias() -> Result<()> {
+        let installation_id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now();
+        let envelope = serde_json::json!({
+            "envelope_id":uuid::Uuid::new_v4().to_string(),
+            "request_id":uuid::Uuid::new_v4().to_string(),
+            "installation_id":installation_id,
+            "actor_id":"actor-1",
+            "channel":"whatsapp",
+            "sender_id":"+15551234567",
+            "external_message_id":"wamid.details",
+            "issued_at":now,
+            "expires_at":now + chrono::Duration::minutes(1),
+            "command":{"type":"details","task_id":"t-abcdef"}
+        });
+        let bytes = serde_json::to_vec(&envelope)?;
+        let subject = format!(
+            "aegis.commands.{}",
+            envelope["installation_id"].as_str().unwrap()
+        );
+        let parsed = RelayCommandEnvelope::parse(
+            &subject,
+            &bytes,
+            envelope["installation_id"].as_str().unwrap(),
+        )?;
+        assert!(matches!(
+            parsed.local_envelope().command,
+            LocalCommand::Details { task_id: Some(id) } if id == "t-abcdef"
+        ));
         Ok(())
     }
 }

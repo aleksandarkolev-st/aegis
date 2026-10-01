@@ -463,14 +463,16 @@ fn apply_command_effects(
             }
             Ok(())
         }
-        RelayCommand::Pause => {
+        RelayCommand::Pause { .. } => {
             let run = Store::open(root)?.run(run_id)?;
             if !run.is_terminal() {
                 crate::pause::request(root, run_id)?;
             }
             Ok(())
         }
-        RelayCommand::Resume | RelayCommand::ApproveOnce { .. } | RelayCommand::Deny { .. } => {
+        RelayCommand::Resume { .. }
+        | RelayCommand::ApproveOnce { .. }
+        | RelayCommand::Deny { .. } => {
             let mut store = Store::open(root)?;
             let run = store.run(run_id)?;
             if matches!(run.state.as_str(), "paused" | "waiting_recovery") {
@@ -482,7 +484,8 @@ fn apply_command_effects(
             Ok(())
         }
         RelayCommand::ListTasks
-        | RelayCommand::Status
+        | RelayCommand::Status { .. }
+        | RelayCommand::Details { .. }
         | RelayCommand::Cancel { .. }
         | RelayCommand::SelectTask { .. } => Ok(()),
     }
@@ -517,17 +520,40 @@ fn format_receipt(command: &RelayCommand, receipt: &super::Receipt) -> String {
                 return "No tasks are currently shared with this phone.".into();
             }
             let mut lines = vec!["Tasks shared with this phone:".to_owned()];
+            let mut body_bytes = lines[0].len();
+            let mut listed = 0usize;
             for task in tasks.iter().take(30) {
-                let id = task["task_id"].as_str().unwrap_or("unknown");
+                let alias = task["alias"].as_str().unwrap_or("unknown");
                 let state = task["state"].as_str().unwrap_or("unknown");
-                let name = task["task"].as_str().unwrap_or("Task");
-                lines.push(format!("{id} [{state}] {name}"));
+                let name = task["task"]
+                    .as_str()
+                    .map(short_task_label)
+                    .unwrap_or_else(|| "Task".into());
+                let line = format!("{alias} [{state}] {name}");
+                if body_bytes + line.len() + 1 + 160 > 3_600 {
+                    break;
+                }
+                body_bytes += line.len() + 1;
+                lines.push(line);
+                listed += 1;
             }
+            if tasks.len() > listed {
+                lines.push(format!(
+                    "{} more task(s) omitted to fit this message.",
+                    tasks.len() - listed
+                ));
+            }
+            lines.push(
+                "Use /use <alias> to select a task; /details [alias] shows its activity.".into(),
+            );
             lines.join("\n")
         }
-        RelayCommand::Status => {
+        RelayCommand::Status { .. } => {
             let state = result["state"].as_str().unwrap_or("unknown");
-            let id = result["task_id"].as_str().unwrap_or("unknown");
+            let id = result["alias"]
+                .as_str()
+                .or_else(|| result["task_id"].as_str())
+                .unwrap_or("unknown");
             let task = result["task"].as_str().unwrap_or("Task");
             let summary = result["summary"].as_str().unwrap_or("");
             if summary.trim().is_empty() {
@@ -536,11 +562,15 @@ fn format_receipt(command: &RelayCommand, receipt: &super::Receipt) -> String {
                 format!("Task {id} [{state}]: {task}\n{summary}")
             }
         }
-        RelayCommand::Pause => "Aegis will pause this task at its next safe boundary.".into(),
-        RelayCommand::Resume => "Aegis has resumed this task.".into(),
+        RelayCommand::Details { .. } => format_task_details(result),
+        RelayCommand::Pause { .. } => {
+            "Aegis will pause this task at its next safe boundary.".into()
+        }
+        RelayCommand::Resume { .. } => "Aegis has resumed this task.".into(),
         RelayCommand::Cancel { .. } => "Aegis marked this task cancelled.".into(),
         RelayCommand::SelectTask { task_id } => {
-            format!("Selected task {task_id}. New messages will be sent to it.")
+            let alias = result["alias"].as_str().unwrap_or(task_id);
+            format!("Selected task {alias}. New messages will be sent to it.")
         }
         RelayCommand::ApproveOnce { .. } => {
             "Aegis recorded approval for that exact operation.".into()
@@ -549,15 +579,87 @@ fn format_receipt(command: &RelayCommand, receipt: &super::Receipt) -> String {
     }
 }
 
+fn short_task_label(task: &str) -> String {
+    crate::text::clean(task)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(48)
+        .collect()
+}
+
 fn rejection_reply(command: &RelayCommand) -> String {
     match command {
         RelayCommand::Message { .. } => "Aegis could not start or update that task. Check the local Aegis setup, then send the request again.".into(),
         RelayCommand::ListTasks => "Aegis could not list tasks right now.".into(),
-        RelayCommand::Status | RelayCommand::Pause | RelayCommand::Resume | RelayCommand::Cancel { .. } => {
+        RelayCommand::Status { .. }
+        | RelayCommand::Details { .. }
+        | RelayCommand::Pause { .. }
+        | RelayCommand::Resume { .. }
+        | RelayCommand::Cancel { .. } => {
             "Aegis could not apply that task command. Check /tasks and try again.".into()
         }
         RelayCommand::SelectTask { .. } => "Aegis could not select that task. Use /tasks to see tasks shared with this phone.".into(),
         RelayCommand::ApproveOnce { .. } | RelayCommand::Deny { .. } => "Aegis could not resolve that approval. It may have expired or already been decided.".into(),
+    }
+}
+
+fn format_task_details(result: &serde_json::Value) -> String {
+    let alias = result["alias"].as_str().unwrap_or("unknown");
+    let state = result["state"].as_str().unwrap_or("unknown");
+    let task = result["task"].as_str().unwrap_or("Task");
+    let provider = result["provider"].as_str().unwrap_or("unknown");
+    let model = result["model"].as_str().unwrap_or("default");
+    let turns = result["model_turns"].as_i64().unwrap_or(0);
+    let successful = result["successful_actions"].as_i64().unwrap_or(0);
+    let pending = result["pending_actions"].as_i64().unwrap_or(0);
+    let uncertain = result["uncertain_actions"].as_i64().unwrap_or(0);
+    let model_tokens = result["model_tokens"].as_i64().unwrap_or(0);
+    let obligations = &result["obligations"];
+    let open = obligations["open"].as_i64().unwrap_or(0);
+    let verified = obligations["verified"].as_i64().unwrap_or(0);
+    let stale = obligations["stale"].as_i64().unwrap_or(0);
+    let superseded = obligations["superseded"].as_i64().unwrap_or(0);
+    let selected = result["selected"].as_bool().unwrap_or(false);
+    let created = result["created_at"]
+        .as_i64()
+        .map(format_utc_timestamp)
+        .unwrap_or_else(|| "unknown".into());
+    let started = result["started_at"]
+        .as_i64()
+        .map(format_utc_timestamp)
+        .unwrap_or_else(|| "not started".into());
+    let elapsed = result["elapsed_seconds"]
+        .as_i64()
+        .map(format_elapsed)
+        .unwrap_or_else(|| "not started".into());
+    format!(
+        "Task {alias} [{state}]{}\n{task}\nProvider: {provider} · Model: {model}\nCreated: {created}\nStarted: {started} · Elapsed: {elapsed}\nEvidence: {turns} model turns, {successful} successful actions, {pending} pending, {uncertain} uncertain · {model_tokens} model tokens.\nExplicit requirements: {open} open, {verified} verified, {stale} stale, {superseded} superseded.",
+        if selected { " · selected" } else { "" },
+    )
+}
+
+fn format_utc_timestamp(timestamp: i64) -> String {
+    chrono::DateTime::<Utc>::from_timestamp(timestamp, 0)
+        .map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn format_elapsed(seconds: i64) -> String {
+    let seconds = seconds.max(0) as u64;
+    let days = seconds / 86_400;
+    let hours = (seconds % 86_400) / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    let seconds = seconds % 60;
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
     }
 }
 
@@ -816,12 +918,101 @@ mod tests {
     #[test]
     fn only_expected_rejections_become_replies_while_internal_errors_retry() {
         let rejection = super::super::reject_command("task is no longer active");
-        let reply = command_failure_reply(&RelayCommand::Status, rejection).unwrap();
+        let reply =
+            command_failure_reply(&RelayCommand::Status { task_id: None }, rejection).unwrap();
         assert!(reply.contains("could not apply"));
 
         let transient = anyhow::anyhow!("temporary SQLite failure");
-        let error = command_failure_reply(&RelayCommand::Status, transient).unwrap_err();
+        let error =
+            command_failure_reply(&RelayCommand::Status { task_id: None }, transient).unwrap_err();
         assert!(error.to_string().contains("temporary SQLite failure"));
+    }
+
+    #[test]
+    fn phone_replies_show_aliases_and_keep_task_details_bounded() -> Result<()> {
+        let list = format_receipt(
+            &RelayCommand::ListTasks,
+            &super::super::Receipt {
+                request_id: Uuid::new_v4().to_string(),
+                duplicate: false,
+                result: json!({"tasks":[
+                    {"alias":"t-abcdef","task":"Inspect parser","state":"running"},
+                    {"alias":"t-123456","task":"Review tests","state":"completed"}
+                ]}),
+            },
+        );
+        assert!(list.contains("t-abcdef [running] Inspect parser"));
+        assert!(list.contains("/use <alias>"));
+        assert!(list.contains("/details [alias]"));
+        let many_tasks = (0..30)
+            .map(|index| {
+                json!({
+                    "alias":format!("t-{index:06}"),
+                    "task":format!("{} more task name", "\u{1f6e1}".repeat(48)),
+                    "state":"running"
+                })
+            })
+            .collect::<Vec<_>>();
+        let bounded_list = format_receipt(
+            &RelayCommand::ListTasks,
+            &super::super::Receipt {
+                request_id: Uuid::new_v4().to_string(),
+                duplicate: false,
+                result: json!({"tasks":many_tasks}),
+            },
+        );
+        assert!(bounded_list.contains("more task(s) omitted"));
+        assert!(bounded_list.len() < 3_700);
+        assert!(
+            AegisEvent::reply(
+                &Uuid::new_v4().to_string(),
+                "actor-1",
+                &Uuid::new_v4().to_string(),
+                &bounded_list,
+            )?
+            .reply_text
+            .unwrap()
+            .len()
+                <= 4 * 1024
+        );
+
+        let details = format_task_details(&json!({
+            "alias":"t-abcdef",
+            "task":"x".repeat(240),
+            "state":"completed",
+            "provider":"codex",
+            "model":"gpt-6.1-sol",
+            "created_at":1_800_000_000_i64,
+            "started_at":1_800_000_060_i64,
+            "elapsed_seconds":121_i64,
+            "model_turns":4,
+            "successful_actions":3,
+            "pending_actions":0,
+            "uncertain_actions":0,
+            "model_tokens":512,
+            "obligations":{"open":1,"verified":2,"stale":3,"superseded":4},
+            "selected":true,
+            "tool_output":"must never appear"
+        }));
+        assert!(details.contains("gpt-6.1-sol"));
+        assert!(details.contains("4 model turns"));
+        assert!(details.contains("2m 1s"));
+        assert!(details.contains("1 open, 2 verified, 3 stale, 4 superseded"));
+        assert!(!details.contains("must never appear"));
+        assert!(details.len() < 4 * 1024);
+        assert!(
+            AegisEvent::reply(
+                &Uuid::new_v4().to_string(),
+                "actor-1",
+                &Uuid::new_v4().to_string(),
+                &details,
+            )?
+            .reply_text
+            .unwrap()
+            .len()
+                <= 4 * 1024
+        );
+        Ok(())
     }
 
     #[test]

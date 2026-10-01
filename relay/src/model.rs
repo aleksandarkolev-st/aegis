@@ -13,9 +13,10 @@ pub const COMMAND_TTL_SECONDS: i64 = 5 * 60;
 pub enum AgentCommand {
     Message { text: String },
     ListTasks,
-    Status,
-    Pause,
-    Resume,
+    Status { task_id: Option<String> },
+    Details { task_id: Option<String> },
+    Pause { task_id: Option<String> },
+    Resume { task_id: Option<String> },
     Cancel { task_id: Option<String> },
     SelectTask { task_id: String },
     ApproveOnce { challenge_id: String },
@@ -91,12 +92,19 @@ pub fn parse_command(input: &str) -> Result<AgentCommand, CommandParseError> {
 
     match command {
         "/tasks" | "/list_tasks" if rest.is_empty() => Ok(AgentCommand::ListTasks),
-        "/status" if rest.is_empty() => Ok(AgentCommand::Status),
-        "/pause" if rest.is_empty() => Ok(AgentCommand::Pause),
-        "/resume" if rest.is_empty() => Ok(AgentCommand::Resume),
-        "/tasks" | "/list_tasks" | "/status" | "/pause" | "/resume" => {
-            Err(CommandParseError::InvalidSyntax)
-        }
+        "/status" => Ok(AgentCommand::Status {
+            task_id: optional_id(rest)?,
+        }),
+        "/details" => Ok(AgentCommand::Details {
+            task_id: optional_id(rest)?,
+        }),
+        "/pause" => Ok(AgentCommand::Pause {
+            task_id: optional_id(rest)?,
+        }),
+        "/resume" => Ok(AgentCommand::Resume {
+            task_id: optional_id(rest)?,
+        }),
+        "/tasks" | "/list_tasks" => Err(CommandParseError::InvalidSyntax),
         "/cancel" => Ok(AgentCommand::Cancel {
             task_id: optional_id(rest)?,
         }),
@@ -265,14 +273,57 @@ mod tests {
                 text: "inspect this".to_owned()
             }
         );
-        assert_eq!(parse_command("/status").unwrap(), AgentCommand::Status);
+        assert_eq!(
+            parse_command("/status").unwrap(),
+            AgentCommand::Status { task_id: None }
+        );
+        assert_eq!(
+            parse_command("/status t-abcdef").unwrap(),
+            AgentCommand::Status {
+                task_id: Some("t-abcdef".into())
+            }
+        );
+        assert_eq!(
+            parse_command("/pause t-abcdef").unwrap(),
+            AgentCommand::Pause {
+                task_id: Some("t-abcdef".into())
+            }
+        );
+        assert_eq!(
+            parse_command("/resume t-abcdef").unwrap(),
+            AgentCommand::Resume {
+                task_id: Some("t-abcdef".into())
+            }
+        );
+        assert_eq!(
+            parse_command("/details").unwrap(),
+            AgentCommand::Details { task_id: None }
+        );
+        assert_eq!(
+            parse_command("/details t-abcdef").unwrap(),
+            AgentCommand::Details {
+                task_id: Some("t-abcdef".to_owned())
+            }
+        );
         assert_eq!(parse_command("/tasks").unwrap(), AgentCommand::ListTasks);
         assert_eq!(
             parse_command("/list_tasks").unwrap(),
             AgentCommand::ListTasks
         );
-        assert_eq!(parse_command("/pause").unwrap(), AgentCommand::Pause);
-        assert_eq!(parse_command("/resume").unwrap(), AgentCommand::Resume);
+        assert_eq!(
+            parse_command("/pause").unwrap(),
+            AgentCommand::Pause { task_id: None }
+        );
+        assert_eq!(
+            parse_command("/resume").unwrap(),
+            AgentCommand::Resume { task_id: None }
+        );
+        assert_eq!(
+            parse_command("/cancel t-abcdef").unwrap(),
+            AgentCommand::Cancel {
+                task_id: Some("t-abcdef".to_owned())
+            }
+        );
         assert_eq!(
             parse_command("/cancel task-4").unwrap(),
             AgentCommand::Cancel {
@@ -289,6 +340,12 @@ mod tests {
             parse_command("/use task-4").unwrap(),
             AgentCommand::SelectTask {
                 task_id: "task-4".to_owned()
+            }
+        );
+        assert_eq!(
+            parse_command("/use t-abcdef").unwrap(),
+            AgentCommand::SelectTask {
+                task_id: "t-abcdef".to_owned()
             }
         );
         assert_eq!(
@@ -319,6 +376,16 @@ mod tests {
         );
         assert_eq!(
             parse_command("/status extra"),
+            Ok(AgentCommand::Status {
+                task_id: Some("extra".to_owned())
+            })
+        );
+        assert_eq!(
+            parse_command("/status t-abcdef extra"),
+            Err(CommandParseError::InvalidSyntax)
+        );
+        assert_eq!(
+            parse_command("/details task-1 extra"),
             Err(CommandParseError::InvalidSyntax)
         );
         assert_eq!(
