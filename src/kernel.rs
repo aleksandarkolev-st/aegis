@@ -2272,7 +2272,8 @@ mod tests {
         assert!(rendered.ends_with("output preview truncated"));
         assert!(
             rendered.chars().count()
-                <= OPERATION_PREVIEW_CHARACTERS + "\n… output preview truncated".chars().count()
+                <= OPERATION_PREVIEW_CHARACTERS
+                    + "\n…\n… output preview truncated".chars().count()
         );
         Ok(())
     }
