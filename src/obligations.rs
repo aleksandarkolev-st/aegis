@@ -341,8 +341,8 @@ impl Store {
             transaction.query_row("SELECT state FROM runs WHERE id=?1", [run_id], |row| {
                 row.get(0)
             })?;
-        if state == "running" {
-            bail!("pause running tasks before changing obligations");
+        if matches!(state.as_str(), "ready" | "running") {
+            bail!("pause active tasks before changing obligations");
         }
         if matches!(
             state.as_str(),
@@ -413,8 +413,8 @@ impl Store {
             transaction.query_row("SELECT state FROM runs WHERE id = ?1", [run_id], |row| {
                 row.get(0)
             })?;
-        if state == "running" {
-            bail!("pause running tasks before changing obligations");
+        if matches!(state.as_str(), "ready" | "running") {
+            bail!("pause active tasks before changing obligations");
         }
         if matches!(
             state.as_str(),
@@ -1023,18 +1023,20 @@ mod tests {
             json!({"obligations":["Preserve public API"]}),
             "",
         )?;
-        store.state(&run.id, "running", json!({}))?;
         let original = store.obligations(&run.id)?;
 
-        assert!(store
-            .add_obligation(&run.id, "Add regression tests", "User approved")
-            .is_err());
-        assert!(store
-            .supersede_obligation(&run.id, 1, "Allow a v2 API", "User approved")
-            .is_err());
-        assert_eq!(store.obligations(&run.id)?, original);
-        assert_eq!(store.event_count(&run.id, "obligation.added")?, 0);
-        assert_eq!(store.event_count(&run.id, "obligation.superseded")?, 0);
+        for state in ["ready", "running"] {
+            store.state(&run.id, state, json!({}))?;
+            assert!(store
+                .add_obligation(&run.id, "Add regression tests", "User approved")
+                .is_err());
+            assert!(store
+                .supersede_obligation(&run.id, 1, "Allow a v2 API", "User approved")
+                .is_err());
+            assert_eq!(store.obligations(&run.id)?, original);
+            assert_eq!(store.event_count(&run.id, "obligation.added")?, 0);
+            assert_eq!(store.event_count(&run.id, "obligation.superseded")?, 0);
+        }
 
         store.request_pause(&run.id)?;
         assert!(crate::pause::boundary(&mut store, &run.id)?);

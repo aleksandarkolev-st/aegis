@@ -3201,7 +3201,7 @@ fn edit_goal(
             "Ended tasks cannot change requirements.",
         );
     }
-    if kernel::is_active(root, id)? {
+    if matches!(run.state.as_str(), "ready" | "running") || kernel::is_active(root, id)? {
         return terminal.message(
             Tone::Warning,
             "Pause first",
