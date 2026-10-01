@@ -44,7 +44,7 @@ pub struct Terminal {
     colors: bool,
     animations: bool,
     activity_rows: std::cell::Cell<u16>,
-    activity_view: std::cell::RefCell<Option<(usize, String, Option<String>)>>,
+    activity_view: std::cell::RefCell<Option<(usize, usize, String, Option<String>)>>,
     input_rows: std::cell::Cell<u16>,
     input_caret_row: std::cell::Cell<u16>,
     task_started_at: std::cell::Cell<Option<i64>>,
@@ -101,6 +101,85 @@ struct EditorView {
     rows: Vec<String>,
     caret_row: usize,
     caret_column: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TerminalSize {
+    columns: usize,
+    rows: usize,
+}
+
+impl TerminalSize {
+    fn measured() -> Option<Self> {
+        terminal::size().ok().map(|(columns, rows)| Self {
+            columns: columns as usize,
+            rows: rows as usize,
+        })
+    }
+
+    fn current() -> Self {
+        Self::measured().unwrap_or(Self {
+            columns: 80,
+            rows: 24,
+        })
+    }
+
+    fn from_event(event: &Event) -> Option<Self> {
+        match event {
+            Event::Resize(columns, rows) => Some(Self {
+                columns: *columns as usize,
+                rows: *rows as usize,
+            }),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct InputLayout {
+    label: String,
+    composer_width: u16,
+    max_input_rows: usize,
+    available: usize,
+}
+
+fn activity_view_key(
+    width: usize,
+    height: usize,
+    text: String,
+    footer: Option<String>,
+) -> (usize, usize, String, Option<String>) {
+    (width, height, text, footer)
+}
+
+fn input_layout(size: TerminalSize, label: &str, composer: bool) -> InputLayout {
+    let width = size.columns.max(1);
+    let visible_label = fit(
+        &if composer {
+            format!("  │ {}", label.trim_start())
+        } else {
+            label.to_owned()
+        },
+        width.saturating_sub(4),
+    );
+    let composer_width = width.saturating_sub(4).max(4).min(u16::MAX as usize) as u16;
+    let max_input_rows = size.rows.saturating_sub(10).clamp(1, 6);
+    let available = if composer {
+        crate::widgets::composer_input_area(
+            label,
+            ratatui::layout::Rect::new(0, 0, composer_width, (max_input_rows + 2) as u16),
+        )
+        .width as usize
+    } else {
+        width.saturating_sub(visible_label.width() + 1)
+    }
+    .max(1);
+    InputLayout {
+        label: visible_label,
+        composer_width,
+        max_input_rows,
+        available,
+    }
 }
 
 fn editor_view(text: &[char], caret: usize, width: usize, height: usize) -> EditorView {
@@ -777,7 +856,7 @@ impl Terminal {
     }
 
     fn paint_activity(&self, width: usize, text: String, footer: Option<String>) -> Result<()> {
-        let view = (width, text, footer);
+        let view = activity_view_key(width, TerminalSize::current().rows, text, footer);
         if self.activity_view.borrow().as_ref() == Some(&view) {
             return Ok(());
         }
@@ -794,9 +873,9 @@ impl Terminal {
         if self.colors {
             queue!(io::stdout(), SetForegroundColor(self.color(Tone::Accent)))?;
         }
-        write!(io::stdout(), "{}", view.1)?;
+        write!(io::stdout(), "{}", view.2)?;
         queue!(io::stdout(), ResetColor)?;
-        if view.2.is_none() {
+        if view.3.is_none() {
             self.activity_rows.set(1);
             io::stdout().flush()?;
             self.activity_view.replace(Some(view));
@@ -808,7 +887,7 @@ impl Terminal {
             cursor::MoveToColumn(0),
             Clear(ClearType::CurrentLine)
         )?;
-        write!(io::stdout(), "{}", view.2.as_deref().unwrap_or_default())?;
+        write!(io::stdout(), "{}", view.3.as_deref().unwrap_or_default())?;
         self.activity_rows.set(2);
         io::stdout().flush()?;
         self.activity_view.replace(Some(view));
@@ -889,32 +968,20 @@ impl Terminal {
         let mut previous_caret_row = 1usize;
         let mut preferred_column = None;
         let mut paste_notice = false;
+        let mut screen_size = TerminalSize::current();
+        let mut pending_resize = None;
+        let mut redraw_from_current_line = false;
         loop {
-            let width = terminal::size()
-                .map(|(width, _)| width as usize)
-                .unwrap_or(80);
-            let label = fit(
-                &if composer {
-                    format!("  │ {}", label.trim_start())
-                } else {
-                    label.into()
-                },
-                width.saturating_sub(4),
-            );
-            let composer_width = width.saturating_sub(4).max(4) as u16;
-            let max_input_rows = terminal::size()
-                .map(|(_, height)| (height as usize).saturating_sub(10).clamp(1, 6))
-                .unwrap_or(5);
-            let available = if composer {
-                crate::widgets::composer_input_area(
-                    &draft_label,
-                    ratatui::layout::Rect::new(0, 0, composer_width, (max_input_rows + 2) as u16),
-                )
-                .width as usize
-            } else {
-                width.saturating_sub(label.width() + 1)
+            if let Some(resized) = pending_resize.take() {
+                screen_size = resized;
+            } else if let Some(measured) = TerminalSize::measured() {
+                screen_size = measured;
             }
-            .max(1);
+            let layout = input_layout(screen_size, &draft_label, composer);
+            let label = &layout.label;
+            let composer_width = layout.composer_width;
+            let max_input_rows = layout.max_input_rows;
+            let available = layout.available;
             let displayed: Vec<_> = text
                 .iter()
                 .map(|character| {
@@ -947,6 +1014,8 @@ impl Terminal {
                 let draw_rows = previous_draw_rows.max(buffer.area.height as usize);
                 if rendered_composer {
                     queue!(io::stdout(), cursor::MoveUp(previous_caret_row as u16))?;
+                } else if redraw_from_current_line {
+                    queue!(io::stdout(), cursor::MoveToColumn(0))?;
                 } else {
                     write!(io::stdout(), "\r\n")?;
                 }
@@ -975,6 +1044,7 @@ impl Terminal {
                 previous_draw_rows = draw_rows;
                 previous_caret_row = caret_row;
                 rendered_composer = true;
+                redraw_from_current_line = false;
                 (composer_input_column(origin, margin), editor.caret_column)
             } else {
                 let (visible, caret_width) = input_view(&displayed, caret, available);
@@ -1009,6 +1079,23 @@ impl Terminal {
                         text.splice(caret..caret, characters.iter().copied());
                         caret += characters.len();
                         paste_notice = false;
+                    }
+                }
+                Event::Resize(width, height) => {
+                    let event = Event::Resize(width, height);
+                    screen_size = TerminalSize::from_event(&event).unwrap_or(screen_size);
+                    pending_resize = Some(screen_size);
+                    if composer && rendered_composer {
+                        queue!(
+                            io::stdout(),
+                            cursor::MoveUp(previous_caret_row as u16),
+                            cursor::MoveToColumn(0),
+                            Clear(ClearType::FromCursorDown)
+                        )?;
+                        io::stdout().flush()?;
+                        rendered_composer = false;
+                        previous_draw_rows = 0;
+                        redraw_from_current_line = true;
                     }
                 }
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
@@ -1239,14 +1326,24 @@ impl Terminal {
         let mut query = String::new();
         let mut rendered = false;
         let mut rendered_rows = 0usize;
+        let mut screen_size = TerminalSize::current();
+        let mut pending_resize = None;
+        let mut redraw_from_current_line = false;
         loop {
-            let (width, height) = terminal::size().unwrap_or((80, 24));
-            let rows = menu_rows(height as usize, choices.len());
+            if let Some(resized) = pending_resize.take() {
+                screen_size = resized;
+            } else if let Some(measured) = TerminalSize::measured() {
+                screen_size = measured;
+            }
+            let width = screen_size.columns.min(u16::MAX as usize) as u16;
+            let rows = menu_rows(screen_size.rows, choices.len());
             if rendered {
                 queue!(
                     io::stdout(),
                     cursor::MoveUp(rendered_rows.saturating_sub(1) as u16)
                 )?;
+            } else if redraw_from_current_line {
+                queue!(io::stdout(), cursor::MoveToColumn(0))?;
             }
             let matches = menu_matches(choices, &query);
             selected = selected.min(matches.len().saturating_sub(1));
@@ -1275,54 +1372,77 @@ impl Terminal {
             io::stdout().flush()?;
             rendered = true;
             rendered_rows = buffer.area.height as usize;
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Release {
-                    continue;
+            redraw_from_current_line = false;
+            match event::read()? {
+                Event::Resize(width, height) => {
+                    let event = Event::Resize(width, height);
+                    screen_size = TerminalSize::from_event(&event).unwrap_or(screen_size);
+                    pending_resize = Some(screen_size);
+                    queue!(
+                        io::stdout(),
+                        cursor::MoveUp(rendered_rows.saturating_sub(1) as u16),
+                        cursor::MoveToColumn(0),
+                        Clear(ClearType::FromCursorDown)
+                    )?;
+                    io::stdout().flush()?;
+                    rendered = false;
+                    rendered_rows = 0;
+                    redraw_from_current_line = true;
                 }
-                match key.code {
-                    KeyCode::Enter => {
-                        if let Some(index) = matches.get(selected) {
-                            self.clear_menu(rows)?;
-                            return Ok(Some(*index));
+                Event::Key(key) => {
+                    if key.kind == KeyEventKind::Release {
+                        continue;
+                    }
+                    match key.code {
+                        KeyCode::Enter => {
+                            if let Some(index) = matches.get(selected) {
+                                self.clear_menu(rows)?;
+                                return Ok(Some(*index));
+                            }
                         }
-                    }
-                    KeyCode::Esc => {
-                        self.clear_menu(rows)?;
-                        return Ok(None);
-                    }
-                    KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.clear_menu(rows)?;
-                        return Ok(None);
-                    }
-                    KeyCode::Char(digit) if digit.is_ascii_digit() && query.is_empty() => {
-                        digits.push(digit);
-                        if let Ok(number) = digits.parse::<usize>() {
-                            if (1..=choices.len()).contains(&number) {
-                                selected = number - 1;
-                            } else {
-                                digits.clear();
+                        KeyCode::Esc => {
+                            self.clear_menu(rows)?;
+                            return Ok(None);
+                        }
+                        KeyCode::Char('c' | 'd')
+                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            self.clear_menu(rows)?;
+                            return Ok(None);
+                        }
+                        KeyCode::Char(digit) if digit.is_ascii_digit() && query.is_empty() => {
+                            digits.push(digit);
+                            if let Ok(number) = digits.parse::<usize>() {
+                                if (1..=choices.len()).contains(&number) {
+                                    selected = number - 1;
+                                } else {
+                                    digits.clear();
+                                }
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            query.pop();
+                            digits.clear();
+                            selected = 0;
+                        }
+                        KeyCode::Char(character)
+                            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            if query.len() < 160 {
+                                query.push(character);
+                            }
+                            digits.clear();
+                            selected = 0;
+                        }
+                        code => {
+                            digits.clear();
+                            if !matches.is_empty() {
+                                selected = menu_move(selected, matches.len(), code);
                             }
                         }
                     }
-                    KeyCode::Backspace => {
-                        query.pop();
-                        digits.clear();
-                        selected = 0;
-                    }
-                    KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        if query.len() < 160 {
-                            query.push(character);
-                        }
-                        digits.clear();
-                        selected = 0;
-                    }
-                    code => {
-                        digits.clear();
-                        if !matches.is_empty() {
-                            selected = menu_move(selected, matches.len(), code);
-                        }
-                    }
                 }
+                _ => {}
             }
         }
     }
@@ -1817,7 +1937,7 @@ mod tests {
     fn activity_cache_is_invalidated_after_clear_and_style_changes() -> Result<()> {
         let mut terminal = Terminal::default();
         terminal.interactive = false;
-        let view = (80, "thinking".to_owned(), Some("context".to_owned()));
+        let view = (80, 24, "thinking".to_owned(), Some("context".to_owned()));
         terminal.activity_view.replace(Some(view.clone()));
         terminal.clear_activity()?;
         assert!(terminal.activity_view.borrow().is_none());
@@ -2001,6 +2121,59 @@ mod tests {
         assert_eq!(resized.rows, vec!["abc", "d日", "本", "las"]);
         assert_eq!(resized.caret_row, 1);
         assert_eq!(resized.caret_column, 1);
+    }
+
+    #[test]
+    fn resize_events_reflow_prompt_and_menu_for_the_new_terminal_dimensions() {
+        let initial = TerminalSize {
+            columns: 80,
+            rows: 24,
+        };
+        let resize = Event::Resize(132, 48);
+        let expanded = TerminalSize::from_event(&resize).unwrap();
+        assert_eq!(
+            expanded,
+            TerminalSize {
+                columns: 132,
+                rows: 48
+            }
+        );
+
+        let narrow = input_layout(initial, "> ", true);
+        let wide = input_layout(expanded, "> ", true);
+        assert!(wide.composer_width > narrow.composer_width);
+        assert!(wide.available > narrow.available);
+        assert_eq!(wide.max_input_rows, 6);
+        assert!(menu_rows(expanded.rows, 40) > menu_rows(initial.rows, 40));
+
+        let tiny = input_layout(
+            TerminalSize {
+                columns: 40,
+                rows: 8,
+            },
+            "> ",
+            true,
+        );
+        assert_eq!(tiny.max_input_rows, 1);
+        let draft: Vec<_> = "first line that wraps æ—¥æœ¬\nsecond line"
+            .chars()
+            .collect();
+        let compact = editor_view(&draft, draft.len(), narrow.available, narrow.max_input_rows);
+        let expanded = editor_view(&draft, draft.len(), wide.available, wide.max_input_rows);
+        assert!(expanded.rows.len() <= compact.rows.len());
+        assert!(
+            expanded
+                .rows
+                .iter()
+                .all(|row| row.width() <= wide.available)
+        );
+    }
+
+    #[test]
+    fn activity_view_refreshes_after_a_height_only_resize() {
+        let before = activity_view_key(100, 24, "Working".into(), Some("context".into()));
+        let after = activity_view_key(100, 50, "Working".into(), Some("context".into()));
+        assert_ne!(before, after);
     }
 
     #[test]
