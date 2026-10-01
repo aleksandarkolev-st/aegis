@@ -92,7 +92,9 @@ fn corrupt_proof_artifacts_and_stale_generic_finish_evidence_are_rejected() -> R
     let fresh_op = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
     let fresh = store.put_artifact(b"after edit")?;
     store.operation_state(&fresh_op, "succeeded", Some(&fresh), json!({}))?;
+    store.state(&run.id, "paused", json!({}))?;
     let id = store.add_obligation(&run.id, "Read source", "Approved coverage")?;
+    store.state(&run.id, "running", json!({}))?;
     store.verify_obligation(&run.id, id, &[fresh.clone()])?;
     fs::write(root.join("artifacts").join(&fresh), b"corrupted")?;
     assert!(
