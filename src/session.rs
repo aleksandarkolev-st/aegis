@@ -2125,12 +2125,158 @@ impl InterruptKeys {
     }
 }
 
+fn request_follow_interrupt(
+    terminal: &Terminal,
+    store: &mut Store,
+    id: &str,
+    interrupts: &mut InterruptKeys,
+) -> Result<()> {
+    let scope = interrupts.next(Instant::now());
+    terminal.clear_activity()?;
+    match store.request_interrupt(id, scope) {
+        Ok(Some(_)) => terminal.message(
+            Tone::Warning,
+            "Interrupt",
+            match scope {
+                crate::interrupt::Scope::Operation => {
+                    "Stopping this operation; the task itself remains available."
+                }
+                crate::interrupt::Scope::Model => {
+                    "Interrupting this model turn; you can resume the task later."
+                }
+            },
+        )?,
+        Ok(None) => terminal.message(
+            Tone::Quiet,
+            "Interrupt",
+            match scope {
+                crate::interrupt::Scope::Operation => {
+                    "No active operation. Press Ctrl+C again quickly to interrupt the model turn."
+                }
+                crate::interrupt::Scope::Model => {
+                    "No active model turn. Ctrl+D detaches; use the task menu to cancel the whole task."
+                }
+            },
+        )?,
+        Err(error) => terminal.message(Tone::Warning, "Interrupt", &error.to_string())?,
+    }
+    Ok(())
+}
+
+struct FollowProgress {
+    sequence: i64,
+    task_started_at: Option<i64>,
+    phase: String,
+    context_status: crate::terminal::ContextStatus,
+}
+
+fn follow_task_is_active(state: &str) -> bool {
+    matches!(state, "ready" | "running")
+}
+
+fn poll_follow_update(
+    progress: &mut FollowProgress,
+    store: &Store,
+    id: &str,
+    terminal: &Terminal,
+) -> Result<Option<(Vec<crate::storage::Event>, bool)>> {
+    let events = progress.poll(store, id, terminal)?;
+    let active = follow_task_is_active(&store.run(id)?.state);
+    if events.is_some() || !active {
+        Ok(Some((events.unwrap_or_default(), active)))
+    } else {
+        Ok(None)
+    }
+}
+
+fn render_follow_update(
+    terminal: &Terminal,
+    (events, active): (Vec<crate::storage::Event>, bool),
+) -> Result<bool> {
+    for event in events {
+        terminal.render_event(&event)?;
+    }
+    Ok(active)
+}
+
+impl FollowProgress {
+    fn new(store: &Store, id: &str, terminal: &Terminal) -> Result<Self> {
+        let task_started_at = store.run_started_at(id)?;
+        terminal.set_task_started_at(task_started_at);
+        let sequence = store
+            .recent_events(id, 64)?
+            .first()
+            .map(|event| event.seq - 1)
+            .unwrap_or(0);
+        Ok(Self {
+            sequence,
+            task_started_at,
+            phase: "Starting task".into(),
+            context_status: crate::terminal::ContextStatus::default(),
+        })
+    }
+
+    fn poll(
+        &mut self,
+        store: &Store,
+        id: &str,
+        terminal: &Terminal,
+    ) -> Result<Option<Vec<crate::storage::Event>>> {
+        let events = store.events_since(id, self.sequence)?;
+        if events.is_empty() {
+            return Ok(None);
+        }
+        self.context_status.operations = store.event_count(id, "operation.pending")? as u64;
+        self.context_status.artifacts = store.evidence_artifacts(id)?.len();
+        for event in &events {
+            if event.kind == "run.running" && self.task_started_at.is_none() {
+                self.task_started_at = Some(event.created_at);
+                terminal.set_task_started_at(self.task_started_at);
+            }
+            match event.kind.as_str() {
+                "model.started" => {
+                    self.phase = "Thinking".into();
+                    self.context_status.prompt_chars = event.payload["prompt_chars"].as_u64();
+                    self.context_status.normalized_tokens =
+                        if event.payload["context_tokenizer"] == crate::tokenization::ENCODING {
+                            event.payload["raw_prompt_tokens"].as_u64()
+                        } else {
+                            None
+                        };
+                    self.context_status.schema_count = event.payload["schema_count"].as_u64();
+                }
+                "checkpoint.created" => self.context_status.checkpoint_at = Some(event.created_at),
+                "acceptance.started" => self.phase = "Verifying acceptance".into(),
+                "operation.pending" => {
+                    self.phase = format!(
+                        "Running {}",
+                        event.payload["capability"].as_str().unwrap_or("tool")
+                    )
+                }
+                "operation.succeeded" => self.phase = "Reviewing evidence".into(),
+                _ => {}
+            }
+            self.sequence = event.seq;
+        }
+        Ok(Some(events))
+    }
+
+    fn render(&self, terminal: &Terminal, events: Vec<crate::storage::Event>) -> Result<()> {
+        for event in events {
+            terminal.render_event(&event)?;
+        }
+        Ok(())
+    }
+}
+
 fn steer_from_follow(
     root: &Path,
     terminal: &mut Terminal,
     store: &mut Store,
     id: &str,
     initial: &str,
+    interrupts: &mut InterruptKeys,
+    progress: &mut FollowProgress,
 ) -> Result<bool> {
     if initial.len() > 65_536 {
         terminal.clear_activity()?;
@@ -2147,12 +2293,37 @@ fn steer_from_follow(
         terminal.set_input_draft(initial);
     }
     let label = terminal.input_prefix();
-    let result = terminal.input(&label, false, &[]);
-    terminal.set_input_status("");
-    if let Input::Submit(message) = result? {
-        return handle_follow_submission(root, terminal, store, id, &message);
+    loop {
+        match terminal.steering_input_with_updates(
+            &label,
+            &[],
+            || poll_follow_update(progress, store, id, terminal),
+            |update| render_follow_update(terminal, update),
+        )? {
+            Input::Submit(message) => {
+                terminal.set_input_status("");
+                return handle_follow_submission(root, terminal, store, id, &message);
+            }
+            Input::Interrupt => request_follow_interrupt(terminal, store, id, interrupts)?,
+            Input::TaskFinished => {
+                terminal.set_input_status("");
+                terminal.message(
+                    Tone::Quiet,
+                    "Task finished",
+                    "Your unfinished text is saved in the prompt.",
+                )?;
+                return Ok(true);
+            }
+            Input::Exit => {
+                terminal.set_input_status("");
+                return Ok(true);
+            }
+            _ => {
+                terminal.set_input_status("");
+                return Ok(true);
+            }
+        }
     }
-    Ok(true)
 }
 
 fn send_follow_steering(
@@ -2272,9 +2443,15 @@ fn run_follow_command_menu(
     terminal: &mut Terminal,
     store: &mut Store,
     id: &str,
+    interrupts: &mut InterruptKeys,
+    progress: &mut FollowProgress,
 ) -> Result<bool> {
     terminal.clear_activity()?;
-    let Some(command) = terminal.command_menu()? else {
+    let Some(command) = terminal.command_menu_with_updates(
+        || poll_follow_update(progress, store, id, terminal),
+        |update| render_follow_update(terminal, update),
+    )?
+    else {
         return Ok(true);
     };
     steer_from_follow(
@@ -2283,66 +2460,27 @@ fn run_follow_command_menu(
         store,
         id,
         &crate::terminal::selected_command_draft(&command),
+        interrupts,
+        progress,
     )
 }
 
 fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
     let _raw = RawMode::enter(terminal.interactive)?;
     let mut store = Store::open(root)?;
-    let mut task_started_at = store.run_started_at(id)?;
-    terminal.set_task_started_at(task_started_at);
-    let mut sequence = store
-        .recent_events(id, 64)?
-        .first()
-        .map(|event| event.seq - 1)
-        .unwrap_or(0);
+    let mut progress = FollowProgress::new(&store, id, terminal)?;
     let mut interrupts = InterruptKeys::default();
     let started = Instant::now();
-    let mut phase = "Starting task".to_owned();
-    let mut context_status = crate::terminal::ContextStatus::default();
     loop {
-        let events = store.events_since(id, sequence)?;
-        if !events.is_empty() {
+        if let Some(events) = progress.poll(&store, id, terminal)? {
             terminal.clear_activity()?;
-            context_status.operations = store.event_count(id, "operation.pending")? as u64;
-            context_status.artifacts = store.evidence_artifacts(id)?.len();
-        }
-        for event in events {
-            if event.kind == "run.running" && task_started_at.is_none() {
-                task_started_at = Some(event.created_at);
-                terminal.set_task_started_at(task_started_at);
-            }
-            match event.kind.as_str() {
-                "model.started" => {
-                    phase = "Thinking".into();
-                    context_status.prompt_chars = event.payload["prompt_chars"].as_u64();
-                    context_status.normalized_tokens =
-                        if event.payload["context_tokenizer"] == crate::tokenization::ENCODING {
-                            event.payload["raw_prompt_tokens"].as_u64()
-                        } else {
-                            None
-                        };
-                    context_status.schema_count = event.payload["schema_count"].as_u64();
-                }
-                "checkpoint.created" => context_status.checkpoint_at = Some(event.created_at),
-                "acceptance.started" => phase = "Verifying acceptance".into(),
-                "operation.pending" => {
-                    phase = format!(
-                        "Running {}",
-                        event.payload["capability"].as_str().unwrap_or("tool")
-                    )
-                }
-                "operation.succeeded" => phase = "Reviewing evidence".into(),
-                _ => {}
-            }
-            terminal.render_event(&event)?;
-            sequence = event.seq;
+            progress.render(terminal, events)?;
         }
         let run = store.run(id)?;
-        if !matches!(run.state.as_str(), "ready" | "running") {
+        if !follow_task_is_active(&run.state) {
             terminal.clear_activity()?;
-            for event in store.events_since(id, sequence)? {
-                terminal.render_event(&event)?;
+            if let Some(events) = progress.poll(&store, id, terminal)? {
+                progress.render(terminal, events)?;
             }
             terminal.message(
                 Tone::Quiet,
@@ -2365,8 +2503,9 @@ fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
             return Ok(());
         }
         terminal.activity(
-            &phase,
-            task_started_at
+            &progress.phase,
+            progress
+                .task_started_at
                 .map(|started_at| {
                     Duration::from_secs(
                         crate::storage::unix_time()
@@ -2376,12 +2515,20 @@ fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
                 })
                 .unwrap_or_else(|| started.elapsed()),
             store.model_tokens(id)?,
-            &context_status,
+            &progress.context_status,
         )?;
         if terminal.interactive && event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Paste(paste) => {
-                    if !steer_from_follow(root, terminal, &mut store, id, &paste)? {
+                    if !steer_from_follow(
+                        root,
+                        terminal,
+                        &mut store,
+                        id,
+                        &paste,
+                        &mut interrupts,
+                        &mut progress,
+                    )? {
                         return Ok(());
                     }
                 }
@@ -2392,7 +2539,14 @@ fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
                     if key.code == KeyCode::Char('/')
                         && !key.modifiers.contains(KeyModifiers::CONTROL)
                     {
-                        if !run_follow_command_menu(root, terminal, &mut store, id)? {
+                        if !run_follow_command_menu(
+                            root,
+                            terminal,
+                            &mut store,
+                            id,
+                            &mut interrupts,
+                            &mut progress,
+                        )? {
                             return Ok(());
                         }
                     } else if key.code == KeyCode::F(8) {
@@ -2413,19 +2567,12 @@ fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
                                 return Ok(());
                             }
                             KeyCode::Char('c') => {
-                                let scope = interrupts.next(Instant::now());
-                                terminal.clear_activity()?;
-                                match store.request_interrupt(id, scope) {
-                                    Ok(Some(_)) => terminal.message(Tone::Warning, "Interrupt", match scope {
-                                        crate::interrupt::Scope::Operation => "Stopping this operation; the task itself remains available.",
-                                        crate::interrupt::Scope::Model => "Interrupting this model turn; you can resume the task later.",
-                                    })?,
-                                    Ok(None) => terminal.message(Tone::Quiet, "Interrupt", match scope {
-                                        crate::interrupt::Scope::Operation => "No active operation. Press Ctrl+C again quickly to interrupt the model turn.",
-                                        crate::interrupt::Scope::Model => "No active model turn. Ctrl+D detaches; use the task menu to cancel the whole task.",
-                                    })?,
-                                    Err(error) => terminal.message(Tone::Warning, "Interrupt", &error.to_string())?,
-                                }
+                                request_follow_interrupt(
+                                    terminal,
+                                    &mut store,
+                                    id,
+                                    &mut interrupts,
+                                )?;
                             }
                             _ => {}
                         }
@@ -2438,6 +2585,8 @@ fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
                                     &mut store,
                                     id,
                                     &character.to_string(),
+                                    &mut interrupts,
+                                    &mut progress,
                                 )? {
                                     return Ok(());
                                 }
@@ -3743,6 +3892,16 @@ pub fn interactive(root: &Path) -> Result<()> {
         ));
         match terminal.input(&terminal.input_prefix(), false, &history)? {
             Input::Exit => break,
+            Input::Interrupt => terminal.message(
+                Tone::Quiet,
+                "Interrupt",
+                "No task is currently being followed.",
+            )?,
+            Input::TaskFinished => terminal.message(
+                Tone::Quiet,
+                "Task finished",
+                "No task is currently being followed.",
+            )?,
             Input::Providers => {
                 switch_provider(root, &terminal, &mut profile, &mut secret)?;
             }
@@ -3945,6 +4104,16 @@ pub fn interactive(root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn follow_input_closes_when_the_run_is_terminal() {
+        for state in ["ready", "running"] {
+            assert!(follow_task_is_active(state));
+        }
+        for state in ["completed", "failed", "blocked", "paused", "cancelled"] {
+            assert!(!follow_task_is_active(state));
+        }
+    }
 
     #[test]
     fn remote_tasks_use_only_the_local_profile_and_stable_run_id() -> Result<()> {

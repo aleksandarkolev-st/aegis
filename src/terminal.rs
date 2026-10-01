@@ -1,5 +1,5 @@
 use std::io::{self, IsTerminal, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::{
@@ -9,6 +9,7 @@ use crossterm::{
     style::{Attribute, Color, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
     terminal::{self, Clear, ClearType},
 };
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::storage::Event as RunEvent;
@@ -19,6 +20,8 @@ const MAX_INPUT_BYTES: usize = 65_536;
 #[derive(Debug, PartialEq)]
 pub enum Input {
     Submit(String),
+    Interrupt,
+    TaskFinished,
     Providers,
     Models,
     Settings,
@@ -87,6 +90,84 @@ impl ContextStatus {
             self.operations, self.artifacts
         )
     }
+
+    fn compact_text(&self) -> String {
+        let context = self
+            .normalized_tokens
+            .map(|tokens| format!("ctx {tokens}"))
+            .unwrap_or_else(|| {
+                self.prompt_chars
+                    .map(|chars| format!("{chars} chars"))
+                    .unwrap_or_else(|| "ctx ?".into())
+            });
+        format!(
+            "{context} · {} ops · {} artifacts",
+            self.operations, self.artifacts
+        )
+    }
+}
+
+fn activity_lines(
+    frame: &str,
+    label: &str,
+    elapsed: Duration,
+    now: i64,
+    tokens: u64,
+    context: &ContextStatus,
+    show_context: bool,
+    terminal_width: usize,
+) -> (String, String) {
+    let width = terminal_width.saturating_sub(1);
+    let duration = format_duration(elapsed);
+    let clock = format_clock_utc(now);
+    if width >= 75 {
+        let text = fit(
+            &format!(
+                "  {frame} {} · {duration} elapsed · {clock}",
+                fit(label, 16)
+            ),
+            width,
+        );
+        let mut footer = "  Type/paste to steer · ^C interrupt · ^D detach".to_owned();
+        if show_context {
+            footer.push_str(&format!(
+                " · {} · {} recorded tokens",
+                context.text(now),
+                tokens
+            ));
+        }
+        (text, fit(&footer, width))
+    } else if width >= 36 {
+        let text = fit(&format!("  {frame} {} · {duration}", fit(label, 12)), width);
+        let compact_clock = clock.strip_suffix(" UTC").unwrap_or(&clock).to_owned() + "Z";
+        let mut footer = if width >= 42 {
+            format!("  {compact_clock} · {tokens}t · ^C stop · ^D detach")
+        } else {
+            format!("  {compact_clock} · ^C stop · ^D detach")
+        };
+        if show_context && width >= 60 {
+            footer.push_str(&format!("; {}", context.compact_text()));
+        }
+        (text, fit(&footer, width))
+    } else {
+        let compact_clock = clock.strip_suffix(" UTC").unwrap_or(&clock).to_owned() + "Z";
+        let label_width = width.saturating_sub(2 + frame.width() + 1 + 3 + duration.width());
+        let text = fit(
+            &format!("  {frame} {} · {duration}", fit(label, label_width)),
+            width,
+        );
+        let footer = if width >= 33 {
+            format!("  {compact_clock} · ^C stop · ^D detach")
+        } else if width >= 26 {
+            format!("  {compact_clock} · ^C stop · ^D")
+        } else if width >= 19 {
+            format!("  {compact_clock} · ^C/^D")
+        } else {
+            format!("  {compact_clock}")
+        };
+        let footer = fit(&footer, width);
+        (text, footer)
+    }
 }
 
 pub struct RawMode(bool);
@@ -102,6 +183,19 @@ struct EditorView {
     rows: Vec<String>,
     caret_row: usize,
     caret_column: usize,
+}
+
+const INPUT_UPDATE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const COMPOSER_MIN_COLUMNS: usize = 8;
+const COMPOSER_MIN_ROWS: usize = 3;
+const HOME_MIN_COLUMNS: usize = 12;
+
+fn input_update_poll_due(last_poll: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_poll) >= INPUT_UPDATE_POLL_INTERVAL
+}
+
+fn composer_available(size: TerminalSize) -> bool {
+    size.columns >= COMPOSER_MIN_COLUMNS && size.rows >= COMPOSER_MIN_ROWS
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,9 +230,18 @@ impl TerminalSize {
     }
 }
 
+fn measured_terminal_resize(
+    previous: TerminalSize,
+    measured: Option<TerminalSize>,
+) -> (TerminalSize, bool) {
+    measured.map_or((previous, false), |size| (size, size != previous))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct InputLayout {
     label: String,
+    composer_prefix: String,
+    composer_margin: u16,
     composer_width: u16,
     max_input_rows: usize,
     available: usize,
@@ -184,11 +287,24 @@ fn input_layout(size: TerminalSize, label: &str, composer: bool) -> InputLayout 
         },
         width.saturating_sub(4),
     );
-    let composer_width = width.saturating_sub(4).max(4).min(u16::MAX as usize) as u16;
-    let max_input_rows = size.rows.saturating_sub(10).clamp(1, 6);
+    let composer_margin = if composer && width >= 16 { 2 } else { 0 };
+    let composer_width = width
+        .saturating_sub(composer_margin as usize)
+        .max(1)
+        .min(u16::MAX as usize) as u16;
+    let composer_prefix = if composer && width < 16 {
+        "›".into()
+    } else {
+        label.to_owned()
+    };
+    let max_input_rows = size
+        .rows
+        .saturating_sub(4)
+        .max(if size.rows >= 5 { 2 } else { 1 })
+        .min(6);
     let available = if composer {
         crate::widgets::composer_input_area(
-            label,
+            &composer_prefix,
             ratatui::layout::Rect::new(0, 0, composer_width, (max_input_rows + 2) as u16),
         )
         .width as usize
@@ -198,6 +314,8 @@ fn input_layout(size: TerminalSize, label: &str, composer: bool) -> InputLayout 
     .max(1);
     InputLayout {
         label: visible_label,
+        composer_prefix,
+        composer_margin,
         composer_width,
         max_input_rows,
         available,
@@ -205,7 +323,11 @@ fn input_layout(size: TerminalSize, label: &str, composer: bool) -> InputLayout 
 }
 
 fn home_render_width(columns: usize) -> usize {
-    columns.saturating_sub(4).max(12)
+    columns.saturating_sub(home_panel_margin(columns)).max(1)
+}
+
+fn home_panel_margin(columns: usize) -> usize {
+    if columns >= 16 { 2 } else { 0 }
 }
 
 fn home_shortcut_rows(columns: usize, visible: bool) -> usize {
@@ -233,10 +355,16 @@ fn home_geometry(
     shortcut_rows: usize,
     composer_rows: usize,
 ) -> Option<HomeGeometry> {
+    if size.columns < HOME_MIN_COLUMNS || size.rows < COMPOSER_MIN_ROWS {
+        return None;
+    }
     let render_width = home_render_width(size.columns);
-    let composer_width = size.columns.saturating_sub(4).max(4);
-    if render_width.saturating_add(4) > size.columns
-        || composer_width.saturating_add(2) > size.columns
+    let panel_margin = home_panel_margin(size.columns);
+    let composer_layout = input_layout(size, "", true);
+    if render_width.saturating_add(panel_margin) > size.columns
+        || (composer_layout.composer_width as usize)
+            .saturating_add(composer_layout.composer_margin as usize)
+            > size.columns
     {
         return None;
     }
@@ -293,6 +421,68 @@ fn input_bytes(text: &[char]) -> usize {
     })
 }
 
+fn strip_terminal_sequences(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\u{1b}' {
+            let Some(next) = characters.next() else {
+                break;
+            };
+            match next {
+                '[' => skip_csi(&mut characters),
+                ']' | 'P' | '^' | '_' => skip_control_string(&mut characters),
+                _ => {}
+            }
+            continue;
+        }
+        match character {
+            '\u{009b}' => skip_csi(&mut characters),
+            '\u{0090}' | '\u{0098}' | '\u{009d}' | '\u{009e}' | '\u{009f}' => {
+                skip_control_string(&mut characters)
+            }
+            _ => output.push(character),
+        }
+    }
+    output
+}
+
+fn skip_csi(characters: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    for character in characters.by_ref() {
+        if ('\u{0040}'..='\u{007e}').contains(&character) {
+            break;
+        }
+    }
+}
+
+fn skip_control_string(characters: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while let Some(character) = characters.next() {
+        if matches!(character, '\u{0007}' | '\u{009c}') {
+            break;
+        }
+        if character == '\u{1b}' && characters.peek() == Some(&'\\') {
+            characters.next();
+            break;
+        }
+    }
+}
+
+fn append_menu_query(query: &mut String, pasted: &str) {
+    const MAX_QUERY_BYTES: usize = 160;
+    if query.len() >= MAX_QUERY_BYTES {
+        return;
+    }
+    // Bound extra paste processing before escape-sequence cleanup allocates its result.
+    let bounded_paste = pasted.chars().take(MAX_QUERY_BYTES).collect::<String>();
+    let flattened = normalize_paste(&bounded_paste).replace('\n', " ");
+    for grapheme in flattened.graphemes(true) {
+        if query.len().saturating_add(grapheme.len()) > MAX_QUERY_BYTES {
+            break;
+        }
+        query.push_str(grapheme);
+    }
+}
+
 fn can_insert_input(current_bytes: usize, inserted_bytes: usize) -> bool {
     current_bytes.saturating_add(inserted_bytes) <= MAX_INPUT_BYTES
 }
@@ -313,69 +503,160 @@ fn insert_input(
     true
 }
 
+fn grapheme_spans(text: &[char]) -> Vec<(usize, usize, String)> {
+    let text = text.iter().collect::<String>();
+    let mut start = 0;
+    text.graphemes(true)
+        .map(|grapheme| {
+            let end = start + grapheme.chars().count();
+            let span = (start, end, grapheme.to_owned());
+            start = end;
+            span
+        })
+        .collect()
+}
+
+fn previous_grapheme_boundary(text: &[char], caret: usize) -> usize {
+    let caret = caret.min(text.len());
+    let spans = grapheme_spans(text);
+    if let Some((start, _, _)) = spans
+        .iter()
+        .find(|(start, end, _)| *start < caret && caret < *end)
+    {
+        return *start;
+    }
+    spans
+        .iter()
+        .rev()
+        .find(|(_, end, _)| *end <= caret)
+        .map_or(0, |(start, _, _)| *start)
+}
+
+fn next_grapheme_boundary(text: &[char], caret: usize) -> usize {
+    let caret = caret.min(text.len());
+    let spans = grapheme_spans(text);
+    if let Some((_, end, _)) = spans
+        .iter()
+        .find(|(start, end, _)| *start < caret && caret < *end)
+    {
+        return *end;
+    }
+    spans
+        .iter()
+        .find(|(start, _, _)| *start >= caret)
+        .map_or(text.len(), |(_, end, _)| *end)
+}
+
+fn restored_grapheme_caret(text: &[char], caret: usize) -> usize {
+    let caret = caret.min(text.len());
+    let spans = grapheme_spans(text);
+    spans
+        .iter()
+        .find(|(start, end, _)| *start < caret && caret < *end)
+        .map_or(caret, |(_, end, _)| *end)
+}
+
+fn previous_grapheme_range(text: &[char], caret: usize) -> std::ops::Range<usize> {
+    let caret = caret.min(text.len());
+    grapheme_spans(text)
+        .iter()
+        .find(|(start, end, _)| *start < caret && caret < *end)
+        .map_or_else(
+            || previous_grapheme_boundary(text, caret)..caret,
+            |(start, end, _)| *start..*end,
+        )
+}
+
+fn next_grapheme_range(text: &[char], caret: usize) -> std::ops::Range<usize> {
+    let caret = caret.min(text.len());
+    grapheme_spans(text)
+        .iter()
+        .find(|(start, end, _)| *start < caret && caret < *end)
+        .map_or_else(
+            || caret..next_grapheme_boundary(text, caret),
+            |(start, end, _)| *start..*end,
+        )
+}
+
 fn normalize_paste(paste: &str) -> String {
     const TAB_STOP: usize = 4;
 
-    let normalized = paste.replace("\r\n", "\n").replace('\r', "\n");
+    let normalized = strip_terminal_sequences(&paste.replace("\r\n", "\n").replace('\r', "\n"));
     let mut expanded = String::with_capacity(normalized.len());
     let mut column = 0usize;
-    for character in normalized.chars() {
-        match character {
-            '\n' => {
+    for grapheme in normalized.graphemes(true) {
+        match grapheme {
+            "\n" => {
                 expanded.push('\n');
                 column = 0;
             }
-            '\t' => {
+            "\t" => {
                 let spaces = TAB_STOP - column % TAB_STOP;
                 for _ in 0..spaces {
                     expanded.push(' ');
                 }
                 column += spaces;
             }
-            character => {
-                expanded.push(character);
-                column += character.width().unwrap_or(0);
+            grapheme => {
+                expanded.push_str(grapheme);
+                column += grapheme.width();
             }
         }
     }
     clean(&expanded)
 }
 
-fn editor_view(text: &[char], caret: usize, width: usize, height: usize) -> EditorView {
+fn editor_layout(text: &[char], width: usize) -> (Vec<String>, Vec<(usize, usize)>, Vec<usize>) {
     let width = width.max(1);
-    let height = height.max(1);
     let mut rows = vec![String::new()];
     let mut positions = vec![(0usize, 0usize); text.len() + 1];
+    let mut boundaries = vec![0usize];
     let mut row = 0;
     let mut column = 0;
 
-    for (index, character) in text.iter().copied().enumerate() {
-        if character == '\n' {
-            positions[index] = (row, column);
+    for (start, end, grapheme) in grapheme_spans(text) {
+        if grapheme == "\n" {
+            positions[start] = (row, column);
             row += 1;
             rows.push(String::new());
             column = 0;
-            positions[index + 1] = (row, column);
+            for position in start + 1..=end {
+                positions[position] = (row, column);
+            }
+            boundaries.push(end);
             continue;
         }
 
-        let mut rendered = character;
-        let mut cells = character.width().unwrap_or(0);
+        let mut rendered = grapheme;
+        let mut cells = rendered.width();
         if cells > 0 && column + cells > width {
             row += 1;
             rows.push(String::new());
             column = 0;
-            positions[index] = (row, column);
         }
         if cells > width {
-            rendered = '?';
+            rendered = "?".into();
             cells = 1;
         }
-        rows[row].push(rendered);
+        positions[start] = (row, column);
+        rows[row].push_str(&rendered);
         column += cells;
-        positions[index + 1] = (row, column);
+        for position in start + 1..=end {
+            positions[position] = (row, column);
+        }
+        boundaries.push(end);
     }
 
+    (rows, positions, boundaries)
+}
+
+fn editor_view(text: &[char], caret: usize, width: usize, height: usize) -> EditorView {
+    let width = width.max(1);
+    let height = height.max(1);
+    if height == 1 {
+        return single_row_editor_view(text, caret, width);
+    }
+    let (mut rows, positions, _) = editor_layout(text, width);
     let caret = caret.min(text.len());
     let (mut caret_row, mut caret_column) = positions[caret];
     if caret == text.len() && caret_column >= width {
@@ -394,6 +675,106 @@ fn editor_view(text: &[char], caret: usize, width: usize, height: usize) -> Edit
     }
 }
 
+fn single_row_editor_view(text: &[char], caret: usize, width: usize) -> EditorView {
+    let caret = restored_grapheme_caret(text, caret);
+    let line_start = text[..caret]
+        .iter()
+        .rposition(|character| *character == '\n')
+        .map_or(0, |index| index + 1);
+    let line_end = text[caret..]
+        .iter()
+        .position(|character| *character == '\n')
+        .map_or(text.len(), |offset| caret + offset);
+    let line = &text[line_start..line_end];
+    let line_caret = caret.saturating_sub(line_start).min(line.len());
+    let spans = grapheme_spans(line);
+    let caret_span = spans
+        .iter()
+        .take_while(|(_, end, _)| *end <= line_caret)
+        .count();
+    let line_width: usize = spans
+        .iter()
+        .map(|(_, _, grapheme)| single_row_grapheme(grapheme, width).width())
+        .sum();
+    if line_width <= width {
+        let visible = spans
+            .iter()
+            .map(|(_, _, grapheme)| single_row_grapheme(grapheme, width))
+            .collect::<String>();
+        let caret_column = spans
+            .iter()
+            .take(caret_span)
+            .map(|(_, _, grapheme)| single_row_grapheme(grapheme, width).width())
+            .sum::<usize>()
+            .min(width.saturating_sub(1));
+        return EditorView {
+            rows: vec![visible],
+            caret_row: 0,
+            caret_column,
+        };
+    }
+
+    if line_caret == line.len() {
+        let mut start = spans.len();
+        let mut visible_width: usize = 0;
+        while start > 0 {
+            let cells = single_row_grapheme(&spans[start - 1].2, width).width();
+            if visible_width.saturating_add(cells) > width {
+                break;
+            }
+            visible_width += cells;
+            start -= 1;
+        }
+        let visible = spans[start..]
+            .iter()
+            .map(|(_, _, grapheme)| single_row_grapheme(grapheme, width))
+            .collect::<String>();
+        return EditorView {
+            rows: vec![visible],
+            caret_row: 0,
+            caret_column: visible_width.min(width.saturating_sub(1)),
+        };
+    }
+
+    let mut start = caret_span;
+    let mut before_width: usize = 0;
+    while start > 0 {
+        let cells = single_row_grapheme(&spans[start - 1].2, width).width();
+        if before_width.saturating_add(cells) > width.saturating_sub(1) {
+            break;
+        }
+        before_width += cells;
+        start -= 1;
+    }
+    let mut visible = spans[start..caret_span]
+        .iter()
+        .map(|(_, _, grapheme)| single_row_grapheme(grapheme, width))
+        .collect::<String>();
+    let mut visible_width = before_width;
+    for (_, _, grapheme) in spans.iter().skip(caret_span) {
+        let grapheme = single_row_grapheme(grapheme, width);
+        let cells = grapheme.width();
+        if visible_width.saturating_add(cells) > width {
+            break;
+        }
+        visible.push_str(grapheme);
+        visible_width += cells;
+    }
+    EditorView {
+        rows: vec![visible],
+        caret_row: 0,
+        caret_column: before_width.min(width.saturating_sub(1)),
+    }
+}
+
+fn single_row_grapheme(grapheme: &str, width: usize) -> &str {
+    if grapheme.width() > width {
+        "?"
+    } else {
+        grapheme
+    }
+}
+
 fn editor_vertical_move(
     text: &[char],
     caret: usize,
@@ -402,27 +783,8 @@ fn editor_vertical_move(
     preferred_column: Option<usize>,
 ) -> Option<(usize, usize)> {
     let width = width.max(1);
-    let mut positions = vec![(0usize, 0usize); text.len() + 1];
-    let mut row = 0;
-    let mut column = 0;
-    for (index, character) in text.iter().copied().enumerate() {
-        if character == '\n' {
-            positions[index] = (row, column);
-            row += 1;
-            column = 0;
-            positions[index + 1] = (row, column);
-            continue;
-        }
-        let cells = character.width().unwrap_or(0).min(width);
-        if cells > 0 && column + cells > width {
-            row += 1;
-            column = 0;
-            positions[index] = (row, column);
-        }
-        column += cells;
-        positions[index + 1] = (row, column);
-    }
-
+    let (rows, positions, boundaries) = editor_layout(text, width);
+    let last_row = rows.len().saturating_sub(1);
     let caret = caret.min(text.len());
     let (mut current_row, mut current_column) = positions[caret];
     if caret == text.len() && current_column >= width {
@@ -431,19 +793,19 @@ fn editor_vertical_move(
     }
     let target_row = match direction {
         KeyCode::Up if current_row > 0 => current_row - 1,
-        KeyCode::Down if current_row < row => current_row + 1,
+        KeyCode::Down if current_row < last_row => current_row + 1,
         _ => return None,
     };
     let desired = preferred_column.unwrap_or(current_column);
-    positions
-        .iter()
-        .enumerate()
-        .filter_map(|(index, (candidate_row, candidate_column))| {
+    boundaries
+        .into_iter()
+        .filter_map(|index| {
+            let (candidate_row, candidate_column) = positions[index];
             let (candidate_row, candidate_column) =
-                if index == text.len() && *candidate_column >= width {
-                    (*candidate_row + 1, 0)
+                if index == text.len() && candidate_column >= width {
+                    (candidate_row + 1, 0)
                 } else {
-                    (*candidate_row, *candidate_column)
+                    (candidate_row, candidate_column)
                 };
             (candidate_row == target_row).then_some((index, candidate_column))
         })
@@ -774,11 +1136,15 @@ impl Terminal {
         recent: &[String],
         size: TerminalSize,
     ) -> Result<(usize, usize)> {
+        if size.columns < HOME_MIN_COLUMNS || size.rows < COMPOSER_MIN_ROWS {
+            return Ok((0, 0));
+        }
         let width = home_render_width(size.columns);
         let buffer = self.home_buffer(provider, workspace, selection, recent, width);
+        let margin = home_panel_margin(size.columns) as u16;
         for row in 0..buffer.area.height {
             if self.interactive {
-                self.paint_widget_row(&buffer, row, 2)?;
+                self.paint_widget_row(&buffer, row, margin)?;
             } else {
                 write!(io::stdout(), "  {}", crate::widgets::row_text(&buffer, row))?;
             }
@@ -882,6 +1248,34 @@ impl Terminal {
             ..snapshot
         }));
         Ok(true)
+    }
+
+    fn clear_input_for_resize(
+        &self,
+        size: TerminalSize,
+        label: &str,
+        displayed: &[char],
+        caret: usize,
+        rendered_composer: bool,
+        previous_caret_row: usize,
+    ) -> Result<()> {
+        if !rendered_composer {
+            return Ok(());
+        }
+        let layout = input_layout(size, label, true);
+        let editor = editor_view(displayed, caret, layout.available, layout.max_input_rows);
+        let home_redrawn =
+            self.redraw_home_for_resize(size, previous_caret_row, editor.rows.len() + 2)?;
+        if !home_redrawn {
+            queue!(
+                io::stdout(),
+                cursor::MoveUp(previous_caret_row as u16),
+                cursor::MoveToColumn(0),
+                Clear(ClearType::FromCursorDown)
+            )?;
+            io::stdout().flush()?;
+        }
+        Ok(())
     }
 
     fn home_buffer(
@@ -1044,7 +1438,7 @@ impl Terminal {
         let completed = format_utc(completed_at);
         match self.task_started_at.get() {
             Some(started_at) => format!(
-                "Completed {completed} · Worked for {}",
+                "Completed {completed} · Elapsed {}",
                 format_duration(Duration::from_secs(
                     completed_at.saturating_sub(started_at).max(0) as u64
                 ))
@@ -1088,22 +1482,16 @@ impl Terminal {
         let width = terminal::size()
             .map(|(width, _)| width as usize)
             .unwrap_or(80);
-        let text = format!(
-            "  {frame} {} · {} elapsed · {}",
-            fit(label, 16),
-            format_duration(elapsed),
-            format_clock_utc(now)
+        let (text, footer) = activity_lines(
+            frame,
+            label,
+            elapsed,
+            now,
+            tokens,
+            context,
+            self.skin.show_context(),
+            width,
         );
-        let text = fit(&text, width.saturating_sub(1));
-        let mut footer = "  Type/paste to steer · ^C interrupt · ^D detach".to_owned();
-        if self.skin.show_context() {
-            footer.push_str(&format!(
-                " · {} · {} recorded tokens",
-                context.text(now),
-                tokens
-            ));
-        }
-        let footer = fit(&footer, width.saturating_sub(1));
         self.paint_activity(width, text, Some(footer))
     }
 
@@ -1180,13 +1568,21 @@ impl Terminal {
         let mut draft = self.input_draft.borrow_mut();
         if !secret && draft.as_ref().is_some_and(|saved| saved.0 == label) {
             let (_, text, caret) = draft.take().unwrap();
-            let caret = caret.min(text.len());
+            let caret = restored_grapheme_caret(&text, caret);
             return (text, caret);
         }
         (Vec::new(), 0)
     }
 
     pub fn command_menu(&self) -> Result<Option<String>> {
+        self.command_menu_with_updates(|| Ok(None::<()>), |_| Ok(true))
+    }
+
+    pub fn command_menu_with_updates<T>(
+        &self,
+        poll_updates: impl FnMut() -> Result<Option<T>>,
+        render_updates: impl FnMut(T) -> Result<bool>,
+    ) -> Result<Option<String>> {
         let choices = crate::commands::COMMANDS
             .iter()
             .map(|(command, description)| format!("{command:<24} {description}"))
@@ -1196,7 +1592,7 @@ impl Terminal {
             choices.len()
         );
         Ok(self
-            .select(&title, &choices)?
+            .select_at_with_updates(&title, &choices, 0, poll_updates, render_updates)?
             .map(|index| crate::commands::COMMANDS[index].0.to_owned()))
     }
 
@@ -1211,7 +1607,47 @@ impl Terminal {
             .replace(Some((self.input_prefix(), text, caret)));
     }
 
+    fn clear_input_draft_for(&self, label: &str) {
+        let mut draft = self.input_draft.borrow_mut();
+        if draft.as_ref().is_some_and(|saved| saved.0 == label) {
+            *draft = None;
+        }
+    }
+
     pub fn input(&self, label: &str, secret: bool, history: &[String]) -> Result<Input> {
+        self.input_with_interrupt(
+            label,
+            secret,
+            history,
+            false,
+            || Ok(None::<()>),
+            |_| Ok(true),
+        )
+    }
+
+    pub fn steering_input(&self, label: &str, history: &[String]) -> Result<Input> {
+        self.steering_input_with_updates(label, history, || Ok(None::<()>), |_| Ok(true))
+    }
+
+    pub fn steering_input_with_updates<T>(
+        &self,
+        label: &str,
+        history: &[String],
+        poll_updates: impl FnMut() -> Result<Option<T>>,
+        render_updates: impl FnMut(T) -> Result<bool>,
+    ) -> Result<Input> {
+        self.input_with_interrupt(label, false, history, true, poll_updates, render_updates)
+    }
+
+    fn input_with_interrupt<T>(
+        &self,
+        label: &str,
+        secret: bool,
+        history: &[String],
+        interrupt_on_ctrl_c: bool,
+        mut poll_updates: impl FnMut() -> Result<Option<T>>,
+        mut render_updates: impl FnMut(T) -> Result<bool>,
+    ) -> Result<Input> {
         if !self.interactive {
             print!("{label}");
             io::stdout().flush()?;
@@ -1245,9 +1681,9 @@ impl Terminal {
             return Ok(Input::Submit(input.into()));
         }
         let _raw = RawMode::enter(true)?;
-        let composer =
+        let composer_requested =
             !secret && label == self.input_prefix() && !self.input_status.borrow().is_empty();
-        if !composer {
+        if !composer_requested {
             self.invalidate_home_snapshot();
         }
         let draft_label = label.to_owned();
@@ -1262,12 +1698,19 @@ impl Terminal {
         let mut screen_size = TerminalSize::current();
         let mut pending_resize = None;
         let mut redraw_from_current_line = false;
+        let mut input_needs_render = true;
+        let mut last_update_poll = Instant::now();
         loop {
-            if let Some(resized) = pending_resize.take() {
+            let measured_resize = if let Some(resized) = pending_resize.take() {
                 screen_size = resized;
-            } else if let Some(measured) = TerminalSize::measured() {
+                false
+            } else {
+                let (measured, changed) =
+                    measured_terminal_resize(screen_size, TerminalSize::measured());
                 screen_size = measured;
-            }
+                changed
+            };
+            let composer = composer_requested && composer_available(screen_size);
             let layout = input_layout(screen_size, &draft_label, composer);
             let label = &layout.label;
             let composer_width = layout.composer_width;
@@ -1287,116 +1730,144 @@ impl Terminal {
                     }
                 })
                 .collect();
-            let (input_column, caret_width) = if composer {
-                let editor = editor_view(&displayed, caret, available, max_input_rows);
-                let status = if paste_notice {
-                    format!("{} · input exceeds 64 KiB", self.input_status.borrow())
-                } else {
-                    self.input_status.borrow().clone()
-                };
-                let (buffer, origin) = crate::widgets::composer(
+            if measured_resize {
+                self.clear_input_for_resize(
+                    screen_size,
                     &draft_label,
-                    &editor.rows,
-                    &status,
-                    composer_width,
-                    &self.skin.palette(),
-                );
-                let margin = 2;
-                let draw_rows = composer_draw_rows(previous_draw_rows, buffer.area.height as usize);
-                if rendered_composer {
-                    queue!(io::stdout(), cursor::MoveUp(previous_caret_row as u16))?;
-                } else if redraw_from_current_line {
-                    queue!(io::stdout(), cursor::MoveToColumn(0))?;
-                } else {
-                    write!(io::stdout(), "\r\n")?;
-                }
-                for row in 0..draw_rows {
-                    if row < buffer.area.height as usize {
-                        self.paint_widget_row(&buffer, row as u16, margin)?;
+                    &displayed,
+                    caret,
+                    rendered_composer,
+                    previous_caret_row,
+                )?;
+                rendered_composer = false;
+                previous_draw_rows = 0;
+                redraw_from_current_line = true;
+                input_needs_render = true;
+            }
+            if input_needs_render {
+                let (input_column, caret_width) = if composer {
+                    let editor = editor_view(&displayed, caret, available, max_input_rows);
+                    let status = if paste_notice {
+                        format!("{} · input exceeds 64 KiB", self.input_status.borrow())
                     } else {
-                        queue!(
-                            io::stdout(),
-                            cursor::MoveToColumn(0),
-                            Clear(ClearType::CurrentLine)
-                        )?;
-                    }
-                    if row + 1 < draw_rows {
+                        self.input_status.borrow().clone()
+                    };
+                    let (buffer, origin) = crate::widgets::composer(
+                        &layout.composer_prefix,
+                        &editor.rows,
+                        &status,
+                        composer_width,
+                        &self.skin.palette(),
+                    );
+                    let margin = layout.composer_margin;
+                    let draw_rows =
+                        composer_draw_rows(previous_draw_rows, buffer.area.height as usize);
+                    if rendered_composer {
+                        queue!(io::stdout(), cursor::MoveUp(previous_caret_row as u16))?;
+                    } else if redraw_from_current_line {
+                        queue!(io::stdout(), cursor::MoveToColumn(0))?;
+                    } else {
                         write!(io::stdout(), "\r\n")?;
                     }
-                }
-                let caret_row = 1 + editor.caret_row;
+                    for row in 0..draw_rows {
+                        if row < buffer.area.height as usize {
+                            self.paint_widget_row(&buffer, row as u16, margin)?;
+                        } else {
+                            queue!(
+                                io::stdout(),
+                                cursor::MoveToColumn(0),
+                                Clear(ClearType::CurrentLine)
+                            )?;
+                        }
+                        if row + 1 < draw_rows {
+                            write!(io::stdout(), "\r\n")?;
+                        }
+                    }
+                    let caret_row = 1 + editor.caret_row;
+                    queue!(
+                        io::stdout(),
+                        cursor::MoveUp(draw_rows.saturating_sub(1 + caret_row) as u16),
+                        ResetColor
+                    )?;
+                    self.input_rows.set(draw_rows.min(u16::MAX as usize) as u16);
+                    self.input_caret_row.set(caret_row as u16);
+                    previous_draw_rows = draw_rows;
+                    previous_caret_row = caret_row;
+                    rendered_composer = true;
+                    redraw_from_current_line = false;
+                    (composer_input_column(origin, margin), editor.caret_column)
+                } else {
+                    let (visible, caret_width) = input_view(&displayed, caret, available);
+                    queue!(
+                        io::stdout(),
+                        cursor::MoveToColumn(0),
+                        Clear(ClearType::CurrentLine)
+                    )?;
+                    if self.colors {
+                        queue!(io::stdout(), SetForegroundColor(self.color(Tone::Accent)))?;
+                    }
+                    write!(io::stdout(), "{label}")?;
+                    queue!(io::stdout(), ResetColor)?;
+                    write!(io::stdout(), "{visible}")?;
+                    (label.width(), caret_width)
+                };
                 queue!(
                     io::stdout(),
-                    cursor::MoveUp(draw_rows.saturating_sub(1 + caret_row) as u16),
-                    ResetColor
+                    cursor::MoveToColumn((input_column + caret_width) as u16)
                 )?;
-                self.input_rows.set(draw_rows.min(u16::MAX as usize) as u16);
-                self.input_caret_row.set(caret_row as u16);
-                previous_draw_rows = draw_rows;
-                previous_caret_row = caret_row;
-                rendered_composer = true;
-                redraw_from_current_line = false;
-                (composer_input_column(origin, margin), editor.caret_column)
-            } else {
-                let (visible, caret_width) = input_view(&displayed, caret, available);
-                queue!(
-                    io::stdout(),
-                    cursor::MoveToColumn(0),
-                    Clear(ClearType::CurrentLine)
-                )?;
-                if self.colors {
-                    queue!(io::stdout(), SetForegroundColor(self.color(Tone::Accent)))?;
+                io::stdout().flush()?;
+                input_needs_render = false;
+            }
+            let event_available = event::poll(Duration::from_millis(100))?;
+            if input_update_poll_due(last_update_poll, Instant::now()) {
+                last_update_poll = Instant::now();
+                if let Some(update) = poll_updates()? {
+                    self.input_draft
+                        .replace(Some((draft_label.clone(), text.clone(), caret)));
+                    self.finish_input(composer, None)?;
+                    if !render_updates(update)? {
+                        return Ok(Input::TaskFinished);
+                    }
+                    rendered_composer = false;
+                    previous_draw_rows = 0;
+                    redraw_from_current_line = true;
+                    input_needs_render = true;
                 }
-                write!(io::stdout(), "{label}")?;
-                queue!(io::stdout(), ResetColor)?;
-                write!(io::stdout(), "{visible}")?;
-                (label.width(), caret_width)
-            };
-            queue!(
-                io::stdout(),
-                cursor::MoveToColumn((input_column + caret_width) as u16)
-            )?;
-            io::stdout().flush()?;
+            }
+            if !event_available {
+                continue;
+            }
             match event::read()? {
                 Event::Paste(paste) => {
-                    let normalized = normalize_paste(&paste);
-                    if !can_insert_input(draft_bytes, normalized.len()) {
+                    if paste.len() > MAX_INPUT_BYTES {
                         paste_notice = true;
                     } else {
-                        let characters: Vec<_> = normalized.chars().collect();
-                        text.splice(caret..caret, characters.iter().copied());
-                        caret += characters.len();
-                        draft_bytes += normalized.len();
-                        paste_notice = false;
+                        let normalized = normalize_paste(&paste);
+                        if !can_insert_input(draft_bytes, normalized.len()) {
+                            paste_notice = true;
+                        } else {
+                            let characters: Vec<_> = normalized.chars().collect();
+                            text.splice(caret..caret, characters.iter().copied());
+                            caret += characters.len();
+                            draft_bytes += normalized.len();
+                            paste_notice = false;
+                        }
                     }
                 }
                 Event::Resize(width, height) => {
                     let event = Event::Resize(width, height);
                     screen_size = TerminalSize::from_event(&event).unwrap_or(screen_size);
                     pending_resize = Some(screen_size);
-                    if composer && rendered_composer {
-                        let resized_layout = input_layout(screen_size, &draft_label, true);
-                        let resized_editor = editor_view(
-                            &displayed,
-                            caret,
-                            resized_layout.available,
-                            resized_layout.max_input_rows,
-                        );
-                        let composer_rows = resized_editor.rows.len() + 2;
-                        let home_redrawn = self.redraw_home_for_resize(
-                            screen_size,
-                            previous_caret_row,
-                            composer_rows,
-                        )?;
-                        if !home_redrawn {
-                            queue!(
-                                io::stdout(),
-                                cursor::MoveUp(previous_caret_row as u16),
-                                cursor::MoveToColumn(0),
-                                Clear(ClearType::FromCursorDown)
-                            )?;
-                            io::stdout().flush()?;
-                        }
+                    redraw_from_current_line = true;
+                    self.clear_input_for_resize(
+                        screen_size,
+                        &draft_label,
+                        &displayed,
+                        caret,
+                        rendered_composer,
+                        previous_caret_row,
+                    )?;
+                    if rendered_composer {
                         rendered_composer = false;
                         previous_draw_rows = 0;
                         redraw_from_current_line = true;
@@ -1424,9 +1895,11 @@ impl Terminal {
                         KeyCode::Enter => {
                             if !can_insert_input(draft_bytes, 0) {
                                 paste_notice = true;
+                                input_needs_render = true;
                                 continue;
                             }
                             let submitted: String = text.iter().collect();
+                            self.clear_input_draft_for(&draft_label);
                             self.finish_input(
                                 composer,
                                 (!secret && !submitted.starts_with('/'))
@@ -1439,6 +1912,15 @@ impl Terminal {
                             return Ok(Input::Exit);
                         }
                         KeyCode::Char('c') if control => {
+                            if interrupt_on_ctrl_c {
+                                self.input_draft.replace(Some((
+                                    draft_label.clone(),
+                                    text.clone(),
+                                    caret,
+                                )));
+                                self.finish_input(composer, None)?;
+                                return Ok(Input::Interrupt);
+                            }
                             text.clear();
                             caret = 0;
                             draft_bytes = 0;
@@ -1491,11 +1973,11 @@ impl Terminal {
                             return Ok(Input::CancelTask);
                         }
                         KeyCode::Left => {
-                            caret = caret.saturating_sub(1);
+                            caret = previous_grapheme_boundary(&text, caret);
                             preferred_column = None;
                         }
                         KeyCode::Right => {
-                            caret = (caret + 1).min(text.len());
+                            caret = next_grapheme_boundary(&text, caret);
                             preferred_column = None;
                         }
                         KeyCode::Home => {
@@ -1507,15 +1989,17 @@ impl Terminal {
                             preferred_column = None;
                         }
                         KeyCode::Backspace if caret > 0 => {
-                            caret -= 1;
-                            let removed = text.remove(caret);
-                            draft_bytes -= removed.len_utf8();
+                            let range = previous_grapheme_range(&text, caret);
+                            let removed = text.drain(range.clone()).collect::<Vec<_>>();
+                            caret = range.start;
+                            draft_bytes -= input_bytes(&removed);
                             paste_notice = draft_bytes > MAX_INPUT_BYTES;
                             preferred_column = None;
                         }
                         KeyCode::Delete if caret < text.len() => {
-                            let removed = text.remove(caret);
-                            draft_bytes -= removed.len_utf8();
+                            let range = next_grapheme_range(&text, caret);
+                            let removed = text.drain(range).collect::<Vec<_>>();
+                            draft_bytes -= input_bytes(&removed);
                             paste_notice = draft_bytes > MAX_INPUT_BYTES;
                             preferred_column = None;
                         }
@@ -1569,6 +2053,7 @@ impl Terminal {
                 }
                 _ => {}
             }
+            input_needs_render = true;
         }
     }
 
@@ -1611,11 +2096,22 @@ impl Terminal {
         choices: &[String],
         initial: usize,
     ) -> Result<Option<usize>> {
+        self.select_at_with_updates(title, choices, initial, || Ok(None::<()>), |_| Ok(true))
+    }
+
+    fn select_at_with_updates<T>(
+        &self,
+        title: &str,
+        choices: &[String],
+        initial: usize,
+        poll_updates: impl FnMut() -> Result<Option<T>>,
+        render_updates: impl FnMut(T) -> Result<bool>,
+    ) -> Result<Option<usize>> {
         if choices.is_empty() {
             return Ok(None);
         }
         if self.interactive {
-            return self.menu(title, choices, initial);
+            return self.menu_with_updates(title, choices, initial, poll_updates, render_updates);
         }
         self.message(Tone::Accent, "◇", title)?;
         for (index, choice) in choices.iter().enumerate() {
@@ -1639,7 +2135,14 @@ impl Terminal {
         }
     }
 
-    fn menu(&self, title: &str, choices: &[String], initial: usize) -> Result<Option<usize>> {
+    fn menu_with_updates<T>(
+        &self,
+        title: &str,
+        choices: &[String],
+        initial: usize,
+        mut poll_updates: impl FnMut() -> Result<Option<T>>,
+        mut render_updates: impl FnMut(T) -> Result<bool>,
+    ) -> Result<Option<usize>> {
         self.invalidate_home_snapshot();
         let _raw = RawMode::enter(true)?;
         let mut selected = initial.min(choices.len() - 1);
@@ -1650,6 +2153,7 @@ impl Terminal {
         let mut screen_size = TerminalSize::current();
         let mut pending_resize = None;
         let mut redraw_from_current_line = false;
+        let mut last_update_poll = Instant::now();
         loop {
             if let Some(resized) = pending_resize.take() {
                 screen_size = resized;
@@ -1694,6 +2198,21 @@ impl Terminal {
             rendered = true;
             rendered_rows = buffer.area.height as usize;
             redraw_from_current_line = false;
+            let event_available = event::poll(Duration::from_millis(100))?;
+            if input_update_poll_due(last_update_poll, Instant::now()) {
+                last_update_poll = Instant::now();
+                if let Some(update) = poll_updates()? {
+                    self.clear_menu(rows)?;
+                    if !render_updates(update)? {
+                        return Ok(None);
+                    }
+                    rendered = false;
+                    rendered_rows = 0;
+                }
+            }
+            if !event_available {
+                continue;
+            }
             match event::read()? {
                 Event::Resize(width, height) => {
                     let event = Event::Resize(width, height);
@@ -1709,6 +2228,11 @@ impl Terminal {
                     rendered = false;
                     rendered_rows = 0;
                     redraw_from_current_line = true;
+                }
+                Event::Paste(paste) => {
+                    append_menu_query(&mut query, &paste);
+                    digits.clear();
+                    selected = 0;
                 }
                 Event::Key(key) => {
                     if key.kind == KeyEventKind::Release {
@@ -1749,9 +2273,7 @@ impl Terminal {
                         KeyCode::Char(character)
                             if !key.modifiers.contains(KeyModifiers::CONTROL) =>
                         {
-                            if query.len() < 160 {
-                                query.push(character);
-                            }
+                            append_menu_query(&mut query, &character.to_string());
                             digits.clear();
                             selected = 0;
                         }
@@ -1823,11 +2345,34 @@ impl Terminal {
                 "Check unavailable",
                 "Task stays paused until its verification environment is ready.",
             ),
-            "capability.search" => self.message(
-                Tone::Accent,
-                "Discover",
-                payload["query"].as_str().unwrap_or_default(),
+            "capability.search" => {
+                self.message(Tone::Accent, "Discover", &capability_search_text(payload))
+            }
+            "artifact.inspected" => {
+                self.message(Tone::Quiet, "Inspect", &artifact_inspection_text(payload))
+            }
+            "obligation.verified" => self.message(
+                Tone::Success,
+                "Requirement verified",
+                &obligation_event_text("obligation.verified", payload),
             ),
+            "obligation.superseded" => self.message(
+                Tone::Quiet,
+                "Requirement changed",
+                &obligation_event_text("obligation.superseded", payload),
+            ),
+            "workspace.revision" => self.message(
+                Tone::Warning,
+                "Evidence may be stale",
+                &workspace_revision_text(payload),
+            ),
+            "model.response" => {
+                if let Some((label, summary)) = model_action_preview(&payload["action"]) {
+                    self.message(Tone::Accent, label, &summary)
+                } else {
+                    Ok(())
+                }
+            }
             "operation.pending" => {
                 let args = &payload["arguments"];
                 let detail = args["path"]
@@ -1863,6 +2408,14 @@ impl Terminal {
                         fit(&detail, 160)
                     ),
                 )
+            }
+            "operation.output" => {
+                let text = operation_stream_text(payload["text"].as_str().unwrap_or_default());
+                if text.is_empty() {
+                    Ok(())
+                } else {
+                    self.message(Tone::Quiet, "Output", &text)
+                }
             }
             "operation.succeeded" => {
                 let (tone, label, text) = result_summary(payload);
@@ -1952,13 +2505,19 @@ impl Terminal {
                 "Interrupted",
                 "Operation stopped; no unsafe effects were assumed undone.",
             ),
-            "operation.failed" | "operation.outcome_unknown" => self.message(
-                Tone::Warning,
-                "!",
-                payload["detail"]["error"]
-                    .as_str()
-                    .unwrap_or("Operation needs review"),
-            ),
+            "operation.failed" | "operation.outcome_unknown" => {
+                self.message(
+                    Tone::Warning,
+                    "!",
+                    payload["detail"]["error"]
+                        .as_str()
+                        .unwrap_or("Operation needs review"),
+                )?;
+                if let Some((label, preview)) = operation_output_preview(payload) {
+                    self.message(Tone::Quiet, &label, &preview)?;
+                }
+                Ok(())
+            }
             "pause.requested" => self.message(
                 Tone::Quiet,
                 "Pause requested",
@@ -2073,10 +2632,10 @@ pub(crate) fn operation_output_preview(payload: &serde_json::Value) -> Option<(S
     };
     let (label, text, truncated) = match preview["kind"].as_str()? {
         "text" => (
-            if preview["source"] == "command" {
-                "Command output"
-            } else {
-                "File excerpt"
+            match preview["source"].as_str() {
+                Some("command") => "Command output",
+                Some("tool") => "Tool result",
+                _ => "File excerpt",
             },
             preview_text(&preview["preview"]),
             preview["preview"]["truncated"] == true,
@@ -2147,6 +2706,108 @@ pub(crate) fn operation_output_preview(payload: &serde_json::Value) -> Option<(S
     Some((label.to_owned(), bounded))
 }
 
+fn operation_stream_text(text: &str) -> String {
+    clean(&strip_terminal_sequences(text))
+}
+
+fn capability_search_text(payload: &serde_json::Value) -> String {
+    let query = clean(payload["query"].as_str().unwrap_or_default());
+    let matches = payload["matches"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(clean)
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return format!("No capabilities matched {}", fit(&query, 180));
+    }
+    let mut summary = format!("{}: activated {}", fit(&query, 100), matches.join(", "));
+    if payload["has_more_matches"] == true {
+        summary.push_str("; more available");
+    }
+    summary
+}
+
+fn artifact_inspection_text(payload: &serde_json::Value) -> String {
+    let query = payload["query"].as_str().unwrap_or_default();
+    let excerpt = operation_stream_text(payload["excerpt"].as_str().unwrap_or_default());
+    if query.trim().is_empty() {
+        excerpt
+    } else {
+        format!("Query: {}\n{excerpt}", fit(&clean(query), 120))
+    }
+}
+
+fn obligation_event_text(kind: &str, payload: &serde_json::Value) -> String {
+    let id = payload["id"].as_i64().unwrap_or_default();
+    match kind {
+        "obligation.verified" => {
+            let revision = payload["revision"].as_i64().unwrap_or_default();
+            let evidence = payload["evidence"].as_array().map_or(0, Vec::len);
+            format!(
+                "O{id} verified at workspace revision {revision} with {evidence} evidence item(s)"
+            )
+        }
+        "obligation.superseded" => format!(
+            "O{id} superseded by O{}: {}",
+            payload["replacement_id"].as_i64().unwrap_or_default(),
+            fit(&clean(payload["reason"].as_str().unwrap_or_default()), 180)
+        ),
+        _ => String::new(),
+    }
+}
+
+fn workspace_revision_text(payload: &serde_json::Value) -> String {
+    let capability = payload["capability"]
+        .as_str()
+        .unwrap_or("workspace operation");
+    let revision = payload["revision"].as_i64().unwrap_or_default();
+    format!(
+        "{capability} advanced the workspace to revision {revision}; recheck verified requirements before finishing"
+    )
+}
+
+fn model_action_preview(action: &serde_json::Value) -> Option<(&'static str, String)> {
+    match action["kind"].as_str()? {
+        "search_capabilities" => Some((
+            "Plan",
+            format!(
+                "Searching capabilities: {}",
+                fit(action["query"].as_str().unwrap_or_default(), 180)
+            ),
+        )),
+        "invoke" => Some((
+            "Action",
+            format!(
+                "Calling {}",
+                fit(action["capability"].as_str().unwrap_or("tool"), 100)
+            ),
+        )),
+        "inspect_result" => Some((
+            "Action",
+            format!(
+                "Inspecting saved result {}",
+                fit(action["artifact"].as_str().unwrap_or("artifact"), 100)
+            ),
+        )),
+        "checkpoint" => Some(("Action", "Saving a checkpoint".into())),
+        "verify_obligations" => Some((
+            "Verify",
+            format!(
+                "Checking {} requirements",
+                action["obligations"].as_array().map_or(0, Vec::len)
+            ),
+        )),
+        "finish" => Some(("Action", "Checking completion evidence".into())),
+        "blocked" => Some((
+            "Blocked",
+            fit(action["reason"].as_str().unwrap_or("Needs input"), 180),
+        )),
+        _ => None,
+    }
+}
+
 fn menu_move(selected: usize, count: usize, key: KeyCode) -> usize {
     match key {
         KeyCode::Up => (selected + count - 1) % count,
@@ -2158,27 +2819,49 @@ fn menu_move(selected: usize, count: usize, key: KeyCode) -> usize {
 }
 
 fn input_view(text: &[char], caret: usize, width: usize) -> (String, usize) {
-    let prefix_width: usize = text[..caret]
+    let caret = restored_grapheme_caret(text, caret);
+    let spans = grapheme_spans(text);
+    let prefix_width = spans
         .iter()
-        .map(|character| character.width().unwrap_or(0))
+        .filter(|(_, end, _)| *end <= caret)
+        .map(|(_, _, grapheme)| grapheme.width())
         .sum();
+    let full = text.iter().collect::<String>();
     if prefix_width <= width {
-        return (fit(&text.iter().collect::<String>(), width), prefix_width);
+        return (fit_graphemes(&full, width), prefix_width);
     }
     let mut start = caret;
     let mut caret_width = 0;
-    while start > 0 {
-        let size = text[start - 1].width().unwrap_or(0);
+    for (cluster_start, cluster_end, grapheme) in spans.iter().rev() {
+        if *cluster_end > caret {
+            continue;
+        }
+        let size = grapheme.width();
         if caret_width + size > width / 2 {
             break;
         }
         caret_width += size;
-        start -= 1;
+        start = *cluster_start;
     }
     (
-        fit(&text[start..].iter().collect::<String>(), width),
+        fit_graphemes(&text[start..].iter().collect::<String>(), width),
         caret_width,
     )
+}
+
+fn fit_graphemes(text: &str, width: usize) -> String {
+    let normalized = clean(text).replace('\n', " ");
+    let mut output = String::new();
+    let mut occupied = 0;
+    for grapheme in normalized.graphemes(true) {
+        let cells = grapheme.width();
+        if occupied + cells > width {
+            break;
+        }
+        occupied += cells;
+        output.push_str(grapheme);
+    }
+    output
 }
 
 fn composer_input_column(origin: u16, margin: u16) -> usize {
@@ -2453,6 +3136,78 @@ mod tests {
         assert_eq!(label, "Edit summary");
         assert!(preview.contains("patched src/main.rs") && preview.contains("2 edits"));
         assert!(preview.contains("SHA256 0123456789ab"));
+
+        let tool = serde_json::json!({"detail":{"output_preview":{
+            "kind":"text","source":"tool",
+            "preview":{"text":"MCP action result","truncated":false}
+        }}});
+        let (label, preview) = operation_output_preview(&tool).unwrap();
+        assert_eq!(label, "Tool result");
+        assert_eq!(preview, "MCP action result");
+    }
+
+    #[test]
+    fn model_action_preview_shows_the_call_name_without_dumping_arguments() {
+        let action = serde_json::json!({
+            "kind":"invoke",
+            "capability":"mcp.git.status",
+            "args":{"token":"private-value","path":"repo"}
+        });
+        let (label, summary) = model_action_preview(&action).unwrap();
+        assert_eq!(label, "Action");
+        assert_eq!(summary, "Calling mcp.git.status");
+        assert!(!summary.contains("private-value"));
+    }
+
+    #[test]
+    fn streamed_tool_output_removes_terminal_and_bidi_controls() {
+        assert_eq!(
+            operation_stream_text("ok\u{1b}[31m red\u{1b}[0m\n\u{202e}spoof"),
+            "ok red\nspoof"
+        );
+    }
+
+    #[test]
+    fn action_event_previews_show_discovered_tools_inspected_text_and_obligation_changes() {
+        let search = serde_json::json!({
+            "query":"read files",
+            "matches":["workspace.read","workspace.read_batch"],
+            "has_more_matches":true
+        });
+        let search_text = capability_search_text(&search);
+        assert!(search_text.contains("workspace.read, workspace.read_batch"));
+        assert!(search_text.contains("more available"));
+
+        let inspected = serde_json::json!({
+            "query":"compiler error",
+            "excerpt":"error[E0425]: unresolved name"
+        });
+        let inspected_text = artifact_inspection_text(&inspected);
+        assert!(inspected_text.contains("compiler error"));
+        assert!(inspected_text.contains("error[E0425]"));
+
+        let verified = serde_json::json!({
+            "id":2,
+            "evidence":["artifact-a","artifact-b"],
+            "revision":7
+        });
+        let verified_text = obligation_event_text("obligation.verified", &verified);
+        assert!(verified_text.contains("O2 verified at workspace revision 7"));
+        assert!(verified_text.contains("2 evidence item(s)"));
+
+        let superseded = serde_json::json!({
+            "id":2,
+            "replacement_id":3,
+            "reason":"Requirement changed"
+        });
+        let superseded_text = obligation_event_text("obligation.superseded", &superseded);
+        assert!(superseded_text.contains("O2 superseded by O3"));
+        assert!(superseded_text.contains("Requirement changed"));
+
+        let revision = serde_json::json!({"capability":"workspace.patch","revision":8});
+        let revision_text = workspace_revision_text(&revision);
+        assert!(revision_text.contains("workspace.patch advanced the workspace to revision 8"));
+        assert!(revision_text.contains("recheck verified requirements"));
     }
 
     #[test]
@@ -2483,6 +3238,44 @@ mod tests {
     }
 
     #[test]
+    fn narrow_activity_footers_keep_the_clock_and_usage_visible() {
+        let context = ContextStatus {
+            normalized_tokens: Some(4200),
+            operations: 3,
+            artifacts: 2,
+            ..ContextStatus::default()
+        };
+        let (text, footer) = activity_lines(
+            "◆",
+            "Running workspace.read",
+            Duration::from_secs(65),
+            3_723,
+            9_876,
+            &context,
+            true,
+            48,
+        );
+        assert!(text.width() <= 47);
+        assert!(footer.width() <= 47);
+        assert!(footer.starts_with("  01:02:03Z · 9876t · ^C stop · ^D detach"));
+
+        let (_, compact_footer) = activity_lines(
+            "◆",
+            "Thinking",
+            Duration::from_secs(65),
+            3_723,
+            9_876,
+            &context,
+            true,
+            28,
+        );
+        assert!(compact_footer.width() <= 27);
+        assert!(compact_footer.contains("01:02:03Z"));
+        assert!(compact_footer.contains("^C"));
+        assert!(compact_footer.contains("^D"));
+    }
+
+    #[test]
     fn goal_time_uses_utc_and_persisted_start_time() {
         assert_eq!(format_utc(0), "1970-01-01 00:00:00 UTC");
         assert_eq!(format_utc(-1), "1969-12-31 23:59:59 UTC");
@@ -2495,7 +3288,7 @@ mod tests {
         terminal.set_task_started_at(Some(100));
         assert_eq!(
             terminal.completion_timing(165),
-            "Completed 1970-01-01 00:02:45 UTC · Worked for 1m 05s"
+            "Completed 1970-01-01 00:02:45 UTC · Elapsed 1m 05s"
         );
         terminal.set_task_started_at(None);
         assert_eq!(
@@ -2534,6 +3327,41 @@ mod tests {
     }
 
     #[test]
+    fn composer_moves_wraps_and_deletes_whole_grapheme_clusters() {
+        let text: Vec<_> = "A👨‍👩‍👧‍👦e\u{301}🇺🇦Z".chars().collect();
+        let family_end = "A👨‍👩‍👧‍👦".chars().count();
+        assert_eq!(next_grapheme_boundary(&text, 1), family_end);
+        assert_eq!(previous_grapheme_boundary(&text, family_end), 1);
+        assert_eq!(restored_grapheme_caret(&text, 4), family_end);
+        assert_eq!(previous_grapheme_range(&text, family_end), 1..family_end);
+        assert_eq!(next_grapheme_range(&text, 1), 1..family_end);
+
+        let view = editor_view(&text, text.len(), 4, 4);
+        assert_eq!(view.rows, vec!["A👨‍👩‍👧‍👦e\u{301}", "🇺🇦Z"]);
+        let (visible, _) = input_view(&text, family_end, 4);
+        assert!(visible == "A👨‍👩‍👧‍👦e\u{301}" || visible == "👨‍👩‍👧‍👦e\u{301}🇺🇦");
+        assert!(visible.contains("👨‍👩‍👧‍👦"));
+    }
+
+    #[test]
+    fn one_row_composer_keeps_an_exact_width_draft_visible_at_the_caret() {
+        let exact: Vec<_> = "abc".chars().collect();
+        let view = editor_view(&exact, exact.len(), 3, 1);
+        assert_eq!(view.rows, vec!["abc"]);
+        assert_eq!(view.caret_column, 2);
+
+        let overflow: Vec<_> = "abcd".chars().collect();
+        let view = editor_view(&overflow, overflow.len(), 3, 1);
+        assert_eq!(view.rows, vec!["bcd"]);
+        assert_eq!(view.caret_column, 2);
+
+        let multiline: Vec<_> = "first\nsecond".chars().collect();
+        let view = editor_view(&multiline, multiline.len(), 4, 1);
+        assert_eq!(view.rows, vec!["cond"]);
+        assert_eq!(view.caret_column, 3);
+    }
+
+    #[test]
     fn resize_events_reflow_prompt_and_menu_for_the_new_terminal_dimensions() {
         let initial = TerminalSize {
             columns: 80,
@@ -2548,6 +3376,15 @@ mod tests {
                 rows: 48
             }
         );
+        assert_eq!(
+            measured_terminal_resize(initial, Some(initial)),
+            (initial, false)
+        );
+        assert_eq!(
+            measured_terminal_resize(initial, Some(expanded)),
+            (expanded, true)
+        );
+        assert_eq!(measured_terminal_resize(initial, None), (initial, false));
 
         let narrow = input_layout(initial, "> ", true);
         let wide = input_layout(expanded, "> ", true);
@@ -2564,7 +3401,19 @@ mod tests {
             "> ",
             true,
         );
-        assert_eq!(tiny.max_input_rows, 1);
+        assert_eq!(tiny.max_input_rows, 4);
+        assert_eq!(
+            input_layout(
+                TerminalSize {
+                    columns: 8,
+                    rows: 5,
+                },
+                "> ",
+                true,
+            )
+            .max_input_rows,
+            2
+        );
         let draft: Vec<_> = "first line that wraps æ—¥æœ¬\nsecond line"
             .chars()
             .collect();
@@ -2581,16 +3430,16 @@ mod tests {
 
     #[test]
     fn home_resize_geometry_requires_panel_and_composer_to_fit() {
-        assert_eq!(home_render_width(132), 128);
-        assert_eq!(home_render_width(80), 76);
-        assert_eq!(home_render_width(15), 12);
+        assert_eq!(home_render_width(132), 130);
+        assert_eq!(home_render_width(80), 78);
+        assert_eq!(home_render_width(15), 15);
 
         let wide = TerminalSize {
             columns: 80,
             rows: 24,
         };
         let geometry = home_geometry(wide, 2, 10, 0, 3).unwrap();
-        assert_eq!(geometry.render_width, 76);
+        assert_eq!(geometry.render_width, 78);
         assert_eq!(geometry.prompt_row_offset, 12);
         assert_eq!(geometry.composer_row, 14);
 
@@ -2610,10 +3459,22 @@ mod tests {
             )
             .is_none()
         );
+        let narrow = home_geometry(
+            TerminalSize {
+                columns: 15,
+                rows: 24,
+            },
+            2,
+            10,
+            0,
+            3,
+        )
+        .unwrap();
+        assert_eq!(narrow.render_width, 15);
         assert!(
             home_geometry(
                 TerminalSize {
-                    columns: 15,
+                    columns: 11,
                     rows: 24,
                 },
                 2,
@@ -2624,6 +3485,22 @@ mod tests {
             .is_none()
         );
         assert!(home_geometry(wide, 2, 10, 0, 12).is_none());
+    }
+
+    #[test]
+    fn compact_composer_has_a_defined_minimum_terminal_size() {
+        assert!(composer_available(TerminalSize {
+            columns: 8,
+            rows: 3,
+        }));
+        assert!(!composer_available(TerminalSize {
+            columns: 7,
+            rows: 24,
+        }));
+        assert!(!composer_available(TerminalSize {
+            columns: 80,
+            rows: 2,
+        }));
     }
 
     #[test]
@@ -2662,7 +3539,7 @@ mod tests {
     fn paste_normalizes_line_endings_and_removes_control_sequences() {
         assert_eq!(
             normalize_paste("first\r\nsecond\rthird\u{1b}[2J"),
-            "first\nsecond\nthird[2J"
+            "first\nsecond\nthird"
         );
         assert_eq!(
             normalize_paste("if ready:\r\n\twork()\n12345\tX\u{202e}\u{1b}"),
@@ -2673,6 +3550,41 @@ mod tests {
                 .chars()
                 .any(char::is_control)
         );
+        assert_eq!(
+            normalize_paste("plain\u{1b}[31m red\u{1b}[0m\u{1b}]0;window title\u{7}\nnext"),
+            "plain red\nnext"
+        );
+        assert_eq!(
+            normalize_paste("keep [literal] brackets"),
+            "keep [literal] brackets"
+        );
+        assert_eq!(
+            normalize_paste("keep \u{009b}2J remove\u{009d}0;title\u{009c} text"),
+            "keep  remove text"
+        );
+        assert_eq!(
+            normalize_paste("A\u{0090}hidden dcs\u{009c}B\u{001b}Phidden dcs\u{001b}\\C"),
+            "ABC"
+        );
+        assert_eq!(
+            normalize_paste("\u{1f1fa}\u{1f1e6}\tX"),
+            "\u{1f1fa}\u{1f1e6}  X"
+        );
+    }
+
+    #[test]
+    fn slash_menu_search_accepts_sanitized_paste_and_obeys_utf8_limit() {
+        let mut query = "model".to_owned();
+        append_menu_query(&mut query, "\u{1b}[31m picker\u{1b}[0m\r\nlatest");
+        assert_eq!(query, "model picker latest");
+
+        let mut bounded = String::new();
+        append_menu_query(&mut bounded, &format!("{}日", "x".repeat(159)));
+        assert_eq!(bounded.len(), 159);
+
+        let mut huge = String::new();
+        append_menu_query(&mut huge, &"q".repeat(1_000_000));
+        assert_eq!(huge.len(), 160);
     }
 
     #[test]
@@ -2807,6 +3719,33 @@ mod tests {
             .input_draft
             .replace(Some(("task › ".into(), vec!['🦊'], 99)));
         assert_eq!(terminal.take_input_draft("task › ", false), (vec!['🦊'], 1));
+    }
+
+    #[test]
+    fn submitting_a_saved_steering_draft_cannot_resurface_in_the_next_prompt() {
+        let terminal = Terminal::default();
+        let label = terminal.input_prefix();
+        terminal
+            .input_draft
+            .replace(Some((label.clone(), "already sent".chars().collect(), 11)));
+
+        terminal.clear_input_draft_for(&label);
+
+        assert_eq!(terminal.take_input_draft(&label, false), (vec![], 0));
+    }
+
+    #[test]
+    fn follow_input_update_polling_has_a_fixed_cadence_even_during_key_events() {
+        let start = Instant::now();
+        assert!(!input_update_poll_due(
+            start,
+            start + Duration::from_millis(99)
+        ));
+        assert!(input_update_poll_due(
+            start,
+            start + INPUT_UPDATE_POLL_INTERVAL
+        ));
+        assert!(input_update_poll_due(start, start + Duration::from_secs(1)));
     }
 
     #[test]
