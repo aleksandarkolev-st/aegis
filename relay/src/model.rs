@@ -95,7 +95,7 @@ pub fn parse_command(input: &str) -> Result<AgentCommand, CommandParseError> {
         .map_or((text, ""), |(command, rest)| (command, rest.trim()));
 
     match command {
-        "/tasks" | "/list_tasks" if rest.is_empty() => Ok(AgentCommand::ListTasks),
+        "tasks" | "/tasks" | "/list_tasks" if rest.is_empty() => Ok(AgentCommand::ListTasks),
         "/status" => Ok(AgentCommand::Status {
             task_id: optional_id(rest)?,
         }),
@@ -105,7 +105,7 @@ pub fn parse_command(input: &str) -> Result<AgentCommand, CommandParseError> {
         "/evidence" => Ok(AgentCommand::Evidence {
             task_id: optional_id(rest)?,
         }),
-        "/details" => Ok(AgentCommand::Details {
+        "details" | "/details" => Ok(AgentCommand::Details {
             task_id: optional_id(rest)?,
         }),
         "/pause" => Ok(AgentCommand::Pause {
@@ -114,11 +114,11 @@ pub fn parse_command(input: &str) -> Result<AgentCommand, CommandParseError> {
         "/resume" => Ok(AgentCommand::Resume {
             task_id: optional_id(rest)?,
         }),
-        "/tasks" | "/list_tasks" => Err(CommandParseError::InvalidSyntax),
+        "tasks" | "/tasks" | "/list_tasks" => Err(CommandParseError::InvalidSyntax),
         "/cancel" => Ok(AgentCommand::Cancel {
             task_id: optional_id(rest)?,
         }),
-        "/select_task" | "/use" => Ok(AgentCommand::SelectTask {
+        "use" | "/select_task" | "/use" => Ok(AgentCommand::SelectTask {
             task_id: required_id(rest)?,
         }),
         "/approve_once" => Ok(AgentCommand::ApproveOnce {
