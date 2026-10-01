@@ -9,6 +9,7 @@ use aegis_relay::{
     transport::JetStreamTransport,
 };
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -58,20 +59,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let address = listener.local_addr()?;
     tracing::info!(%address, "Aegis relay listening");
 
-    let server = async {
-        axum::serve(listener, router(http_state))
-            .with_graceful_shutdown(shutdown_signal())
-            .await
-    };
-    tokio::pin!(server);
-    let event_consumer = transport.consume_events(service);
-    tokio::pin!(event_consumer);
-    tokio::select! {
-        result = &mut server => result?,
-        result = &mut event_consumer => {
-            result.map_err(|_| std::io::Error::other("JetStream event consumer stopped"))?;
-        }
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let event_consumer = tokio::spawn(transport.supervise_events(service, async move {
+        let _ = shutdown_rx.await;
+    }));
+    let server_result = axum::serve(listener, router(http_state))
+        .with_graceful_shutdown(shutdown_signal())
+        .await;
+    let _ = shutdown_tx.send(());
+    if let Err(error) = event_consumer.await {
+        tracing::warn!(%error, "JetStream event supervisor stopped unexpectedly");
     }
+    server_result?;
     Ok(())
 }
 

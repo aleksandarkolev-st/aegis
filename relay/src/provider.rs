@@ -202,6 +202,8 @@ impl WhatsAppProvider for EvolutionAdapter {
         text: &str,
         _idempotency_key: &str,
     ) -> Result<Option<String>, ProviderError> {
+        // Evolution's current sendText DTO has no idempotency-key field. The key is
+        // therefore only useful to provider adapters whose APIs support deduplication.
         let digits = normalize_phone(destination).ok_or(ProviderError::InvalidRequest)?;
         let endpoint = self
             .base_url

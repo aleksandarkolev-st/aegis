@@ -15,6 +15,7 @@ use uuid::Uuid;
 #[derive(Default)]
 struct FakeProvider {
     sends: Mutex<Vec<(String, String, String)>>,
+    ambiguous_first_send: Mutex<bool>,
 }
 
 #[async_trait]
@@ -58,11 +59,58 @@ impl WhatsAppProvider for FakeProvider {
             text.to_owned(),
             idempotency_key.to_owned(),
         ));
+        if std::mem::take(&mut *self.ambiguous_first_send.lock().unwrap()) {
+            // Model the provider accepting the send while the response is lost.
+            return Err(ProviderError::Delivery);
+        }
         Ok(Some(format!(
             "provider-{}",
             self.sends.lock().unwrap().len()
         )))
     }
+}
+
+#[tokio::test]
+async fn ambiguous_provider_send_retries_at_least_once_then_receipt_deduplicates() {
+    let installation_id = Uuid::new_v4();
+    let binding = ChannelBinding {
+        id: Uuid::new_v4(),
+        user_id: Uuid::new_v4(),
+        installation_id,
+        channel: "whatsapp".into(),
+        actor_id: "owner-1".into(),
+        sender_id: "+4915112345678".into(),
+        destination_id: "+4915112345678".into(),
+    };
+    let repository = std::sync::Arc::new(FakeRepository::default());
+    *repository.binding.lock().unwrap() = Some(binding);
+    *repository.notifications.lock().unwrap() = true;
+    let provider = std::sync::Arc::new(FakeProvider::default());
+    *provider.ambiguous_first_send.lock().unwrap() = true;
+    let service = RelayService::new(
+        repository,
+        std::sync::Arc::new(FakeTransport::default()),
+        provider.clone(),
+    );
+    let event = AegisEvent {
+        event_id: Uuid::new_v4(),
+        installation_id,
+        actor_id: "owner-1".into(),
+        kind: RemoteEventKind::Reply,
+        task_id: None,
+        challenge_id: None,
+        display_detail: None,
+        reply_text: Some("The task completed.".into()),
+    };
+
+    assert!(service.deliver_event(&event).await.is_err());
+    service.deliver_event(&event).await.unwrap();
+    service.deliver_event(&event).await.unwrap();
+
+    let sends = provider.sends.lock().unwrap();
+    assert_eq!(sends.len(), 2);
+    assert_eq!(sends[0].2, event.event_id.to_string());
+    assert_eq!(sends[1].2, event.event_id.to_string());
 }
 
 #[derive(Default)]
