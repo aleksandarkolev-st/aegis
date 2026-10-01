@@ -542,7 +542,9 @@ impl Authority {
                 )?;
                 result
             } else {
-                serde_json::from_str(&prior_result)?
+                let mut result = serde_json::from_str(&prior_result)?;
+                redact_cached_remote_text(&mut result, &request.command);
+                result
             };
             transaction.commit()?;
             return Ok(Receipt {
@@ -645,7 +647,7 @@ impl Authority {
             tasks.push(json!({
                 "task_id":id,
                 "alias":alias,
-                "task":crate::text::clean(&task).chars().take(300).collect::<String>(),
+                "task":redact_remote_text(&task).chars().take(300).collect::<String>(),
                 "state":state,
                 "provider":provider,
                 "created_at":created_at,
@@ -1206,12 +1208,12 @@ fn apply_command(
                 params![actor_id, run_id],
                 |row| row.get(0),
             )?;
-            let task = crate::text::clean(&task)
+            let task = redact_remote_text(&task)
                 .chars()
                 .take(300)
                 .collect::<String>();
             let summary = summary.map(|value| {
-                crate::text::clean(&value)
+                redact_remote_text(&value)
                     .chars()
                     .take(300)
                     .collect::<String>()
@@ -1235,7 +1237,7 @@ fn apply_command(
                 return Err(reject_command("task has no final result yet"));
             }
             let summary = summary
-                .map(|value| crate::text::clean(&value))
+                .map(|value| redact_remote_text(&value))
                 .map(|value| {
                     crate::remote::protocol::truncate_utf8(&value, MAX_REMOTE_RESULT_BYTES)
                 })
@@ -1615,6 +1617,287 @@ fn safe_remote_capability(capability: &str) -> String {
     }
 }
 
+/// Defense in depth for free-form remote exports. Recognizes common credential
+/// formats and explicitly labeled secret assignments; it cannot identify an
+/// arbitrary unnamed secret, encoded credentials, or every provider format.
+/// Always redact the complete text before applying the caller's export limit.
+fn redact_remote_text(text: &str) -> String {
+    let text = crate::text::clean(
+        &text
+            .replace("\r\n", "\n")
+            .replace('\t', " ")
+            .replace('\r', "\n"),
+    );
+    let bytes = text.as_bytes();
+    let mut output = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        let mut secret = None;
+        if text[index..].starts_with("-----BEGIN ") {
+            let label_start = index + "-----BEGIN ".len();
+            if let Some(length) = text[label_start..].find("-----") {
+                let label = &text[label_start..label_start + length];
+                if label.ends_with("PRIVATE KEY")
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_uppercase() || byte == b' ')
+                {
+                    let end_marker = format!("-----END {label}-----");
+                    let body_start = label_start + length + 5;
+                    let end = text[body_start..]
+                        .find(&end_marker)
+                        .map_or(text.len(), |offset| body_start + offset + end_marker.len());
+                    // An unterminated private-key block also hides its remaining body.
+                    secret = Some((index, end));
+                }
+            }
+        }
+        if secret.is_none() && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_') {
+            let mut word_end = index
+                + bytes[index..]
+                    .iter()
+                    .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                    .count();
+            let word = &text[index..word_end];
+            let mut key = word.to_ascii_lowercase().replace('-', "_");
+            for (first, second) in [
+                ("api", "key"),
+                ("access", "token"),
+                ("refresh", "token"),
+                ("client", "secret"),
+                ("private", "key"),
+            ] {
+                if key == first {
+                    let next = text[word_end..].trim_start_matches(' ');
+                    if next
+                        .get(..second.len())
+                        .is_some_and(|word| word.eq_ignore_ascii_case(second))
+                        && !next
+                            .as_bytes()
+                            .get(second.len())
+                            .is_some_and(u8::is_ascii_alphanumeric)
+                    {
+                        word_end = text.len() - next.len() + second.len();
+                        key = format!("{first}_{second}");
+                        break;
+                    }
+                }
+            }
+            let mut value_start = word_end;
+            if matches!(bytes.get(value_start), Some(b'\'' | b'"' | b'`')) {
+                value_start += 1;
+            }
+            while matches!(bytes.get(value_start), Some(b' ' | b'\t')) {
+                value_start += 1;
+            }
+            let secret_key = matches!(
+                key.as_str(),
+                "api_key"
+                    | "apikey"
+                    | "token"
+                    | "access_token"
+                    | "accesstoken"
+                    | "refresh_token"
+                    | "refreshtoken"
+                    | "secret"
+                    | "secret_key"
+                    | "password"
+                    | "passwd"
+                    | "passphrase"
+                    | "pwd"
+                    | "authorization"
+                    | "credential"
+                    | "credentials"
+                    | "client_secret"
+                    | "clientsecret"
+                    | "private_key"
+                    | "privatekey"
+            ) || [
+                "_api_key",
+                "_token",
+                "_secret",
+                "_secret_key",
+                "_password",
+                "_access_key",
+                "_private_key",
+            ]
+            .iter()
+            .any(|suffix| key.ends_with(suffix));
+            if secret_key && matches!(bytes.get(value_start), Some(b'=' | b':')) {
+                value_start += 1;
+                while matches!(bytes.get(value_start), Some(b' ' | b'\t')) {
+                    value_start += 1;
+                }
+                let (start, mut end) = remote_secret_value(&text, value_start);
+                if key == "authorization"
+                    && matches!(
+                        text[start..end].to_ascii_lowercase().as_str(),
+                        "bearer" | "basic"
+                    )
+                {
+                    let mut next = end;
+                    while matches!(bytes.get(next), Some(b' ' | b'\t')) {
+                        next += 1;
+                    }
+                    end = remote_secret_value(&text, next).1;
+                }
+                if end > start {
+                    secret = Some((start, end));
+                }
+            } else if key == "bearer" && bytes.get(word_end) == Some(&b' ') {
+                let mut start = word_end;
+                while bytes.get(start) == Some(&b' ') {
+                    start += 1;
+                }
+                let (start, end) = remote_secret_value(&text, start);
+                let token = &text[start..end];
+                // Avoid treating ordinary phrases such as "bearer bonds" or
+                // "Bearer authentication" as a credential.
+                if token.len() >= 20
+                    || token.bytes().any(|byte| {
+                        byte.is_ascii_digit()
+                            || matches!(byte, b'_' | b'-' | b'.' | b'+' | b'/' | b'=')
+                    })
+                {
+                    secret = Some((start, end));
+                }
+            }
+            if secret.is_none() {
+                let token_end = index
+                    + bytes[index..]
+                        .iter()
+                        .take_while(|byte| {
+                            byte.is_ascii_alphanumeric()
+                                || matches!(byte, b'_' | b'-' | b'.' | b'+' | b'/' | b'=')
+                        })
+                        .count();
+                let token = text[index..token_end].trim_end_matches('.');
+                if remote_credential_token(token) {
+                    secret = Some((index, index + token.len()));
+                } else {
+                    index = token_end;
+                    continue;
+                }
+            }
+        }
+        if let Some((start, end)) = secret {
+            output.push_str(&text[copied..start]);
+            output.push_str("[redacted]");
+            copied = end;
+            index = end;
+        } else {
+            index += text[index..].chars().next().unwrap().len_utf8();
+        }
+    }
+    output.push_str(&text[copied..]);
+    output
+}
+
+fn remote_secret_value(text: &str, start: usize) -> (usize, usize) {
+    let bytes = text.as_bytes();
+    if let Some(quote @ (b'\'' | b'"' | b'`')) = bytes.get(start) {
+        let mut end = start + 1;
+        while end < bytes.len() && bytes[end] != *quote {
+            if bytes[end] == b'\\' && end + 1 < bytes.len() {
+                end += 1;
+            }
+            end += 1;
+        }
+        (start + 1, end)
+    } else {
+        let length = text[start..]
+            .find(|character: char| {
+                character.is_whitespace()
+                    || matches!(character, ',' | ';' | '"' | '\'' | '`' | '}' | ')')
+            })
+            .unwrap_or(text.len() - start);
+        (start, start + length)
+    }
+}
+
+fn remote_credential_token(token: &str) -> bool {
+    let prefixed = [
+        "sk-",
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        "glpat-",
+        "xoxb-",
+        "xoxp-",
+        "xoxa-",
+        "xoxr-",
+        "xoxs-",
+        "npm_",
+    ]
+    .iter()
+    .any(|prefix| {
+        token
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.len() >= 8)
+    });
+    let aws = (token.starts_with("AKIA") || token.starts_with("ASIA"))
+        && token.len() == 20
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit());
+    let google = token.starts_with("AIza") && token.len() >= 35;
+    let parts = token.split('.').collect::<Vec<_>>();
+    let jwt = parts.len() == 3
+        && parts[0].starts_with("eyJ")
+        && parts[0].len() >= 8
+        && parts[1].len() >= 4
+        && parts[2].len() >= 8
+        && parts.iter().all(|part| {
+            part.bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        });
+    prefixed || aws || google || jwt
+}
+
+fn redact_cached_remote_text(result: &mut Value, command: &Command) {
+    fn field(result: &mut Value, key: &str, characters: usize) {
+        if let Some(value) = result.get_mut(key).filter(|value| value.is_string()) {
+            *value = Value::String(
+                redact_remote_text(value.as_str().unwrap())
+                    .chars()
+                    .take(characters)
+                    .collect(),
+            );
+        }
+    }
+    // Replies persisted by older versions must cross the same export boundary.
+    match command {
+        Command::Result { .. } => {
+            if let Some(value) = result.get_mut("summary").filter(|value| value.is_string()) {
+                *value = Value::String(protocol::truncate_utf8(
+                    &redact_remote_text(value.as_str().unwrap()),
+                    MAX_REMOTE_RESULT_BYTES,
+                ));
+            }
+        }
+        Command::Status { .. } => {
+            field(result, "summary", 300);
+            field(result, "task", 300);
+        }
+        Command::Details { .. } => {
+            field(result, "task", 240);
+            field(result, "model", 100);
+        }
+        Command::ListTasks => {
+            if let Some(tasks) = result.get_mut("tasks").and_then(Value::as_array_mut) {
+                for task in tasks {
+                    field(task, "task", 300);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Build a bounded status report from task metadata and aggregate counters.
 /// Event payloads, artifacts, operation arguments and tool output are excluded.
 fn task_details(
@@ -1677,7 +1960,7 @@ fn task_details(
     let elapsed_seconds = row
         .5
         .map(|started| terminal_at.unwrap_or(now).saturating_sub(started).max(0));
-    let task = crate::text::clean(&row.0)
+    let task = redact_remote_text(&row.0)
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -1685,7 +1968,7 @@ fn task_details(
         .take(240)
         .collect::<String>();
     let model = row.4.filter(|value| !value.trim().is_empty()).map(|value| {
-        crate::text::clean(&value)
+        redact_remote_text(&value)
             .chars()
             .take(100)
             .collect::<String>()
@@ -1775,7 +2058,7 @@ fn authorized_runs_in_transaction(
     let mut tasks = Vec::new();
     for row in rows {
         let (id, task, state, provider, created_at, alias, selected) = row?;
-        tasks.push(json!({"task_id":id,"alias":alias,"task":crate::text::clean(&task).chars().take(300).collect::<String>(),"state":state,"provider":provider,"created_at":created_at,"selected":selected}));
+        tasks.push(json!({"task_id":id,"alias":alias,"task":redact_remote_text(&task).chars().take(300).collect::<String>(),"state":state,"provider":provider,"created_at":created_at,"selected":selected}));
     }
     Ok(tasks)
 }
@@ -2129,6 +2412,186 @@ mod tests {
                 .apply_from_authenticated_relay(&fixture.actor_id, &wrong_install, test_now(),)
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn remote_text_redacts_recognized_credentials_and_preserves_prose() {
+        let cases = [
+            (
+                "Authorization: Bearer abc123SECRET",
+                "Authorization: [redacted]",
+            ),
+            ("bearer\tabc123SECRET", "bearer [redacted]"),
+            ("Bearer \"abc123SECRET\"", "Bearer \"[redacted]\""),
+            (
+                "Authorization: Basic dXNlcjpwYXNz",
+                "Authorization: [redacted]",
+            ),
+            ("API Key: private-value, next", "API Key: [redacted], next"),
+            ("API_KEY=short; done", "API_KEY=[redacted]; done"),
+            ("SECRET_KEY=opaque-value", "SECRET_KEY=[redacted]"),
+            (
+                r#"{"access_token":"value with spaces", "password":"a\"b"}"#,
+                r#"{"access_token":"[redacted]", "password":"[redacted]"}"#,
+            ),
+            (
+                "AWS_SECRET_ACCESS_KEY=arbitrary-value",
+                "AWS_SECRET_ACCESS_KEY=[redacted]",
+            ),
+            ("clientSecret='short secret'", "clientSecret='[redacted]'"),
+            (
+                "JWT: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.c2lnbmF0dXJl",
+                "JWT: [redacted]",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(redact_remote_text(input), expected, "case: {input}");
+            assert_eq!(
+                redact_remote_text(expected),
+                expected,
+                "redaction is idempotent"
+            );
+        }
+        for token in [
+            "sk-proj-0123456789abcdef",
+            "sk-ant-api03-0123456789abcdef",
+            "ghp_0123456789abcdef",
+            "gho_0123456789abcdef",
+            "ghu_0123456789abcdef",
+            "ghs_0123456789abcdef",
+            "ghr_0123456789abcdef",
+            "github_pat_0123456789abcdef",
+            "glpat-0123456789abcdef",
+            "xoxb-12345678-abcdefgh",
+            "xoxp-12345678-abcdefgh",
+            "npm_0123456789abcdef",
+            "AKIA0123456789ABCDEF",
+            "ASIA0123456789ABCDEF",
+            "AIza0123456789abcdefghijklmnopqrstuvwxyz",
+        ] {
+            assert_eq!(
+                redact_remote_text(&format!("Found `{token}`. Done.")),
+                "Found `[redacted]`. Done."
+            );
+        }
+        for label in [
+            "PRIVATE KEY",
+            "RSA PRIVATE KEY",
+            "EC PRIVATE KEY",
+            "OPENSSH PRIVATE KEY",
+            "ENCRYPTED PRIVATE KEY",
+        ] {
+            let block = format!(
+                "Before\n-----BEGIN {label}-----\nPRIVATEBODY\n-----END {label}-----\nAfter"
+            );
+            assert_eq!(redact_remote_text(&block), "Before\n[redacted]\nAfter");
+            assert_eq!(
+                redact_remote_text(&format!("Before\n-----BEGIN {label}-----\nPRIVATEBODY")),
+                "Before\n[redacted]"
+            );
+        }
+        let prose = "Parser fixed. 12 tests pass. Use Bearer authentication and rotate the API key.\nThe bearer bonds mature in 2028. 日本語 🛡 version 1.2.3.";
+        assert_eq!(redact_remote_text(prose), prose);
+        assert_eq!(redact_remote_text("Done.\r\nNext."), "Done.\nNext.");
+        // Unlabeled arbitrary strings are deliberately outside this heuristic.
+        assert_eq!(
+            redact_remote_text("unnamed-private-value"),
+            "unnamed-private-value"
+        );
+    }
+
+    #[test]
+    fn result_and_status_redact_before_limits_and_legacy_retries() -> Result<()> {
+        let mut fixture = Fixture::new()?;
+        let summary = format!(
+            "API_KEY=\"{}\"\nAll tests pass. {}",
+            "PRIVATEVALUE".repeat(200),
+            "🛡".repeat(900)
+        );
+        fixture
+            .authority
+            .store
+            .state(&fixture.run_id, "running", json!({}))?;
+        fixture
+            .authority
+            .store
+            .answer_run(&fixture.run_id, &summary)?;
+        for command in [
+            Command::Result {
+                task_id: Some(fixture.run_id.clone()),
+            },
+            Command::Status {
+                task_id: Some(fixture.run_id.clone()),
+            },
+        ] {
+            let request = fixture.request(command.clone());
+            let result = fixture.authority.apply_from_authenticated_relay(
+                &fixture.actor_id,
+                &request,
+                test_now(),
+            )?;
+            let returned = result.result["summary"].as_str().unwrap();
+            assert!(returned.starts_with("API_KEY=\"[redacted]\"\nAll tests pass."));
+            assert!(!returned.contains("PRIVATEVALUE"));
+            if matches!(command, Command::Result { .. }) {
+                assert!(returned.len() <= MAX_REMOTE_RESULT_BYTES);
+                assert!(returned.is_char_boundary(returned.len()));
+            } else {
+                assert!(returned.chars().count() <= 300);
+            }
+            let expected = result.result["summary"].clone();
+            // Simulate a receipt cached before this export hardening existed.
+            let mut legacy = result.result;
+            legacy["summary"] = Value::String(summary.clone());
+            fixture.authority.store.connection.execute(
+                "UPDATE remote_requests SET result=?1 WHERE request_id=?2",
+                params![legacy.to_string(), request.request_id],
+            )?;
+            let retry = fixture.authority.apply_from_authenticated_relay(
+                &fixture.actor_id,
+                &request,
+                test_now(),
+            )?;
+            assert!(retry.duplicate);
+            assert!(
+                !retry.result["summary"]
+                    .as_str()
+                    .unwrap()
+                    .contains("PRIVATEVALUE")
+            );
+            assert_eq!(retry.result["summary"], expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn task_labels_are_redacted_in_remote_views() -> Result<()> {
+        let mut fixture = Fixture::new()?;
+        let task = format!(
+            "Inspect API_KEY=\"{}\" then repair the parser.",
+            "PRIVATEVALUE".repeat(100)
+        );
+        fixture.authority.store.connection.execute(
+            "UPDATE runs SET task=?1 WHERE id=?2",
+            params![task, fixture.run_id],
+        )?;
+        let expected = "Inspect API_KEY=\"[redacted]\" then repair the parser.";
+        let listed = fixture.authority.authorized_runs(&fixture.actor_id)?;
+        assert_eq!(listed[0]["task"], expected);
+        let list = fixture.apply(Command::ListTasks)?;
+        assert_eq!(list.result["tasks"][0]["task"], expected);
+        for command in [
+            Command::Status {
+                task_id: Some(fixture.run_id.clone()),
+            },
+            Command::Details {
+                task_id: Some(fixture.run_id.clone()),
+            },
+        ] {
+            let result = fixture.apply(command)?;
+            assert_eq!(result.result["task"], expected);
+        }
         Ok(())
     }
 
