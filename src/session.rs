@@ -2126,18 +2126,20 @@ impl InterruptKeys {
 }
 
 fn steer_from_follow(
+    root: &Path,
     terminal: &mut Terminal,
     store: &mut Store,
     id: &str,
     initial: &str,
-) -> Result<()> {
+) -> Result<bool> {
     if initial.len() > 65_536 {
         terminal.clear_activity()?;
-        return terminal.message(
+        terminal.message(
             Tone::Warning,
             "Steering not sent",
             "A steering message can contain at most 64 KiB.",
-        );
+        )?;
+        return Ok(true);
     }
     terminal.clear_activity()?;
     terminal.set_input_status("Steer this task · Enter sends · Shift+Enter adds a line");
@@ -2148,26 +2150,140 @@ fn steer_from_follow(
     let result = terminal.input(&label, false, &[]);
     terminal.set_input_status("");
     if let Input::Submit(message) = result? {
-        if message.trim().is_empty() {
-            return Ok(());
-        }
-        match store.steer(id, &message) {
-            Ok(true) => terminal.message(
-                Tone::Accent,
-                "Steering",
-                "Interrupting the current model turn and resuming with your instruction.",
+        return handle_follow_submission(root, terminal, store, id, &message);
+    }
+    Ok(true)
+}
+
+fn send_follow_steering(
+    terminal: &Terminal,
+    store: &mut Store,
+    id: &str,
+    message: &str,
+) -> Result<()> {
+    match store.steer(id, message) {
+        Ok(true) => terminal.message(
+            Tone::Accent,
+            "Steering",
+            "Interrupting the current model turn and resuming with your instruction.",
+        ),
+        Ok(false) => terminal.message(
+            Tone::Accent,
+            "Steering queued",
+            "The current operation will reach its safe boundary before Aegis applies this.",
+        ),
+        Err(error) => terminal.message(Tone::Warning, "Steering not sent", &error.to_string()),
+    }
+}
+
+/// Apply a request entered while following a run. Plain text and `/goal <text>` steer the
+/// selected run; slash commands inspect or control that same run instead of becoming inert chat.
+fn handle_follow_submission(
+    root: &Path,
+    terminal: &mut Terminal,
+    store: &mut Store,
+    id: &str,
+    request: &str,
+) -> Result<bool> {
+    let request = request.trim();
+    if request.is_empty() {
+        return Ok(true);
+    }
+    if let Some(goal) = goal_task_submission(request) {
+        send_follow_steering(terminal, store, id, goal)?;
+        return Ok(true);
+    }
+    if !request.starts_with('/') {
+        send_follow_steering(terminal, store, id, request)?;
+        return Ok(true);
+    }
+
+    let mut words = request.split_whitespace();
+    let command = words.next().unwrap_or_default().trim_start_matches('/');
+    let argument = words.next();
+    match command {
+        "pause" => match crate::pause::request(root, id) {
+            Ok(()) => terminal.message(
+                Tone::Quiet,
+                "Pause requested",
+                "Waiting for the current action's safe boundary. Use /resume after it pauses.",
             )?,
-            Ok(false) => terminal.message(
-                Tone::Accent,
-                "Steering queued",
-                "The current operation will reach its safe boundary before Aegis applies this.",
-            )?,
-            Err(error) => {
-                terminal.message(Tone::Warning, "Steering not sent", &error.to_string())?
+            Err(error) => terminal.message(Tone::Warning, "Pause unavailable", &error.to_string())?,
+        },
+        "resume" => terminal.message(
+            Tone::Quiet,
+            "Already following",
+            "This task is still running. Use /pause to stop at a safe boundary.",
+        )?,
+        "context" => context_view(root, id, terminal)?,
+        "tools" => tools_view(root, id, terminal)?,
+        "artifacts" => artifacts(root, id, terminal)?,
+        "trace" => trace::display(&store.run(id)?, &store.events(id)?),
+        "tasks" => {
+            let milestones = store.milestones(id)?;
+            for milestone in &milestones {
+                terminal.message(Tone::Quiet, &milestone.state, &milestone.title)?;
+            }
+            if milestones.is_empty() {
+                terminal.message(Tone::Quiet, "Tasks", "No plan milestones have been saved yet.")?;
             }
         }
+        "checkpoint" => checkpoint_view(root, Some(id), terminal)?,
+        "cancel" => cancel_task(root, Some(id), terminal)?,
+        "help" => help(terminal)?,
+        "exit" | "quit" => {
+            terminal.message(
+                Tone::Quiet,
+                "Detached",
+                "Your task keeps running. Use /sessions or /resume from the prompt to return.",
+            )?;
+            return Ok(false);
+        }
+        "goal" | "contract" if matches!(argument, Some("add" | "replace")) => {
+            edit_goal(root, id, argument.unwrap(), words.next(), terminal)?;
+        }
+        "new" | "sessions" | "chats" | "providers" | "models" | "model" | "reasoning"
+        | "login" | "settings" | "memory" | "instructions" => terminal.message(
+            Tone::Quiet,
+            "Task still running",
+            "Use Ctrl+D to detach, then run this workspace command from the prompt.",
+        )?,
+        _ if crate::control::VIEWS.contains(&command) => {
+            match crate::control::view(store, id, command, argument) {
+                Ok(value) => terminal.message(
+                    Tone::Quiet,
+                    command,
+                    &crate::control::display(command, &value),
+                )?,
+                Err(error) => terminal.message(Tone::Warning, "View unavailable", &error.to_string())?,
+            }
+        }
+        _ => terminal.message(
+            Tone::Quiet,
+            "Unknown shortcut",
+            "Type / to see the command list. Plain text or /goal followed by text steers this task.",
+        )?,
     }
-    Ok(())
+    Ok(true)
+}
+
+fn run_follow_command_menu(
+    root: &Path,
+    terminal: &mut Terminal,
+    store: &mut Store,
+    id: &str,
+) -> Result<bool> {
+    terminal.clear_activity()?;
+    let Some(command) = terminal.command_menu()? else {
+        return Ok(true);
+    };
+    steer_from_follow(
+        root,
+        terminal,
+        store,
+        id,
+        &crate::terminal::selected_command_draft(&command),
+    )
 }
 
 fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
@@ -2265,7 +2381,9 @@ fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
         if terminal.interactive && event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Paste(paste) => {
-                    steer_from_follow(terminal, &mut store, id, &paste)?;
+                    if !steer_from_follow(root, terminal, &mut store, id, &paste)? {
+                        return Ok(());
+                    }
                 }
                 Event::Key(key) => {
                     if key.kind == KeyEventKind::Release {
@@ -2274,34 +2392,8 @@ fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
                     if key.code == KeyCode::Char('/')
                         && !key.modifiers.contains(KeyModifiers::CONTROL)
                     {
-                        terminal.clear_activity()?;
-                        let selected = terminal.command_menu()?;
-                        if let Some(command) = selected {
-                            let mut words = command.split_whitespace();
-                            let command = words.next().unwrap_or_default().trim_start_matches('/');
-                            if command == "pause" {
-                                crate::pause::request(root, id)?;
-                                terminal.message(
-                                    Tone::Quiet,
-                                    "Pause requested",
-                                    "Waiting for the current action's safe boundary.",
-                                )?;
-                            } else if crate::control::VIEWS.contains(&command) {
-                                match crate::control::view(&store, id, command, words.next()) {
-                                    Ok(value) => terminal.message(
-                                        Tone::Quiet,
-                                        command,
-                                        &crate::control::display(command, &value),
-                                    )?,
-                                    Err(error) => terminal.message(
-                                        Tone::Warning,
-                                        "View unavailable",
-                                        &error.to_string(),
-                                    )?,
-                                }
-                            } else {
-                                terminal.message(Tone::Quiet,"Task controls","/goal /status /why /evidence O3 /verify /provider /budget /handoff /pause")?;
-                            }
+                        if !run_follow_command_menu(root, terminal, &mut store, id)? {
+                            return Ok(());
                         }
                     } else if key.code == KeyCode::F(8) {
                         terminal.clear_activity()?;
@@ -2340,12 +2432,15 @@ fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
                     } else if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
                         if let KeyCode::Char(character) = key.code {
                             if character != '/' {
-                                steer_from_follow(
+                                if !steer_from_follow(
+                                    root,
                                     terminal,
                                     &mut store,
                                     id,
                                     &character.to_string(),
-                                )?;
+                                )? {
+                                    return Ok(());
+                                }
                             }
                         }
                     }
@@ -3960,6 +4055,42 @@ mod tests {
                 Some(paste)
             );
         }
+    }
+
+    #[test]
+    fn follow_routes_goal_text_to_the_selected_run() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        let mut store = Store::open(root)?;
+        let run = store.create_run(
+            "Improve Aegis",
+            root,
+            "codex",
+            json!(["workspace.read"]),
+            json!({"provider_transport":"aegis-direct-v1"}),
+            "",
+        )?;
+        let mut terminal = Terminal::default();
+        let request = "/goal Repair slash commands\nRequirements:\n- keep pasted lines";
+
+        assert!(handle_follow_submission(
+            root,
+            &mut terminal,
+            &mut store,
+            &run.id,
+            request,
+        )?);
+
+        let steering = store
+            .events(&run.id)?
+            .into_iter()
+            .find(|event| event.kind == "user.steering")
+            .expect("goal text should be persisted as steering");
+        assert_eq!(
+            steering.payload["text"],
+            "Repair slash commands\nRequirements:\n- keep pasted lines"
+        );
+        Ok(())
     }
 
     #[test]
