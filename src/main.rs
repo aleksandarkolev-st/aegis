@@ -442,6 +442,18 @@ fn execute() -> Result<()> {
     match arguments.first().map(String::as_str) {
         None => interactive(&root),
         Some("run") => run(&root, &arguments[1..]),
+        Some("remote")
+            if arguments
+                .get(1)
+                .is_some_and(|command| command == "identity") =>
+        {
+            if arguments.len() != 2 {
+                bail!("usage: aegis remote identity");
+            }
+            let authority = arun::remote::Authority::open(&root)?;
+            println!("{}", authority.installation_id());
+            Ok(())
+        }
         Some("remote") => arun::remote::daemon::command(&root, &arguments[1..]),
         Some("eval") => arun::evaluation::command(&root, &arguments[1..]),
         Some("eval-report") => {
