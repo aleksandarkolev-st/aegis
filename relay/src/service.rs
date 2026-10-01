@@ -253,7 +253,8 @@ impl RelayService {
 
 fn pairing_code(text: &str) -> Option<&str> {
     let mut pieces = text.split_whitespace();
-    if pieces.next()? != "/pair" {
+    let command = pieces.next()?;
+    if command != "/pair" && !command.eq_ignore_ascii_case("AEGIS") {
         return None;
     }
     let code = pieces.next()?;
@@ -269,7 +270,9 @@ fn pairing_code(text: &str) -> Option<&str> {
 }
 
 fn is_pairing_attempt(text: &str) -> bool {
-    text.trim_start().starts_with("/pair")
+    text.split_whitespace()
+        .next()
+        .is_some_and(|command| command == "/pair" || command.eq_ignore_ascii_case("AEGIS"))
 }
 
 fn stable_envelope_id(sender: &str, external_message_id: &str) -> Uuid {
@@ -319,9 +322,21 @@ mod tests {
     fn pairing_codes_must_be_one_exact_token() {
         let code = "a".repeat(43);
         assert_eq!(pairing_code(&format!("/pair {code}")), Some(code.as_str()));
+        assert_eq!(pairing_code(&format!("AEGIS {code}")), Some(code.as_str()));
+        assert_eq!(pairing_code(&format!("aegis {code}")), Some(code.as_str()));
         assert_eq!(pairing_code(&format!("/pair {code} extra")), None);
+        assert_eq!(pairing_code(&format!("AEGIS {code} extra")), None);
         assert_eq!(pairing_code("/pair short"), None);
         assert_eq!(pairing_code("hello"), None);
+    }
+
+    #[test]
+    fn pairing_attempt_detection_reserves_only_the_exact_command_token() {
+        assert!(is_pairing_attempt("/pair anything"));
+        assert!(is_pairing_attempt("AEGIS anything"));
+        assert!(is_pairing_attempt("aegis anything"));
+        assert!(!is_pairing_attempt("/pairing anything"));
+        assert!(!is_pairing_attempt("please use AEGIS"));
     }
 
     #[test]

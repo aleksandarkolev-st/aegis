@@ -418,7 +418,7 @@ async fn used_pair_code_retry_is_deduplicated_and_never_published_as_a_command()
     let mut headers = HeaderMap::new();
     headers.insert("x-fake-auth", HeaderValue::from_static("local-fixture"));
     let first = format!(
-        "{{\"sender_id\":\"+4915112345678\",\"external_message_id\":\"pair-1\",\"text\":\"/pair {code}\"}}"
+        "{{\"sender_id\":\"+4915112345678\",\"external_message_id\":\"pair-1\",\"text\":\"AEGIS {code}\"}}"
     );
     assert_eq!(
         service
