@@ -265,13 +265,29 @@ mod tests {
             "expires_at":Utc::now() + chrono::Duration::minutes(1),
             "command":{"type":"status"}
         });
+        let subject = format!("aegis.commands.{installation_id}");
+        let valid_bytes = serde_json::to_vec(&input)?;
+        assert!(RelayCommandEnvelope::parse(&subject, &valid_bytes, &installation_id).is_ok());
+        assert!(
+            RelayCommandEnvelope::parse("aegis.commands.other", &valid_bytes, &installation_id)
+                .is_err()
+        );
+        assert!(
+            RelayCommandEnvelope::parse(
+                &format!("{subject}.other"),
+                &valid_bytes,
+                &installation_id
+            )
+            .is_err()
+        );
+        let other_installation = uuid::Uuid::new_v4().to_string();
+        let other_subject = format!("aegis.commands.{other_installation}");
+        assert!(
+            RelayCommandEnvelope::parse(&other_subject, &valid_bytes, &other_installation).is_err()
+        );
         input["extra"] = json!(true);
         let bytes = serde_json::to_vec(&input)?;
-        let subject = format!("aegis.commands.{installation_id}");
         assert!(RelayCommandEnvelope::parse(&subject, &bytes, &installation_id).is_err());
-        assert!(
-            RelayCommandEnvelope::parse("aegis.commands.other", &bytes, &installation_id).is_err()
-        );
         assert_eq!(truncate_utf8(&"я".repeat(10), 7).len(), 6);
         Ok(())
     }

@@ -133,6 +133,14 @@ The key value is read from the named environment variable at request time and is
 
 ## Run and recover
 
+### Remote control and NATS permissions
+
+`aegis remote pair` provisions an installation and shows a short-lived WhatsApp pairing code. `aegis remote run` maintains an outbound TLS connection; it does not open a listener or require port forwarding. The local SQLite database remains authoritative for actors, task grants, command receipts and approval decisions. Remote task creation uses only the locally configured workspace and saved profile.
+
+The Aegis daemon consumes only `aegis.commands.<installation-uuid>` and publishes only `aegis.events.<installation-uuid>`. The local protocol rejects a mismatched subject or installation ID. The JetStream consumer filter is an application filter, not broker authorization: configure NATS ACLs so each installation's device credential can consume only its exact command subject and publish only its exact event subject, plus only the JetStream API permissions needed for that stream, consumer and acknowledgments. Never give a device credential wildcard access such as `aegis.commands.*`, `aegis.events.*` or `>`; keep broader relay credentials server-side. `.arun/remote.json` stores endpoint settings and environment-variable names, not relay or NATS token values.
+
+`aegis remote revoke` disables the actor in local SQLite before asking the authenticated relay admin API to revoke its channel bindings and unused pairing codes. If the relay is unavailable, local authorization stays revoked and the actor remains queued in SQLite; rerun `aegis remote revoke` after connectivity returns. A later `aegis remote pair` also retries every queued revocation before registering a fresh actor. Revoked actor IDs cannot be re-enabled, and cleanup failures report the affected IDs.
+
 ```powershell
 arun run "Find the source of the failing test" --provider chatgpt
 arun attach <run-id>
