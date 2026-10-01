@@ -305,7 +305,7 @@ async fn admin_revoke_is_scoped_and_blocks_commands_from_the_revoked_phone() {
         provider.sends.lock().unwrap().as_slice(),
         &[(
             sender_id.clone(),
-            "Pair this number with Aegis using /pair <one-time-code>.".into()
+            "Pair with Aegis using AEGIS <one-time-code> or /pair <one-time-code>.".into()
         )]
     );
 

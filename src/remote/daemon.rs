@@ -127,8 +127,8 @@ fn pair_command(root: &Path, args: &[String]) -> Result<()> {
         .build()?;
     let code = runtime.block_on(provision(&config))?;
     println!("Aegis remote pairing code (expires in 10 minutes):");
-    println!("/pair {code}");
-    println!("Send that command to the Aegis WhatsApp relay account.");
+    println!("Send either: AEGIS {code}  or  /pair {code}");
+    println!("to the Aegis WhatsApp relay account.");
     Ok(())
 }
 

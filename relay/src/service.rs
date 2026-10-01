@@ -150,7 +150,7 @@ impl RelayService {
             self.provider
                 .send_text(
                     &message.sender_id,
-                    "Pair this number with Aegis using /pair <one-time-code>.",
+                    "Pair with Aegis using AEGIS <one-time-code> or /pair <one-time-code>.",
                     &message.external_message_id,
                 )
                 .await?;
