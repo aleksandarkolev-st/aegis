@@ -12,6 +12,7 @@ services:
       - relay-postgres:/var/lib/postgresql/data
     networks:
       - relay-private
+      - relay-host-access
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U relay -d aegis_relay"]
       interval: 5s
@@ -43,11 +44,18 @@ services:
       - "127.0.0.1:${RELAY_NATS_PORT:-4422}:4222"
     volumes:
       - ./dev/nats-server.conf:/etc/nats/nats-server.conf:ro
-      - ./dev/certs/nats.crt:/run/certs/nats.crt:ro
-      - ./dev/certs/nats.key:/run/certs/nats.key:ro
+      - type: bind
+        source: ${RELAY_NATS_CERT_DIR:-./dev/certs}/nats.crt
+        target: /run/certs/nats.crt
+        read_only: true
+      - type: bind
+        source: ${RELAY_NATS_CERT_DIR:-./dev/certs}/nats.key
+        target: /run/certs/nats.key
+        read_only: true
       - relay-jetstream:/data/jetstream
     networks:
       - relay-private
+      - relay-host-access
     healthcheck:
       test: ["CMD-SHELL", "nc -z 127.0.0.1 4222"]
       interval: 5s
@@ -57,6 +65,7 @@ services:
 networks:
   relay-private:
     internal: true
+  relay-host-access:
 
 volumes:
   relay-postgres:
