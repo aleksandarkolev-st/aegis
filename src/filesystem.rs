@@ -91,6 +91,93 @@ pub(crate) fn path_name(path: &str) -> Result<String> {
     Ok(path)
 }
 
+/// Conservative deny list for workspace reads initiated by remote-control
+/// tasks. Local Aegis runs keep their configured read policy unchanged.
+pub(crate) fn remote_secret_path(path: &str) -> bool {
+    let path = path.replace('\\', "/").to_ascii_lowercase();
+    let components: Vec<_> = path.split('/').collect();
+    components.iter().any(|component| {
+        let component = *component;
+        component == ".env"
+            || component == ".envrc"
+            || component.starts_with(".env.")
+            || component.starts_with(".env-")
+            || matches!(
+                component,
+                ".ssh"
+                    | ".aws"
+                    | ".azure"
+                    | ".gnupg"
+                    | ".kube"
+                    | ".docker"
+                    | ".secrets"
+                    | ".password-store"
+            )
+            || matches!(
+                component,
+                ".npmrc" | ".pypirc" | ".netrc" | ".git-credentials" | ".dockercfg"
+            )
+            || matches!(
+                component,
+                "id_rsa" | "id_dsa" | "id_ecdsa" | "id_ed25519" | "id_xmss"
+            )
+            || component == "credential"
+            || component == "credentials"
+            || component.starts_with("credentials.")
+            || component == "token"
+            || component == "tokens"
+            || component == "password"
+            || component == "passwords"
+            || component == "secrets"
+            || component.starts_with("secrets.")
+            || matches!(
+                component,
+                "secret"
+                    | "private_key"
+                    | "private-key"
+                    | "api_key"
+                    | "api-key"
+                    | "access_token"
+                    | "refresh_token"
+                    | "client_secret"
+                    | "auth.json"
+                    | "token.json"
+                    | "tokens.json"
+                    | "password.json"
+                    | "passwords.json"
+                    | ".vault-token"
+                    | "vault-token"
+                    | "application_default_credentials.json"
+                    | ".dockerconfigjson"
+            )
+            || [
+                "secret.",
+                "secret-",
+                "private_key.",
+                "private-key.",
+                "api_key.",
+                "api-key.",
+            ]
+            .iter()
+            .any(|prefix| component.starts_with(prefix))
+            || [
+                ".pem",
+                ".key",
+                ".p8",
+                ".ppk",
+                ".p12",
+                ".pfx",
+                ".jks",
+                ".keystore",
+                ".asc",
+            ]
+            .iter()
+            .any(|extension| component.ends_with(extension))
+    }) || components
+        .windows(2)
+        .any(|pair| pair == [".config", "gcloud"] || pair == [".config", "gh"])
+}
+
 fn covers(pattern: &str, path: &str) -> bool {
     pattern == "**"
         || pattern == path
@@ -358,6 +445,37 @@ mod tests {
             .is_err()
         );
         Ok(())
+    }
+
+    #[test]
+    fn remote_secret_path_filter_is_case_insensitive_and_nested() {
+        for path in [
+            ".env",
+            ".env.local",
+            ".env.example",
+            ".envrc",
+            "config/credentials.json",
+            "nested/secrets/provider.toml",
+            "nested/tokens/provider.json",
+            "local/Passwords.json",
+            ".ssh/id_ed25519",
+            ".AWS/credentials",
+            "certs/client.PEM",
+            "secrets.p12",
+            ".vault-token",
+            "application_default_credentials.json",
+            ".config/gcloud/application_default_credentials.json",
+        ] {
+            assert!(remote_secret_path(path), "expected secret path: {path}");
+        }
+        for path in [
+            "src/main.rs",
+            "docs/environment.md",
+            ".environment.md",
+            "public/ca.crt",
+        ] {
+            assert!(!remote_secret_path(path), "unexpected secret path: {path}");
+        }
     }
 
     #[test]

@@ -190,6 +190,46 @@ pub(crate) fn authorize_program(run: &Run, args: &Value) -> Result<()> {
     Ok(())
 }
 
+fn remote_read_path_is_secret(workspace: &Path, path: &str) -> Result<bool> {
+    if crate::filesystem::remote_secret_path(path) {
+        return Ok(true);
+    }
+    let normalized = crate::filesystem::path_name(path)?;
+    let workspace = dunce::canonicalize(workspace)?;
+    let target = workspace.join(normalized);
+    let Ok(resolved) = dunce::canonicalize(target) else {
+        return Ok(false);
+    };
+    if let Ok(relative) = resolved.strip_prefix(&workspace) {
+        return Ok(crate::filesystem::remote_secret_path(
+            &relative.to_string_lossy(),
+        ));
+    }
+    Ok(false)
+}
+
+fn authorize_remote_file_reads(run: &Run, operation: &Operation) -> Result<()> {
+    if run.budgets["remote_origin"] != true {
+        return Ok(());
+    }
+    let paths: Vec<&str> = match operation.capability.as_str() {
+        "workspace.read" => vec![string(&operation.arguments, "path")?],
+        "workspace.read_batch" => operation.arguments["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|file| file["path"].as_str())
+            .collect(),
+        _ => return Ok(()),
+    };
+    for path in paths {
+        if remote_read_path_is_secret(Path::new(&run.workspace), path)? {
+            bail!("remote tasks cannot read credential or private-key files");
+        }
+    }
+    Ok(())
+}
+
 pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
     uuid::Uuid::parse_str(operation_id).context("invalid operation ID")?;
     let lock = File::options()
@@ -237,6 +277,7 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
         bail!("capability version changed after intent was recorded");
     }
     capability::validate_arguments(&manifest, &operation.arguments)?;
+    authorize_remote_file_reads(&run, &operation)?;
     if operation.capability == "workspace.read_batch" {
         crate::read_batch::authorize(&run, &operation.arguments)?;
     }
@@ -294,6 +335,7 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
             if query.is_empty() {
                 bail!("empty search query");
             }
+            let remote_origin = run.budgets["remote_origin"] == true;
             let mut pending = vec![workspace.to_path_buf()];
             let mut matches = Vec::new();
             while let Some(directory) = pending.pop() {
@@ -304,15 +346,18 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
                     {
                         continue;
                     }
+                    let relative_path = entry
+                        .path()
+                        .strip_prefix(workspace)?
+                        .to_string_lossy()
+                        .into_owned();
+                    if remote_origin && crate::filesystem::remote_secret_path(&relative_path) {
+                        continue;
+                    }
                     let kind = entry.file_type()?;
                     if kind.is_dir() {
                         if let Some(scopes) = &file_scopes {
-                            let path = entry
-                                .path()
-                                .strip_prefix(workspace)?
-                                .to_string_lossy()
-                                .into_owned();
-                            if !scopes.may_descend(&path)
+                            if !scopes.may_descend(&relative_path)
                                 || crate::filesystem::linked(&fs::symlink_metadata(entry.path())?)
                             {
                                 continue;
@@ -321,11 +366,6 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
                         pending.push(entry.path());
                     } else if kind.is_file() && entry.metadata()?.len() <= MAX_FILE {
                         if let Some(scopes) = &file_scopes {
-                            let relative_path = entry
-                                .path()
-                                .strip_prefix(workspace)?
-                                .to_string_lossy()
-                                .into_owned();
                             if scopes
                                 .checked_path(workspace, &relative_path, false)
                                 .is_err()
@@ -336,12 +376,7 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
                         if let Ok(text) = fs::read_to_string(entry.path()) {
                             for (line_number, line) in text.lines().enumerate() {
                                 if line.contains(query) {
-                                    let path = entry
-                                        .path()
-                                        .strip_prefix(workspace)?
-                                        .to_string_lossy()
-                                        .into_owned();
-                                    matches.push(json!({"path": path, "line": line_number + 1, "text": line.chars().take(300).collect::<String>()}));
+                                    matches.push(json!({"path": relative_path, "line": line_number + 1, "text": line.chars().take(300).collect::<String>()}));
                                     if matches.len() >= 100 {
                                         return Ok(json!({"matches": matches, "truncated": true}));
                                     }
@@ -526,6 +561,112 @@ mod tests {
         );
         assert_eq!(store.operation(&operation.id)?.state, "dispatched");
         assert!(!directory.path().join("fixture.txt").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn remote_reads_block_secret_files_but_search_filters_and_local_reads_remain_configured()
+    -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(".arun");
+        fs::write(directory.path().join(".env"), "canary-secret")?;
+        fs::write(directory.path().join("notes.txt"), "canary-public")?;
+        let secret_alias = directory.path().join("public-alias.txt");
+        #[cfg(windows)]
+        let alias_created =
+            std::os::windows::fs::symlink_file(directory.path().join(".env"), &secret_alias)
+                .is_ok();
+        #[cfg(unix)]
+        let alias_created = std::os::unix::fs::symlink(".env", &secret_alias).is_ok();
+        #[cfg(not(any(windows, unix)))]
+        let alias_created = false;
+
+        let mut store = Store::open(&root)?;
+        let remote_run = store.create_run(
+            "remote read",
+            directory.path(),
+            "codex",
+            json!(["workspace.read"]),
+            json!({"remote_origin":true}),
+            "",
+        )?;
+        store.state(&remote_run.id, "running", json!({}))?;
+        let direct = store.begin_operation(
+            &remote_run.id,
+            "workspace.read",
+            json!({"path":".env"}),
+            true,
+        )?;
+        store.operation_state(&direct, "dispatched", None, json!({}))?;
+        let batch = store.begin_operation(
+            &remote_run.id,
+            "workspace.read_batch",
+            json!({"files":[{"path":".env","offset":0,"length":32}]}),
+            true,
+        )?;
+        store.operation_state(&batch, "dispatched", None, json!({}))?;
+        let search = store.begin_operation(
+            &remote_run.id,
+            "workspace.search",
+            json!({"query":"canary"}),
+            true,
+        )?;
+        store.operation_state(&search, "dispatched", None, json!({}))?;
+        let alias_read = if alias_created {
+            let operation = store.begin_operation(
+                &remote_run.id,
+                "workspace.read",
+                json!({"path":"public-alias.txt"}),
+                true,
+            )?;
+            store.operation_state(&operation, "dispatched", None, json!({}))?;
+            Some(operation)
+        } else {
+            None
+        };
+
+        let local_run = store.create_run(
+            "local read",
+            directory.path(),
+            "codex",
+            json!(["workspace.read"]),
+            json!({}),
+            "",
+        )?;
+        store.state(&local_run.id, "running", json!({}))?;
+        let local_read = store.begin_operation(
+            &local_run.id,
+            "workspace.read",
+            json!({"path":".env"}),
+            true,
+        )?;
+        store.operation_state(&local_read, "dispatched", None, json!({}))?;
+        drop(store);
+
+        for operation in [&direct, &batch] {
+            let error = execute(&root, &operation.id).unwrap_err();
+            assert!(error.to_string().contains("cannot read credential"));
+            assert_eq!(
+                Store::open(&root)?.operation(&operation.id)?.state,
+                "dispatched"
+            );
+        }
+        if let Some(operation) = alias_read {
+            let error = execute(&root, &operation.id).unwrap_err();
+            assert!(error.to_string().contains("cannot read credential"));
+            assert_eq!(
+                Store::open(&root)?.operation(&operation.id)?.state,
+                "dispatched"
+            );
+        }
+        let search_result = execute(&root, &search.id)?;
+        let matches = search_result["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["path"], "notes.txt");
+        assert_eq!(matches[0]["text"], "canary-public");
+
+        let local_result = execute(&root, &local_read.id)?;
+        assert_eq!(local_result["content"], "canary-secret");
         Ok(())
     }
 
