@@ -3,10 +3,10 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use anyhow::{bail, Context, Result};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -779,7 +779,7 @@ impl Store {
 
     pub fn recent_context_events(&self, run_id: &str, limit: i64) -> Result<Vec<Event>> {
         let mut statement = self.connection.prepare(
-            "SELECT seq, kind, payload, created_at FROM events WHERE run_id = ?1 AND kind NOT IN ('model.started','operation.dispatched','operation.executing') ORDER BY seq DESC LIMIT ?2",
+            "SELECT seq, kind, payload, created_at FROM events WHERE run_id = ?1 AND kind NOT IN ('model.started','operation.dispatched','operation.executing','operation.output') ORDER BY seq DESC LIMIT ?2",
         )?;
         let rows = statement.query_map(params![run_id, limit.max(0)], |row| {
             let payload: String = row.get(2)?;
@@ -1832,6 +1832,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn process_output_chunks_are_excluded_from_recent_model_context() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "exclude live process output from model context",
+            directory.path(),
+            "codex",
+            json!(["process.run"]),
+            json!({}),
+            "",
+        )?;
+        store.event(
+            &run.id,
+            "operation.output",
+            json!({"stream":"combined","text":"live output"}),
+        )?;
+        store.event(&run.id, "model.failed", json!({"error":"visible status"}))?;
+
+        let context = store.recent_context_events(&run.id, 12)?;
+        assert!(context.iter().all(|event| event.kind != "operation.output"));
+        assert!(context.iter().any(|event| event.kind == "model.failed"));
+        Ok(())
+    }
+
+    #[test]
     fn projection_migration_preserves_history_and_updates_atomically() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let mut store = Store::open(directory.path())?;
@@ -2004,11 +2029,9 @@ mod tests {
         forged.capability_version = 99;
         forged.arguments = json!({"path":"forged.txt"});
         forged.retry_safe = false;
-        assert!(
-            store
-                .operation_state(&forged, "outcome_unknown", None, json!({}))
-                .is_err()
-        );
+        assert!(store
+            .operation_state(&forged, "outcome_unknown", None, json!({}))
+            .is_err());
         assert_eq!(store.operation(&read.id)?.state, "executing");
         store.operation_state(&forged, "succeeded", Some(&forged_artifact), json!({}))?;
 
@@ -2045,17 +2068,13 @@ mod tests {
 
         let read = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
         let receipt = store.put_artifact(b"read receipt")?;
-        assert!(
-            store
-                .operation_state(&read, "succeeded", Some(&receipt), json!({}))
-                .is_err()
-        );
+        assert!(store
+            .operation_state(&read, "succeeded", Some(&receipt), json!({}))
+            .is_err());
         store.operation_state(&read, "dispatched", None, json!({}))?;
-        assert!(
-            store
-                .operation_state(&read, "succeeded", Some(&receipt), json!({}))
-                .is_err()
-        );
+        assert!(store
+            .operation_state(&read, "succeeded", Some(&receipt), json!({}))
+            .is_err());
         store.claim_operation(&read)?;
         store.operation_state(&read, "succeeded", Some(&receipt), json!({}))?;
 
@@ -2092,31 +2111,23 @@ mod tests {
             br#"{"path":"fixture.txt","bytes":8,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"#,
         )?;
 
-        assert!(
-            store
-                .operation_state(&write, "unknown", None, json!({}))
-                .is_err()
-        );
-        assert!(
-            store
-                .operation_state(&write, "succeeded", Some(&result), json!({}))
-                .is_err()
-        );
+        assert!(store
+            .operation_state(&write, "unknown", None, json!({}))
+            .is_err());
+        assert!(store
+            .operation_state(&write, "succeeded", Some(&result), json!({}))
+            .is_err());
         assert_eq!(store.operation(&write.id)?.state, "pending");
 
         store.operation_state(&write, "dispatched", None, json!({}))?;
-        assert!(
-            store
-                .operation_state(&write, "succeeded", Some(&result), json!({}))
-                .is_err()
-        );
+        assert!(store
+            .operation_state(&write, "succeeded", Some(&result), json!({}))
+            .is_err());
         store.claim_operation(&write)?;
         store.operation_state(&write, "succeeded", Some(&result), json!({}))?;
-        assert!(
-            store
-                .operation_state(&write, "failed", None, json!({}))
-                .is_err()
-        );
+        assert!(store
+            .operation_state(&write, "failed", None, json!({}))
+            .is_err());
         store.operation_state(
             &write,
             "succeeded",
@@ -2200,11 +2211,9 @@ mod tests {
         let operation = store.begin_operation(&run.id, "external.write", json!({}), false)?;
         store.operation_state(&operation, "dispatched", None, json!({}))?;
         store.reconcile(&run.id)?;
-        assert!(
-            store
-                .resolve_unknown(&run.id, &operation.id, true, "")
-                .is_err()
-        );
+        assert!(store
+            .resolve_unknown(&run.id, &operation.id, true, "")
+            .is_err());
         store.resolve_unknown(&run.id, &operation.id, true, "external receipt 123")?;
         assert_eq!(store.unknown_count(&run.id)?, 0);
         assert_eq!(store.run(&run.id)?.state, "ready");
@@ -2212,11 +2221,9 @@ mod tests {
             &run.id,
             store.operation(&operation.id)?.artifact.as_deref().unwrap()
         )?);
-        assert!(
-            store
-                .resolve_unknown(&run.id, &operation.id, true, "duplicate")
-                .is_err()
-        );
+        assert!(store
+            .resolve_unknown(&run.id, &operation.id, true, "duplicate")
+            .is_err());
         Ok(())
     }
 
@@ -2250,17 +2257,13 @@ mod tests {
         store.activate(&run.id, "tool_04", 2)?;
         store.activate(&run.id, "tool_12", 1)?;
         assert_eq!(store.working_capabilities(&run.id)?.len(), 8);
-        assert!(
-            store
-                .active_capabilities(&run.id)?
-                .contains(&("tool_04".into(), 2))
-        );
-        assert!(
-            !store
-                .active_capabilities(&run.id)?
-                .iter()
-                .any(|(id, _)| id == "tool_05")
-        );
+        assert!(store
+            .active_capabilities(&run.id)?
+            .contains(&("tool_04".into(), 2)));
+        assert!(!store
+            .active_capabilities(&run.id)?
+            .iter()
+            .any(|(id, _)| id == "tool_05"));
         assert!(store.load_recovery(&run.id)?.is_some());
         drop(store);
         let mut store = Store::open(directory.path())?;
@@ -2345,11 +2348,9 @@ mod tests {
             "milestone title must contain 1..200 bytes of nonblank text"
         );
         assert_eq!(store.last_checkpoint(&run.id)?, Some(checkpoint.clone()));
-        assert!(
-            store
-                .complete_run(&run.id, "done", &[evidence.clone()])
-                .is_err()
-        );
+        assert!(store
+            .complete_run(&run.id, "done", &[evidence.clone()])
+            .is_err());
         drop(store);
         let mut store = Store::open(directory.path())?;
         assert_eq!(store.last_checkpoint(&run.id)?, Some(checkpoint.clone()));
@@ -2410,17 +2411,13 @@ mod tests {
             json!({}),
         )?;
         assert_ne!(old_evidence, unrelated_fresh_evidence);
-        assert!(
-            store
-                .validate_completion(&run.id, &[unrelated_fresh_evidence.clone()])
-                .is_err()
-        );
+        assert!(store
+            .validate_completion(&run.id, &[unrelated_fresh_evidence.clone()])
+            .is_err());
         assert!(store.save_checkpoint(&run.id, &checkpoint).is_err());
-        assert!(
-            store
-                .complete_run(&run.id, "done", &[unrelated_fresh_evidence.clone()])
-                .is_err()
-        );
+        assert!(store
+            .complete_run(&run.id, "done", &[unrelated_fresh_evidence.clone()])
+            .is_err());
         assert_eq!(store.run(&run.id)?.state, "running");
 
         checkpoint.milestones[0].evidence = vec![unrelated_fresh_evidence.clone()];
@@ -2479,16 +2476,12 @@ mod tests {
             b"tampered milestone proof",
         )?;
         assert!(store.save_checkpoint(&run.id, &checkpoint).is_err());
-        assert!(
-            store
-                .validate_completion(&run.id, &[final_evidence.clone()])
-                .is_err()
-        );
-        assert!(
-            store
-                .complete_run(&run.id, "done", &[final_evidence])
-                .is_err()
-        );
+        assert!(store
+            .validate_completion(&run.id, &[final_evidence.clone()])
+            .is_err());
+        assert!(store
+            .complete_run(&run.id, "done", &[final_evidence])
+            .is_err());
         assert_eq!(store.run(&run.id)?.state, "running");
         Ok(())
     }
@@ -2522,15 +2515,13 @@ mod tests {
         let current_evidence = store.put_artifact(b"revision one proof")?;
         claim_test_operation(&mut store, &final_read)?;
         store.operation_state(&final_read, "succeeded", Some(&current_evidence), json!({}))?;
-        assert!(
-            store
-                .complete_run(
-                    &run.id,
-                    "done",
-                    &[old_evidence.clone(), current_evidence.clone()],
-                )
-                .is_err()
-        );
+        assert!(store
+            .complete_run(
+                &run.id,
+                "done",
+                &[old_evidence.clone(), current_evidence.clone()],
+            )
+            .is_err());
         assert_eq!(store.milestones(&run.id)?[0].state, "active");
 
         store.complete_run(&run.id, "done", &[current_evidence.clone()])?;

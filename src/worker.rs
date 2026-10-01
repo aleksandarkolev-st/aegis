@@ -5,8 +5,8 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
+use anyhow::{bail, Context, Result};
+use serde_json::{json, Value};
 
 use crate::storage::{Operation, Run, Store};
 use crate::{capability, mcp};
@@ -483,8 +483,23 @@ fn execute_container(
     if seconds == 0 {
         bail!("process deadline exhausted before launch");
     }
-    let output_dir = tempfile::tempdir_in(root)?;
-    let path = output_dir.path().join("process-output");
+    let output_path = if operation.capability == "process.run" {
+        shared_process_output_path(root)?
+    } else {
+        None
+    };
+    let output_dir = if output_path.is_none() {
+        Some(tempfile::tempdir_in(root)?)
+    } else {
+        None
+    };
+    let path = output_path.unwrap_or_else(|| {
+        output_dir
+            .as_ref()
+            .expect("fallback output directory was created")
+            .path()
+            .join("process-output")
+    });
     let file = File::create(&path)?;
     let mut command = docker_command(run, operation, program, arguments)?;
     command
@@ -524,13 +539,65 @@ fn execute_container(
     let hash = store.put_artifact(&bytes)?;
     store.link_artifact(&operation.id, &hash, "process.output")?;
     Ok(
-        json!({"exit_code":status.code(), "output_artifact":hash, "bytes":bytes.len(), "preview":String::from_utf8_lossy(&bytes).chars().take(300).collect::<String>()}),
+        json!({"exit_code":status.code(), "output_artifact":hash, "bytes":bytes.len(), "preview":String::from_utf8_lossy(&bytes).chars().take(1200).collect::<String>()}),
     )
+}
+
+fn shared_process_output_path(root: &Path) -> Result<Option<PathBuf>> {
+    let Some(path) = std::env::var_os(crate::kernel::PROCESS_OUTPUT_PATH_ENV).map(PathBuf::from)
+    else {
+        return Ok(None);
+    };
+    validate_shared_process_output_path(root, &path).map(Some)
+}
+
+fn validate_shared_process_output_path(root: &Path, candidate: &Path) -> Result<PathBuf> {
+    let path = dunce::canonicalize(candidate)?;
+    let parent = path
+        .parent()
+        .context("process output spool has no parent")?;
+    let parent_parent = parent
+        .parent()
+        .context("process output spool is outside its dispatch directory")?;
+    let canonical_root = dunce::canonicalize(root)?;
+    if parent_parent != canonical_root
+        || !parent
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(crate::kernel::DISPATCH_TEMP_PREFIX))
+        || path.file_name().and_then(|name| name.to_str()) != Some("process-output")
+    {
+        bail!("process output spool is outside the Aegis dispatch directory");
+    }
+    if !path.is_file() {
+        bail!("process output spool is not a regular file");
+    }
+    Ok(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_process_output_path_accepts_only_dispatch_spools_under_the_store() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(".arun");
+        fs::create_dir(&root)?;
+        let dispatch_dir = tempfile::Builder::new()
+            .prefix(crate::kernel::DISPATCH_TEMP_PREFIX)
+            .tempdir_in(&root)?;
+        let spool = dispatch_dir.path().join("process-output");
+        File::create(&spool)?;
+
+        let validated = validate_shared_process_output_path(&root, &spool)?;
+        assert_eq!(validated, dunce::canonicalize(&spool)?);
+
+        let outside = directory.path().join("outside-output");
+        File::create(&outside)?;
+        assert!(validate_shared_process_output_path(&root, &outside).is_err());
+        Ok(())
+    }
 
     #[test]
     fn exhausted_tasks_cannot_claim_or_execute_a_dispatched_write() -> Result<()> {
@@ -553,20 +620,18 @@ mod tests {
             false,
         )?;
         store.operation_state(&operation, "dispatched", None, json!({}))?;
-        assert!(
-            execute(&root, &operation.id)
-                .unwrap_err()
-                .to_string()
-                .contains("budget exhausted")
-        );
+        assert!(execute(&root, &operation.id)
+            .unwrap_err()
+            .to_string()
+            .contains("budget exhausted"));
         assert_eq!(store.operation(&operation.id)?.state, "dispatched");
         assert!(!directory.path().join("fixture.txt").exists());
         Ok(())
     }
 
     #[test]
-    fn remote_reads_block_secret_files_but_search_filters_and_local_reads_remain_configured()
-    -> Result<()> {
+    fn remote_reads_block_secret_files_but_search_filters_and_local_reads_remain_configured(
+    ) -> Result<()> {
         let directory = tempfile::tempdir()?;
         let root = directory.path().join(".arun");
         fs::write(directory.path().join(".env"), "canary-secret")?;
@@ -802,12 +867,10 @@ mod tests {
             false,
         )?;
         store.operation_state(&operation, "dispatched", None, json!({}))?;
-        assert!(
-            execute(&root, &operation.id)
-                .unwrap_err()
-                .to_string()
-                .starts_with("invalid arguments")
-        );
+        assert!(execute(&root, &operation.id)
+            .unwrap_err()
+            .to_string()
+            .starts_with("invalid arguments"));
         assert_eq!(store.operation(&operation.id)?.state, "dispatched");
         assert!(!directory.path().join("fixture.txt").exists());
         Ok(())
@@ -877,12 +940,10 @@ mod tests {
                 false,
             )?;
             store.operation_state(&operation, "dispatched", None, json!({}))?;
-            assert!(
-                execute(&root, &operation.id)
-                    .unwrap_err()
-                    .to_string()
-                    .starts_with("program is not explicitly granted")
-            );
+            assert!(execute(&root, &operation.id)
+                .unwrap_err()
+                .to_string()
+                .starts_with("program is not explicitly granted"));
             assert_eq!(store.operation(&operation.id)?.state, "dispatched");
         }
         assert_eq!(store.event_count(&run.id, "operation.executing")?, 0);
@@ -915,12 +976,10 @@ mod tests {
                 false,
             )?;
             store.operation_state(&operation, "dispatched", None, json!({}))?;
-            assert!(
-                execute(&root, &operation.id)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("exact command scopes")
-            );
+            assert!(execute(&root, &operation.id)
+                .unwrap_err()
+                .to_string()
+                .contains("exact command scopes"));
             assert_eq!(store.operation(&operation.id)?.state, "dispatched");
         }
         assert_eq!(store.event_count(&run.id, "operation.executing")?, 0);
@@ -952,34 +1011,29 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert!(args.windows(2).any(|pair| pair == ["--network", "none"]));
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--tmpfs", "/tmp:rw,noexec,size=256m"])
-        );
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--tmpfs", "/tmp/target:rw,exec,size=512m"])
-        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--tmpfs", "/tmp:rw,noexec,size=256m"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--tmpfs", "/tmp/target:rw,exec,size=512m"]));
         assert!(args.iter().any(|argument| argument == "--pull=never"));
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--env", &format!("ARUN_OPERATION_ID={}", operation.id)])
-        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--env", &format!("ARUN_OPERATION_ID={}", operation.id)]));
         assert!(args.windows(2).any(|pair| pair
             == [
                 "--env",
                 &format!("ARUN_IDEMPOTENCY_KEY={}", operation.idempotency_key)
             ]));
         assert!(args.iter().any(|argument| argument.ends_with(",readonly")));
-        assert!(
-            args.iter()
-                .any(|argument| argument.starts_with("/workspace/.arun:"))
-        );
+        assert!(args
+            .iter()
+            .any(|argument| argument.starts_with("/workspace/.arun:")));
         assert_eq!(args.last().unwrap(), "test");
-        assert!(
-            args.iter()
-                .any(|argument| argument.starts_with("/workspace/.git:"))
-        );
+        assert!(args
+            .iter()
+            .any(|argument| argument.starts_with("/workspace/.git:")));
         Ok(())
     }
 
@@ -992,11 +1046,9 @@ mod tests {
         fs::create_dir(directory.path().join(".aegis"))?;
         let mut masked = Command::new("docker");
         mask_metadata(&mut masked, directory.path())?;
-        assert!(
-            masked
-                .get_args()
-                .any(|argument| argument == "/workspace/.aegis:rw,noexec,size=1m")
-        );
+        assert!(masked
+            .get_args()
+            .any(|argument| argument == "/workspace/.aegis:rw,noexec,size=1m"));
         fs::write(directory.path().join(".git"), "gitdir: ../private")?;
         assert!(mask_metadata(&mut command, directory.path()).is_err());
         fs::remove_file(directory.path().join(".git"))?;

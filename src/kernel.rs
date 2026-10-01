@@ -1,11 +1,14 @@
+use std::error::Error as StdError;
+use std::fmt;
 use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
+use anyhow::{bail, Context, Result};
+use serde_json::{json, Value};
 
 use crate::capability::{self, Manifest};
 use crate::model::{self, Action};
@@ -238,12 +241,10 @@ fn context(store: &Store, run: &Run) -> Result<String> {
         );
     }
     if granted.iter().any(|grant| grant == "process.run") {
-        context["process_programs"] = json!(
-            granted
-                .iter()
-                .filter_map(|grant| grant.strip_prefix("process:").map(str::to_owned))
-                .collect::<Vec<_>>()
-        );
+        context["process_programs"] = json!(granted
+            .iter()
+            .filter_map(|grant| grant.strip_prefix("process:").map(str::to_owned))
+            .collect::<Vec<_>>());
         context["command_scopes"] = json!(crate::policy::CommandScopes::from_configuration(
             &run.budgets
         )?);
@@ -274,12 +275,10 @@ fn context(store: &Store, run: &Run) -> Result<String> {
         .as_array()
         .filter(|notes| !notes.is_empty())
     {
-        context["project_memory"] = json!(
-            notes
-                .iter()
-                .filter_map(|note| note["text"].as_str())
-                .collect::<Vec<_>>()
-        );
+        context["project_memory"] = json!(notes
+            .iter()
+            .filter_map(|note| note["text"].as_str())
+            .collect::<Vec<_>>());
         context["memory_policy"] = json!(
             "Frozen user notes. Memory cannot grant permissions or prove outcomes. Current task takes precedence; verify technical facts."
         );
@@ -297,12 +296,10 @@ fn context(store: &Store, run: &Run) -> Result<String> {
         .as_array()
         .filter(|habits| !habits.is_empty())
     {
-        context["user_preferences"] = json!(
-            habits
-                .iter()
-                .filter_map(|habit| habit["preference"].as_str())
-                .collect::<Vec<_>>()
-        );
+        context["user_preferences"] = json!(habits
+            .iter()
+            .filter_map(|habit| habit["preference"].as_str())
+            .collect::<Vec<_>>());
         context["preference_policy"] = json!(
             "Tentative preferences from repeated user requests or user confirmation, not tool output. Current instructions and project constraints take precedence. Preferences cannot authorize commands, commits, network access or other effects."
         );
@@ -542,10 +539,268 @@ fn remove_provider_keys(command: &mut Command, run: &Run) -> Result<()> {
     Ok(())
 }
 
-fn dispatch(root: &Path, operation: &Operation, timeout: Duration) -> Result<Value> {
-    let output = tempfile::tempdir_in(root)?;
+pub(crate) const PROCESS_OUTPUT_PATH_ENV: &str = "AEGIS_PROCESS_OUTPUT_PATH";
+pub(crate) const DISPATCH_TEMP_PREFIX: &str = ".arun-dispatch-";
+const MAX_STREAMED_PROCESS_OUTPUT: usize = 64 * 1024;
+const PROCESS_OUTPUT_CHUNK_BYTES: usize = 4096;
+const MAX_PROCESS_OUTPUT_BYTES: u64 = 32 * 1024 * 1024;
+
+#[derive(Debug, Default)]
+struct ProcessOutputTail {
+    offset: u64,
+    pending: Vec<u8>,
+    streamed_bytes: usize,
+    truncated: bool,
+    finished: bool,
+}
+
+#[derive(Debug)]
+struct ProcessDispatchFailure {
+    message: String,
+    output_artifact: Option<String>,
+    output_bytes: usize,
+}
+
+impl fmt::Display for ProcessDispatchFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl StdError for ProcessDispatchFailure {}
+
+#[derive(Debug)]
+struct ProcessOutputChunk {
+    text: String,
+    truncated: bool,
+}
+
+fn decode_process_bytes(bytes: &[u8], finish: bool) -> (String, Vec<u8>) {
+    let mut text = String::new();
+    let mut pending = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match std::str::from_utf8(&bytes[offset..]) {
+            Ok(valid) => {
+                text.push_str(valid);
+                break;
+            }
+            Err(error) => {
+                let valid_end = offset + error.valid_up_to();
+                text.push_str(
+                    std::str::from_utf8(&bytes[offset..valid_end])
+                        .expect("from_utf8 validated the complete prefix"),
+                );
+                offset = valid_end;
+                if let Some(invalid_length) = error.error_len() {
+                    text.push('\u{fffd}');
+                    offset += invalid_length;
+                } else if finish {
+                    text.push('\u{fffd}');
+                    break;
+                } else {
+                    pending.extend_from_slice(&bytes[offset..]);
+                    break;
+                }
+            }
+        }
+    }
+    (text, pending)
+}
+
+fn utf8_prefix_length(text: &str, maximum_bytes: usize) -> usize {
+    let mut length = text.len().min(maximum_bytes);
+    while !text.is_char_boundary(length) {
+        length -= 1;
+    }
+    length
+}
+
+impl ProcessOutputTail {
+    fn next_chunk(&mut self, path: &Path, finish: bool) -> Result<Option<ProcessOutputChunk>> {
+        if self.finished || self.truncated {
+            return Ok(None);
+        }
+        let mut file = File::open(path)?;
+        let file_length = file.metadata()?.len();
+        if file_length < self.offset {
+            bail!("process output spool was truncated while being streamed");
+        }
+        let available = file_length - self.offset;
+        let remaining_budget = MAX_STREAMED_PROCESS_OUTPUT.saturating_sub(self.streamed_bytes);
+        if remaining_budget == 0 {
+            if available > 0 || !self.pending.is_empty() {
+                self.truncated = true;
+                return Ok(Some(ProcessOutputChunk {
+                    text: String::new(),
+                    truncated: true,
+                }));
+            }
+            if finish {
+                self.finished = true;
+            }
+            return Ok(None);
+        }
+
+        if available == 0 {
+            if finish && !self.pending.is_empty() {
+                let (decoded, _) = decode_process_bytes(&self.pending, true);
+                self.pending.clear();
+                self.finished = true;
+                return self.bound_decoded(decoded, true, file_length);
+            }
+            if finish {
+                self.finished = true;
+            }
+            return Ok(None);
+        }
+
+        let chunk_capacity = PROCESS_OUTPUT_CHUNK_BYTES
+            .saturating_sub(self.pending.len())
+            .max(1);
+        let read_capacity = chunk_capacity.min(remaining_budget.saturating_add(4));
+        let read_length = available.min(read_capacity as u64) as usize;
+        file.seek(SeekFrom::Start(self.offset))?;
+        let mut newly_read = vec![0; read_length];
+        file.read_exact(&mut newly_read)?;
+        self.offset += read_length as u64;
+
+        let mut bytes = std::mem::take(&mut self.pending);
+        bytes.extend_from_slice(&newly_read);
+        let reached_end = finish && self.offset == file_length;
+        let (decoded, pending) = decode_process_bytes(&bytes, reached_end);
+        self.pending = pending;
+        if reached_end {
+            self.finished = self.pending.is_empty();
+        }
+        self.bound_decoded(decoded, reached_end, file_length)
+    }
+
+    fn bound_decoded(
+        &mut self,
+        decoded: String,
+        reached_end: bool,
+        file_length: u64,
+    ) -> Result<Option<ProcessOutputChunk>> {
+        let remaining = MAX_STREAMED_PROCESS_OUTPUT.saturating_sub(self.streamed_bytes);
+        let emitted_length = utf8_prefix_length(&decoded, remaining);
+        let text = crate::text::clean(&decoded[..emitted_length]);
+        self.streamed_bytes += emitted_length;
+        let has_more =
+            emitted_length < decoded.len() || !self.pending.is_empty() || self.offset < file_length;
+        let truncated = has_more && self.streamed_bytes >= MAX_STREAMED_PROCESS_OUTPUT;
+        if truncated {
+            self.truncated = true;
+        }
+        if reached_end && !has_more {
+            self.finished = true;
+        }
+        if text.is_empty() && !truncated {
+            return Ok(None);
+        }
+        Ok(Some(ProcessOutputChunk { text, truncated }))
+    }
+}
+
+fn drain_process_output(
+    store: &mut Store,
+    operation: &Operation,
+    path: &Path,
+    tail: &mut ProcessOutputTail,
+    finish: bool,
+) -> Result<()> {
+    while let Some(chunk) = tail.next_chunk(path, finish)? {
+        if !chunk.text.is_empty() || chunk.truncated {
+            store.event(
+                &operation.run_id,
+                "operation.output",
+                json!({
+                    "id":operation.id,
+                    "stream":"combined",
+                    "text":chunk.text,
+                    "truncated":chunk.truncated,
+                }),
+            )?;
+        }
+        if chunk.truncated {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn preserve_partial_process_output(
+    store: &mut Store,
+    operation: &Operation,
+    path: &Path,
+) -> Result<Option<(String, usize)>> {
+    let file_length = File::open(path)?.metadata()?.len();
+    if file_length == 0 {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(MAX_PROCESS_OUTPUT_BYTES)
+        .read_to_end(&mut bytes)?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let hash = store.put_artifact(&bytes)?;
+    store.link_artifact(&operation.id, &hash, "process.output.partial")?;
+    store.event(
+        &operation.run_id,
+        "operation.output",
+        json!({
+            "id":operation.id,
+            "stream":"combined",
+            "text":"",
+            "artifact":hash,
+            "bytes":bytes.len(),
+            "partial":true,
+            "truncated":file_length > MAX_PROCESS_OUTPUT_BYTES,
+        }),
+    )?;
+    Ok(Some((hash, bytes.len())))
+}
+
+fn process_dispatch_failure(
+    store: &mut Store,
+    operation: &Operation,
+    path: Option<&Path>,
+    tail: &mut ProcessOutputTail,
+    message: String,
+) -> Result<anyhow::Error> {
+    let Some(path) = path else {
+        return Ok(anyhow::anyhow!("{message}"));
+    };
+    let stream_error = drain_process_output(store, operation, path, tail, true).err();
+    let partial = preserve_partial_process_output(store, operation, path)?;
+    let message = stream_error.map_or(message.clone(), |error| {
+        format!("{message}; final output drain failed: {error}")
+    });
+    Ok(anyhow::Error::new(ProcessDispatchFailure {
+        message,
+        output_artifact: partial.as_ref().map(|(hash, _)| hash.clone()),
+        output_bytes: partial.map_or(0, |(_, bytes)| bytes),
+    }))
+}
+
+fn dispatch(
+    store: &mut Store,
+    root: &Path,
+    operation: &Operation,
+    timeout: Duration,
+) -> Result<Value> {
+    let output = tempfile::Builder::new()
+        .prefix(DISPATCH_TEMP_PREFIX)
+        .tempdir_in(root)?;
     let stdout = output.path().join("result");
     let stderr = output.path().join("error");
+    let process_output =
+        (operation.capability == "process.run").then(|| output.path().join("process-output"));
+    if let Some(path) = &process_output {
+        File::create(path)?;
+    }
     let mut command = Command::new(std::env::current_exe()?);
     command
         .arg("worker")
@@ -554,31 +809,100 @@ fn dispatch(root: &Path, operation: &Operation, timeout: Duration) -> Result<Val
         .stdin(Stdio::null())
         .stdout(Stdio::from(File::create(&stdout)?))
         .stderr(Stdio::from(File::create(&stderr)?));
-    let run = Store::open(root)?.run(&operation.run_id)?;
+    if let Some(path) = &process_output {
+        command.env(PROCESS_OUTPUT_PATH_ENV, path);
+    }
+    let run = store.run(&operation.run_id)?;
     remove_provider_keys(&mut command, &run)?;
     let mut child = crate::process::spawn(command)?;
     let start = Instant::now();
+    let mut tail = ProcessOutputTail::default();
     loop {
-        if let Some(status) = child.try_wait()? {
-            if !status.success() {
-                bail!(
-                    "worker failed: {}",
-                    std::fs::read_to_string(stderr)?
-                        .chars()
-                        .take(800)
-                        .collect::<String>()
-                );
+        let status = match child.try_wait() {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                cleanup_container(operation);
+                return Err(process_dispatch_failure(
+                    store,
+                    operation,
+                    process_output.as_deref(),
+                    &mut tail,
+                    format!("checking worker status failed: {error}"),
+                )?);
             }
-            return serde_json::from_str(&std::fs::read_to_string(stdout)?)
-                .context("invalid worker result");
+        };
+        if let Some(status) = status {
+            if let Some(path) = &process_output {
+                if let Err(error) = drain_process_output(store, operation, path, &mut tail, true) {
+                    return Err(process_dispatch_failure(
+                        store,
+                        operation,
+                        process_output.as_deref(),
+                        &mut tail,
+                        format!("final process output drain failed: {error}"),
+                    )?);
+                }
+            }
+            if !status.success() {
+                let worker_stderr = std::fs::read_to_string(&stderr)
+                    .unwrap_or_else(|error| format!("worker stderr unavailable: {error}"));
+                let message = format!(
+                    "worker failed: {}",
+                    worker_stderr.chars().take(800).collect::<String>()
+                );
+                return Err(process_dispatch_failure(
+                    store,
+                    operation,
+                    process_output.as_deref(),
+                    &mut tail,
+                    message,
+                )?);
+            }
+            let result = std::fs::read_to_string(&stdout)
+                .context("reading worker result")
+                .and_then(|text| {
+                    serde_json::from_str(&text).context("invalid worker result")
+                });
+            return match result {
+                Ok(result) => Ok(result),
+                Err(error) => Err(process_dispatch_failure(
+                    store,
+                    operation,
+                    process_output.as_deref(),
+                    &mut tail,
+                    error.to_string(),
+                )?),
+            };
+        }
+        if let Some(path) = &process_output {
+            if let Err(error) = drain_process_output(store, operation, path, &mut tail, false) {
+                let _ = child.kill();
+                let _ = child.wait();
+                cleanup_container(operation);
+                return Err(process_dispatch_failure(
+                    store,
+                    operation,
+                    process_output.as_deref(),
+                    &mut tail,
+                    format!("streaming process output failed: {error}"),
+                )?);
+            }
         }
         if start.elapsed() >= timeout {
             child.kill()?;
             child.wait()?;
             cleanup_container(operation);
-            bail!("worker timed out after {} seconds", timeout.as_secs());
+            return Err(process_dispatch_failure(
+                store,
+                operation,
+                process_output.as_deref(),
+                &mut tail,
+                format!("worker timed out after {} seconds", timeout.as_secs()),
+            )?);
         }
-        if Store::open(root)?.interrupt_requested(
+        if store.interrupt_requested(
             &operation.run_id,
             crate::interrupt::Scope::Operation,
             &operation.id,
@@ -586,13 +910,25 @@ fn dispatch(root: &Path, operation: &Operation, timeout: Duration) -> Result<Val
             child.kill()?;
             child.wait()?;
             cleanup_container(operation);
-            bail!("operation interrupted by user");
+            return Err(process_dispatch_failure(
+                store,
+                operation,
+                process_output.as_deref(),
+                &mut tail,
+                "operation interrupted by user".into(),
+            )?);
         }
-        if Store::open(root)?.run(&operation.run_id)?.state == "cancelled" {
+        if store.run(&operation.run_id)?.state == "cancelled" {
             child.kill()?;
             child.wait()?;
             cleanup_container(operation);
-            bail!("run cancelled while worker was active");
+            return Err(process_dispatch_failure(
+                store,
+                operation,
+                process_output.as_deref(),
+                &mut tail,
+                "run cancelled while worker was active".into(),
+            )?);
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -640,7 +976,7 @@ fn perform_with_dispatch(
     root: &Path,
     run: &Run,
     operation: &Operation,
-    mut dispatch_fn: impl FnMut(&Path, &Operation, Duration) -> Result<Value>,
+    mut dispatch_fn: impl FnMut(&mut Store, &Path, &Operation, Duration) -> Result<Value>,
 ) -> Result<bool> {
     if store.interrupt_requested(&run.id, crate::interrupt::Scope::Operation, &operation.id)? {
         store.operation_state(
@@ -711,7 +1047,7 @@ fn perform_with_dispatch(
             .min(remaining),
     );
     let started = Instant::now();
-    match dispatch_fn(root, operation, timeout) {
+    match dispatch_fn(store, root, operation, timeout) {
         Ok(result) => {
             commit_result(store, operation, result, started.elapsed().as_millis())?;
         }
@@ -729,7 +1065,14 @@ fn perform_with_dispatch(
             } else {
                 "outcome_unknown"
             };
-            store.operation_state(operation, state, None, json!({"error": error.to_string()}))?;
+            let mut detail = json!({"error": error.to_string()});
+            if let Some(failure) = error.downcast_ref::<ProcessDispatchFailure>() {
+                if let Some(hash) = &failure.output_artifact {
+                    detail["output_artifact"] = json!(hash);
+                    detail["output_bytes"] = json!(failure.output_bytes);
+                }
+            }
+            store.operation_state(operation, state, None, detail)?;
             store.acknowledge_interrupt(
                 &run.id,
                 crate::interrupt::Scope::Operation,
@@ -1419,6 +1762,139 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn process_output_tail_keeps_utf8_sequences_across_reads() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("process-output");
+        std::fs::write(&path, [b'a', 0xe2])?;
+        let mut tail = ProcessOutputTail::default();
+
+        let first = tail.next_chunk(&path, false)?.unwrap();
+        assert_eq!(first.text, "a");
+        assert!(!first.truncated);
+        assert!(tail.next_chunk(&path, false)?.is_none());
+
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
+        file.write_all(&[0x82, 0xac, b'b'])?;
+        drop(file);
+        let second = tail.next_chunk(&path, false)?.unwrap();
+        assert_eq!(second.text, "€b");
+        assert!(!second.truncated);
+        Ok(())
+    }
+
+    #[test]
+    fn process_output_final_drain_includes_the_short_utf8_tail() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("process-output");
+        let mut expected = "x".repeat(PROCESS_OUTPUT_CHUNK_BYTES + 17);
+        expected.push_str(" tail €");
+        std::fs::write(&path, expected.as_bytes())?;
+
+        let mut tail = ProcessOutputTail::default();
+        let mut actual = String::new();
+        while let Some(chunk) = tail.next_chunk(&path, true)? {
+            assert!(!chunk.truncated);
+            actual.push_str(&chunk.text);
+        }
+        assert_eq!(actual, expected);
+        assert!(tail.finished);
+        Ok(())
+    }
+
+    #[test]
+    fn process_output_stream_stays_within_its_total_text_bound() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("process-output");
+        std::fs::write(
+            &path,
+            "x".repeat(MAX_STREAMED_PROCESS_OUTPUT + PROCESS_OUTPUT_CHUNK_BYTES),
+        )?;
+
+        let mut tail = ProcessOutputTail::default();
+        let mut streamed = String::new();
+        let mut truncated = false;
+        while let Some(chunk) = tail.next_chunk(&path, true)? {
+            assert!(chunk.text.len() <= PROCESS_OUTPUT_CHUNK_BYTES);
+            streamed.push_str(&chunk.text);
+            truncated |= chunk.truncated;
+        }
+        assert_eq!(streamed.len(), MAX_STREAMED_PROCESS_OUTPUT);
+        assert!(truncated);
+        assert!(tail.truncated);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_process_output_is_linked_before_the_operation_state_event() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(".arun");
+        let mut store = Store::open(&root)?;
+        let run = store.create_run(
+            "preserve failed process output",
+            directory.path(),
+            "codex",
+            json!(["process.run"]),
+            json!({"wall_seconds":3600}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let operation = store.begin_operation(
+            &run.id,
+            "process.run",
+            json!({"program":"test","args":[]}),
+            false,
+        )?;
+        let spool_directory = tempfile::Builder::new()
+            .prefix(DISPATCH_TEMP_PREFIX)
+            .tempdir_in(&root)?;
+        let spool_path = spool_directory.path().join("process-output");
+        let bytes = b"partial test output";
+        std::fs::write(&spool_path, bytes)?;
+
+        let waiting_recovery = perform_with_dispatch(
+            &mut store,
+            &root,
+            &run,
+            &operation,
+            |store, _, operation, _| {
+                let current = store.operation(&operation.id)?;
+                crate::storage::claim_test_operation(store, &current)?;
+                let mut tail = ProcessOutputTail::default();
+                Err(process_dispatch_failure(
+                    store,
+                    operation,
+                    Some(&spool_path),
+                    &mut tail,
+                    "worker failed".into(),
+                )?)
+            },
+        )?;
+
+        assert!(waiting_recovery);
+        assert_eq!(store.operation(&operation.id)?.state, "outcome_unknown");
+        let events = store.events(&run.id)?;
+        let artifact_event = events
+            .iter()
+            .position(|event| {
+                event.kind == "operation.output" && event.payload["artifact"].is_string()
+            })
+            .unwrap();
+        let outcome_event = events
+            .iter()
+            .position(|event| event.kind == "operation.outcome_unknown")
+            .unwrap();
+        assert!(artifact_event < outcome_event);
+        let output_hash = events[outcome_event].payload["detail"]["output_artifact"]
+            .as_str()
+            .unwrap();
+        assert!(store.has_operation_artifact(&run.id, output_hash)?);
+        assert_eq!(store.artifact(output_hash)?, bytes);
+        assert!(!store.has_evidence(&run.id, output_hash)?);
+        Ok(())
+    }
+
     fn remote_write_fixture() -> Result<(tempfile::TempDir, Store, Run, Operation)> {
         let directory = tempfile::tempdir()?;
         let mut store = Store::open(directory.path())?;
@@ -1500,7 +1976,7 @@ mod tests {
             &root,
             &run,
             &operation,
-            |_, _, _| -> Result<Value> { bail!("pending remote operation must not dispatch") },
+            |_, _, _, _| -> Result<Value> { bail!("pending remote operation must not dispatch") },
         )?;
         assert!(result);
         assert_eq!(store.run(&run.id)?.state, "waiting_recovery");
@@ -1520,7 +1996,7 @@ mod tests {
             &root,
             &run,
             &operation,
-            |_, _, _| -> Result<Value> { bail!("pending remote operation must not dispatch") },
+            |_, _, _, _| -> Result<Value> { bail!("pending remote operation must not dispatch") },
         )?);
         let challenge_id = remote_challenge_id(&store, &run.id)?;
         approve_remote_operation(&root, &run.id, &challenge_id, true)?;
@@ -1534,7 +2010,7 @@ mod tests {
             &root,
             &current_run,
             &current_operation,
-            |workspace, operation, _| -> Result<Value> {
+            |_, workspace, operation, _| -> Result<Value> {
                 dispatches += 1;
                 assert_eq!(operation.id, current_operation.id);
                 let mut worker_store = Store::open(&root)?;
@@ -1565,7 +2041,9 @@ mod tests {
                 &root,
                 &run,
                 &operation,
-                |_, _, _| -> Result<Value> { bail!("pending remote operation must not dispatch") },
+                |_, _, _, _| -> Result<Value> {
+                    bail!("pending remote operation must not dispatch")
+                },
             )?);
             let challenge_id = remote_challenge_id(&store, &run.id)?;
             if expired {
@@ -1585,7 +2063,7 @@ mod tests {
                 &root,
                 &current_run,
                 &current_operation,
-                |_, _, _| -> Result<Value> {
+                |_, _, _, _| -> Result<Value> {
                     dispatches += 1;
                     Ok(json!({"unexpected_dispatch":true}))
                 },
@@ -1723,11 +2201,9 @@ mod tests {
                 .env(reference, "secret")
                 .env("OTHER_SETTING", "safe");
             remove_provider_keys(&mut command, &run)?;
-            assert!(
-                command.get_envs().any(|(name, value)| {
-                    name.to_string_lossy() == reference && value.is_none()
-                })
-            );
+            assert!(command
+                .get_envs()
+                .any(|(name, value)| { name.to_string_lossy() == reference && value.is_none() }));
             assert!(command.get_envs().any(|(name, value)| {
                 name.to_string_lossy() == "OTHER_SETTING"
                     && value.is_some_and(|value| value == "safe")
@@ -1748,13 +2224,11 @@ mod tests {
             json!({"model":"local-model","endpoint":{"base_url":"https://example.test/v1","api_key_env":"PRIMARY_KEY"},"fallback_routes":[{"provider":"claude-api","model":"claude-account-model","api_key_env":"CLAUDE_FALLBACK_KEY"}]}),
             "",
         )?;
-        assert!(
-            validate_supplied_secrets(
-                &run,
-                &[("PRIMARY_KEY", "one"), ("CLAUDE_FALLBACK_KEY", "two")]
-            )
-            .is_ok()
-        );
+        assert!(validate_supplied_secrets(
+            &run,
+            &[("PRIMARY_KEY", "one"), ("CLAUDE_FALLBACK_KEY", "two")]
+        )
+        .is_ok());
         assert!(
             validate_supplied_secrets(&run, &[("PRIMARY_KEY", "one"), ("PRIMARY_KEY", "two")])
                 .is_err()
@@ -1839,12 +2313,10 @@ mod tests {
             },
         )?);
         assert_eq!(store.run(&run.id)?.state, "completed");
-        assert!(
-            store
-                .obligations(&run.id)?
-                .iter()
-                .all(|item| item.state == "verified")
-        );
+        assert!(store
+            .obligations(&run.id)?
+            .iter()
+            .all(|item| item.state == "verified"));
         Ok(())
     }
 
@@ -1935,20 +2407,18 @@ mod tests {
         );
         assert_eq!(state["continuation_handoff"]["context_only"], true);
         assert!(state["continuation_handoff"].get("milestones").is_none());
-        assert!(
-            state["continuation_policy"]
-                .as_str()
-                .unwrap()
-                .contains("fresh successful-operation evidence")
-        );
+        assert!(state["continuation_policy"]
+            .as_str()
+            .unwrap()
+            .contains("fresh successful-operation evidence"));
         assert_eq!(state["milestones"][0]["state"], "active");
         assert!(store.operations(&child.id)?.is_empty());
         Ok(())
     }
 
     #[test]
-    fn rejected_provider_receipts_charge_budget_and_survive_recovery_without_applying_actions()
-    -> Result<()> {
+    fn rejected_provider_receipts_charge_budget_and_survive_recovery_without_applying_actions(
+    ) -> Result<()> {
         let directory = tempfile::tempdir()?;
         let mut store = Store::open(directory.path())?;
         let run = store.create_run(
@@ -2064,12 +2534,10 @@ mod tests {
         assert!(small_read(&json!({"content":"🦊".repeat(1025)})).is_none());
         assert!(small_read(&json!({"content":42})).is_none());
         assert_eq!(small_read(&json!({"content":""})).unwrap()["content"], "");
-        assert!(
-            small_read(&json!({"content":"old artifact"}))
-                .unwrap()
-                .get("sha256")
-                .is_none()
-        );
+        assert!(small_read(&json!({"content":"old artifact"}))
+            .unwrap()
+            .get("sha256")
+            .is_none());
         assert!(
             small_read(&json!({"content":"source","sha256":"invalid metadata"}))
                 .unwrap()
@@ -2079,8 +2547,8 @@ mod tests {
     }
 
     #[test]
-    fn small_read_context_uses_committed_artifacts_not_changed_workspace_or_large_previews()
-    -> Result<()> {
+    fn small_read_context_uses_committed_artifacts_not_changed_workspace_or_large_previews(
+    ) -> Result<()> {
         let directory = tempfile::tempdir()?;
         let mut store = Store::open(directory.path())?;
         for mode in ["durable", "artifact", "eager", "lazy"] {
@@ -2194,11 +2662,9 @@ mod tests {
             "move unavailable"
         );
         assert!(store.evidence_artifacts(&run.id)?.is_empty());
-        assert!(
-            store
-                .complete_run(&run.id, "claimed success", &[artifact])
-                .is_err()
-        );
+        assert!(store
+            .complete_run(&run.id, "claimed success", &[artifact])
+            .is_err());
         assert_eq!(store.run(&run.id)?.state, "running");
         Ok(())
     }
@@ -2253,27 +2719,22 @@ mod tests {
             preview["preview"]["text"].as_str().unwrap().chars().count(),
             OPERATION_PREVIEW_CHARACTERS
         );
-        assert!(
-            preview["preview"]["text"]
-                .as_str()
-                .unwrap()
-                .starts_with("ready\n")
-        );
+        assert!(preview["preview"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("ready\n"));
         assert_eq!(preview["preview"]["truncated"], true);
-        assert!(
-            !preview["preview"]["text"]
-                .as_str()
-                .unwrap()
-                .contains(['\u{1b}', '\u{202e}'])
-        );
+        assert!(!preview["preview"]["text"]
+            .as_str()
+            .unwrap()
+            .contains(['\u{1b}', '\u{202e}']));
         let rendered = crate::terminal::operation_output_preview(&succeeded.payload)
             .expect("MCP output should use the established TUI text preview")
             .1;
         assert!(rendered.ends_with("output preview truncated"));
         assert!(
             rendered.chars().count()
-                <= OPERATION_PREVIEW_CHARACTERS
-                    + "\n…\n… output preview truncated".chars().count()
+                <= OPERATION_PREVIEW_CHARACTERS + "\n…\n… output preview truncated".chars().count()
         );
         Ok(())
     }
@@ -2418,11 +2879,9 @@ mod tests {
         );
         assert!(store.operations(&run.id)?.is_empty());
         assert!(store.evidence_artifacts(&run.id)?.is_empty());
-        assert!(
-            store
-                .complete_run(&run.id, "False verified work", &[handle])
-                .is_err()
-        );
+        assert!(store
+            .complete_run(&run.id, "False verified work", &[handle])
+            .is_err());
         store.save_snapshot(&run.id)?;
         drop(store);
         let mut store = Store::open(directory.path())?;
@@ -2493,20 +2952,18 @@ mod tests {
         store.activate(&run.id, "process.run", 1)?;
         let prompt = context(&store, &run)?;
         assert!(prompt.contains("\"process_programs\":[\"node\"]"));
-        assert!(
-            apply(
-                &mut store,
-                directory.path(),
-                &run,
-                Action::Invoke {
-                    capability: "process.run".into(),
-                    args: json!({"program":"cargo","args":["test"]}),
-                }
-            )
-            .unwrap_err()
-            .to_string()
-            .starts_with("program is not explicitly granted")
-        );
+        assert!(apply(
+            &mut store,
+            directory.path(),
+            &run,
+            Action::Invoke {
+                capability: "process.run".into(),
+                args: json!({"program":"cargo","args":["test"]}),
+            }
+        )
+        .unwrap_err()
+        .to_string()
+        .starts_with("program is not explicitly granted"));
         assert_eq!(store.run(&run.id)?.state, "running");
         assert!(store.operations(&run.id)?.is_empty());
         assert_eq!(store.unknown_count(&run.id)?, 0);
@@ -2551,18 +3008,16 @@ mod tests {
         );
         assert!(prompt.contains("current task take precedence"));
         assert!(prompt.contains("src/**"));
-        assert!(
-            apply(
-                &mut store,
-                directory.path(),
-                &run,
-                Action::Invoke {
-                    capability: "workspace.write".into(),
-                    args: json!({"path":"src/new.rs","content":"bad"}),
-                }
-            )
-            .is_err()
-        );
+        assert!(apply(
+            &mut store,
+            directory.path(),
+            &run,
+            Action::Invoke {
+                capability: "workspace.write".into(),
+                args: json!({"path":"src/new.rs","content":"bad"}),
+            }
+        )
+        .is_err());
         assert!(store.operations(&run.id)?.is_empty());
         assert!(!directory.path().join("src/new.rs").exists());
         Ok(())
@@ -2599,18 +3054,16 @@ mod tests {
                 < prompt.find("STATE (bounded").unwrap()
         );
         assert!(prompt.contains(&candidate.sha256));
-        assert!(
-            apply(
-                &mut store,
-                directory.path(),
-                &run,
-                Action::Invoke {
-                    capability: "workspace.write".into(),
-                    args: json!({"path":"bad.txt","content":"bad"})
-                }
-            )
-            .is_err()
-        );
+        assert!(apply(
+            &mut store,
+            directory.path(),
+            &run,
+            Action::Invoke {
+                capability: "workspace.write".into(),
+                args: json!({"path":"bad.txt","content":"bad"})
+            }
+        )
+        .is_err());
         assert!(store.operations(&run.id)?.is_empty());
         assert!(store.evidence_artifacts(&run.id)?.is_empty());
         Ok(())
@@ -2667,18 +3120,16 @@ mod tests {
         assert!(store.operations(&run.id)?.is_empty());
         assert_eq!(store.run(&run.id)?.state, "running");
         assert_eq!(store.unknown_count(&run.id)?, 0);
-        assert!(
-            store
-                .create_run(
-                    "bad policy",
-                    directory.path(),
-                    "codex",
-                    json!([]),
-                    json!({"command_scopes":{"commands":null}}),
-                    ""
-                )
-                .is_err()
-        );
+        assert!(store
+            .create_run(
+                "bad policy",
+                directory.path(),
+                "codex",
+                json!([]),
+                json!({"command_scopes":{"commands":null}}),
+                ""
+            )
+            .is_err());
         Ok(())
     }
 
@@ -2765,18 +3216,16 @@ mod tests {
                 json!({"files":[{"path":"allowed.txt","length":1500},{"path":"secret.txt","length":1501}]}),
                 json!({"files":[{"path":"allowed.txt","length":10},{"path":"../secret.txt","length":10}]}),
             ] {
-                assert!(
-                    apply(
-                        &mut store,
-                        &directory.path().join(".arun"),
-                        &run,
-                        Action::Invoke {
-                            capability: "workspace.read_batch".into(),
-                            args: arguments
-                        }
-                    )
-                    .is_err()
-                );
+                assert!(apply(
+                    &mut store,
+                    &directory.path().join(".arun"),
+                    &run,
+                    Action::Invoke {
+                        capability: "workspace.read_batch".into(),
+                        args: arguments
+                    }
+                )
+                .is_err());
                 assert!(store.operations(&run.id)?.is_empty());
             }
         }
@@ -2918,12 +3367,10 @@ mod tests {
                 .1,
         )?;
         assert_eq!(state["process_programs"], json!(["cargo"]));
-        assert!(
-            state["process_policy"]
-                .as_str()
-                .unwrap()
-                .contains("inside the approved container")
-        );
+        assert!(state["process_policy"]
+            .as_str()
+            .unwrap()
+            .contains("inside the approved container"));
         assert!(command_context.len() > greeting.len());
         Ok(())
     }
@@ -2944,17 +3391,12 @@ mod tests {
             "Project tests",
         )?;
         let prompt = context(&store, &run)?;
-        assert!(
-            prompt.contains(
-                "A configured independent acceptance check runs automatically after finish"
-            )
-        );
+        assert!(prompt
+            .contains("A configured independent acceptance check runs automatically after finish"));
         assert!(prompt.contains("finish with existing successful-operation evidence"));
-        assert!(
-            !visible_manifests(&store, &run)?
-                .iter()
-                .any(|manifest| manifest.id == crate::acceptance::CAPABILITY)
-        );
+        assert!(!visible_manifests(&store, &run)?
+            .iter()
+            .any(|manifest| manifest.id == crate::acceptance::CAPABILITY));
         Ok(())
     }
 
@@ -2983,11 +3425,9 @@ mod tests {
         assert_eq!(search.kind, "capability.search");
         assert_eq!(search.payload["limit"], 3);
         assert_eq!(search.payload["has_more_matches"], true);
-        assert!(
-            !activated(&store, &run.id)?
-                .iter()
-                .any(|item| item.id == "process.run")
-        );
+        assert!(!activated(&store, &run.id)?
+            .iter()
+            .any(|item| item.id == "process.run"));
         apply(
             &mut store,
             directory.path(),
@@ -2996,11 +3436,9 @@ mod tests {
                 query: "process.run".into(),
             },
         )?;
-        assert!(
-            activated(&store, &run.id)?
-                .iter()
-                .any(|item| item.id == "process.run")
-        );
+        assert!(activated(&store, &run.id)?
+            .iter()
+            .any(|item| item.id == "process.run"));
         apply(
             &mut store,
             directory.path(),
@@ -3009,11 +3447,9 @@ mod tests {
                 query: "network.fetch".into(),
             },
         )?;
-        assert!(
-            !activated(&store, &run.id)?
-                .iter()
-                .any(|item| item.id == "network.fetch")
-        );
+        assert!(!activated(&store, &run.id)?
+            .iter()
+            .any(|item| item.id == "network.fetch"));
         Ok(())
     }
 
@@ -3082,12 +3518,10 @@ mod tests {
             .map(|message| message["text"].as_str().unwrap())
             .collect();
         assert_eq!(steering, ["Keep the patch small", "Run the focused test"]);
-        assert!(
-            prompt["steering_policy"]
-                .as_str()
-                .unwrap()
-                .contains("never grants access")
-        );
+        assert!(prompt["steering_policy"]
+            .as_str()
+            .unwrap()
+            .contains("never grants access"));
         assert!(prompt["active_capabilities"].as_array().unwrap().is_empty());
         assert!(!prompt.to_string().contains("workspace.write"));
         Ok(())
@@ -3163,18 +3597,16 @@ mod tests {
             let prompt = context(&store, &run)?;
             if matches!(mode, "eager" | "lazy") {
                 assert!(prompt.len() > 800_000);
-                assert!(
-                    apply(
-                        &mut store,
-                        directory.path(),
-                        &run,
-                        Action::InspectResult {
-                            artifact: hash.clone(),
-                            query: "warning".into()
-                        }
-                    )
-                    .is_err()
-                );
+                assert!(apply(
+                    &mut store,
+                    directory.path(),
+                    &run,
+                    Action::InspectResult {
+                        artifact: hash.clone(),
+                        query: "warning".into()
+                    }
+                )
+                .is_err());
             } else {
                 assert!(prompt.len() < 5000);
             }
@@ -3287,18 +3719,16 @@ mod tests {
             json!({"mode":"eager","filesystem_scopes":{"read":["allowed.txt"],"write":[]}}),
             "",
         )?;
-        assert!(
-            apply(
-                &mut store,
-                directory.path(),
-                &run,
-                Action::Invoke {
-                    capability: "workspace.read".into(),
-                    args: json!({"path":"secret.txt"})
-                }
-            )
-            .is_err()
-        );
+        assert!(apply(
+            &mut store,
+            directory.path(),
+            &run,
+            Action::Invoke {
+                capability: "workspace.read".into(),
+                args: json!({"path":"secret.txt"})
+            }
+        )
+        .is_err());
         assert!(store.operations(&run.id)?.is_empty());
         assert_eq!(store.event_count(&run.id, "operation.pending")?, 0);
         Ok(())
