@@ -117,6 +117,44 @@ fn corrupt_proof_artifacts_and_stale_generic_finish_evidence_are_rejected() -> R
 }
 
 #[test]
+fn every_generic_finish_artifact_must_match_the_current_revision() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let mut store = Store::open(&directory.path().join(".arun"))?;
+    let run = store.create_run(
+        "verify current result",
+        directory.path(),
+        "custom",
+        json!(["workspace.write"]),
+        json!({}),
+        "",
+    )?;
+    store.state(&run.id, "running", json!({}))?;
+
+    let old_read = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
+    let old = store.put_artifact(b"revision zero proof")?;
+    operation_fixture::claim_fixture_operation(&mut store, &old_read.id)?;
+    store.operation_state(&old_read, "succeeded", Some(&old), json!({}))?;
+
+    let mutation = store.begin_operation(&run.id, "workspace.write", json!({}), false)?;
+    operation_fixture::claim_fixture_operation(&mut store, &mutation.id)?;
+    let mutation_receipt = store.put_artifact(b"workspace changed")?;
+    store.operation_state(&mutation, "succeeded", Some(&mutation_receipt), json!({}))?;
+
+    let current_read = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
+    let current = store.put_artifact(b"revision one proof")?;
+    operation_fixture::claim_fixture_operation(&mut store, &current_read.id)?;
+    store.operation_state(&current_read, "succeeded", Some(&current), json!({}))?;
+
+    assert!(
+        store
+            .validate_completion(&run.id, &[old.clone(), current.clone()])
+            .is_err()
+    );
+    store.validate_completion(&run.id, &[current])?;
+    Ok(())
+}
+
+#[test]
 fn actual_file_read_and_external_edit_force_fresh_proof_before_binary_completion() -> Result<()> {
     use std::{
         process::Command,

@@ -248,14 +248,18 @@ pub(crate) fn validate_finish_evidence(
         )
         .optional()?;
     let Some(revision) = revision else {
+        // Pre-revision runs have no freshness ledger; callers still validate
+        // that each supplied artifact belongs to a successful operation.
         return Ok(());
     };
     for hash in evidence {
-        if current_evidence(connection, run_id, revision, hash)? {
-            return Ok(());
+        if !current_evidence(connection, run_id, revision, hash)? {
+            bail!(
+                "every completion artifact must be successful evidence from the current workspace revision"
+            );
         }
     }
-    bail!("Completion needs successful evidence from the current workspace revision")
+    Ok(())
 }
 
 pub(crate) fn validate_connection(connection: &rusqlite::Connection, run_id: &str) -> Result<()> {
