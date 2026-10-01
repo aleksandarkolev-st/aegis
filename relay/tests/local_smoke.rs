@@ -8,6 +8,8 @@ use aegis_relay::{
     },
     service::{CommandTransport, TransportError},
 };
+use arun::remote::{Authority, Command as AegisCommand, CommandEnvelope as AegisCommandEnvelope};
+use arun::storage::Store;
 use async_trait::async_trait;
 use axum::http::{HeaderMap, HeaderValue};
 use uuid::Uuid;
@@ -446,4 +448,192 @@ async fn used_pair_code_retry_is_deduplicated_and_never_published_as_a_command()
     );
     assert!(transport.commands.lock().unwrap().is_empty());
     assert_eq!(provider.sends.lock().unwrap().len(), 2);
+}
+
+fn aegis_request(envelope: &CommandEnvelope) -> AegisCommandEnvelope {
+    let command = match &envelope.command {
+        AgentCommand::Message { text } => AegisCommand::Message {
+            text: text.clone(),
+            task_id: None,
+        },
+        AgentCommand::Status { task_id } => AegisCommand::Status {
+            task_id: task_id.clone(),
+        },
+        unsupported => panic!("unexpected fixture command: {unsupported:?}"),
+    };
+    AegisCommandEnvelope {
+        version: 1,
+        installation_id: envelope.installation_id.to_string(),
+        actor_id: envelope.actor_id.clone(),
+        request_id: envelope.request_id.to_string(),
+        issued_at: envelope.issued_at.timestamp(),
+        expires_at: envelope.expires_at.timestamp(),
+        command,
+    }
+}
+
+#[tokio::test]
+async fn relay_messages_use_aegis_local_authority_and_safe_events_return_to_the_paired_actor()
+-> Result<(), Box<dyn std::error::Error>> {
+    let workspace = tempfile::tempdir()?;
+    let data_dir = workspace.path().join(".arun");
+    std::fs::create_dir_all(&data_dir)?;
+
+    let actor_id = "paired-phone";
+    let mut store = Store::open(&data_dir)?;
+    let selected_run = store.create_run(
+        "Review the parser",
+        workspace.path(),
+        "codex",
+        serde_json::json!(["workspace.read"]),
+        serde_json::json!({}),
+        "",
+    )?;
+    store.state(&selected_run.id, "running", serde_json::json!({}))?;
+    let private_run = store.create_run(
+        "Unshared task",
+        workspace.path(),
+        "codex",
+        serde_json::json!(["workspace.read"]),
+        serde_json::json!({}),
+        "",
+    )?;
+    store.state(&private_run.id, "running", serde_json::json!({}))?;
+    drop(store);
+
+    let mut authority = Authority::open(&data_dir)?;
+    let installation_id = Uuid::parse_str(authority.installation_id())?;
+    authority.pair_actor(actor_id, std::slice::from_ref(&selected_run.id))?;
+    authority.bind_selected_task(actor_id, &selected_run.id)?;
+
+    let binding = ChannelBinding {
+        id: Uuid::new_v4(),
+        user_id: Uuid::new_v4(),
+        installation_id,
+        channel: "whatsapp".into(),
+        actor_id: actor_id.into(),
+        sender_id: "+4915112345678".into(),
+        destination_id: "+4915112345678".into(),
+    };
+    let repository = std::sync::Arc::new(FakeRepository::default());
+    *repository.binding.lock().unwrap() = Some(binding.clone());
+    *repository.other_bindings.lock().unwrap() = vec![ChannelBinding {
+        id: Uuid::new_v4(),
+        user_id: binding.user_id,
+        installation_id,
+        channel: "whatsapp".into(),
+        actor_id: "different-phone".into(),
+        sender_id: "+4915119999999".into(),
+        destination_id: "+4915119999999".into(),
+    }];
+    *repository.notifications.lock().unwrap() = true;
+    let transport = std::sync::Arc::new(FakeTransport::default());
+    let provider = std::sync::Arc::new(FakeProvider::default());
+    let service = RelayService::new(repository, transport.clone(), provider.clone());
+    let mut headers = HeaderMap::new();
+    headers.insert("x-fake-auth", HeaderValue::from_static("local-fixture"));
+
+    let inbound = serde_json::to_vec(&serde_json::json!({
+        "sender_id":binding.sender_id.clone(),
+        "external_message_id":"wamid.aegis-message-1",
+        "text":"/message Continue the parser review"
+    }))?;
+    assert_eq!(
+        service.handle_webhook(&headers, &inbound).await?,
+        InboundDisposition::Published
+    );
+    let relayed = transport.commands.lock().unwrap()[0].clone();
+    assert_eq!(relayed.installation_id, installation_id);
+    assert_eq!(relayed.actor_id, actor_id);
+    assert_eq!(
+        relayed.command,
+        AgentCommand::Message {
+            text: "Continue the parser review".into()
+        }
+    );
+    let local = aegis_request(&relayed);
+    let receipt = authority.apply_from_authenticated_relay(
+        actor_id,
+        &local,
+        relayed.issued_at.timestamp(),
+    )?;
+    assert!(!receipt.duplicate);
+    assert_eq!(receipt.result["task_id"], selected_run.id);
+    assert_eq!(
+        authority.selected_task(actor_id)?.as_deref(),
+        Some(selected_run.id.as_str())
+    );
+
+    let retry = authority.apply_from_authenticated_relay(
+        actor_id,
+        &local,
+        relayed.issued_at.timestamp(),
+    )?;
+    assert!(retry.duplicate);
+    let mut store = Store::open(&data_dir)?;
+    assert_eq!(store.event_count(&selected_run.id, "user.steering")?, 1);
+
+    let denied_inbound = serde_json::to_vec(&serde_json::json!({
+        "sender_id":binding.sender_id.clone(),
+        "external_message_id":"wamid.aegis-message-2",
+        "text":format!("/status {}", private_run.id)
+    }))?;
+    assert_eq!(
+        service.handle_webhook(&headers, &denied_inbound).await?,
+        InboundDisposition::Published
+    );
+    let unauthorized = transport.commands.lock().unwrap()[1].clone();
+    let error = authority
+        .apply_from_authenticated_relay(
+            actor_id,
+            &aegis_request(&unauthorized),
+            unauthorized.issued_at.timestamp(),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("not authorized for this task"));
+    assert_eq!(store.event_count(&private_run.id, "user.steering")?, 0);
+    assert!(
+        authority
+            .authorized_runs(actor_id)?
+            .iter()
+            .all(|task| task["task_id"].as_str() != Some(private_run.id.as_str()))
+    );
+
+    store.state(
+        &selected_run.id,
+        "completed",
+        serde_json::json!({"summary":"model-authored fixture secret"}),
+    )?;
+    let local_completion = store
+        .events(&selected_run.id)?
+        .into_iter()
+        .find(|event| event.kind == "run.completed")
+        .expect("Aegis recorded the local completion state");
+    assert_eq!(
+        local_completion.payload["summary"],
+        "model-authored fixture secret"
+    );
+    let completion = AegisEvent {
+        event_id: Uuid::new_v4(),
+        installation_id,
+        actor_id: actor_id.into(),
+        kind: RemoteEventKind::Completed,
+        task_id: Some(selected_run.id.clone()),
+        challenge_id: None,
+        display_detail: None,
+        reply_text: None,
+    };
+    service.deliver_event(&completion).await?;
+    service.deliver_event(&completion).await?;
+
+    let sends = provider.sends.lock().unwrap();
+    assert_eq!(sends.len(), 1);
+    assert_eq!(sends[0].0, binding.destination_id);
+    assert_eq!(
+        sends[0].1,
+        format!("Aegis task {} completed.", selected_run.id)
+    );
+    assert!(!sends[0].1.contains("model-authored fixture secret"));
+    assert_eq!(sends[0].2, completion.event_id.to_string());
+    Ok(())
 }
