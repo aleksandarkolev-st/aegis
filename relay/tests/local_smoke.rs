@@ -1,20 +1,30 @@
-use std::{collections::HashSet, sync::Mutex};
+use std::{
+    collections::HashSet,
+    process::{Child, Command, Stdio},
+    sync::Mutex,
+    time::Duration,
+};
 
 use aegis_relay::{
     AegisEvent, AgentCommand, CommandEnvelope, InboundDisposition, RelayService, RemoteEventKind,
     channel::{ChannelCapabilities, ChannelError, ChannelId, ChannelMessage, MessagingChannel},
+    http::{HttpState, router},
     repository::{
-        ChannelBinding, DeliveryTarget, InboundReceiptClaim, RelayRepository, RepositoryError,
+        ChannelBinding, DeliveryTarget, InboundReceiptClaim, PgRepository, RelayRepository,
+        RepositoryError,
     },
     service::{CommandTransport, TransportError},
 };
 use arun::remote::{
     Authority, Command as AegisCommand, CommandEnvelope as AegisCommandEnvelope,
-    DispatchAuthorization, ensure_remote_approval_gate,
+    DispatchAuthorization, config::Config as RemoteConfig, ensure_remote_approval_gate,
 };
 use arun::storage::Store;
 use async_trait::async_trait;
-use axum::http::{HeaderMap, HeaderValue};
+use axum::{
+    http::{HeaderMap, HeaderValue},
+    serve,
+};
 use uuid::Uuid;
 
 #[derive(Default)]
@@ -918,5 +928,234 @@ async fn relay_messages_use_aegis_local_authority_and_safe_events_return_to_the_
     );
     assert!(!sends[0].1.contains("model-authored fixture secret"));
     assert_eq!(sends[0].2, completion.event_id.to_string());
+    Ok(())
+}
+
+struct RemoteDaemonChild(Child);
+
+impl RemoteDaemonChild {
+    fn stop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for RemoteDaemonChild {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL, local TLS JetStream, and AEGIS_E2E_BINARY; run relay/scripts/e2e-smoke.ps1"]
+async fn jetstream_remote_command_and_event_round_trip_uses_local_authority()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_url = std::env::var("RELAY_E2E_DATABASE_URL")?;
+    let nats_url = std::env::var("RELAY_E2E_NATS_URL")?;
+    let nats_token = std::env::var("RELAY_E2E_NATS_TOKEN")?;
+    let root_certificate = std::path::PathBuf::from(std::env::var("RELAY_E2E_NATS_ROOT_CERT")?);
+    let aegis_binary = std::path::PathBuf::from(std::env::var("AEGIS_E2E_BINARY")?);
+    if !aegis_binary.is_file() {
+        return Err(std::io::Error::other("AEGIS_E2E_BINARY does not name a file").into());
+    }
+
+    let transport = std::sync::Arc::new(
+        aegis_relay::transport::JetStreamTransport::connect(
+            &nats_url,
+            &nats_token,
+            Some(&root_certificate),
+        )
+        .await?,
+    );
+    let repository = PgRepository::connect(&database_url).await?;
+    let workspace = tempfile::tempdir()?;
+    let data_dir = workspace.path().join(".arun");
+    std::fs::create_dir_all(&data_dir)?;
+    let sender_id = format!(
+        "+4915{}",
+        Uuid::new_v4().simple().to_string()[..10].to_owned()
+    );
+    let mut store = Store::open(&data_dir)?;
+    let selected_run = store.create_run(
+        "Review the parser through JetStream",
+        workspace.path(),
+        "codex",
+        serde_json::json!(["workspace.read"]),
+        serde_json::json!({}),
+        "",
+    )?;
+    store.state(&selected_run.id, "completed", serde_json::json!({}))?;
+    drop(store);
+
+    let authority = Authority::open(&data_dir)?;
+    let installation_id = Uuid::parse_str(authority.installation_id())?;
+    drop(authority);
+
+    let provider = std::sync::Arc::new(FakeProvider::default());
+    let service = std::sync::Arc::new(RelayService::new(
+        std::sync::Arc::new(repository.clone()),
+        transport.clone(),
+        provider.clone(),
+    ));
+    let admin_token = "local-e2e-admin-token";
+    let http_router = router(HttpState {
+        service: service.clone(),
+        repository: repository.clone(),
+        admin_token: std::sync::Arc::new(admin_token.to_owned()),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        serve(listener, http_router)
+            .with_graceful_shutdown(async move {
+                let _ = server_shutdown_rx.await;
+            })
+            .await
+    });
+    let (events_shutdown_tx, events_shutdown_rx) = tokio::sync::oneshot::channel();
+    let event_consumer = tokio::spawn(transport.clone().supervise_events(
+        service.clone(),
+        async move {
+            let _ = events_shutdown_rx.await;
+        },
+    ));
+
+    let base_url = format!("http://{address}");
+    let http = reqwest::Client::new();
+    let pair_output = Command::new(&aegis_binary)
+        .args([
+            "remote",
+            "pair",
+            "--relay-admin-url",
+            &base_url,
+            "--admin-token-env",
+            "AEGIS_E2E_RELAY_ADMIN_TOKEN",
+            "--nats-url",
+            &nats_url,
+            "--nats-token-env",
+            "AEGIS_E2E_NATS_TOKEN",
+            "--nats-root-cert",
+            root_certificate
+                .to_str()
+                .ok_or_else(|| std::io::Error::other("NATS certificate path is not valid UTF-8"))?,
+        ])
+        .current_dir(workspace.path())
+        .env("AEGIS_E2E_RELAY_ADMIN_TOKEN", admin_token)
+        .env("AEGIS_E2E_NATS_TOKEN", &nats_token)
+        .output()?;
+    if !pair_output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "Aegis remote pair failed: {}",
+            String::from_utf8_lossy(&pair_output.stderr)
+        ))
+        .into());
+    }
+    let pair_output = String::from_utf8(pair_output.stdout)?;
+    let pairing_code = pair_output
+        .split_whitespace()
+        .find(|value| {
+            value.len() == 43
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        })
+        .ok_or_else(|| std::io::Error::other("Aegis remote pair omitted its one-time code"))?
+        .to_owned();
+    let remote_config = RemoteConfig::load(&data_dir)?;
+    assert_eq!(remote_config.installation_id, installation_id.to_string());
+    let actor_id = remote_config.actor_id;
+    let mut authority = Authority::open(&data_dir)?;
+    authority.pair_actor(&actor_id, std::slice::from_ref(&selected_run.id))?;
+    authority.bind_selected_task(&actor_id, &selected_run.id)?;
+    drop(authority);
+    let user_id = sqlx::query_scalar::<_, Uuid>("SELECT user_id FROM installations WHERE id = $1")
+        .bind(installation_id)
+        .fetch_one(repository.pool())
+        .await?;
+
+    let pair_response = http
+        .post(format!("{base_url}/v1/webhooks/whatsapp/evolution"))
+        .header("x-fake-auth", "local-fixture")
+        .json(&serde_json::json!({
+            "sender_id": sender_id,
+            "external_message_id": format!("pair-{}", Uuid::new_v4()),
+            "text": format!("AEGIS {pairing_code}")
+        }))
+        .send()
+        .await?;
+    assert_eq!(pair_response.status(), axum::http::StatusCode::ACCEPTED);
+
+    let mut daemon = RemoteDaemonChild(
+        Command::new(aegis_binary)
+            .args(["remote", "run"])
+            .current_dir(workspace.path())
+            .env("AEGIS_E2E_RELAY_ADMIN_TOKEN", admin_token)
+            .env("AEGIS_E2E_NATS_TOKEN", &nats_token)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+
+    let status_response = http
+        .post(format!("{base_url}/v1/webhooks/whatsapp/evolution"))
+        .header("x-fake-auth", "local-fixture")
+        .json(&serde_json::json!({
+            "sender_id": sender_id,
+            "external_message_id": format!("status-{}", Uuid::new_v4()),
+            "text": "/status"
+        }))
+        .send()
+        .await?;
+    assert_eq!(status_response.status(), axum::http::StatusCode::ACCEPTED);
+
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Some(status) = daemon.0.try_wait()? {
+                return Err(std::io::Error::other(format!(
+                    "Aegis remote daemon exited before replying ({status})"
+                )));
+            }
+            if provider.sends.lock().unwrap().len() >= 2 {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await??;
+
+    {
+        let sends = provider.sends.lock().unwrap();
+        assert_eq!(sends.len(), 2);
+        assert_eq!(sends[0].0, sender_id);
+        assert_eq!(sends[0].1, "This account is paired with Aegis.");
+        assert_eq!(sends[1].0, sender_id);
+        assert!(sends[1].1.contains("[completed]"));
+        assert!(sends[1].1.contains("Review the parser through JetStream"));
+    }
+
+    daemon.stop();
+    let _ = events_shutdown_tx.send(());
+    event_consumer.await?;
+    let _ = server_shutdown_tx.send(());
+    server.await??;
+
+    let cleanup_client = async_nats::ConnectOptions::new()
+        .token(nats_token)
+        .require_tls(true)
+        .add_root_certificates(root_certificate)
+        .connect(nats_url)
+        .await?;
+    let context = async_nats::jetstream::new(cleanup_client);
+    context
+        .get_stream("AEGIS_COMMANDS")
+        .await?
+        .delete_consumer(&format!("aegis-{installation_id}"))
+        .await?;
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(repository.pool())
+        .await?;
     Ok(())
 }
