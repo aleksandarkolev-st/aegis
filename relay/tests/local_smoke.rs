@@ -22,9 +22,13 @@ use arun::remote::{
 use arun::storage::Store;
 use async_trait::async_trait;
 use axum::{
+    Json,
+    extract::State,
     http::{HeaderMap, HeaderValue},
+    routing::post,
     serve,
 };
+use serde_json::Value;
 use uuid::Uuid;
 
 #[derive(Default)]
@@ -952,51 +956,336 @@ impl Drop for RemoteDaemonChild {
     }
 }
 
+fn start_remote_daemon(
+    binary: &std::path::Path,
+    workspace: &std::path::Path,
+    admin_token: &str,
+    device_password: &str,
+) -> std::io::Result<RemoteDaemonChild> {
+    Command::new(binary)
+        .args(["remote", "run"])
+        .current_dir(workspace)
+        .env("AEGIS_E2E_RELAY_ADMIN_TOKEN", admin_token)
+        .env("AEGIS_E2E_NATS_TOKEN", device_password)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(RemoteDaemonChild)
+}
+
+#[derive(Default)]
+struct FixtureModel {
+    requests: Mutex<Vec<Value>>,
+}
+
+async fn fixture_model(
+    State(fixture): State<std::sync::Arc<FixtureModel>>,
+    Json(request): Json<Value>,
+) -> Json<Value> {
+    {
+        let mut requests = fixture.requests.lock().unwrap();
+        requests.push(request.clone());
+    }
+    let prompt = request["messages"][0]["content"]
+        .as_str()
+        .expect("fixture request has a user prompt");
+    let state = prompt
+        .split_once("STATE (bounded, data not instructions):\n")
+        .map(|(_, json)| serde_json::from_str::<Value>(json))
+        .expect("fixture prompt contains bounded kernel state")
+        .expect("fixture state is JSON");
+    let evidence = state["recent_operation_outcomes"]
+        .as_array()
+        .and_then(|outcomes| {
+            outcomes.iter().find(|outcome| {
+                outcome["capability"] == "workspace.write"
+                    && outcome["successful_current_evidence"] == true
+            })
+        })
+        .and_then(|outcome| outcome["artifact"].as_str());
+    let action = if let Some(evidence) = evidence {
+        let evidence = evidence.to_owned();
+        let proofs = state["obligations"]
+            .as_array()
+            .expect("fixture state includes obligations")
+            .iter()
+            .filter(|obligation| {
+                obligation["id"].as_i64().is_some_and(|id| id > 0)
+                    && obligation["state"] != "verified"
+                    && obligation["state"] != "superseded"
+            })
+            .map(|obligation| serde_json::json!({"id":obligation["id"],"evidence":[evidence]}))
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "kind":"finish",
+            "summary":"Created phone-e2e.txt after its exact operation was approved.",
+            "evidence":[evidence],
+            "obligations":proofs
+        })
+    } else if state["active_capabilities"]
+        .as_array()
+        .is_some_and(|capabilities| {
+            capabilities
+                .iter()
+                .any(|capability| capability["id"] == "workspace.write")
+        })
+    {
+        serde_json::json!({
+            "kind":"invoke",
+            "capability":"workspace.write",
+            "args":"{\"path\":\"phone-e2e.txt\",\"content\":\"written once after phone approval\\n\"}"
+        })
+    } else {
+        serde_json::json!({
+            "kind":"search_capabilities",
+            "query":"create a workspace file"
+        })
+    };
+    let content = serde_json::to_string(&action).expect("fixture action serializes");
+    Json(serde_json::json!({
+        "choices":[{"message":{"content":content}}],
+        "usage":{"prompt_tokens":32,"completion_tokens":8}
+    }))
+}
+
+async fn post_phone_message(
+    client: &reqwest::Client,
+    base_url: &str,
+    sender_id: &str,
+    text: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = client
+        .post(format!("{base_url}/v1/webhooks/whatsapp/evolution"))
+        .header("x-fake-auth", "local-fixture")
+        .json(&serde_json::json!({
+            "sender_id":sender_id,
+            "external_message_id":format!("e2e-{}", Uuid::new_v4()),
+            "text":text
+        }))
+        .send()
+        .await?;
+    if response.status() != axum::http::StatusCode::ACCEPTED {
+        return Err(std::io::Error::other(format!(
+            "phone webhook returned HTTP {} for {text:?}",
+            response.status()
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn recorded_phone_text(provider: &FakeProvider, contains: &str) -> Option<String> {
+    provider
+        .sends
+        .lock()
+        .ok()?
+        .iter()
+        .map(|(_, text, _)| text)
+        .find(|text| text.contains(contains))
+        .cloned()
+}
+
+async fn wait_until<T>(
+    timeout: Duration,
+    mut check: impl FnMut() -> Result<Option<T>, Box<dyn std::error::Error>>,
+) -> Result<T, Box<dyn std::error::Error>> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if let Some(value) = check()? {
+                return Ok(value);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await?
+}
+
+async fn assert_device_principal_isolation(
+    nats_url: &str,
+    root_certificate: &std::path::Path,
+    first_installation_id: &str,
+    second_installation_id: &str,
+    second_password: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = async_nats::ConnectOptions::new()
+        .user_and_password(
+            format!("aegis-{second_installation_id}"),
+            second_password.to_owned(),
+        )
+        .custom_inbox_prefix(format!("_INBOX.aegis.device.{second_installation_id}"))
+        .require_tls(true)
+        .add_root_certificates(root_certificate.to_path_buf())
+        .connect(nats_url)
+        .await?;
+    let context = async_nats::jetstream::new(client);
+    let stream = context.get_stream_no_info("AEGIS_COMMANDS").await?;
+    let second_name = format!("aegis-{second_installation_id}");
+    let second_subject = format!("aegis.commands.{second_installation_id}");
+    let own = stream
+        .get_or_create_consumer(
+            &second_name,
+            async_nats::jetstream::consumer::pull::Config {
+                durable_name: Some(second_name.clone()),
+                name: Some(second_name.clone()),
+                filter_subject: second_subject,
+                ack_policy: async_nats::jetstream::consumer::AckPolicy::Explicit,
+                ack_wait: Duration::from_secs(45),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert_eq!(
+        own.cached_info().config.filter_subject,
+        format!("aegis.commands.{second_installation_id}")
+    );
+
+    let first_name = format!("aegis-{first_installation_id}");
+    let foreign = stream
+        .get_or_create_consumer(
+            &first_name,
+            async_nats::jetstream::consumer::pull::Config {
+                durable_name: Some(first_name.clone()),
+                name: Some(first_name.clone()),
+                filter_subject: format!("aegis.commands.{first_installation_id}"),
+                ack_policy: async_nats::jetstream::consumer::AckPolicy::Explicit,
+                ack_wait: Duration::from_secs(45),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        foreign.is_err(),
+        "a device principal must not inspect or create another installation's command consumer"
+    );
+
+    let own_event = AegisEvent {
+        event_id: Uuid::new_v4(),
+        installation_id: Uuid::parse_str(second_installation_id)?,
+        actor_id: "device-e2e".into(),
+        kind: RemoteEventKind::Reply,
+        task_id: None,
+        challenge_id: None,
+        expires_at: None,
+        display_detail: None,
+        reply_text: Some("device isolation fixture".into()),
+    };
+    let own_ack = context
+        .publish(
+            format!("aegis.events.{second_installation_id}"),
+            serde_json::to_vec(&own_event)?.into(),
+        )
+        .await?;
+    own_ack.await?;
+
+    let mut foreign_event = own_event;
+    foreign_event.event_id = Uuid::new_v4();
+    foreign_event.installation_id = Uuid::parse_str(first_installation_id)?;
+    let foreign_payload = serde_json::to_vec(&foreign_event)?;
+    let foreign_publish = tokio::time::timeout(Duration::from_secs(3), async {
+        let ack = context
+            .publish(
+                format!("aegis.events.{first_installation_id}"),
+                foreign_payload.into(),
+            )
+            .await
+            .map_err(|_| ())?;
+        ack.await.map(|_| ()).map_err(|_| ())
+    })
+    .await;
+    assert!(
+        !matches!(foreign_publish, Ok(Ok(()))),
+        "a device principal must not publish another installation's events"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires PostgreSQL, local TLS JetStream, and AEGIS_E2E_BINARY; run relay/scripts/e2e-smoke.ps1"]
-async fn jetstream_remote_command_and_event_round_trip_uses_local_authority()
+async fn jetstream_remote_phone_lifecycle_uses_local_authority_and_isolates_devices()
 -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_env_filter("info")
+        .try_init();
     let database_url = std::env::var("RELAY_E2E_DATABASE_URL")?;
     let nats_url = std::env::var("RELAY_E2E_NATS_URL")?;
-    let nats_token = std::env::var("RELAY_E2E_NATS_TOKEN")?;
+    let relay_nats_password = std::env::var("RELAY_E2E_NATS_TOKEN")?;
+    let device_password = std::env::var("AEGIS_E2E_NATS_TOKEN")?;
+    let second_device_password = std::env::var("AEGIS_E2E_DEVICE2_NATS_TOKEN")?;
+    let first_installation_id = std::env::var("RELAY_E2E_INSTALLATION_ID")?;
+    let second_installation_id = std::env::var("AEGIS_E2E_DEVICE2_INSTALLATION_ID")?;
+    Uuid::parse_str(&first_installation_id)?;
+    Uuid::parse_str(&second_installation_id)?;
+    if first_installation_id == second_installation_id {
+        return Err(std::io::Error::other("device installation IDs must be distinct").into());
+    }
     let root_certificate = std::path::PathBuf::from(std::env::var("RELAY_E2E_NATS_ROOT_CERT")?);
     let aegis_binary = std::path::PathBuf::from(std::env::var("AEGIS_E2E_BINARY")?);
+    let workspace = std::path::PathBuf::from(std::env::var("RELAY_E2E_WORKSPACE")?);
     if !aegis_binary.is_file() {
         return Err(std::io::Error::other("AEGIS_E2E_BINARY does not name a file").into());
     }
+    std::fs::create_dir_all(&workspace)?;
+    let workspace = std::fs::canonicalize(workspace)?;
+    let data_dir = workspace.join(".arun");
+    std::fs::create_dir_all(&data_dir)?;
+    let authority = Authority::open(&data_dir)?;
+    if authority.installation_id() != first_installation_id {
+        return Err(std::io::Error::other(
+            "workspace identity differs from the pre-provisioned NATS principal",
+        )
+        .into());
+    }
+    drop(authority);
+
+    let model_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let model_address = model_listener.local_addr()?;
+    let fixture = std::sync::Arc::new(FixtureModel::default());
+    let model_fixture = fixture.clone();
+    let model_server = tokio::spawn(async move {
+        serve(
+            model_listener,
+            axum::Router::new()
+                .route("/v1/chat/completions", post(fixture_model))
+                .with_state(model_fixture),
+        )
+        .await
+    });
+    std::fs::write(
+        data_dir.join("profile.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "provider":"custom",
+            "model":"fixture-model",
+            "write":true,
+            "image":null,
+            "endpoint":{
+                "base_url":format!("http://{model_address}/v1"),
+                "api_key_env":null,
+                "response_format":"schema",
+                "allow_insecure":false
+            }
+        }))?,
+    )?;
 
     let transport = std::sync::Arc::new(
         aegis_relay::transport::JetStreamTransport::connect(
             &nats_url,
-            &nats_token,
+            &relay_nats_password,
             Some(&root_certificate),
         )
         .await?,
     );
+    assert_device_principal_isolation(
+        &nats_url,
+        &root_certificate,
+        &first_installation_id,
+        &second_installation_id,
+        &second_device_password,
+    )
+    .await?;
+
     let repository = PgRepository::connect(&database_url).await?;
-    let workspace = tempfile::tempdir()?;
-    let data_dir = workspace.path().join(".arun");
-    std::fs::create_dir_all(&data_dir)?;
-    let sender_id = format!(
-        "+4915{}",
-        Uuid::new_v4().simple().to_string()[..10].to_owned()
-    );
-    let mut store = Store::open(&data_dir)?;
-    let selected_run = store.create_run(
-        "Review the parser through JetStream",
-        workspace.path(),
-        "codex",
-        serde_json::json!(["workspace.read"]),
-        serde_json::json!({}),
-        "",
-    )?;
-    store.state(&selected_run.id, "completed", serde_json::json!({}))?;
-    drop(store);
-
-    let authority = Authority::open(&data_dir)?;
-    let installation_id = Uuid::parse_str(authority.installation_id())?;
-    drop(authority);
-
     let provider = std::sync::Arc::new(FakeProvider::default());
     let service = std::sync::Arc::new(RelayService::new(
         std::sync::Arc::new(repository.clone()),
@@ -1029,27 +1318,37 @@ async fn jetstream_remote_command_and_event_round_trip_uses_local_authority()
 
     let base_url = format!("http://{address}");
     let http = reqwest::Client::new();
-    let pair_output = Command::new(&aegis_binary)
-        .args([
-            "remote",
-            "pair",
-            "--relay-admin-url",
-            &base_url,
-            "--admin-token-env",
-            "AEGIS_E2E_RELAY_ADMIN_TOKEN",
-            "--nats-url",
-            &nats_url,
-            "--nats-token-env",
-            "AEGIS_E2E_NATS_TOKEN",
-            "--nats-root-cert",
-            root_certificate
-                .to_str()
-                .ok_or_else(|| std::io::Error::other("NATS certificate path is not valid UTF-8"))?,
-        ])
-        .current_dir(workspace.path())
-        .env("AEGIS_E2E_RELAY_ADMIN_TOKEN", admin_token)
-        .env("AEGIS_E2E_NATS_TOKEN", &nats_token)
-        .output()?;
+    let pair_binary = aegis_binary.clone();
+    let pair_workspace = workspace.clone();
+    let pair_base_url = base_url.clone();
+    let pair_nats_url = nats_url.clone();
+    let pair_root_certificate = root_certificate.clone();
+    let pair_admin_token = admin_token.to_owned();
+    let pair_device_password = device_password.clone();
+    let pair_output = tokio::task::spawn_blocking(move || {
+        Command::new(&pair_binary)
+            .args([
+                "remote",
+                "pair",
+                "--relay-admin-url",
+                &pair_base_url,
+                "--admin-token-env",
+                "AEGIS_E2E_RELAY_ADMIN_TOKEN",
+                "--nats-url",
+                &pair_nats_url,
+                "--nats-token-env",
+                "AEGIS_E2E_NATS_TOKEN",
+                "--nats-root-cert",
+                pair_root_certificate
+                    .to_str()
+                    .ok_or_else(|| std::io::Error::other("NATS certificate path is not UTF-8"))?,
+            ])
+            .current_dir(&pair_workspace)
+            .env("AEGIS_E2E_RELAY_ADMIN_TOKEN", pair_admin_token)
+            .env("AEGIS_E2E_NATS_TOKEN", pair_device_password)
+            .output()
+    })
+    .await??;
     if !pair_output.status.success() {
         return Err(std::io::Error::other(format!(
             "Aegis remote pair failed: {}",
@@ -1069,99 +1368,139 @@ async fn jetstream_remote_command_and_event_round_trip_uses_local_authority()
         .ok_or_else(|| std::io::Error::other("Aegis remote pair omitted its one-time code"))?
         .to_owned();
     let remote_config = RemoteConfig::load(&data_dir)?;
-    assert_eq!(remote_config.installation_id, installation_id.to_string());
-    let actor_id = remote_config.actor_id;
-    let mut authority = Authority::open(&data_dir)?;
-    authority.pair_actor(&actor_id, std::slice::from_ref(&selected_run.id))?;
-    authority.bind_selected_task(&actor_id, &selected_run.id)?;
-    drop(authority);
-    let user_id = sqlx::query_scalar::<_, Uuid>("SELECT user_id FROM installations WHERE id = $1")
-        .bind(installation_id)
-        .fetch_one(repository.pool())
-        .await?;
+    assert_eq!(remote_config.installation_id, first_installation_id);
+    assert_eq!(std::fs::canonicalize(&remote_config.workspace)?, workspace);
 
-    let pair_response = http
-        .post(format!("{base_url}/v1/webhooks/whatsapp/evolution"))
-        .header("x-fake-auth", "local-fixture")
-        .json(&serde_json::json!({
-            "sender_id": sender_id,
-            "external_message_id": format!("pair-{}", Uuid::new_v4()),
-            "text": format!("AEGIS {pairing_code}")
-        }))
-        .send()
-        .await?;
-    assert_eq!(pair_response.status(), axum::http::StatusCode::ACCEPTED);
-
-    let mut daemon = RemoteDaemonChild(
-        Command::new(aegis_binary)
-            .args(["remote", "run"])
-            .current_dir(workspace.path())
-            .env("AEGIS_E2E_RELAY_ADMIN_TOKEN", admin_token)
-            .env("AEGIS_E2E_NATS_TOKEN", &nats_token)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?,
+    let sender_id = format!(
+        "+4915{}",
+        Uuid::new_v4().simple().to_string()[..10].to_owned()
+    );
+    post_phone_message(
+        &http,
+        &base_url,
+        &sender_id,
+        &format!("AEGIS {pairing_code}"),
+    )
+    .await?;
+    assert!(
+        recorded_phone_text(&provider, "This account is paired with Aegis.").is_some(),
+        "pairing should acknowledge the bound phone"
     );
 
-    let status_response = http
-        .post(format!("{base_url}/v1/webhooks/whatsapp/evolution"))
-        .header("x-fake-auth", "local-fixture")
-        .json(&serde_json::json!({
-            "sender_id": sender_id,
-            "external_message_id": format!("status-{}", Uuid::new_v4()),
-            "text": "/status"
-        }))
-        .send()
-        .await?;
-    assert_eq!(status_response.status(), axum::http::StatusCode::ACCEPTED);
+    let mut daemon = start_remote_daemon(&aegis_binary, &workspace, admin_token, &device_password)?;
+    post_phone_message(&http, &base_url, &sender_id, "Create phone-e2e.txt.").await?;
+    let run_id = wait_until(Duration::from_secs(30), || {
+        if let Some(status) = daemon.0.try_wait()? {
+            return Err(std::io::Error::other(format!(
+                "Aegis remote daemon exited before creating a task ({status})"
+            ))
+            .into());
+        }
+        let store = Store::open(&data_dir)?;
+        let runs = store.runs()?;
+        Ok(runs.into_iter().next().map(|run| run.id))
+    })
+    .await?;
+    let approval_text = wait_until(Duration::from_secs(45), || {
+        if let Some(status) = daemon.0.try_wait()? {
+            return Err(std::io::Error::other(format!(
+                "Aegis remote daemon exited before requesting approval ({status})"
+            ))
+            .into());
+        }
+        Ok(recorded_phone_text(&provider, "/approve_once "))
+    })
+    .await?;
+    let challenge_id = approval_text
+        .split_once("/approve_once ")
+        .and_then(|(_, suffix)| suffix.split_whitespace().next())
+        .ok_or_else(|| std::io::Error::other("approval notification omitted its challenge"))?
+        .to_owned();
+    let pending_store = Store::open(&data_dir)?;
+    let pending_run = pending_store.run(&run_id)?;
+    let pending_writes = pending_store
+        .operations(&run_id)?
+        .into_iter()
+        .filter(|operation| {
+            operation.capability == "workspace.write" && operation.state == "pending"
+        })
+        .count();
+    assert_eq!(pending_run.state, "waiting_recovery");
+    assert_eq!(pending_writes, 1);
+    assert!(!workspace.join("phone-e2e.txt").exists());
 
-    tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            if let Some(status) = daemon.0.try_wait()? {
-                return Err(std::io::Error::other(format!(
-                    "Aegis remote daemon exited before replying ({status})"
-                )));
-            }
-            if provider.sends.lock().unwrap().len() >= 2 {
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+    // Queue the exact approval while the local daemon is down. Its durable
+    // consumer must receive the decision after reconnecting.
+    daemon.stop();
+    drop(daemon);
+    post_phone_message(
+        &http,
+        &base_url,
+        &sender_id,
+        &format!("/approve_once {challenge_id}"),
+    )
+    .await?;
+    let mut daemon = start_remote_daemon(&aegis_binary, &workspace, admin_token, &device_password)?;
+    wait_until(Duration::from_secs(45), || {
+        if let Some(status) = daemon.0.try_wait()? {
+            return Err(std::io::Error::other(format!(
+                "Aegis remote daemon exited while recovering approval ({status})"
+            ))
+            .into());
+        }
+        let store = Store::open(&data_dir)?;
+        let run = store.run(&run_id)?;
+        let writes = store
+            .operations(&run_id)?
+            .into_iter()
+            .filter(|operation| operation.capability == "workspace.write")
+            .collect::<Vec<_>>();
+        if run.state == "completed"
+            && writes.len() == 1
+            && writes[0].state == "succeeded"
+            && workspace.join("phone-e2e.txt").is_file()
+        {
+            Ok(Some(()))
+        } else {
+            Ok(None)
         }
     })
-    .await??;
+    .await?;
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("phone-e2e.txt"))?,
+        "written once after phone approval\n"
+    );
+    let completed_store = Store::open(&data_dir)?;
+    assert!(
+        completed_store
+            .obligations(&run_id)?
+            .iter()
+            .all(|obligation| matches!(obligation.state.as_str(), "verified" | "superseded"))
+    );
 
-    {
-        let sends = provider.sends.lock().unwrap();
-        assert_eq!(sends.len(), 2);
-        assert_eq!(sends[0].0, sender_id);
-        assert_eq!(sends[0].1, "This account is paired with Aegis.");
-        assert_eq!(sends[1].0, sender_id);
-        assert!(sends[1].1.contains("[completed]"));
-        assert!(sends[1].1.contains("Review the parser through JetStream"));
-    }
+    wait_until(Duration::from_secs(20), || {
+        Ok(
+            recorded_phone_text(&provider, &format!("Aegis task {run_id} completed."))
+                .map(|text| text),
+        )
+    })
+    .await?;
+    post_phone_message(&http, &base_url, &sender_id, "/result").await?;
+    let result_text = wait_until(Duration::from_secs(20), || {
+        Ok(recorded_phone_text(
+            &provider,
+            "Created phone-e2e.txt after its exact operation was approved.",
+        ))
+    })
+    .await?;
+    assert!(result_text.contains("completed"));
+    assert_eq!(fixture.requests.lock().unwrap().len(), 3);
 
     daemon.stop();
     let _ = events_shutdown_tx.send(());
     event_consumer.await?;
     let _ = server_shutdown_tx.send(());
     server.await??;
-
-    let cleanup_client = async_nats::ConnectOptions::new()
-        .token(nats_token)
-        .require_tls(true)
-        .add_root_certificates(root_certificate)
-        .connect(nats_url)
-        .await?;
-    let context = async_nats::jetstream::new(cleanup_client);
-    context
-        .get_stream("AEGIS_COMMANDS")
-        .await?
-        .delete_consumer(&format!("aegis-{installation_id}"))
-        .await?;
-    sqlx::query("DELETE FROM users WHERE id = $1")
-        .bind(user_id)
-        .execute(repository.pool())
-        .await?;
+    model_server.abort();
     Ok(())
 }
