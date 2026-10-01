@@ -688,14 +688,25 @@ pub fn expire_remote_approval_gates(store: &mut Store, now: i64) -> Result<usize
 }
 
 fn operation_display_descriptor(operation: &crate::storage::Operation) -> String {
-    let target = ["path", "program", "url", "host"]
-        .iter()
-        .find_map(|key| operation.arguments.get(*key).and_then(Value::as_str))
-        .unwrap_or("(target not available)");
+    // A URL path or query may contain a bearer token even when its parameter
+    // name is unfamiliar. Approval notifications cross the relay, so show
+    // only the public authority for URL operations.
+    let target = if let Some(address) = operation.arguments["url"].as_str() {
+        reqwest::Url::parse(address)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .unwrap_or_else(|| "(URL target hidden)".to_owned())
+    } else {
+        ["path", "program", "host"]
+            .iter()
+            .find_map(|key| operation.arguments.get(*key).and_then(Value::as_str))
+            .unwrap_or("(target not available)")
+            .to_owned()
+    };
     format!(
         "{} · {}",
         operation.capability,
-        crate::text::clean(target)
+        crate::text::clean(&target)
             .chars()
             .take(120)
             .collect::<String>()
@@ -2300,6 +2311,35 @@ mod tests {
             fixture.authority.store.operation(&second.id)?.state,
             "cancelled"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn remote_approval_notification_hides_url_paths_and_queries() -> Result<()> {
+        let mut fixture = Fixture::new()?;
+        let operation = fixture.authority.store.begin_operation(
+            &fixture.run_id,
+            "network.fetch",
+            json!({"url":"https://public.example/reset/private-token?state=secret-value"}),
+            true,
+        )?;
+        ensure_remote_approval_gate(
+            &mut fixture.authority.store,
+            &fixture.run_id,
+            &operation.id,
+            test_now(),
+        )?;
+        let required = fixture
+            .authority
+            .store
+            .events(&fixture.run_id)?
+            .into_iter()
+            .find(|event| event.kind == "approval.required")
+            .expect("approval event is recorded");
+        let descriptor = required.payload["descriptor"].as_str().unwrap();
+        assert!(descriptor.contains("public.example"));
+        assert!(!descriptor.contains("/reset/private-token"));
+        assert!(!descriptor.contains("secret-value"));
         Ok(())
     }
 
