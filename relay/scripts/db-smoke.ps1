@@ -12,10 +12,10 @@ function Set-SmokeDevicePrincipal {
         USERNAME = $consumer
         PASSWORD = $Password
         EVENT_SUBJECT = "aegis.events.$DeviceId"
-        CONSUMER_INFO = ('$JS.API.CONSUMER.INFO.AEGIS_COMMANDS.{0}' -f $consumer)
-        CONSUMER_CREATE = ('$JS.API.CONSUMER.CREATE.AEGIS_COMMANDS.{0}.aegis.commands.{1}' -f $consumer, $DeviceId)
-        CONSUMER_NEXT = ('$JS.API.CONSUMER.MSG.NEXT.AEGIS_COMMANDS.{0}' -f $consumer)
-        ACK = ('$JS.ACK.AEGIS_COMMANDS.{0}.*.*.*.*.*' -f $consumer)
+        CONSUMER_INFO = ('"$JS.API.CONSUMER.INFO.AEGIS_COMMANDS.{0}"' -f $consumer)
+        CONSUMER_CREATE = ('"$JS.API.CONSUMER.CREATE.AEGIS_COMMANDS.{0}.aegis.commands.{1}"' -f $consumer, $DeviceId)
+        CONSUMER_NEXT = ('"$JS.API.CONSUMER.MSG.NEXT.AEGIS_COMMANDS.{0}"' -f $consumer)
+        ACK = ('"$JS.ACK.AEGIS_COMMANDS.{0}.*.*.*.*.*"' -f $consumer)
         INBOX = "_INBOX.aegis.device.$DeviceId.>"
     }
 

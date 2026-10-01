@@ -147,6 +147,8 @@ Compose requires `NATS_AUTH_TOKEN` for the relay password and the following comp
 
 Derive these values from the installation identity before starting NATS. Supply the first device's password to its daemon under the environment variable named by `--nats-token-env`. Treat the inputs as operator configuration: setting a wildcard where an exact subject is specified would weaken the boundary.
 
+For the four `$JS...` values, include double quote characters around the full value in the environment variable (for example, `"$JS.API.CONSUMER.INFO.AEGIS_COMMANDS.C"`). NATS parses environment variable values as config text; these quotes keep `$JS` literal, and are removed before the subject permission is applied.
+
 From the repository root in PowerShell, run:
 
     .\relay\dev\start-local.ps1

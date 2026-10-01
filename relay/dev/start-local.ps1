@@ -20,7 +20,7 @@ if (-not [Guid]::TryParseExact($installationId, "D", [ref]$parsedInstallationId)
 }
 
 function New-LocalPassword {
-    return ([Guid]::NewGuid().ToString("N") + [Guid]::NewGuid().ToString("N"))
+    return ("local-" + [Guid]::NewGuid().ToString("N") + [Guid]::NewGuid().ToString("N"))
 }
 
 function Set-LocalDevicePrincipal {
@@ -35,10 +35,10 @@ function Set-LocalDevicePrincipal {
         USERNAME = $consumer
         PASSWORD = $Password
         EVENT_SUBJECT = "aegis.events.$DeviceId"
-        CONSUMER_INFO = ('$JS.API.CONSUMER.INFO.AEGIS_COMMANDS.{0}' -f $consumer)
-        CONSUMER_CREATE = ('$JS.API.CONSUMER.CREATE.AEGIS_COMMANDS.{0}.aegis.commands.{1}' -f $consumer, $DeviceId)
-        CONSUMER_NEXT = ('$JS.API.CONSUMER.MSG.NEXT.AEGIS_COMMANDS.{0}' -f $consumer)
-        ACK = ('$JS.ACK.AEGIS_COMMANDS.{0}.*.*.*.*.*' -f $consumer)
+        CONSUMER_INFO = ('"$JS.API.CONSUMER.INFO.AEGIS_COMMANDS.{0}"' -f $consumer)
+        CONSUMER_CREATE = ('"$JS.API.CONSUMER.CREATE.AEGIS_COMMANDS.{0}.aegis.commands.{1}"' -f $consumer, $DeviceId)
+        CONSUMER_NEXT = ('"$JS.API.CONSUMER.MSG.NEXT.AEGIS_COMMANDS.{0}"' -f $consumer)
+        ACK = ('"$JS.ACK.AEGIS_COMMANDS.{0}.*.*.*.*.*"' -f $consumer)
         INBOX = "_INBOX.aegis.device.$DeviceId.>"
     }
 
@@ -57,9 +57,7 @@ $env:AEGIS_NATS_DEVICE2_PASSWORD = New-LocalPassword
 Set-LocalDevicePrincipal -Prefix "AEGIS_NATS_DEVICE_" -DeviceId $installationId -Password $env:AEGIS_NATS_DEVICE_PASSWORD
 Set-LocalDevicePrincipal -Prefix "AEGIS_NATS_DEVICE2_" -DeviceId $device2Id -Password $env:AEGIS_NATS_DEVICE2_PASSWORD
 
-if (-not (Test-Path (Join-Path $PSScriptRoot "certs\nats.crt"))) {
-    & (Join-Path $PSScriptRoot "make-nats-certs.ps1")
-}
+& (Join-Path $PSScriptRoot "make-nats-certs.ps1")
 
 $composeFile = Join-Path $PSScriptRoot "..\docker-compose.yml"
 docker compose -f $composeFile up -d
