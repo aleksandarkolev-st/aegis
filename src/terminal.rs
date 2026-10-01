@@ -182,6 +182,80 @@ fn input_layout(size: TerminalSize, label: &str, composer: bool) -> InputLayout 
     }
 }
 
+fn composer_draw_rows(previous: usize, current: usize) -> usize {
+    previous.max(current)
+}
+
+fn logical_line_start(text: &[char], caret: usize) -> usize {
+    let caret = caret.min(text.len());
+    text[..caret]
+        .iter()
+        .rposition(|character| *character == '\n')
+        .map_or(0, |index| index + 1)
+}
+
+fn logical_line_end(text: &[char], caret: usize) -> usize {
+    let caret = caret.min(text.len());
+    text[caret..]
+        .iter()
+        .position(|character| *character == '\n')
+        .map_or(text.len(), |offset| caret + offset)
+}
+
+fn input_bytes(text: &[char]) -> usize {
+    text.iter().fold(0usize, |bytes, character| {
+        bytes.saturating_add(character.len_utf8())
+    })
+}
+
+fn can_insert_input(current_bytes: usize, inserted_bytes: usize) -> bool {
+    current_bytes.saturating_add(inserted_bytes) <= MAX_INPUT_BYTES
+}
+
+fn insert_input(
+    text: &mut Vec<char>,
+    caret: &mut usize,
+    character: char,
+    bytes: &mut usize,
+) -> bool {
+    let added_bytes = character.len_utf8();
+    if !can_insert_input(*bytes, added_bytes) {
+        return false;
+    }
+    text.insert(*caret, character);
+    *caret += 1;
+    *bytes += added_bytes;
+    true
+}
+
+fn normalize_paste(paste: &str) -> String {
+    const TAB_STOP: usize = 4;
+
+    let normalized = paste.replace("\r\n", "\n").replace('\r', "\n");
+    let mut expanded = String::with_capacity(normalized.len());
+    let mut column = 0usize;
+    for character in normalized.chars() {
+        match character {
+            '\n' => {
+                expanded.push('\n');
+                column = 0;
+            }
+            '\t' => {
+                let spaces = TAB_STOP - column % TAB_STOP;
+                for _ in 0..spaces {
+                    expanded.push(' ');
+                }
+                column += spaces;
+            }
+            character => {
+                expanded.push(character);
+                column += character.width().unwrap_or(0);
+            }
+        }
+    }
+    clean(&expanded)
+}
+
 fn editor_view(text: &[char], caret: usize, width: usize, height: usize) -> EditorView {
     let width = width.max(1);
     let height = height.max(1);
@@ -950,18 +1024,24 @@ impl Terminal {
                     text.push_str(&line);
                 }
                 let (paste, tail) = text.split_once("\u{1b}[201~").unwrap();
-                if !tail.trim().is_empty() || paste.len() > MAX_INPUT_BYTES {
+                let normalized = normalize_paste(paste);
+                if !tail.trim().is_empty() || !can_insert_input(0, normalized.len()) {
                     anyhow::bail!("Pasted input has trailing data or exceeds its limit");
                 }
-                return Ok(Input::Submit(normalize_paste(paste)));
+                return Ok(Input::Submit(normalized));
             }
-            return Ok(Input::Submit(text.trim_end_matches(['\r', '\n']).into()));
+            let input = text.trim_end_matches(['\r', '\n']);
+            if !can_insert_input(0, input.len()) {
+                anyhow::bail!("Input exceeds {MAX_INPUT_BYTES} bytes");
+            }
+            return Ok(Input::Submit(input.into()));
         }
         let _raw = RawMode::enter(true)?;
         let composer =
             !secret && label == self.input_prefix() && !self.input_status.borrow().is_empty();
         let draft_label = label.to_owned();
         let (mut text, mut caret) = self.take_input_draft(label, secret);
+        let mut draft_bytes = input_bytes(&text);
         let mut input_history = InputHistory::new(history);
         let mut rendered_composer = false;
         let mut previous_draw_rows = 0usize;
@@ -999,7 +1079,7 @@ impl Terminal {
             let (input_column, caret_width) = if composer {
                 let editor = editor_view(&displayed, caret, available, max_input_rows);
                 let status = if paste_notice {
-                    format!("{} · paste exceeds 64 KiB", self.input_status.borrow())
+                    format!("{} · input exceeds 64 KiB", self.input_status.borrow())
                 } else {
                     self.input_status.borrow().clone()
                 };
@@ -1011,7 +1091,7 @@ impl Terminal {
                     &self.skin.palette(),
                 );
                 let margin = 2;
-                let draw_rows = previous_draw_rows.max(buffer.area.height as usize);
+                let draw_rows = composer_draw_rows(previous_draw_rows, buffer.area.height as usize);
                 if rendered_composer {
                     queue!(io::stdout(), cursor::MoveUp(previous_caret_row as u16))?;
                 } else if redraw_from_current_line {
@@ -1039,7 +1119,7 @@ impl Terminal {
                     cursor::MoveUp(draw_rows.saturating_sub(1 + caret_row) as u16),
                     ResetColor
                 )?;
-                self.input_rows.set(buffer.area.height);
+                self.input_rows.set(draw_rows.min(u16::MAX as usize) as u16);
                 self.input_caret_row.set(caret_row as u16);
                 previous_draw_rows = draw_rows;
                 previous_caret_row = caret_row;
@@ -1069,15 +1149,13 @@ impl Terminal {
             match event::read()? {
                 Event::Paste(paste) => {
                     let normalized = normalize_paste(&paste);
-                    let current_bytes = text.iter().collect::<String>().len();
-                    if normalized.len() > MAX_INPUT_BYTES
-                        || current_bytes.saturating_add(normalized.len()) > MAX_INPUT_BYTES
-                    {
+                    if !can_insert_input(draft_bytes, normalized.len()) {
                         paste_notice = true;
                     } else {
                         let characters: Vec<_> = normalized.chars().collect();
                         text.splice(caret..caret, characters.iter().copied());
                         caret += characters.len();
+                        draft_bytes += normalized.len();
                         paste_notice = false;
                     }
                 }
@@ -1108,18 +1186,20 @@ impl Terminal {
                         KeyCode::Enter
                             if composer && key.modifiers.contains(KeyModifiers::SHIFT) =>
                         {
-                            text.insert(caret, '\n');
-                            caret += 1;
-                            paste_notice = false;
+                            paste_notice =
+                                !insert_input(&mut text, &mut caret, '\n', &mut draft_bytes);
                             preferred_column = None;
                         }
                         KeyCode::Char('j') if composer && control => {
-                            text.insert(caret, '\n');
-                            caret += 1;
-                            paste_notice = false;
+                            paste_notice =
+                                !insert_input(&mut text, &mut caret, '\n', &mut draft_bytes);
                             preferred_column = None;
                         }
                         KeyCode::Enter => {
+                            if !can_insert_input(draft_bytes, 0) {
+                                paste_notice = true;
+                                continue;
+                            }
                             let submitted: String = text.iter().collect();
                             self.finish_input(
                                 composer,
@@ -1135,12 +1215,16 @@ impl Terminal {
                         KeyCode::Char('c') if control => {
                             text.clear();
                             caret = 0;
+                            draft_bytes = 0;
+                            paste_notice = false;
                             input_history.reset();
                             preferred_column = None;
                         }
                         KeyCode::Char('u') if control => {
                             text.clear();
                             caret = 0;
+                            draft_bytes = 0;
+                            paste_notice = false;
                             input_history.reset();
                             preferred_column = None;
                         }
@@ -1189,20 +1273,24 @@ impl Terminal {
                             preferred_column = None;
                         }
                         KeyCode::Home => {
-                            caret = 0;
+                            caret = logical_line_start(&text, caret);
                             preferred_column = None;
                         }
                         KeyCode::End => {
-                            caret = text.len();
+                            caret = logical_line_end(&text, caret);
                             preferred_column = None;
                         }
                         KeyCode::Backspace if caret > 0 => {
                             caret -= 1;
-                            text.remove(caret);
+                            let removed = text.remove(caret);
+                            draft_bytes -= removed.len_utf8();
+                            paste_notice = draft_bytes > MAX_INPUT_BYTES;
                             preferred_column = None;
                         }
                         KeyCode::Delete if caret < text.len() => {
-                            text.remove(caret);
+                            let removed = text.remove(caret);
+                            draft_bytes -= removed.len_utf8();
+                            paste_notice = draft_bytes > MAX_INPUT_BYTES;
                             preferred_column = None;
                         }
                         KeyCode::Up | KeyCode::Down if !secret => {
@@ -1219,10 +1307,14 @@ impl Terminal {
                                     preferred_column = Some(column);
                                 } else {
                                     input_history.navigate(key.code, &mut text, &mut caret);
+                                    draft_bytes = input_bytes(&text);
+                                    paste_notice = draft_bytes > MAX_INPUT_BYTES;
                                     preferred_column = None;
                                 }
                             } else {
                                 input_history.navigate(key.code, &mut text, &mut caret);
+                                draft_bytes = input_bytes(&text);
+                                paste_notice = draft_bytes > MAX_INPUT_BYTES;
                             }
                         }
                         KeyCode::Char('/')
@@ -1235,14 +1327,15 @@ impl Terminal {
                             let selected = self.command_menu()?.unwrap_or_else(|| "/".into());
                             text = selected_command_draft(&selected).chars().collect();
                             caret = text.len();
+                            draft_bytes = input_bytes(&text);
+                            paste_notice = draft_bytes > MAX_INPUT_BYTES;
                             rendered_composer = false;
                             previous_draw_rows = 0;
                             preferred_column = None;
                         }
                         KeyCode::Char(character) if !control => {
-                            text.insert(caret, character);
-                            caret += 1;
-                            paste_notice = false;
+                            paste_notice =
+                                !insert_input(&mut text, &mut caret, character, &mut draft_bytes);
                             preferred_column = None;
                         }
                         _ => {}
@@ -1863,11 +1956,6 @@ fn composer_input_column(origin: u16, margin: u16) -> usize {
     origin as usize + margin as usize
 }
 
-fn normalize_paste(paste: &str) -> String {
-    let normalized = paste.replace("\r\n", "\n").replace('\r', "\n");
-    clean(&normalized)
-}
-
 fn wrap_text(text: &str, first_width: usize, next_width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     for paragraph in text.split('\n') {
@@ -2290,6 +2378,52 @@ mod tests {
             normalize_paste("first\r\nsecond\rthird\u{1b}[2J"),
             "first\nsecond\nthird[2J"
         );
+        assert_eq!(
+            normalize_paste("if ready:\r\n\twork()\n12345\tX\u{202e}\u{1b}"),
+            "if ready:\n    work()\n12345   X"
+        );
+        assert!(
+            !normalize_paste("\ttext\u{202e}\u{1b}")
+                .chars()
+                .any(char::is_control)
+        );
+    }
+
+    #[test]
+    fn typed_insertions_share_the_byte_limit_and_count_utf8_bytes() {
+        let mut text = vec!['x'; MAX_INPUT_BYTES - 3];
+        let mut caret = text.len();
+        let mut bytes = input_bytes(&text);
+        assert!(insert_input(&mut text, &mut caret, '日', &mut bytes));
+        assert_eq!(bytes, MAX_INPUT_BYTES);
+        assert!(!insert_input(&mut text, &mut caret, 'a', &mut bytes));
+        assert_eq!(caret, MAX_INPUT_BYTES - 2);
+        assert_eq!(text.len(), caret);
+
+        assert!(can_insert_input(MAX_INPUT_BYTES - 1, 1));
+        assert!(!can_insert_input(MAX_INPUT_BYTES, 1));
+        assert!(!can_insert_input(MAX_INPUT_BYTES - 2, '日'.len_utf8()));
+    }
+
+    #[test]
+    fn home_and_end_move_to_current_logical_line_boundaries() {
+        let text: Vec<_> = "first\n日本 second\nthird".chars().collect();
+        let second_start = "first\n".chars().count();
+        let second_end = second_start + "日本 second".chars().count();
+        let caret = second_start + 4;
+        assert_eq!(logical_line_start(&text, caret), second_start);
+        assert_eq!(logical_line_end(&text, caret), second_end);
+        assert_eq!(logical_line_end(&text, second_end), second_end);
+        assert_eq!(logical_line_start(&text, second_end + 1), second_end + 1);
+        assert_eq!(logical_line_start(&text, usize::MAX), second_end + 1);
+        assert_eq!(logical_line_end(&text, usize::MAX), text.len());
+    }
+
+    #[test]
+    fn shrinking_a_composer_keeps_its_full_painted_footprint_for_cleanup() {
+        assert_eq!(composer_draw_rows(8, 3), 8);
+        assert_eq!(composer_draw_rows(3, 8), 8);
+        assert_eq!(composer_draw_rows(3, 3), 3);
     }
 
     #[test]
