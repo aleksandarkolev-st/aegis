@@ -235,10 +235,53 @@ impl Authority {
         transaction.execute(
             "INSERT INTO remote_actors(actor_id,enabled,paired_at)
              VALUES (?1,1,?2)
-             ON CONFLICT(actor_id) DO UPDATE SET enabled=1,paired_at=excluded.paired_at",
+             ON CONFLICT(actor_id) DO NOTHING",
+            params![actor_id, crate::storage::unix_time()],
+        )?;
+        let enabled: bool = transaction.query_row(
+            "SELECT enabled FROM remote_actors WHERE actor_id=?1",
+            [actor_id],
+            |row| row.get(0),
+        )?;
+        if !enabled {
+            bail!("a revoked remote actor identity cannot be re-enabled; pair a new identity");
+        }
+        transaction.execute(
+            "UPDATE remote_actors SET paired_at=?2 WHERE actor_id=?1 AND enabled=1",
             params![actor_id, crate::storage::unix_time()],
         )?;
         transaction.commit()?;
+        Ok(())
+    }
+
+    /// Lists locally revoked actor identities whose relay cleanup is pending.
+    /// The SQLite database is installation-local, so this cannot return IDs
+    /// belonging to another installation.
+    pub fn pending_relay_revocation_actor_ids(&self) -> Result<Vec<String>> {
+        let mut statement = self.store.connection.prepare(
+            "SELECT actor.actor_id FROM remote_actors AS actor
+                 JOIN remote_actor_revocations AS revocation USING(actor_id)
+                 WHERE actor.enabled=0 AND revocation.relay_revoked_at IS NULL
+                 ORDER BY actor.actor_id",
+        )?;
+        let actors = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(actors)
+    }
+
+    /// Records successful cleanup at the authenticated relay. Failed requests
+    /// stay pending and can be retried by `remote revoke` or the next pair.
+    pub fn mark_relay_actor_revoked(&mut self, actor_id: &str) -> Result<()> {
+        validate_actor_id(actor_id)?;
+        self.store.connection.execute(
+            "UPDATE remote_actor_revocations
+             SET relay_revoked_at=?2
+             WHERE actor_id=?1
+               AND relay_revoked_at IS NULL
+               AND EXISTS (SELECT 1 FROM remote_actors WHERE actor_id=?1 AND enabled=0)",
+            params![actor_id, crate::storage::unix_time()],
+        )?;
         Ok(())
     }
 
@@ -294,11 +337,32 @@ impl Authority {
         Ok(())
     }
 
+    /// Revokes a principal and clears its active run scopes and task selection.
+    /// A later pairing must explicitly grant tasks again.
     pub fn revoke_actor(&mut self, actor_id: &str) -> Result<bool> {
-        let changed = self.store.connection.execute(
+        validate_actor_id(actor_id)?;
+        let transaction = self
+            .store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
             "UPDATE remote_actors SET enabled=0 WHERE actor_id=?1 AND enabled=1",
             [actor_id],
         )?;
+        transaction.execute(
+            "UPDATE remote_actor_runs SET enabled=0 WHERE actor_id=?1",
+            [actor_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM remote_selected_tasks WHERE actor_id=?1",
+            [actor_id],
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO remote_actor_revocations(actor_id,relay_revoked_at)
+             SELECT actor_id,NULL FROM remote_actors WHERE actor_id=?1 AND enabled=0",
+            [actor_id],
+        )?;
+        transaction.commit()?;
         Ok(changed == 1)
     }
 
@@ -879,6 +943,10 @@ fn ensure_schema(connection: &rusqlite::Connection) -> Result<()> {
             enabled INTEGER NOT NULL,
             paired_at INTEGER NOT NULL
          );
+         CREATE TABLE IF NOT EXISTS remote_actor_revocations (
+            actor_id TEXT PRIMARY KEY REFERENCES remote_actors(actor_id),
+            relay_revoked_at INTEGER
+         );
          CREATE TABLE IF NOT EXISTS remote_actor_runs (
             actor_id TEXT NOT NULL REFERENCES remote_actors(actor_id),
             run_id TEXT NOT NULL REFERENCES runs(id),
@@ -920,6 +988,13 @@ fn ensure_schema(connection: &rusqlite::Connection) -> Result<()> {
             decided_at INTEGER,
             PRIMARY KEY(run_id,operation_id)
          );",
+    )?;
+    // Treat historical local revocations as pending until the authenticated
+    // relay endpoint confirms each cleanup. This preserves retry on upgrades.
+    connection.execute(
+        "INSERT OR IGNORE INTO remote_actor_revocations(actor_id,relay_revoked_at)
+         SELECT actor_id,NULL FROM remote_actors WHERE enabled=0",
+        [],
     )?;
     // Backfill aliases for installations that already have authorized remote
     // tasks. Ordering makes first-time allocation deterministic; thereafter

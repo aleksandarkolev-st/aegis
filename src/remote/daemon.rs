@@ -40,6 +40,7 @@ pub fn command(root: &Path, args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("pair") => pair_command(root, &args[1..]),
         Some("status") if args.len() == 1 => status(root),
+        Some("revoke") if args.len() == 1 => revoke(root),
         Some("run") if args.len() == 1 => run_daemon(root),
         Some("help" | "--help") | None => {
             usage();
@@ -53,7 +54,7 @@ fn usage() {
     println!(
         "aegis remote pair [--relay-admin-url <url> --admin-token-env <name> --nats-url <tls-url> --nats-token-env <name> [--nats-root-cert <path>]]"
     );
-    println!("aegis remote status | run");
+    println!("aegis remote status | revoke | run");
     println!(
         "Pair stores only endpoint settings and environment variable names in .arun/remote.json."
     );
@@ -106,9 +107,7 @@ fn pair_command(root: &Path, args: &[String]) -> Result<()> {
     {
         bail!("local remote configuration belongs to a different Aegis installation");
     }
-    let actor_id = existing
-        .map(|value| value.actor_id)
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let actor_id = actor_for_pair(&authority, existing.as_ref())?;
     let workspace = root
         .parent()
         .context("Aegis data directory has no workspace parent")?;
@@ -125,8 +124,24 @@ fn pair_command(root: &Path, args: &[String]) -> Result<()> {
     };
     config.validate(root)?;
 
+    // Drain relay bindings for every locally revoked identity before the new
+    // pairing registers another actor. A failed cleanup leaves the old IDs in
+    // SQLite, so both `remote revoke` and a later `remote pair` can retry.
+    let revoked_actor_ids = authority.pending_relay_revocation_actor_ids()?;
+    if !revoked_actor_ids.is_empty() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(revoke_relay_actors(
+            &config,
+            &revoked_actor_ids,
+            &mut authority,
+        ))?;
+    }
+
     // Persist the local identity before the request. If the network call fails,
-    // rerunning `remote pair` rotates the relay code for the same identity.
+    // rerunning `remote pair` reuses this enabled identity; a revoked identity
+    // is replaced above so a stale relay binding cannot become valid again.
     authority.register_actor(&actor_id)?;
     config.save(root)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -137,6 +152,18 @@ fn pair_command(root: &Path, args: &[String]) -> Result<()> {
     println!("Send either: AEGIS {code}  or  /pair {code}");
     println!("to the Aegis WhatsApp relay account.");
     Ok(())
+}
+
+fn actor_for_pair(authority: &Authority, existing: Option<&Config>) -> Result<String> {
+    if let Some(config) = existing
+        && actor_enabled(authority, &config.actor_id)?
+    {
+        return Ok(config.actor_id.clone());
+    }
+    // A revoked actor may still have a stale relay binding if cloud cleanup
+    // failed. Never re-enable that identity: leave it locally disabled and
+    // make the new pairing code name a fresh actor with no inherited task grants.
+    Ok(Uuid::new_v4().to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -246,6 +273,102 @@ fn status(root: &Path) -> Result<()> {
     );
     println!("Relay: {}", config.relay_admin_url);
     println!("NATS: {}", config.nats_url);
+    Ok(())
+}
+
+fn revoke(root: &Path) -> Result<()> {
+    let (config, newly_revoked, revoked_actor_ids, mut authority) = revoke_locally(root)?;
+    if newly_revoked {
+        println!("Remote actor revoked locally.");
+    } else {
+        println!("Remote actor was already revoked locally.");
+    }
+
+    if revoked_actor_ids.is_empty() {
+        println!("No locally revoked actor bindings are pending relay cleanup.");
+        return Ok(());
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(revoke_relay_actors(
+        &config,
+        &revoked_actor_ids,
+        &mut authority,
+    ))?;
+    println!("Pending remote channel bindings and pairing tokens revoked at relay.");
+    Ok(())
+}
+
+fn revoke_locally(root: &Path) -> Result<(Config, bool, Vec<String>, Authority)> {
+    let config = Config::load(root)?;
+    let mut authority = Authority::open(root)?;
+    if authority.installation_id() != config.installation_id {
+        bail!("remote configuration does not match the local installation identity");
+    }
+    let newly_revoked = authority.revoke_actor(&config.actor_id)?;
+    let revoked_actor_ids = authority.pending_relay_revocation_actor_ids()?;
+    Ok((config, newly_revoked, revoked_actor_ids, authority))
+}
+
+fn actor_revoke_endpoint(config: &Config, actor_id: &str) -> Result<reqwest::Url> {
+    let mut endpoint = admin_endpoint(&config.relay_admin_url)?;
+    endpoint
+        .path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("relay admin URL cannot contain an opaque path"))?
+        .extend([
+            config.installation_id.as_str(),
+            "actors",
+            actor_id,
+            "bindings",
+            "revoke",
+        ]);
+    Ok(endpoint)
+}
+
+async fn revoke_relay_actor(config: &Config, actor_id: &str) -> Result<()> {
+    let token = env_secret(&config.admin_token_env)?;
+    let endpoint = actor_revoke_endpoint(config, actor_id)?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(15))
+        .build()?;
+    let response = client
+        .post(endpoint)
+        .bearer_auth(token)
+        .send()
+        .await
+        .context("could not reach the remote relay admin endpoint")?;
+    if response.status() != reqwest::StatusCode::NO_CONTENT {
+        bail!(
+            "relay rejected remote actor revocation (HTTP {})",
+            response.status()
+        );
+    }
+    Ok(())
+}
+
+async fn revoke_relay_actors(
+    config: &Config,
+    actor_ids: &[String],
+    authority: &mut Authority,
+) -> Result<()> {
+    let mut failed = Vec::new();
+    for actor_id in actor_ids {
+        if revoke_relay_actor(config, actor_id).await.is_err() {
+            failed.push(actor_id.as_str());
+        } else if authority.mark_relay_actor_revoked(actor_id).is_err() {
+            // The relay operation is idempotent. Leave this actor pending for
+            // retry and continue cleaning up the remaining locally revoked IDs.
+            failed.push(actor_id.as_str());
+        }
+    }
+    if !failed.is_empty() {
+        bail!(
+            "local revocation remains active, but relay cleanup failed for actor IDs: {}; retry `aegis remote revoke` or `aegis remote pair` when the relay is reachable",
+            failed.join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -1083,6 +1206,112 @@ mod tests {
         assert_eq!(response.installation_id, installation_id);
         assert_eq!(response.actor_id, actor_id);
         assert_eq!(response.pairing_code, "one-time-code");
+        Ok(())
+    }
+
+    #[test]
+    fn local_revoke_disables_command_and_notification_access() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let root = workspace.path().join(".arun");
+        let (config, mut authority, _) = fixture(workspace.path())?;
+        let run = authority.store.create_run(
+            "authorized remote task",
+            workspace.path(),
+            "codex",
+            json!(["workspace.read"]),
+            json!({}),
+            "",
+        )?;
+        authority.grant_run(&config.actor_id, &run.id)?;
+        config.save(&root)?;
+        drop(authority);
+
+        let (revoked_config, newly_revoked, revoked_actor_ids, authority) = revoke_locally(&root)?;
+        assert!(newly_revoked);
+        assert_eq!(revoked_config.actor_id, config.actor_id);
+        assert_eq!(revoked_actor_ids, vec![config.actor_id.clone()]);
+        drop(authority);
+
+        let mut authority = Authority::open(&root)?;
+        assert!(!actor_enabled(&authority, &config.actor_id)?);
+        assert!(authority.actors_for_run(&run.id)?.is_empty());
+        assert_eq!(
+            authority.pending_relay_revocation_actor_ids()?,
+            vec![config.actor_id.clone()]
+        );
+        assert!(!authority.revoke_actor(&config.actor_id)?);
+        authority.mark_relay_actor_revoked(&config.actor_id)?;
+        drop(authority);
+        let authority = Authority::open(&root)?;
+        assert!(authority.pending_relay_revocation_actor_ids()?.is_empty());
+        assert!(!revoke_locally(&root)?.1);
+        Ok(())
+    }
+
+    #[test]
+    fn pairing_after_revoke_rotates_identity_without_restoring_old_task_access() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let (old_config, mut authority, _) = fixture(workspace.path())?;
+        let run = authority.store.create_run(
+            "previously shared task",
+            workspace.path(),
+            "codex",
+            json!(["workspace.read"]),
+            json!({}),
+            "",
+        )?;
+        authority.grant_run(&old_config.actor_id, &run.id)?;
+        authority.bind_selected_task(&old_config.actor_id, &run.id)?;
+        assert!(authority.revoke_actor(&old_config.actor_id)?);
+
+        let new_actor_id = actor_for_pair(&authority, Some(&old_config))?;
+        assert_ne!(new_actor_id, old_config.actor_id);
+        authority.register_actor(&new_actor_id)?;
+        assert!(!actor_enabled(&authority, &old_config.actor_id)?);
+        assert!(authority.selected_task(&old_config.actor_id)?.is_none());
+        assert!(authority.authorized_runs(&old_config.actor_id)?.is_empty());
+        assert!(authority.authorized_runs(&new_actor_id)?.is_empty());
+        assert_eq!(
+            authority.pending_relay_revocation_actor_ids()?,
+            vec![old_config.actor_id.clone()]
+        );
+        assert!(authority.register_actor(&old_config.actor_id).is_err());
+        assert_eq!(
+            authority.pending_relay_revocation_actor_ids()?,
+            vec![old_config.actor_id.clone()]
+        );
+
+        let now = Utc::now().timestamp();
+        let stale_phone_request = super::super::CommandEnvelope {
+            version: 1,
+            installation_id: authority.installation_id().to_owned(),
+            actor_id: old_config.actor_id.clone(),
+            request_id: Uuid::new_v4().to_string(),
+            issued_at: now,
+            expires_at: now + 60,
+            command: Command::Status {
+                task_id: Some(run.id),
+            },
+        };
+        assert!(
+            authority
+                .apply_from_authenticated_relay(&old_config.actor_id, &stale_phone_request, now,)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn relay_revoke_endpoint_is_scoped_to_this_installation_and_actor() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let (config, _, _) = fixture(workspace.path())?;
+        assert_eq!(
+            actor_revoke_endpoint(&config, &config.actor_id)?.as_str(),
+            format!(
+                "https://relay.example/admin/v1/installations/{}/actors/{}/bindings/revoke",
+                config.installation_id, config.actor_id
+            )
+        );
         Ok(())
     }
 
