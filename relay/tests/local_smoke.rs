@@ -576,6 +576,12 @@ fn aegis_request(envelope: &CommandEnvelope) -> AegisCommandEnvelope {
         AgentCommand::Status { task_id } => AegisCommand::Status {
             task_id: task_id.clone(),
         },
+        AgentCommand::Result { task_id } => AegisCommand::Result {
+            task_id: task_id.clone(),
+        },
+        AgentCommand::Evidence { task_id } => AegisCommand::Evidence {
+            task_id: task_id.clone(),
+        },
         AgentCommand::ApproveOnce { challenge_id } => AegisCommand::ApproveOnce {
             challenge_id: challenge_id.clone(),
         },

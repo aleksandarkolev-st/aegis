@@ -14,6 +14,8 @@ pub enum AgentCommand {
     Message { text: String },
     ListTasks,
     Status { task_id: Option<String> },
+    Result { task_id: Option<String> },
+    Evidence { task_id: Option<String> },
     Details { task_id: Option<String> },
     Pause { task_id: Option<String> },
     Resume { task_id: Option<String> },
@@ -95,6 +97,12 @@ pub fn parse_command(input: &str) -> Result<AgentCommand, CommandParseError> {
     match command {
         "/tasks" | "/list_tasks" if rest.is_empty() => Ok(AgentCommand::ListTasks),
         "/status" => Ok(AgentCommand::Status {
+            task_id: optional_id(rest)?,
+        }),
+        "/result" => Ok(AgentCommand::Result {
+            task_id: optional_id(rest)?,
+        }),
+        "/evidence" => Ok(AgentCommand::Evidence {
             task_id: optional_id(rest)?,
         }),
         "/details" => Ok(AgentCommand::Details {
@@ -304,6 +312,26 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_command("/result").unwrap(),
+            AgentCommand::Result { task_id: None }
+        );
+        assert_eq!(
+            parse_command("/result t-abcdef").unwrap(),
+            AgentCommand::Result {
+                task_id: Some("t-abcdef".into())
+            }
+        );
+        assert_eq!(
+            parse_command("/evidence").unwrap(),
+            AgentCommand::Evidence { task_id: None }
+        );
+        assert_eq!(
+            parse_command("/evidence t-abcdef").unwrap(),
+            AgentCommand::Evidence {
+                task_id: Some("t-abcdef".into())
+            }
+        );
+        assert_eq!(
             parse_command("/pause t-abcdef").unwrap(),
             AgentCommand::Pause {
                 task_id: Some("t-abcdef".into())
@@ -406,6 +434,14 @@ mod tests {
         );
         assert_eq!(
             parse_command("/details task-1 extra"),
+            Err(CommandParseError::InvalidSyntax)
+        );
+        assert_eq!(
+            parse_command("/result task-1 extra"),
+            Err(CommandParseError::InvalidSyntax)
+        );
+        assert_eq!(
+            parse_command("/evidence task-1 extra"),
             Err(CommandParseError::InvalidSyntax)
         );
         assert_eq!(

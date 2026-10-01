@@ -24,6 +24,8 @@ const MAX_ENVELOPE_BYTES: usize = 128 * 1024;
 const MAX_COMMAND_TTL_SECONDS: i64 = 5 * 60;
 const CLOCK_SKEW_SECONDS: i64 = 30;
 const MAX_MESSAGE_BYTES: usize = 65_536;
+const MAX_REMOTE_RESULT_BYTES: usize = 2 * 1024;
+const MAX_REMOTE_EVIDENCE_RECEIPTS: usize = 8;
 
 #[derive(Debug)]
 struct CommandRejected(String);
@@ -58,6 +60,12 @@ pub enum Command {
     },
     ListTasks,
     Status {
+        task_id: Option<String>,
+    },
+    Result {
+        task_id: Option<String>,
+    },
+    Evidence {
         task_id: Option<String>,
     },
     Details {
@@ -511,7 +519,31 @@ impl Authority {
             if let Some(task_id) = task_id.as_deref() {
                 require_actor_run(&transaction, &request.actor_id, task_id)?;
             }
-            let result: Value = serde_json::from_str(&prior_result)?;
+            let result: Value = if matches!(&request.command, Command::Evidence { .. }) {
+                let refresh_command = match &request.command {
+                    Command::Evidence { task_id: None } => Command::Evidence {
+                        task_id: task_id.clone(),
+                    },
+                    command => command.clone(),
+                };
+                let CommandApply::Applied { result, .. } = apply_command(
+                    &transaction,
+                    &request.actor_id,
+                    &request.request_id,
+                    now,
+                    &refresh_command,
+                )?
+                else {
+                    bail!("evidence command unexpectedly requested task creation");
+                };
+                transaction.execute(
+                    "UPDATE remote_requests SET result=?3 WHERE actor_id=?1 AND request_id=?2",
+                    params![request.actor_id, request.request_id, result.to_string()],
+                )?;
+                result
+            } else {
+                serde_json::from_str(&prior_result)?
+            };
             transaction.commit()?;
             return Ok(Receipt {
                 request_id: request.request_id.clone(),
@@ -1190,6 +1222,109 @@ fn apply_command(
                 json!({"alias":alias,"task":task,"provider":provider,"state":state,"created_at":created_at,"started_at":started_at,"summary":summary,"selected":selected}),
             ))
         }
+        Command::Result { task_id } => {
+            let run_id = require_resolved_task(transaction, actor_id, task_id.as_deref())?;
+            let (state, summary): (String, Option<String>) = transaction.query_row(
+                "SELECT run.state,projection.summary FROM runs AS run
+                 LEFT JOIN run_projection AS projection ON projection.run_id=run.id
+                 WHERE run.id=?1",
+                [&run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if !is_terminal(&state) {
+                return Err(reject_command("task has no final result yet"));
+            }
+            let summary = summary
+                .map(|value| crate::text::clean(&value))
+                .map(|value| {
+                    crate::remote::protocol::truncate_utf8(&value, MAX_REMOTE_RESULT_BYTES)
+                })
+                .filter(|value| !value.trim().is_empty());
+            let verification = match state.as_str() {
+                "completed" => "verified",
+                "answered" => "unverified",
+                _ => "not_verified",
+            };
+            let alias = task_alias(transaction, actor_id, &run_id)?;
+            Ok(applied_for_task(
+                &run_id,
+                json!({"alias":alias,"state":state,"summary":summary,"verification":verification}),
+            ))
+        }
+        Command::Evidence { task_id } => {
+            let run_id = require_resolved_task(transaction, actor_id, task_id.as_deref())?;
+            let state = run_state(transaction, &run_id)?;
+            let alias = task_alias(transaction, actor_id, &run_id)?;
+            if state == "answered" {
+                return Ok(applied_for_task(
+                    &run_id,
+                    json!({"alias":alias,"state":state,"task_completed":false,"receipts":[],"omitted":0}),
+                ));
+            }
+            let revision: Option<i64> = transaction
+                .query_row(
+                    "SELECT revision FROM workspace_revisions WHERE run_id=?1",
+                    [&run_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let mut receipts = Vec::new();
+            let mut omitted = 0usize;
+            if let Some(revision) = revision {
+                let evidence = {
+                    let mut statement = transaction.prepare(
+                        "SELECT DISTINCT evidence.value FROM obligations AS obligation,
+                         json_each(obligation.evidence) AS evidence
+                         WHERE obligation.run_id=?1 AND obligation.state='verified'
+                         AND obligation.verified_revision=?2
+                         ORDER BY evidence.value",
+                    )?;
+                    statement
+                        .query_map(params![run_id, revision], |row| row.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                for hash in evidence {
+                    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                        continue;
+                    }
+                    let source: Option<(String, i64)> = transaction
+                        .query_row(
+                            "SELECT operation.capability, artifact.bytes
+                             FROM operations AS operation
+                             JOIN operation_revisions AS operation_revision
+                               ON operation_revision.operation_id=operation.id
+                              AND operation_revision.run_id=operation.run_id
+                             JOIN artifacts AS artifact ON artifact.hash=?3
+                             WHERE operation.run_id=?1 AND operation.state='succeeded'
+                               AND operation_revision.revision=?2
+                               AND (operation.artifact=?3 OR EXISTS(
+                                 SELECT 1 FROM operation_artifacts AS linked
+                                 WHERE linked.operation_id=operation.id AND linked.hash=?3
+                               ))
+                             ORDER BY operation.rowid LIMIT 1",
+                            params![run_id, revision, hash],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .optional()?;
+                    let Some((capability, bytes)) = source else {
+                        continue;
+                    };
+                    if receipts.len() == MAX_REMOTE_EVIDENCE_RECEIPTS {
+                        omitted = omitted.saturating_add(1);
+                        continue;
+                    }
+                    receipts.push(json!({
+                        "capability":safe_remote_capability(&capability),
+                        "hash_prefix":hash.chars().take(12).collect::<String>(),
+                        "bytes":bytes.max(0),
+                    }));
+                }
+            }
+            Ok(applied_for_task(
+                &run_id,
+                json!({"alias":alias,"state":state,"task_completed":state == "completed","receipts":receipts,"omitted":omitted}),
+            ))
+        }
         Command::Details { task_id } => {
             let run_id = if let Some(reference) = task_id.as_deref() {
                 resolve_actor_task_reference(transaction, actor_id, reference)?
@@ -1465,6 +1600,21 @@ fn task_alias(transaction: &Transaction<'_>, actor_id: &str, run_id: &str) -> Re
         .context("authorized task has no short alias")
 }
 
+fn safe_remote_capability(capability: &str) -> String {
+    let value = crate::text::clean(capability)
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        })
+        .take(64)
+        .collect::<String>();
+    if value.is_empty() {
+        "operation".into()
+    } else {
+        value
+    }
+}
+
 /// Build a bounded status report from task metadata and aggregate counters.
 /// Event payloads, artifacts, operation arguments and tool output are excluded.
 fn task_details(
@@ -1672,6 +1822,8 @@ fn validate_request_shape(request: &CommandEnvelope) -> Result<()> {
     }
     if let Some(task_id) = match &request.command {
         Command::Status { task_id }
+        | Command::Result { task_id }
+        | Command::Evidence { task_id }
         | Command::Details { task_id }
         | Command::Pause { task_id }
         | Command::Resume { task_id }
@@ -1793,6 +1945,111 @@ mod tests {
         }
     }
 
+    fn complete_with_verified_evidence(
+        fixture: &mut Fixture,
+        summary: &str,
+        referenced_count: usize,
+    ) -> Result<Vec<String>> {
+        let run_id = fixture.run_id.clone();
+        fixture
+            .authority
+            .store
+            .state(&run_id, "paused", json!({}))?;
+        let obligation = fixture.authority.store.add_obligation(
+            &run_id,
+            "review evidence",
+            "verify current local receipts",
+        )?;
+        fixture
+            .authority
+            .store
+            .state(&run_id, "running", json!({}))?;
+        let mut evidence = Vec::new();
+        for index in 0..referenced_count {
+            let relative_path = format!("proof-{index}.txt");
+            let source = format!("current evidence source {index}");
+            std::fs::write(fixture.directory.path().join(&relative_path), &source)?;
+            let source_hash = hex::encode(Sha256::digest(source.as_bytes()));
+            let receipt_bytes = serde_json::to_vec(&json!({
+                "path":relative_path,
+                "sha256":source_hash,
+                "bytes":source.len(),
+                "stdout":"TOP_SECRET_TOOL_OUTPUT",
+                "search_preview":"TOP_SECRET_SEARCH_PREVIEW",
+                "arguments":"TOP_SECRET_ARGUMENTS"
+            }))?;
+            let receipt_hash = fixture.authority.store.put_artifact(&receipt_bytes)?;
+            let operation = fixture.authority.store.begin_operation(
+                &run_id,
+                "workspace.read",
+                json!({"path":relative_path,"private_argument":"TOP_SECRET_ARGUMENTS"}),
+                false,
+            )?;
+            fixture.authority.store.operation_state(
+                &operation,
+                "succeeded",
+                Some(&receipt_hash),
+                json!({"output_preview":"TOP_SECRET_TOOL_OUTPUT"}),
+            )?;
+            evidence.push(receipt_hash);
+        }
+
+        // Successful but unreferenced evidence must not be returned to the phone.
+        let unreferenced_path = "unreferenced.txt";
+        let unreferenced_source = b"unreferenced source";
+        std::fs::write(
+            fixture.directory.path().join(unreferenced_path),
+            unreferenced_source,
+        )?;
+        let unreferenced_bytes = serde_json::to_vec(&json!({
+            "path":unreferenced_path,
+            "sha256":hex::encode(Sha256::digest(unreferenced_source)),
+            "bytes":unreferenced_source.len(),
+            "stdout":"UNREFERENCED_SECRET"
+        }))?;
+        let unreferenced_hash = fixture.authority.store.put_artifact(&unreferenced_bytes)?;
+        let unreferenced_operation = fixture.authority.store.begin_operation(
+            &run_id,
+            "workspace.read",
+            json!({"path":unreferenced_path}),
+            false,
+        )?;
+        fixture.authority.store.operation_state(
+            &unreferenced_operation,
+            "succeeded",
+            Some(&unreferenced_hash),
+            json!({}),
+        )?;
+
+        // Failed artifacts are also excluded, even if still stored locally.
+        let failed_hash = fixture
+            .authority
+            .store
+            .put_artifact(b"TOP_SECRET_FAILED_ARTIFACT")?;
+        let failed_operation = fixture.authority.store.begin_operation(
+            &run_id,
+            "workspace.read",
+            json!({"path":"failed.txt"}),
+            false,
+        )?;
+        fixture.authority.store.operation_state(
+            &failed_operation,
+            "failed",
+            Some(&failed_hash),
+            json!({"output_preview":"TOP_SECRET_FAILED_OUTPUT"}),
+        )?;
+
+        fixture
+            .authority
+            .store
+            .verify_obligation(&run_id, obligation, &evidence)?;
+        fixture
+            .authority
+            .store
+            .complete_run(&run_id, summary, &evidence)?;
+        Ok(evidence)
+    }
+
     #[test]
     fn authenticated_command_is_expiry_checked_scoped_and_idempotent() -> Result<()> {
         let mut fixture = Fixture::new()?;
@@ -1867,6 +2124,140 @@ mod tests {
                 .apply_from_authenticated_relay(&fixture.actor_id, &wrong_install, test_now(),)
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn result_is_terminal_authorized_and_utf8_byte_bounded() -> Result<()> {
+        let mut fixture = Fixture::new()?;
+        let not_ready = fixture
+            .apply(Command::Result {
+                task_id: Some(fixture.run_id.clone()),
+            })
+            .unwrap_err();
+        assert!(not_ready.to_string().contains("no final result"));
+
+        let summary = "🛡".repeat(900);
+        complete_with_verified_evidence(&mut fixture, &summary, 1)?;
+        let result = fixture.apply(Command::Result {
+            task_id: Some(fixture.run_id.clone()),
+        })?;
+        assert_eq!(result.result["state"], "completed");
+        assert_eq!(result.result["verification"], "verified");
+        let returned = result.result["summary"].as_str().unwrap();
+        assert!(!returned.is_empty());
+        assert!(returned.len() <= MAX_REMOTE_RESULT_BYTES);
+        assert!(returned.is_char_boundary(returned.len()));
+        assert!(summary.starts_with(returned));
+
+        let other_actor = "other-phone";
+        fixture.authority.register_actor(other_actor)?;
+        for command in [
+            Command::Result {
+                task_id: Some(fixture.run_id.clone()),
+            },
+            Command::Evidence {
+                task_id: Some(fixture.run_id.clone()),
+            },
+        ] {
+            let request = CommandEnvelope {
+                actor_id: other_actor.into(),
+                request_id: uuid::Uuid::new_v4().to_string(),
+                command,
+                ..fixture.request(Command::ListTasks)
+            };
+            assert!(
+                fixture
+                    .authority
+                    .apply_from_authenticated_relay(other_actor, &request, test_now())
+                    .is_err()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn answered_result_is_unverified_and_has_no_tool_receipts() -> Result<()> {
+        let mut fixture = Fixture::new()?;
+        fixture
+            .authority
+            .store
+            .state(&fixture.run_id, "running", json!({}))?;
+        fixture
+            .authority
+            .store
+            .answer_run(&fixture.run_id, "A concise conversational answer.")?;
+
+        let result = fixture.apply(Command::Result {
+            task_id: Some(fixture.run_id.clone()),
+        })?;
+        assert_eq!(result.result["state"], "answered");
+        assert_eq!(result.result["verification"], "unverified");
+        assert_eq!(result.result["summary"], "A concise conversational answer.");
+
+        let evidence = fixture.apply(Command::Evidence {
+            task_id: Some(fixture.run_id.clone()),
+        })?;
+        assert_eq!(evidence.result["state"], "answered");
+        assert_eq!(evidence.result["task_completed"], false);
+        assert_eq!(evidence.result["receipts"], json!([]));
+        assert_eq!(evidence.result["omitted"], 0);
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_returns_only_bounded_verified_current_receipts_without_contents() -> Result<()> {
+        let mut fixture = Fixture::new()?;
+        complete_with_verified_evidence(&mut fixture, "Completed safely.", 10)?;
+        let request = fixture.request(Command::Evidence {
+            task_id: Some(fixture.run_id.clone()),
+        });
+        let evidence = fixture.authority.apply_from_authenticated_relay(
+            &fixture.actor_id,
+            &request,
+            test_now(),
+        )?;
+        assert_eq!(evidence.result["state"], "completed");
+        assert_eq!(evidence.result["task_completed"], true);
+        assert_eq!(evidence.result["receipts"].as_array().unwrap().len(), 8);
+        assert_eq!(evidence.result["omitted"], 2);
+        for receipt in evidence.result["receipts"].as_array().unwrap() {
+            assert_eq!(receipt["capability"], "workspace.read");
+            assert_eq!(receipt["hash_prefix"].as_str().unwrap().len(), 12);
+            assert!(receipt["bytes"].as_i64().unwrap() > 0);
+        }
+        let serialized = evidence.result.to_string();
+        for private_value in [
+            "TOP_SECRET_TOOL_OUTPUT",
+            "TOP_SECRET_SEARCH_PREVIEW",
+            "TOP_SECRET_ARGUMENTS",
+            "UNREFERENCED_SECRET",
+            "TOP_SECRET_FAILED_ARTIFACT",
+            "TOP_SECRET_FAILED_OUTPUT",
+            "proof-0.txt",
+            "unreferenced.txt",
+        ] {
+            assert!(
+                !serialized.contains(private_value),
+                "leaked {private_value}"
+            );
+        }
+
+        let transaction = fixture.authority.store.connection.unchecked_transaction()?;
+        crate::obligations::invalidate_workspace(
+            &transaction,
+            &fixture.run_id,
+            json!({"reason":"test workspace change"}),
+        )?;
+        transaction.commit()?;
+        let stale = fixture.authority.apply_from_authenticated_relay(
+            &fixture.actor_id,
+            &request,
+            test_now(),
+        )?;
+        assert!(stale.duplicate);
+        assert_eq!(stale.result["receipts"], json!([]));
+        assert_eq!(stale.result["omitted"], 0);
         Ok(())
     }
 

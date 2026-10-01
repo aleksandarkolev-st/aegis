@@ -756,6 +756,8 @@ fn apply_command_effects(
         }
         RelayCommand::ListTasks
         | RelayCommand::Status { .. }
+        | RelayCommand::Result { .. }
+        | RelayCommand::Evidence { .. }
         | RelayCommand::Details { .. }
         | RelayCommand::Cancel { .. }
         | RelayCommand::SelectTask { .. } => Ok(()),
@@ -815,7 +817,7 @@ fn format_receipt(command: &RelayCommand, receipt: &super::Receipt) -> String {
                 ));
             }
             lines.push(
-                "Use /use <alias> to select a task; /details [alias] shows its activity.".into(),
+                "Use /use <alias> to select a task; /status [alias], /result [alias], /evidence [alias] and /details [alias] inspect it.".into(),
             );
             lines.join("\n")
         }
@@ -833,6 +835,8 @@ fn format_receipt(command: &RelayCommand, receipt: &super::Receipt) -> String {
                 format!("Task {id} [{state}]: {task}\n{summary}")
             }
         }
+        RelayCommand::Result { .. } => format_task_result(result),
+        RelayCommand::Evidence { .. } => format_task_evidence(result),
         RelayCommand::Details { .. } => format_task_details(result),
         RelayCommand::Pause { .. } => {
             "Aegis will pause this task at its next safe boundary.".into()
@@ -865,6 +869,8 @@ fn rejection_reply(command: &RelayCommand) -> String {
         RelayCommand::Message { .. } => "Aegis could not start or update that task. Check the local Aegis setup, then send the request again.".into(),
         RelayCommand::ListTasks => "Aegis could not list tasks right now.".into(),
         RelayCommand::Status { .. }
+        | RelayCommand::Result { .. }
+        | RelayCommand::Evidence { .. }
         | RelayCommand::Details { .. }
         | RelayCommand::Pause { .. }
         | RelayCommand::Resume { .. }
@@ -874,6 +880,50 @@ fn rejection_reply(command: &RelayCommand) -> String {
         RelayCommand::SelectTask { .. } => "Aegis could not select that task. Use /tasks to see tasks shared with this phone.".into(),
         RelayCommand::ApproveOnce { .. } | RelayCommand::Deny { .. } => "Aegis could not resolve that approval. It may have expired or already been decided.".into(),
     }
+}
+
+fn format_task_result(result: &serde_json::Value) -> String {
+    let alias = result["alias"].as_str().unwrap_or("unknown");
+    let state = result["state"].as_str().unwrap_or("unknown");
+    let verification = result["verification"].as_str().unwrap_or("not verified");
+    let Some(summary) = result["summary"]
+        .as_str()
+        .filter(|summary| !summary.trim().is_empty())
+    else {
+        return format!("Task {alias} [{state}; {verification}] has no saved final answer.");
+    };
+    let summary = crate::text::clean(summary);
+    let summary = super::protocol::truncate_utf8(&summary, super::MAX_REMOTE_RESULT_BYTES);
+    format!("Final answer for {alias} [{state}; {verification}]:\n{summary}")
+}
+
+fn format_task_evidence(result: &serde_json::Value) -> String {
+    let alias = result["alias"].as_str().unwrap_or("unknown");
+    let state = result["state"].as_str().unwrap_or("unknown");
+    if state == "answered" {
+        return format!(
+            "Task {alias} [answered; unverified]. Conversational answers have no tool receipts."
+        );
+    }
+    let Some(receipts) = result["receipts"].as_array() else {
+        return format!("No verified current evidence is available for task {alias}.");
+    };
+    let mut lines = vec![format!("Verified current evidence for {alias} [{state}]:")];
+    if receipts.is_empty() {
+        lines.push("No verified current evidence receipts.".into());
+    } else {
+        for receipt in receipts {
+            let capability = receipt["capability"].as_str().unwrap_or("operation");
+            let hash = receipt["hash_prefix"].as_str().unwrap_or("unknown");
+            let bytes = receipt["bytes"].as_i64().unwrap_or(0).max(0);
+            lines.push(format!("{capability} · {hash} · {bytes} bytes"));
+        }
+    }
+    let omitted = result["omitted"].as_u64().unwrap_or(0);
+    if omitted > 0 {
+        lines.push(format!("{omitted} more receipt(s) omitted."));
+    }
+    lines.join("\n")
 }
 
 fn format_task_details(result: &serde_json::Value) -> String {
@@ -1545,6 +1595,54 @@ mod tests {
             .len()
                 <= 4 * 1024
         );
+        Ok(())
+    }
+
+    #[test]
+    fn phone_result_and_evidence_replies_are_bounded_and_allowlisted() -> Result<()> {
+        let result = format_task_result(&json!({
+            "alias":"t-abcdef",
+            "state":"answered",
+            "verification":"unverified",
+            "summary":"🛡".repeat(900),
+            "stdout":"TOP_SECRET_TOOL_OUTPUT"
+        }));
+        assert!(result.contains("answered; unverified"));
+        assert!(result.len() <= super::super::MAX_REMOTE_RESULT_BYTES + 128);
+        let reply = AegisEvent::reply(
+            &Uuid::new_v4().to_string(),
+            "actor-1",
+            &Uuid::new_v4().to_string(),
+            &result,
+        )?;
+        assert!(reply.reply_text.unwrap().len() <= 4 * 1024);
+
+        let evidence = format_task_evidence(&json!({
+            "alias":"t-abcdef",
+            "state":"completed",
+            "receipts":[{
+                "capability":"workspace.read",
+                "hash_prefix":"0123456789ab",
+                "bytes":123,
+                "path":"TOP_SECRET_PATH",
+                "stdout":"TOP_SECRET_TOOL_OUTPUT",
+                "arguments":"TOP_SECRET_ARGUMENTS"
+            }],
+            "omitted":3
+        }));
+        assert!(evidence.contains("workspace.read · 0123456789ab · 123 bytes"));
+        assert!(evidence.contains("3 more receipt(s) omitted"));
+        assert!(!evidence.contains("TOP_SECRET"));
+
+        let answered = format_task_evidence(&json!({
+            "alias":"t-abcdef",
+            "state":"answered",
+            "receipts":[{"capability":"workspace.read","hash_prefix":"0123456789ab","bytes":1}],
+            "omitted":1
+        }));
+        assert!(answered.contains("unverified"));
+        assert!(answered.contains("no tool receipts"));
+        assert!(!answered.contains("workspace.read"));
         Ok(())
     }
 

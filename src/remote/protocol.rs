@@ -13,6 +13,8 @@ pub enum RelayCommand {
     Message { text: String },
     ListTasks,
     Status { task_id: Option<String> },
+    Result { task_id: Option<String> },
+    Evidence { task_id: Option<String> },
     Details { task_id: Option<String> },
     Pause { task_id: Option<String> },
     Resume { task_id: Option<String> },
@@ -86,6 +88,12 @@ impl RelayCommandEnvelope {
             },
             RelayCommand::ListTasks => LocalCommand::ListTasks,
             RelayCommand::Status { task_id } => LocalCommand::Status {
+                task_id: task_id.clone(),
+            },
+            RelayCommand::Result { task_id } => LocalCommand::Result {
+                task_id: task_id.clone(),
+            },
+            RelayCommand::Evidence { task_id } => LocalCommand::Evidence {
                 task_id: task_id.clone(),
             },
             RelayCommand::Details { task_id } => LocalCommand::Details {
@@ -247,6 +255,41 @@ mod tests {
             local.command,
             LocalCommand::Message { task_id: None, .. }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn result_and_evidence_commands_map_to_the_local_authority() -> Result<()> {
+        let installation_id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now();
+        for (command, expected) in [
+            (
+                RelayCommand::Result {
+                    task_id: Some("t-abcdef".into()),
+                },
+                LocalCommand::Result {
+                    task_id: Some("t-abcdef".into()),
+                },
+            ),
+            (
+                RelayCommand::Evidence { task_id: None },
+                LocalCommand::Evidence { task_id: None },
+            ),
+        ] {
+            let envelope = RelayCommandEnvelope {
+                envelope_id: uuid::Uuid::new_v4().to_string(),
+                request_id: uuid::Uuid::new_v4().to_string(),
+                installation_id: installation_id.clone(),
+                actor_id: "actor-1".into(),
+                channel: "whatsapp".into(),
+                sender_id: "+15551234567".into(),
+                external_message_id: "wamid.result-evidence".into(),
+                issued_at: now,
+                expires_at: now + chrono::Duration::minutes(5),
+                command,
+            };
+            assert_eq!(envelope.local_envelope().command, expected);
+        }
         Ok(())
     }
 
