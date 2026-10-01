@@ -8,7 +8,7 @@ anyhow = "1"
 base64 = "0.22.1"
 crossterm = "0.29"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
-async-nats = { version = "0.50", default-features = false, features = ["jetstream", "ring"] }
+async-nats = { version = "0.50", default-features = false, features = ["jetstream", "aws-lc-rs"] }
 chrono = { version = "0.4", features = ["serde", "clock"] }
 futures-util = "0.3"
 dunce = "1"
