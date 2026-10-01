@@ -194,6 +194,7 @@ fn saved_task_replaces_a_requirement_only_after_terminal_confirmation() -> Resul
         json!({}),
         "",
     )?;
+    store.state(&run.id, "paused", json!({}))?;
     fs::write(
         root.join("profile.json"),
         serde_json::to_vec(
