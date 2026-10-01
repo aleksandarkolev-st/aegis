@@ -19,6 +19,8 @@ async fn postgres_pairing_rotation_and_inbound_receipts_are_idempotent() {
         .provision_installation(&actor_id, Some(installation_id))
         .await
         .unwrap();
+    let pairing_lifetime = (first.pairing_expires_at - chrono::Utc::now()).num_seconds();
+    assert!((240..=300).contains(&pairing_lifetime));
     let second = repository
         .provision_installation(&actor_id, Some(installation_id))
         .await

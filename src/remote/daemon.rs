@@ -126,7 +126,7 @@ fn pair_command(root: &Path, args: &[String]) -> Result<()> {
         .enable_all()
         .build()?;
     let code = runtime.block_on(provision(&config))?;
-    println!("Aegis remote pairing code (expires in 10 minutes):");
+    println!("Aegis remote pairing code (expires in 5 minutes):");
     println!("Send either: AEGIS {code}  or  /pair {code}");
     println!("to the Aegis WhatsApp relay account.");
     Ok(())
@@ -189,7 +189,7 @@ async fn provision(config: &Config) -> Result<String> {
         || response.pairing_code.chars().any(char::is_whitespace)
         || response.pairing_code.chars().any(char::is_control)
         || response.pairing_expires_at <= Utc::now()
-        || response.pairing_expires_at > Utc::now() + chrono::Duration::minutes(11)
+        || response.pairing_expires_at > Utc::now() + chrono::Duration::minutes(6)
     {
         bail!("relay pairing response does not match this local installation");
     }
@@ -894,7 +894,7 @@ mod tests {
             "installation_id":installation_id,
             "actor_id":actor_id,
             "pairing_code":"one-time-code",
-            "pairing_expires_at":Utc::now() + chrono::Duration::minutes(10),
+            "pairing_expires_at":Utc::now() + chrono::Duration::minutes(5),
         });
         let response: ProvisionResponse = serde_json::from_value(value)?;
         assert_eq!(response.installation_id, installation_id);

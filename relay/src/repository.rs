@@ -216,7 +216,7 @@ impl PgRepository {
         OsRng.fill_bytes(&mut token_bytes);
         let pairing_code = URL_SAFE_NO_PAD.encode(token_bytes);
         let token_hash = Sha256::digest(pairing_code.as_bytes()).to_vec();
-        let pairing_expires_at = Utc::now() + chrono::Duration::minutes(10);
+        let pairing_expires_at = Utc::now() + chrono::Duration::minutes(5);
         let pairing_token_id = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO pairing_tokens (id, user_id, installation_id, actor_id, token_hash, expires_at) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (actor_id) DO UPDATE SET token_hash = EXCLUDED.token_hash, expires_at = EXCLUDED.expires_at, used_at = NULL, created_at = now() WHERE pairing_tokens.installation_id = EXCLUDED.installation_id AND pairing_tokens.user_id = EXCLUDED.user_id RETURNING id",
         )
