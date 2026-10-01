@@ -1312,11 +1312,7 @@ impl Store {
             bail!("all planned milestones must have evidence before completion");
         }
         validate_completed_milestone_evidence(&transaction, run_id, &milestones)?;
-        validate_completed_milestone_artifacts(
-            &transaction,
-            &artifact_directory,
-            &milestones,
-        )?;
+        validate_completed_milestone_artifacts(&transaction, &artifact_directory, &milestones)?;
         let revision: Option<i64> = transaction
             .query_row(
                 "SELECT revision FROM workspace_revisions WHERE run_id = ?1",
@@ -2075,13 +2071,17 @@ mod tests {
             json!({}),
         )?;
         assert_ne!(old_evidence, unrelated_fresh_evidence);
-        assert!(store
-            .validate_completion(&run.id, &[unrelated_fresh_evidence.clone()])
-            .is_err());
+        assert!(
+            store
+                .validate_completion(&run.id, &[unrelated_fresh_evidence.clone()])
+                .is_err()
+        );
         assert!(store.save_checkpoint(&run.id, &checkpoint).is_err());
-        assert!(store
-            .complete_run(&run.id, "done", &[unrelated_fresh_evidence.clone()])
-            .is_err());
+        assert!(
+            store
+                .complete_run(&run.id, "done", &[unrelated_fresh_evidence.clone()])
+                .is_err()
+        );
         assert_eq!(store.run(&run.id)?.state, "running");
 
         checkpoint.milestones[0].evidence = vec![unrelated_fresh_evidence.clone()];
@@ -2134,17 +2134,20 @@ mod tests {
         store.save_checkpoint(&run.id, &checkpoint)?;
 
         std::fs::write(
-            directory
-                .path()
-                .join("artifacts")
-                .join(&milestone_evidence),
+            directory.path().join("artifacts").join(&milestone_evidence),
             b"tampered milestone proof",
         )?;
         assert!(store.save_checkpoint(&run.id, &checkpoint).is_err());
-        assert!(store.validate_completion(&run.id, &[final_evidence.clone()]).is_err());
-        assert!(store
-            .complete_run(&run.id, "done", &[final_evidence])
-            .is_err());
+        assert!(
+            store
+                .validate_completion(&run.id, &[final_evidence.clone()])
+                .is_err()
+        );
+        assert!(
+            store
+                .complete_run(&run.id, "done", &[final_evidence])
+                .is_err()
+        );
         assert_eq!(store.run(&run.id)?.state, "running");
         Ok(())
     }
@@ -2175,19 +2178,24 @@ mod tests {
         let final_read = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
         let current_evidence = store.put_artifact(b"revision one proof")?;
         store.operation_state(&final_read, "succeeded", Some(&current_evidence), json!({}))?;
-        assert!(store
-            .complete_run(
-                &run.id,
-                "done",
-                &[old_evidence.clone(), current_evidence.clone()],
-            )
-            .is_err());
+        assert!(
+            store
+                .complete_run(
+                    &run.id,
+                    "done",
+                    &[old_evidence.clone(), current_evidence.clone()],
+                )
+                .is_err()
+        );
         assert_eq!(store.milestones(&run.id)?[0].state, "active");
 
         store.complete_run(&run.id, "done", &[current_evidence.clone()])?;
         assert_eq!(store.run(&run.id)?.state, "completed");
         assert_eq!(store.milestones(&run.id)?[0].state, "completed");
-        assert_eq!(store.milestones(&run.id)?[0].evidence, vec![current_evidence]);
+        assert_eq!(
+            store.milestones(&run.id)?[0].evidence,
+            vec![current_evidence]
+        );
         Ok(())
     }
 }

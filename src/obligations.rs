@@ -1027,12 +1027,16 @@ mod tests {
 
         for state in ["ready", "running"] {
             store.state(&run.id, state, json!({}))?;
-            assert!(store
-                .add_obligation(&run.id, "Add regression tests", "User approved")
-                .is_err());
-            assert!(store
-                .supersede_obligation(&run.id, 1, "Allow a v2 API", "User approved")
-                .is_err());
+            assert!(
+                store
+                    .add_obligation(&run.id, "Add regression tests", "User approved")
+                    .is_err()
+            );
+            assert!(
+                store
+                    .supersede_obligation(&run.id, 1, "Allow a v2 API", "User approved")
+                    .is_err()
+            );
             assert_eq!(store.obligations(&run.id)?, original);
             assert_eq!(store.event_count(&run.id, "obligation.added")?, 0);
             assert_eq!(store.event_count(&run.id, "obligation.superseded")?, 0);
