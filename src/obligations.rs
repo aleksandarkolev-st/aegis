@@ -314,7 +314,7 @@ pub(crate) fn validate_connection(connection: &rusqlite::Connection, run_id: &st
     Ok(())
 }
 
-fn current_evidence(
+pub(crate) fn current_evidence(
     connection: &rusqlite::Connection,
     run_id: &str,
     revision: i64,
