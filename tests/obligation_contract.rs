@@ -3,6 +3,8 @@ use arun::model::{Checkpoint, Milestone};
 use arun::routing::Reason;
 use arun::storage::Store;
 use serde_json::json;
+#[path = "support/operation.rs"]
+mod operation_fixture;
 
 fn successful_operation(
     store: &mut Store,
@@ -17,6 +19,7 @@ fn successful_operation(
         capability != "workspace.write",
     )?;
     let artifact = store.put_artifact(result)?;
+    operation_fixture::claim_fixture_operation(store, &operation.id)?;
     store.operation_state(&operation, "succeeded", Some(&artifact), json!({}))?;
     Ok(artifact)
 }

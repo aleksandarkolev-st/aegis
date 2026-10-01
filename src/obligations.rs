@@ -618,6 +618,7 @@ mod tests {
             let op =
                 store.begin_operation(&run.id, "workspace.read", serde_json::json!({}), true)?;
             let hash = store.put_artifact(run.id.as_bytes())?;
+            crate::storage::claim_test_operation(&mut store, &op)?;
             store.operation_state(&op, "succeeded", Some(&hash), serde_json::json!({}))?;
             store.verify_obligation(&run.id, 1, &[hash.clone()])?;
             hashes.push(hash);
@@ -704,6 +705,7 @@ mod tests {
         store.state(&run.id, "running", json!({}))?;
         let operation = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
         let evidence = store.put_artifact(b"test receipt")?;
+        crate::storage::claim_test_operation(&mut store, &operation)?;
         store.operation_state(&operation, "succeeded", Some(&evidence), json!({}))?;
         store.verify_obligation(&run.id, 1, &[evidence.clone()])?;
         // Simulate a corrupted operation row so completion validation proves it
@@ -838,6 +840,7 @@ mod tests {
         store.state(&run.id, "running", json!({}))?;
         let operation = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
         let evidence = store.put_artifact(b"fixture evidence")?;
+        crate::storage::claim_test_operation(&mut store, &operation)?;
         store.operation_state(&operation, "succeeded", Some(&evidence), json!({}))?;
         store.verify_obligation(&run.id, 1, &[evidence.clone()])?;
         assert!(
@@ -886,6 +889,7 @@ mod tests {
         store.state(&run.id, "running", json!({}))?;
         let check = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
         let old_evidence = store.put_artifact(b"old test result")?;
+        crate::storage::claim_test_operation(&mut store, &check)?;
         store.operation_state(&check, "succeeded", Some(&old_evidence), json!({}))?;
         store.verify_obligation(&run.id, 1, &[old_evidence.clone()])?;
         let edit = store.begin_operation(&run.id, "workspace.write", json!({}), false)?;
@@ -912,6 +916,7 @@ mod tests {
         assert_eq!(store.obligations(&run.id)?[1].state, "stale");
         let current_check = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
         let current_evidence = store.put_artifact(b"current test result")?;
+        crate::storage::claim_test_operation(&mut store, &current_check)?;
         store.operation_state(
             &current_check,
             "succeeded",
@@ -939,6 +944,7 @@ mod tests {
         store.state(&run.id, "running", json!({}))?;
         let operation = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
         let evidence = store.put_artifact(b"current receipt")?;
+        crate::storage::claim_test_operation(&mut store, &operation)?;
         store.operation_state(&operation, "succeeded", Some(&evidence), json!({}))?;
         let invalid = [
             Proof {
@@ -976,6 +982,7 @@ mod tests {
         store.state(&run.id, "running", json!({}))?;
         let operation = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
         let evidence = store.put_artifact(b"api compatibility proof")?;
+        crate::storage::claim_test_operation(&mut store, &operation)?;
         store.operation_state(&operation, "succeeded", Some(&evidence), json!({}))?;
         store.verify_obligation(&run.id, 1, &[evidence.clone()])?;
         assert!(
@@ -1108,6 +1115,7 @@ mod tests {
         store.state(&run.id, "running", json!({}))?;
         let check = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
         let receipt = store.put_artifact(b"test pass before edit")?;
+        crate::storage::claim_test_operation(&mut store, &check)?;
         store.operation_state(&check, "succeeded", Some(&receipt), json!({}))?;
         store.verify_obligation(&run.id, 1, &[receipt.clone()])?;
         let command = store.begin_operation(&run.id, "process.run", json!({}), true)?;
@@ -1139,6 +1147,7 @@ mod tests {
         store.state(&run.id, "running", json!({}))?;
         let check = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
         let old_evidence = store.put_artifact(b"passing suite before edit")?;
+        crate::storage::claim_test_operation(&mut store, &check)?;
         store.operation_state(&check, "succeeded", Some(&old_evidence), json!({}))?;
         store.verify_obligation(&run.id, 1, &[old_evidence.clone()])?;
 
@@ -1180,6 +1189,7 @@ mod tests {
         store.state(&run.id, "running", json!({}))?;
         let recheck = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
         let current_evidence = store.put_artifact(b"passing suite after reconciliation")?;
+        crate::storage::claim_test_operation(&mut store, &recheck)?;
         store.operation_state(&recheck, "succeeded", Some(&current_evidence), json!({}))?;
         store.verify_obligation(&run.id, 1, &[current_evidence.clone()])?;
         store.complete_run(&run.id, "done", &[current_evidence])?;

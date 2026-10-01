@@ -8,6 +8,8 @@ use std::sync::{
 };
 #[path = "support/http.rs"]
 mod http;
+#[path = "support/operation.rs"]
+mod operation_fixture;
 
 #[test]
 fn failed_logs_survive_context_rotation_and_are_inspectable_but_cannot_prove_completion()
@@ -89,6 +91,7 @@ fn failed_logs_survive_context_rotation_and_are_inspectable_but_cannot_prove_com
         "",
     )?;
     let other_op = store.begin_operation(&other.id, "workspace.read", json!({}), true)?;
+    operation_fixture::claim_fixture_operation(&mut store, &other_op.id)?;
     store.operation_state(&other_op, "succeeded", Some(&foreign_hash), json!({}))?;
     for index in 0..12 {
         let read = store.begin_operation(
@@ -98,6 +101,7 @@ fn failed_logs_survive_context_rotation_and_are_inspectable_but_cannot_prove_com
             true,
         )?;
         let hash = store.put_artifact(b"read fixture")?;
+        operation_fixture::claim_fixture_operation(&mut store, &read.id)?;
         store.operation_state(&read, "succeeded", Some(&hash), json!({}))?;
     }
     for _ in 0..180 {

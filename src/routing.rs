@@ -283,6 +283,7 @@ mod tests {
         store.state(&run.id, "running", json!({}))?;
         let operation = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
         let evidence = store.put_artifact(b"compatibility proof")?;
+        crate::storage::claim_test_operation(&mut store, &operation)?;
         store.operation_state(&operation, "succeeded", Some(&evidence), json!({}))?;
         store.verify_obligation(&run.id, 1, &[evidence.clone()])?;
         let checkpoint = crate::model::Checkpoint {
@@ -542,6 +543,7 @@ mod tests {
         store.state(&run.id, "running", json!({}))?;
         let operation = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
         let evidence = store.put_artifact(b"API compatibility proof")?;
+        crate::storage::claim_test_operation(&mut store, &operation)?;
         store.operation_state(&operation, "succeeded", Some(&evidence), json!({}))?;
         store.verify_obligation(&run.id, 1, &[evidence.clone()])?;
         store.event(&run.id, "model.started", json!({"turn":1}))?;

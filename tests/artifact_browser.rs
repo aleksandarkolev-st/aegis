@@ -5,6 +5,8 @@ use std::process::{Command, Stdio};
 use anyhow::Result;
 use arun::storage::Store;
 use serde_json::json;
+#[path = "support/operation.rs"]
+mod operation_fixture;
 
 #[test]
 fn guided_artifact_ranges_and_literal_search_need_no_commands_or_model_calls() -> Result<()> {
@@ -25,6 +27,7 @@ fn guided_artifact_ranges_and_literal_search_need_no_commands_or_model_calls() -
     );
     let hash = store.put_artifact(original.as_bytes())?;
     let operation = store.begin_operation(&run.id, "fixture.read", json!({}), true)?;
+    operation_fixture::claim_fixture_operation(&mut store, &operation.id)?;
     store.operation_state(&operation, "succeeded", Some(&hash), json!({}))?;
     store.state(&run.id, "completed", json!({}))?;
     fs::write(

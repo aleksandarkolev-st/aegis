@@ -185,6 +185,10 @@ fn validate_operation_transition(
         return Ok(());
     }
 
+    if operation.state == "failed" && operation.retry_safe && next == "dispatched" {
+        return Ok(());
+    }
+
     match operation.state.as_str() {
         "pending" => {
             if !matches!(next, "dispatched" | "succeeded" | "failed" | "cancelled") {
@@ -212,13 +216,8 @@ fn validate_operation_transition(
         _ => bail!("operation is already terminal"),
     }
 
-    let needs_claim = !operation.retry_safe
-        || matches!(
-            operation.capability.as_str(),
-            "workspace.write" | "workspace.patch"
-        );
-    if next == "succeeded" && needs_claim && operation.state != "executing" {
-        bail!("a side-effecting operation must be claimed before it can succeed");
+    if next == "succeeded" && operation.state != "executing" {
+        bail!("an operation must be claimed before it can succeed");
     }
     if next == "outcome_unknown"
         && (operation.retry_safe || !matches!(operation.state.as_str(), "dispatched" | "executing"))
@@ -1558,7 +1557,12 @@ impl Store {
         let resolving_unknown = allow_unknown_resolution
             && canonical.state == "outcome_unknown"
             && matches!(state, "succeeded" | "failed");
-        if terminal_operation_state(&canonical.state) && !resolving_unknown {
+        let retrying_safe_failure =
+            canonical.state == "failed" && canonical.retry_safe && state == "dispatched";
+        if terminal_operation_state(&canonical.state)
+            && !resolving_unknown
+            && !retrying_safe_failure
+        {
             if canonical.state == state
                 && artifact.is_none_or(|hash| canonical.artifact.as_deref() == Some(hash))
             {
@@ -1802,6 +1806,28 @@ impl Store {
 }
 
 #[cfg(test)]
+pub(crate) fn claim_test_operation(store: &mut Store, operation: &Operation) -> Result<()> {
+    let run = store.run(&operation.run_id)?;
+    if run.is_terminal() {
+        bail!("cannot claim an operation for a terminal test fixture run");
+    }
+    if run.state != "running" {
+        store.state(&operation.run_id, "running", json!({"test_fixture":true}))?;
+    }
+    let mut current = store.operation(&operation.id)?;
+    if current.state == "pending" {
+        store.operation_state(&current, "dispatched", None, json!({"test_fixture":true}))?;
+        current = store.operation(&operation.id)?;
+    }
+    if current.state == "dispatched" {
+        store.claim_operation(&current)?;
+    } else if current.state != "executing" {
+        bail!("test fixture can only claim an unresolved operation");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2004,6 +2030,46 @@ mod tests {
     }
 
     #[test]
+    fn every_success_requires_claim_and_safe_failed_reads_can_retry() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "read proof",
+            directory.path(),
+            "codex",
+            json!([]),
+            json!({}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+
+        let read = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
+        let receipt = store.put_artifact(b"read receipt")?;
+        assert!(
+            store
+                .operation_state(&read, "succeeded", Some(&receipt), json!({}))
+                .is_err()
+        );
+        store.operation_state(&read, "dispatched", None, json!({}))?;
+        assert!(
+            store
+                .operation_state(&read, "succeeded", Some(&receipt), json!({}))
+                .is_err()
+        );
+        store.claim_operation(&read)?;
+        store.operation_state(&read, "succeeded", Some(&receipt), json!({}))?;
+
+        let retry = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
+        store.operation_state(&retry, "failed", None, json!({}))?;
+        store.operation_state(&retry, "dispatched", None, json!({}))?;
+        store.claim_operation(&retry)?;
+        let retry_receipt = store.put_artifact(b"retried read receipt")?;
+        store.operation_state(&retry, "succeeded", Some(&retry_receipt), json!({}))?;
+        assert_eq!(store.operation(&retry.id)?.state, "succeeded");
+        Ok(())
+    }
+
+    #[test]
     fn operation_state_rejects_invalid_transitions_and_terminal_rewrites() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let mut store = Store::open(directory.path())?;
@@ -2172,6 +2238,7 @@ mod tests {
         let run = store.create_run("work", directory.path(), "codex", json!([]), json!({}), "")?;
         let operation = store.begin_operation(&run.id, "tool_00", json!({}), true)?;
         let evidence = store.put_artifact(b"recorded before schema eviction")?;
+        claim_test_operation(&mut store, &operation)?;
         store.operation_state(&operation, "succeeded", Some(&evidence), json!({}))?;
         for index in 0..12 {
             store.activate(&run.id, &format!("tool_{index:02}"), 1)?;
@@ -2239,6 +2306,7 @@ mod tests {
         store.state(&run.id, "running", json!({}))?;
         let operation = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
         let evidence = store.put_artifact(b"observed result")?;
+        claim_test_operation(&mut store, &operation)?;
         store.operation_state(&operation, "succeeded", Some(&evidence), json!({}))?;
         let checkpoint = Handoff {
             decisions: vec!["reproduce first".into()],
@@ -2310,6 +2378,7 @@ mod tests {
 
         let initial_read = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
         let old_evidence = store.put_artifact(b"revision zero proof")?;
+        claim_test_operation(&mut store, &initial_read)?;
         store.operation_state(&initial_read, "succeeded", Some(&old_evidence), json!({}))?;
         let mut checkpoint = Handoff {
             decisions: vec![],
@@ -2333,6 +2402,7 @@ mod tests {
 
         let final_read = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
         let unrelated_fresh_evidence = store.put_artifact(b"unrelated fresh proof")?;
+        claim_test_operation(&mut store, &final_read)?;
         store.operation_state(
             &final_read,
             "succeeded",
@@ -2376,6 +2446,7 @@ mod tests {
         let milestone_operation =
             store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
         let milestone_evidence = store.put_artifact(b"milestone proof")?;
+        claim_test_operation(&mut store, &milestone_operation)?;
         store.operation_state(
             &milestone_operation,
             "succeeded",
@@ -2384,6 +2455,7 @@ mod tests {
         )?;
         let final_operation = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
         let final_evidence = store.put_artifact(b"final proof")?;
+        claim_test_operation(&mut store, &final_operation)?;
         store.operation_state(
             &final_operation,
             "succeeded",
@@ -2436,6 +2508,7 @@ mod tests {
         store.state(&run.id, "running", json!({}))?;
         let initial_read = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
         let old_evidence = store.put_artifact(b"revision zero proof")?;
+        claim_test_operation(&mut store, &initial_read)?;
         store.operation_state(&initial_read, "succeeded", Some(&old_evidence), json!({}))?;
 
         let mutation = store.begin_operation(&run.id, "workspace.write", json!({}), true)?;
@@ -2447,6 +2520,7 @@ mod tests {
 
         let final_read = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
         let current_evidence = store.put_artifact(b"revision one proof")?;
+        claim_test_operation(&mut store, &final_read)?;
         store.operation_state(&final_read, "succeeded", Some(&current_evidence), json!({}))?;
         assert!(
             store

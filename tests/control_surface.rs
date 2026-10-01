@@ -1,6 +1,8 @@
 use anyhow::Result;
 use arun::{control, storage::Store};
 use serde_json::json;
+#[path = "support/operation.rs"]
+mod operation_fixture;
 use std::{
     fs,
     io::Write,
@@ -123,6 +125,7 @@ fn views_inspect_open_verified_and_stale_obligations_without_inference() -> Resu
     let operation =
         store.begin_operation(&run.id, "workspace.read", json!({"path":"api.rs"}), true)?;
     let hash = store.put_artifact(b"API test receipt")?;
+    operation_fixture::claim_fixture_operation(&mut store, &operation.id)?;
     store.operation_state(&operation, "succeeded", Some(&hash), json!({"exit_code":0}))?;
     store.verify_obligation(&run.id, 1, &[hash.clone()])?;
     store.save_checkpoint(&run.id,&serde_json::from_value(json!({"decisions":["Preserve v1"],"unresolved":["Missing tests"],"next_action":"Add regression tests","milestones":[]}))?)?;
@@ -171,6 +174,7 @@ fn views_inspect_open_verified_and_stale_obligations_without_inference() -> Resu
     assert!(text.contains(&hash));
     assert_eq!(store.event_count(&run.id, "model.started")?, 0);
     let edit = store.begin_operation(&run.id, "workspace.write", json!({}), false)?;
+    operation_fixture::claim_fixture_operation(&mut store, &edit.id)?;
     let edit_hash = store.put_artifact(b"edit")?;
     store.operation_state(&edit, "succeeded", Some(&edit_hash), json!({}))?;
     assert_eq!(
@@ -257,6 +261,7 @@ fn completion_explanation_is_saved_with_the_terminal_event() -> Result<()> {
     store.state(&run.id, "running", json!({}))?;
     let op = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
     let hash = store.put_artifact(b"proof")?;
+    operation_fixture::claim_fixture_operation(&mut store, &op.id)?;
     store.operation_state(&op, "succeeded", Some(&hash), json!({}))?;
     store.verify_obligation(&run.id, 1, &[hash.clone()])?;
     store.complete_run(&run.id, "API inspected", &[hash.clone()])?;
@@ -353,6 +358,7 @@ fn archived_receipts_and_provider_turns_survive_completion() -> Result<()> {
         true,
     )?;
     let hash = store.put_artifact(&serde_json::to_vec(&json!({"exit_code":0}))?)?;
+    operation_fixture::claim_fixture_operation(&mut store, &op.id)?;
     store.operation_state(&op, "succeeded", Some(&hash), json!({"exit_code":0}))?;
     store.verify_obligation(&run.id, 1, &[hash.clone()])?;
     store.event(&run.id, "model.started", json!({"turn":84}))?;

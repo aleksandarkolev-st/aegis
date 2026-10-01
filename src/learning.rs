@@ -296,6 +296,7 @@ mod tests {
             true,
         )?;
         let evidence = store.put_artifact(b"private tool transcript")?;
+        crate::storage::claim_test_operation(store, &read)?;
         store.operation_state(&read, "succeeded", Some(&evidence), json!({}))?;
         if checked {
             crate::acceptance::propose(store, &run, "done", std::slice::from_ref(&evidence))?;
@@ -308,6 +309,7 @@ mod tests {
                 true,
             )?;
             let passed = store.put_artifact(br#"{"exit_code":0}"#)?;
+            crate::storage::claim_test_operation(store, &operation)?;
             store.operation_state(&operation, "succeeded", Some(&passed), json!({}))?;
         }
         store.complete_run(&run.id, "done", &[evidence])?;

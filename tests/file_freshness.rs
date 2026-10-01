@@ -5,12 +5,15 @@ use sha2::{Digest, Sha256};
 use std::fs;
 #[path = "support/http.rs"]
 mod http;
+#[path = "support/operation.rs"]
+mod operation_fixture;
 
 fn read_receipt(store: &mut Store, id: &str, source: &str) -> Result<String> {
     let op = store.begin_operation(id, "workspace.read", json!({"path":"source.txt"}), true)?;
     let hash = store.put_artifact(&serde_json::to_vec(
         &json!({"sha256":hex::encode(Sha256::digest(source.as_bytes())),"content":source}),
     )?)?;
+    operation_fixture::claim_fixture_operation(store, &op.id)?;
     store.operation_state(&op, "succeeded", Some(&hash), json!({}))?;
     Ok(hash)
 }
@@ -84,6 +87,7 @@ fn corrupt_proof_artifacts_and_stale_generic_finish_evidence_are_rejected() -> R
     store.state(&run.id, "running", json!({}))?;
     let old_op = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
     let old = store.put_artifact(b"before edit")?;
+    operation_fixture::claim_fixture_operation(&mut store, &old_op.id)?;
     store.operation_state(&old_op, "succeeded", Some(&old), json!({}))?;
     let edit = store.begin_operation(&run.id, "workspace.write", json!({}), false)?;
     store.operation_state(&edit, "dispatched", None, json!({}))?;
@@ -91,6 +95,7 @@ fn corrupt_proof_artifacts_and_stale_generic_finish_evidence_are_rejected() -> R
     assert!(store.complete_run(&run.id, "done", &[old.clone()]).is_err());
     let fresh_op = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
     let fresh = store.put_artifact(b"after edit")?;
+    operation_fixture::claim_fixture_operation(&mut store, &fresh_op.id)?;
     store.operation_state(&fresh_op, "succeeded", Some(&fresh), json!({}))?;
     store.state(&run.id, "paused", json!({}))?;
     let id = store.add_obligation(&run.id, "Read source", "Approved coverage")?;

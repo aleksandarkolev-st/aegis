@@ -1985,6 +1985,7 @@ mod tests {
                 json!({"path":relative_path,"private_argument":"TOP_SECRET_ARGUMENTS"}),
                 false,
             )?;
+            crate::storage::claim_test_operation(&mut fixture.authority.store, &operation)?;
             fixture.authority.store.operation_state(
                 &operation,
                 "succeeded",
@@ -2013,6 +2014,10 @@ mod tests {
             "workspace.read",
             json!({"path":unreferenced_path}),
             false,
+        )?;
+        crate::storage::claim_test_operation(
+            &mut fixture.authority.store,
+            &unreferenced_operation,
         )?;
         fixture.authority.store.operation_state(
             &unreferenced_operation,

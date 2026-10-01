@@ -533,6 +533,7 @@ mod tests {
             true,
         )?;
         let hash = store.put_artifact(MARKER.as_bytes())?;
+        crate::storage::claim_test_operation(&mut store, &operation)?;
         store.operation_state(&operation, "succeeded", Some(&hash), json!({}))?;
         store.complete_run(&run.id, "unverified claim", &[hash])?;
         let run = store.run(&run.id)?;
@@ -555,6 +556,7 @@ mod tests {
                 true,
             )?;
             let hash = store.put_artifact(format!("{LOG_ERROR} at codec.rs:73").as_bytes())?;
+            crate::storage::claim_test_operation(&mut store, &operation)?;
             store.operation_state(&operation, "succeeded", Some(&hash), json!({}))?;
             store.complete_run(&run.id, &summary, &[hash])?;
             let result =

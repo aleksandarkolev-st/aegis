@@ -1487,6 +1487,8 @@ mod tests {
             |workspace, operation, _| -> Result<Value> {
                 dispatches += 1;
                 assert_eq!(operation.id, current_operation.id);
+                let mut worker_store = Store::open(&root)?;
+                crate::storage::claim_test_operation(&mut worker_store, operation)?;
                 let path = workspace.join(operation.arguments["path"].as_str().unwrap());
                 std::fs::write(&path, operation.arguments["content"].as_str().unwrap())?;
                 Ok(json!({"path":"approved.txt","bytes":8,"exit_code":0}))
@@ -1596,6 +1598,7 @@ mod tests {
         )?;
         let operation = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
         let evidence = store.put_artifact(br#"{"content":"fixture result"}"#)?;
+        crate::storage::claim_test_operation(&mut store, &operation)?;
         store.operation_state(
             &operation,
             "succeeded",
@@ -1754,6 +1757,7 @@ mod tests {
         store.state(&run.id, "running", json!({}))?;
         let operation = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
         let evidence = store.put_artifact(b"fixture evidence")?;
+        crate::storage::claim_test_operation(&mut store, &operation)?;
         store.operation_state(&operation, "succeeded", Some(&evidence), json!({}))?;
         let prompt = context(&store, &run)?;
         assert!(prompt.contains("Nested expressions"));
@@ -2046,6 +2050,7 @@ mod tests {
                     true,
                 )?;
                 store.operation_state(&operation, "dispatched", None, json!({}))?;
+                crate::storage::claim_test_operation(&mut store, &operation)?;
                 let content = if large {
                     "large-source-".repeat(1000)
                 } else {

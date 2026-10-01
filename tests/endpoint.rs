@@ -10,6 +10,8 @@ use arun::model::Checkpoint;
 use arun::routing::Reason;
 use arun::storage::Store;
 use serde_json::{Value, json};
+#[path = "support/operation.rs"]
+mod operation_fixture;
 
 fn request(stream: &mut TcpStream) -> Result<(String, Value)> {
     stream.set_nonblocking(false)?;
@@ -75,6 +77,7 @@ fn local_fallback_continuation(key: Option<&str>) -> Result<()> {
     store.state(&run.id, "running", json!({}))?;
     let operation = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
     let evidence = store.put_artifact(b"API compatibility proof")?;
+    operation_fixture::claim_fixture_operation(&mut store, &operation.id)?;
     store.operation_state(&operation, "succeeded", Some(&evidence), json!({}))?;
     store.verify_obligation(&run.id, 1, &[evidence.clone()])?;
     let checkpoint = Checkpoint {

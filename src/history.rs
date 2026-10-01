@@ -354,6 +354,7 @@ mod tests {
             true,
         )?;
         let evidence = store.put_artifact(b"verified progress")?;
+        crate::storage::claim_test_operation(&mut store, &operation)?;
         store.operation_state(&operation, "succeeded", Some(&evidence), json!({}))?;
         let checkpoint = Checkpoint {
             decisions: vec!["preserve verified progress".into()],

@@ -222,7 +222,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let root = directory.path().join("state");
         let mut store = Store::open(&root)?;
-        let source = source(&mut store, directory.path())?;
+        let mut source = source(&mut store, directory.path())?;
         let operation = store.begin_operation(
             &source.id,
             "workspace.read",
@@ -230,6 +230,8 @@ mod tests {
             true,
         )?;
         let evidence = store.put_artifact(b"old successful read")?;
+        crate::storage::claim_test_operation(&mut store, &operation)?;
+        source = store.run(&source.id)?;
         store.operation_state(&operation, "succeeded", Some(&evidence), json!({}))?;
         store.save_checkpoint(
             &source.id,
@@ -342,9 +344,9 @@ mod tests {
         drop(lock);
         let operation = store.begin_operation(
             &source.id,
-            "workspace.read",
-            json!({"path":"src/parser.rs"}),
-            true,
+            "workspace.write",
+            json!({"path":"src/parser.rs","content":"replacement"}),
+            false,
         )?;
         assert!(
             prepare(
@@ -357,6 +359,7 @@ mod tests {
             )
             .is_err()
         );
+        store.operation_state(&operation, "dispatched", None, json!({}))?;
         store.operation_state(&operation, "outcome_unknown", None, json!({}))?;
         assert!(
             prepare(
@@ -425,7 +428,15 @@ mod tests {
         let child = commit(&mut store, &root, &review)?;
         assert!(store.operations(&child.id)?.is_empty());
         assert_eq!(store.run(&source.id)?.state, "cancelled");
-        store.operation_state(&operation, "outcome_unknown", None, json!({}))?;
+        assert_eq!(store.operation(&operation.id)?.state, "pending");
+        let uncertain = store.begin_operation(
+            &source.id,
+            "workspace.write",
+            json!({"path":"src/parser.rs","content":"uncertain"}),
+            false,
+        )?;
+        store.operation_state(&uncertain, "dispatched", None, json!({}))?;
+        store.operation_state(&uncertain, "outcome_unknown", None, json!({}))?;
         assert!(prepare(&store, &source.id, directory.path(), "grok", "model", None).is_err());
         Ok(())
     }

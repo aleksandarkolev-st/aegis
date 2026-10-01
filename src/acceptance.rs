@@ -338,6 +338,7 @@ mod tests {
         let read =
             store.begin_operation(&run.id, "workspace.read", json!({"path":"fixture"}), true)?;
         let evidence = store.put_artifact(b"fixture evidence")?;
+        crate::storage::claim_test_operation(&mut store, &read)?;
         store.operation_state(&read, "succeeded", Some(&evidence), json!({}))?;
         assert!(
             store
@@ -346,27 +347,36 @@ mod tests {
         );
         propose(&mut store, &run, "done", &[evidence.clone()])?;
         let proposal = store.completion_proposal(&run.id)?.unwrap();
-        let operation = store.begin_operation_versioned(
+        let failed_operation = store.begin_operation_versioned(
             &run.id,
             CAPABILITY,
             check.version()?,
             json!({"proposal":proposal}),
             true,
         )?;
-        assert!(authorized_check(&store, &run, &operation).is_ok());
+        assert!(authorized_check(&store, &run, &failed_operation).is_ok());
         let unrelated = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
-        assert!(authorized_check(&store, &run, &operation).is_err());
+        assert!(authorized_check(&store, &run, &failed_operation).is_err());
         store.operation_state(&unrelated, "cancelled", None, json!({}))?;
-        assert!(authorized_check(&store, &run, &operation).is_ok());
+        assert!(authorized_check(&store, &run, &failed_operation).is_ok());
         let failed = store.put_artifact(br#"{"exit_code":1}"#)?;
-        store.operation_state(&operation, "succeeded", Some(&failed), json!({}))?;
+        crate::storage::claim_test_operation(&mut store, &failed_operation)?;
+        store.operation_state(&failed_operation, "failed", Some(&failed), json!({}))?;
         assert!(
             store
                 .complete_run(&run.id, "done", &[evidence.clone()])
                 .is_err()
         );
         let passed = store.put_artifact(br#"{"exit_code":0}"#)?;
-        store.operation_state(&operation, "succeeded", Some(&passed), json!({}))?;
+        let passed_operation = store.begin_operation_versioned(
+            &run.id,
+            CAPABILITY,
+            check.version()?,
+            json!({"proposal":proposal}),
+            true,
+        )?;
+        crate::storage::claim_test_operation(&mut store, &passed_operation)?;
+        store.operation_state(&passed_operation, "succeeded", Some(&passed), json!({}))?;
         assert!(
             store
                 .complete_run(&run.id, "different summary", &[evidence.clone()])
@@ -374,7 +384,7 @@ mod tests {
         );
         assert!(resume(&mut store, directory.path(), &run)?);
         assert_eq!(store.run(&run.id)?.state, "completed");
-        assert_eq!(store.event_count(&run.id, "operation.dispatched")?, 0);
+        assert_eq!(store.event_count(&run.id, "operation.dispatched")?, 3);
         assert!(store.completion_proposal(&run.id)?.is_none());
         Ok(())
     }
