@@ -117,6 +117,19 @@ fn parser_obligations_survive_replanning_provider_change_and_workspace_edit() ->
         store.verify_obligation(&run.id, id, &[artifact.clone()])?;
         current_evidence.push(artifact);
     }
+    store.save_checkpoint(
+        &run.id,
+        &Checkpoint {
+            decisions: vec!["Keep the public API".into()],
+            unresolved: vec![],
+            next_action: "Review the refreshed proof".into(),
+            milestones: vec![Milestone {
+                title: "Implementation compiles".into(),
+                state: "completed".into(),
+                evidence: vec![current_evidence[0].clone()],
+            }],
+        },
+    )?;
     store.complete_run(&run.id, "done", &current_evidence)?;
     assert_eq!(store.run(&run.id)?.state, "completed");
     assert_eq!(store.event_count(&run.id, "provider.transition")?, 1);
