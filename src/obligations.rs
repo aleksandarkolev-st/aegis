@@ -125,14 +125,6 @@ pub(crate) fn record_operation(
     operation: &Operation,
     may_have_run: bool,
 ) -> Result<()> {
-    let already_recorded: i64 = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM operation_revisions WHERE operation_id = ?1)",
-        [&operation.id],
-        |row| row.get(0),
-    )?;
-    if already_recorded != 0 {
-        return Ok(());
-    }
     let Some(current) = transaction
         .query_row(
             "SELECT revision FROM workspace_revisions WHERE run_id = ?1",
@@ -143,31 +135,8 @@ pub(crate) fn record_operation(
     else {
         return Ok(());
     };
-    let might_mutate = match operation.capability.as_str() {
-        "workspace.write" | "workspace.patch" => true,
-        "process.run" => {
-            let grants: String = transaction.query_row(
-                "SELECT grants FROM runs WHERE id = ?1",
-                [&operation.run_id],
-                |row| row.get(0),
-            )?;
-            serde_json::from_str::<Vec<String>>(&grants)?
-                .iter()
-                .any(|grant| grant == "workspace.write")
-        }
-        capability if capability.starts_with("mcp.") => {
-            let grants: String = transaction.query_row(
-                "SELECT grants FROM runs WHERE id = ?1",
-                [&operation.run_id],
-                |row| row.get(0),
-            )?;
-            serde_json::from_str::<Vec<String>>(&grants)?
-                .iter()
-                .any(|grant| grant == "workspace.write")
-        }
-        _ => false,
-    };
-    let invalidates = might_mutate && may_have_run;
+    let invalidates = may_have_run
+        && might_mutate_workspace(transaction, &operation.run_id, &operation.capability)?;
     let revision = if invalidates {
         current
             .checked_add(1)
@@ -183,10 +152,97 @@ pub(crate) fn record_operation(
         )?;
     }
     transaction.execute(
-        "INSERT OR REPLACE INTO operation_revisions(operation_id, run_id, revision) VALUES (?1, ?2, ?3)",
+        "INSERT INTO operation_revisions(operation_id, run_id, revision) VALUES (?1, ?2, ?3)
+         ON CONFLICT(operation_id) DO UPDATE SET run_id=excluded.run_id, revision=excluded.revision",
         params![operation.id, operation.run_id, revision],
     )?;
     Ok(())
+}
+
+fn might_mutate_workspace(
+    connection: &rusqlite::Connection,
+    run_id: &str,
+    capability: &str,
+) -> Result<bool> {
+    Ok(match capability {
+        "workspace.write" | "workspace.patch" => true,
+        "process.run" => {
+            let grants: String = connection.query_row(
+                "SELECT grants FROM runs WHERE id = ?1",
+                [run_id],
+                |row| row.get(0),
+            )?;
+            serde_json::from_str::<Vec<String>>(&grants)?
+                .iter()
+                .any(|grant| grant == "workspace.write")
+        }
+        capability if capability.starts_with("mcp.") => {
+            let grants: String = connection.query_row(
+                "SELECT grants FROM runs WHERE id = ?1",
+                [run_id],
+                |row| row.get(0),
+            )?;
+            serde_json::from_str::<Vec<String>>(&grants)?
+                .iter()
+                .any(|grant| grant == "workspace.write")
+        }
+        _ => false,
+    })
+}
+
+pub(crate) fn claim_operation_revision(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    operation_id: &str,
+    capability: &str,
+) -> Result<Option<i64>> {
+    if might_mutate_workspace(transaction, run_id, capability)? {
+        invalidate_workspace(
+            transaction,
+            run_id,
+            serde_json::json!({
+                "operation":operation_id,
+                "capability":capability,
+                "phase":"claimed"
+            }),
+        )?;
+    }
+    transaction
+        .query_row(
+            "SELECT revision FROM workspace_revisions WHERE run_id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+pub(crate) fn workspace_mutation_in_flight(
+    connection: &rusqlite::Connection,
+    run_id: &str,
+) -> Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM runs AS source
+            JOIN runs AS peer ON peer.workspace = source.workspace
+            JOIN operations AS operation ON operation.run_id = peer.id
+            WHERE source.id = ?1
+              AND operation.state = 'executing'
+              AND (
+                  operation.capability IN ('workspace.write', 'workspace.patch')
+                  OR (
+                      (operation.capability = 'process.run' OR operation.capability LIKE 'mcp.%')
+                      AND EXISTS (
+                          SELECT 1 FROM json_each(peer.grants) AS grant_item
+                          WHERE grant_item.value = 'workspace.write'
+                      )
+                  )
+              )
+        )",
+        [run_id],
+        |row| row.get(0),
+    )?)
 }
 
 pub(crate) fn invalidate_workspace(
@@ -324,8 +380,41 @@ pub(crate) fn current_evidence(
     revision: i64,
     hash: &str,
 ) -> Result<bool> {
+    if workspace_mutation_in_flight(connection, run_id)? {
+        return Ok(false);
+    }
     Ok(connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM operations AS operation JOIN operation_revisions AS revision ON revision.operation_id = operation.id AND revision.run_id = operation.run_id WHERE operation.run_id = ?1 AND operation.state = 'succeeded' AND revision.revision = ?2 AND (operation.artifact = ?3 OR EXISTS (SELECT 1 FROM operation_artifacts AS linked WHERE linked.operation_id = operation.id AND linked.hash = ?3)))",
+        "SELECT EXISTS(
+            SELECT 1
+            FROM operations AS operation
+            JOIN operation_revisions AS revision
+              ON revision.operation_id = operation.id AND revision.run_id = operation.run_id
+            JOIN runs AS run ON run.id = operation.run_id
+            WHERE operation.run_id = ?1
+              AND operation.state = 'succeeded'
+              AND revision.revision = ?2
+              AND (operation.artifact = ?3 OR EXISTS (
+                  SELECT 1 FROM operation_artifacts AS linked
+                  WHERE linked.operation_id = operation.id AND linked.hash = ?3
+              ))
+              AND operation.started_revision IS NOT NULL
+              AND (
+                  operation.started_revision = ?2
+                  OR (
+                      operation.started_revision + 1 = ?2
+                      AND (
+                          operation.capability IN ('workspace.write', 'workspace.patch')
+                          OR (
+                              (operation.capability = 'process.run' OR operation.capability LIKE 'mcp.%')
+                              AND EXISTS (
+                                  SELECT 1 FROM json_each(run.grants) AS grant_item
+                                  WHERE grant_item.value = 'workspace.write'
+                              )
+                          )
+                      )
+                  )
+              )
+        )",
         params![run_id, revision, hash], |row| row.get(0),
     )?)
 }
@@ -638,8 +727,8 @@ mod tests {
         store.claim_operation(&edit)?;
         let hash = store.put_artifact(b"edit")?;
         store.operation_state(&edit, "succeeded", Some(&hash), serde_json::json!({}))?;
-        assert_eq!(store.workspace_revision(&runs[0].id)?, Some(1));
-        assert_eq!(store.workspace_revision(&runs[1].id)?, Some(1));
+        assert_eq!(store.workspace_revision(&runs[0].id)?, Some(2));
+        assert_eq!(store.workspace_revision(&runs[1].id)?, Some(2));
         assert_eq!(store.obligations(&runs[1].id)?[1].state, "stale");
         assert_eq!(store.obligations(&runs[2].id)?, history);
         store.resume_paused(&runs[1].id)?;
@@ -654,6 +743,103 @@ mod tests {
                 .complete_run(&runs[1].id, "done", &[hashes[1].clone()])
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_from_reads_overlapping_a_peer_mutation_is_not_current() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let grants = json!(["workspace.read", "workspace.write"]);
+        let reader = store.create_run(
+            "Check parser behavior",
+            directory.path(),
+            "custom",
+            grants.clone(),
+            json!({"obligations":["Parser behavior is correct"]}),
+            "",
+        )?;
+        let editor = store.create_run(
+            "Edit parser",
+            directory.path(),
+            "custom",
+            grants,
+            json!({"obligations":["Parser edit is correct"]}),
+            "",
+        )?;
+        store.state(&reader.id, "running", json!({}))?;
+        store.state(&editor.id, "running", json!({}))?;
+
+        let early_read = store.begin_operation(
+            &reader.id,
+            "workspace.search",
+            json!({"query":"parser"}),
+            true,
+        )?;
+        crate::storage::claim_test_operation(&mut store, &early_read)?;
+
+        let edit = store.begin_operation(
+            &editor.id,
+            "workspace.write",
+            json!({"path":"parser.rs","content":"updated"}),
+            false,
+        )?;
+        store.operation_state(&edit, "dispatched", None, json!({}))?;
+        store.claim_operation(&edit)?;
+        assert_eq!(store.workspace_revision(&reader.id)?, Some(1));
+
+        let read_after_claim = store.begin_operation(
+            &reader.id,
+            "workspace.search",
+            json!({"query":"parser"}),
+            true,
+        )?;
+        crate::storage::claim_test_operation(&mut store, &read_after_claim)?;
+
+        let early_artifact = store.put_artifact(b"search started before the edit")?;
+        store.operation_state(&early_read, "succeeded", Some(&early_artifact), json!({}))?;
+        let overlapping_artifact = store.put_artifact(b"search started during the edit")?;
+        store.operation_state(
+            &read_after_claim,
+            "succeeded",
+            Some(&overlapping_artifact),
+            json!({}),
+        )?;
+        assert!(store
+            .verify_obligation(&reader.id, 1, &[early_artifact.clone()])
+            .is_err());
+        assert!(store
+            .validate_completion(&reader.id, &[early_artifact.clone()])
+            .is_err());
+        assert!(store
+            .complete_run(&reader.id, "done", &[early_artifact.clone()])
+            .is_err());
+
+        let edit_artifact = store.put_artifact(b"write result")?;
+        store.operation_state(&edit, "succeeded", Some(&edit_artifact), json!({}))?;
+        assert_eq!(store.workspace_revision(&reader.id)?, Some(2));
+        store.verify_obligation(&editor.id, 1, &[edit_artifact.clone()])?;
+        assert_eq!(store.obligations(&editor.id)?[1].state, "verified");
+
+        assert!(store
+            .verify_obligation(&reader.id, 1, &[early_artifact])
+            .is_err());
+        assert!(store
+            .verify_obligation(&reader.id, 1, &[overlapping_artifact])
+            .is_err());
+        assert_eq!(store.obligations(&reader.id)?[1].state, "open");
+
+        let fresh_read = store.begin_operation(
+            &reader.id,
+            "workspace.search",
+            json!({"query":"parser"}),
+            true,
+        )?;
+        crate::storage::claim_test_operation(&mut store, &fresh_read)?;
+        let fresh_artifact = store.put_artifact(b"search started after the edit")?;
+        store.operation_state(&fresh_read, "succeeded", Some(&fresh_artifact), json!({}))?;
+        store.verify_obligation(&reader.id, 1, &[fresh_artifact])?;
+        assert_eq!(store.obligations(&reader.id)?[1].state, "verified");
         Ok(())
     }
 
@@ -901,7 +1087,7 @@ mod tests {
         store.claim_operation(&edit)?;
         let edit_evidence = store.put_artifact(b"new file result")?;
         store.operation_state(&edit, "succeeded", Some(&edit_evidence), json!({}))?;
-        assert_eq!(store.workspace_revision(&run.id)?, Some(1));
+        assert_eq!(store.workspace_revision(&run.id)?, Some(2));
         assert_eq!(store.obligations(&run.id)?[1].state, "stale");
         assert!(
             store
@@ -914,7 +1100,7 @@ mod tests {
                 .is_err()
         );
         store.operation_state(&edit, "succeeded", Some(&edit_evidence), json!({}))?;
-        assert_eq!(store.workspace_revision(&run.id)?, Some(1));
+        assert_eq!(store.workspace_revision(&run.id)?, Some(2));
         drop(store);
         let mut store = Store::open(directory.path())?;
         assert_eq!(store.obligations(&run.id)?[1].state, "stale");
@@ -929,7 +1115,7 @@ mod tests {
         )?;
         store.verify_obligation(&run.id, 1, &[current_evidence.clone()])?;
         store.complete_run(&run.id, "done", &[current_evidence])?;
-        assert_eq!(store.obligations(&run.id)?[1].verified_revision, Some(1));
+        assert_eq!(store.obligations(&run.id)?[1].verified_revision, Some(2));
         Ok(())
     }
 

@@ -553,6 +553,25 @@ impl Store {
                 COMMIT;",
             )?;
         }
+        if schema_version < 12 {
+            let has_started_revision = {
+                let mut statement = store.connection.prepare("PRAGMA table_info(operations)")?;
+                statement
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+                    .iter()
+                    .any(|column| column == "started_revision")
+            };
+            store.connection.execute_batch("BEGIN IMMEDIATE;")?;
+            if !has_started_revision {
+                store
+                    .connection
+                    .execute_batch("ALTER TABLE operations ADD COLUMN started_revision INTEGER;")?;
+            }
+            store
+                .connection
+                .execute_batch("PRAGMA user_version=12; COMMIT;")?;
+        }
         store.connection.execute_batch("CREATE TABLE IF NOT EXISTS pause_requests (run_id TEXT PRIMARY KEY REFERENCES runs(id), pending INTEGER NOT NULL)")?;
         store.connection.execute_batch("CREATE TABLE IF NOT EXISTS observed_files (run_id TEXT NOT NULL REFERENCES runs(id), path TEXT NOT NULL, hash TEXT NOT NULL, PRIMARY KEY(run_id,path))")?;
         Ok(store)
@@ -1181,6 +1200,9 @@ impl Store {
         allowed_operation: Option<&str>,
     ) -> Result<()> {
         self.check_observed_files(run_id)?;
+        if crate::obligations::workspace_mutation_in_flight(&self.connection, run_id)? {
+            bail!("completion waits for mutating operations in the shared workspace");
+        }
         if evidence.is_empty() {
             bail!("completion requires evidence");
         }
@@ -1343,6 +1365,9 @@ impl Store {
         )?;
         if unresolved != 0 {
             bail!("operations changed before completion; finish or reconcile them first");
+        }
+        if crate::obligations::workspace_mutation_in_flight(&transaction, run_id)? {
+            bail!("workspace mutation started before completion could be committed");
         }
         crate::obligations::validate_connection(&transaction, run_id)?;
         crate::obligations::validate_finish_evidence(&transaction, run_id, evidence)?;
@@ -1596,9 +1621,14 @@ impl Store {
         }
         if terminal_operation_state(state) {
             crate::freshness::record(&transaction, &canonical, observed_result.as_ref())?;
-            let may_have_run =
-                state == "succeeded" || matches!(previous.as_str(), "dispatched" | "executing");
-            crate::obligations::record_operation(&transaction, &canonical, may_have_run)?;
+            // `outcome_unknown` already invalidated the workspace for this
+            // attempt. Reconciliation resolves that same attempt, it does
+            // not constitute another workspace mutation.
+            if previous != "outcome_unknown" {
+                let may_have_run = state == "succeeded"
+                    || matches!(previous.as_str(), "dispatched" | "executing");
+                crate::obligations::record_operation(&transaction, &canonical, may_have_run)?;
+            }
         }
         append_event(
             &transaction,
@@ -1614,9 +1644,28 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let capability: Option<String> = transaction
+            .query_row(
+                "SELECT operation.capability FROM operations AS operation
+                 WHERE operation.id = ?1 AND operation.run_id = ?2
+                   AND operation.state = 'dispatched'
+                   AND EXISTS (SELECT 1 FROM runs WHERE id = ?2 AND state = 'running')",
+                params![operation.id, operation.run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(capability) = capability else {
+            bail!("operation has already been claimed or is no longer dispatched");
+        };
+        let started_revision = crate::obligations::claim_operation_revision(
+            &transaction,
+            &operation.run_id,
+            &operation.id,
+            &capability,
+        )?;
         let changed = transaction.execute(
-            "UPDATE operations SET state = 'executing' WHERE id = ?1 AND run_id = ?2 AND state = 'dispatched' AND EXISTS (SELECT 1 FROM runs WHERE id = ?2 AND state = 'running')",
-            params![operation.id, operation.run_id],
+            "UPDATE operations SET state = 'executing', started_revision = ?3 WHERE id = ?1 AND run_id = ?2 AND state = 'dispatched' AND EXISTS (SELECT 1 FROM runs WHERE id = ?2 AND state = 'running')",
+            params![operation.id, operation.run_id, started_revision],
         )?;
         if changed != 1 {
             bail!("operation has already been claimed or is no longer dispatched");
@@ -2135,7 +2184,7 @@ mod tests {
             json!({"duplicate":true}),
         )?;
         assert_eq!(store.operation(&write.id)?.state, "succeeded");
-        assert_eq!(store.workspace_revision(&run.id)?, Some(1));
+        assert_eq!(store.workspace_revision(&run.id)?, Some(2));
         Ok(())
     }
 
@@ -2399,7 +2448,7 @@ mod tests {
         store.claim_operation(&mutation)?;
         let mutation_receipt = store.put_artifact(b"workspace changed")?;
         store.operation_state(&mutation, "succeeded", Some(&mutation_receipt), json!({}))?;
-        assert_eq!(store.workspace_revision(&run.id)?, Some(1));
+        assert_eq!(store.workspace_revision(&run.id)?, Some(2));
 
         let final_read = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
         let unrelated_fresh_evidence = store.put_artifact(b"unrelated fresh proof")?;
@@ -2509,7 +2558,7 @@ mod tests {
         store.claim_operation(&mutation)?;
         let mutation_receipt = store.put_artifact(b"workspace changed")?;
         store.operation_state(&mutation, "succeeded", Some(&mutation_receipt), json!({}))?;
-        assert_eq!(store.workspace_revision(&run.id)?, Some(1));
+        assert_eq!(store.workspace_revision(&run.id)?, Some(2));
 
         let final_read = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
         let current_evidence = store.put_artifact(b"revision one proof")?;
