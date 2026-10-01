@@ -842,7 +842,7 @@ impl Terminal {
         let completed = format_utc(completed_at);
         match self.task_started_at.get() {
             Some(started_at) => format!(
-                "Completed {completed} · elapsed {}",
+                "Completed {completed} · Worked for {}",
                 format_duration(Duration::from_secs(
                     completed_at.saturating_sub(started_at).max(0) as u64
                 ))
@@ -886,19 +886,22 @@ impl Terminal {
             .map(|(width, _)| width as usize)
             .unwrap_or(80);
         let text = format!(
-            "  {frame} {} · {} elapsed · {} · ^C interrupt / ^D detach",
+            "  {frame} {} · {} elapsed · {}",
             fit(label, 16),
             format_duration(elapsed),
             format_clock_utc(now)
         );
         let text = fit(&text, width.saturating_sub(1));
-        let footer = self.skin.show_context().then(|| {
-            fit(
-                &format!("  {} · {} recorded tokens", context.text(now), tokens),
-                width.saturating_sub(1),
-            )
-        });
-        self.paint_activity(width, text, footer)
+        let mut footer = "  Type/paste to steer · ^C interrupt · ^D detach".to_owned();
+        if self.skin.show_context() {
+            footer.push_str(&format!(
+                " · {} · {} recorded tokens",
+                context.text(now),
+                tokens
+            ));
+        }
+        let footer = fit(&footer, width.saturating_sub(1));
+        self.paint_activity(width, text, Some(footer))
     }
 
     pub fn authentication_activity(&self, label: &str, elapsed: Duration) -> Result<()> {
@@ -2266,7 +2269,7 @@ mod tests {
         terminal.set_task_started_at(Some(100));
         assert_eq!(
             terminal.completion_timing(165),
-            "Completed 1970-01-01 00:02:45 UTC · elapsed 1m 05s"
+            "Completed 1970-01-01 00:02:45 UTC · Worked for 1m 05s"
         );
         terminal.set_task_started_at(None);
         assert_eq!(
