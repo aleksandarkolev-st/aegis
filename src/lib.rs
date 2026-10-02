@@ -43,6 +43,7 @@ pub mod session;
 pub mod signin;
 pub mod storage;
 pub mod terminal;
+pub mod terminal_input;
 pub mod text;
 pub mod tokenization;
 pub mod trace;

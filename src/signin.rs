@@ -4,11 +4,12 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
-use crossterm::event::{self, Event};
+use crossterm::event::Event;
 
 use crate::auth_store::Vault;
 use crate::oauth::{AuthClient, BrowserLogin, DeviceLogin, Poll};
 use crate::terminal::{RawMode, Terminal, Tone};
+use crate::terminal_input as event;
 
 enum Update {
     Browser {

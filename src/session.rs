@@ -4,8 +4,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::terminal_input as event;
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -3988,6 +3989,10 @@ fn is_auth_error(error: &str) -> bool {
 pub fn interactive(root: &Path) -> Result<()> {
     Store::open(root)?;
     let mut terminal = Terminal::default();
+    // Own the Windows reader for the whole UI. Prompt/menu transitions must not
+    // cancel a console read and recreate its waiter while the user is typing.
+    #[cfg(windows)]
+    let _input = RawMode::enter(terminal.interactive)?;
     terminal.load_ui(root)?;
     let saved = fs::read(root.join("profile.json"))
         .ok()

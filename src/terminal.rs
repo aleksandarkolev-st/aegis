@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{Event, KeyCode, KeyEventKind, KeyModifiers},
     queue,
     style::{Attribute, Color, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
     terminal::{self, Clear, ClearType},
@@ -13,6 +13,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::storage::Event as RunEvent;
+use crate::terminal_input as event;
 pub use crate::text::clean;
 
 const MAX_INPUT_BYTES: usize = 65_536;
@@ -215,7 +216,7 @@ fn activity_lines(
     }
 }
 
-pub struct RawMode(bool);
+pub struct RawMode(bool, Option<crate::terminal_input::InputGuard>, bool);
 
 struct InputHistory<'a> {
     entries: &'a [String],
@@ -436,8 +437,17 @@ fn home_cursor_matches(
 }
 
 fn query_cursor_position() -> Option<(u16, u16)> {
-    let _raw = RawMode::enter(true).ok()?;
-    cursor::position().ok()
+    #[cfg(windows)]
+    {
+        // Windows queries the screen buffer directly; starting/cancelling an
+        // input reader here can consume the first key of the next prompt.
+        cursor::position().ok()
+    }
+    #[cfg(not(windows))]
+    {
+        let _raw = RawMode::enter(true).ok()?;
+        cursor::position().ok()
+    }
 }
 
 fn composer_draw_rows(previous: usize, current: usize) -> usize {
@@ -901,23 +911,34 @@ impl<'a> InputHistory<'a> {
 impl RawMode {
     pub fn enter(enabled: bool) -> Result<Self> {
         if enabled {
-            if terminal::is_raw_mode_enabled()? {
-                return Ok(Self(false));
+            let restore_raw = !terminal::is_raw_mode_enabled()?;
+            if restore_raw {
+                terminal::enable_raw_mode()?;
             }
-            terminal::enable_raw_mode()?;
-            let guard = Self(true);
-            queue!(io::stdout(), event::EnableBracketedPaste)?;
-            io::stdout().flush()?;
+            let input = match crate::terminal_input::start() {
+                Ok(input) => input,
+                Err(error) => {
+                    if restore_raw {
+                        terminal::disable_raw_mode()?;
+                    }
+                    return Err(error.into());
+                }
+            };
+            let restore_paste = restore_raw || input.owns_input();
+            let guard = Self(restore_raw, Some(input), restore_paste);
+            if restore_paste {
+                queue!(io::stdout(), event::EnableBracketedPaste)?;
+                io::stdout().flush()?;
+            }
             return Ok(guard);
         }
-        Ok(Self(enabled))
+        Ok(Self(enabled, None, false))
     }
 }
 
 impl Drop for RawMode {
     fn drop(&mut self) {
-        if self.0 {
-            let _ = terminal::disable_raw_mode();
+        if self.2 {
             let _ = queue!(
                 io::stdout(),
                 event::DisableBracketedPaste,
@@ -925,6 +946,10 @@ impl Drop for RawMode {
                 ResetColor
             );
             let _ = io::stdout().flush();
+        }
+        self.1.take();
+        if self.0 {
+            let _ = terminal::disable_raw_mode();
         }
     }
 }

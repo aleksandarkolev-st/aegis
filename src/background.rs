@@ -4,9 +4,10 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
 use crate::terminal::{RawMode, Terminal};
+use crate::terminal_input as event;
 
 struct Worker {
     cancelled: Arc<AtomicBool>,
