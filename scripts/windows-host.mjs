@@ -180,7 +180,10 @@ export async function callTool(name, input = {}, workspace = process.cwd()) {
         { type: 'image', mimeType: 'image/png', data: bytes.toString('base64') }], isError: false };
     } catch (error) { await fs.unlink(output).catch(() => {}); throw error; }
   }
-  return textResult(await native(name, nativeArgs, absolute(args.cwd ?? '.')));
+  const result = await native(name, nativeArgs, absolute(args.cwd ?? '.'));
+  const reply = textResult(result);
+  if (name === 'powershell') reply.isError = result.exit_code !== 0 || result.timed_out;
+  return reply;
 }
 
 export async function serve() {

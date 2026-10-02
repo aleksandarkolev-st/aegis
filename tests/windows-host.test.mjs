@@ -93,6 +93,9 @@ test('actual stdio MCP discovers all tools and reports per-call errors without e
   const discovery = await rpc.request('tools/list', {});
   assert.equal(discovery.result.tools.length, tools.length);
   assert.equal((await rpc.call('file_write', { path: 'protocol.txt', content: 'stdio✓' })).isError, false);
+  const failedCommand = await rpc.call('powershell', { script: 'exit 7' });
+  assert.equal(failedCommand.isError, true, 'Failed commands must never become successful MCP evidence');
+  assert.equal(data(failedCommand).exit_code, 7);
   assert.equal(data(await rpc.call('file_read', { path: 'protocol.txt' })).text, 'stdio✓');
   assert.equal((await rpc.call('desktop_keyboard', { keys: ['INVALID_KEY'] })).isError, true);
   assert.equal((await rpc.call('desktop_mouse', { action: 'move', x: 32768, y: 32768 })).isError, true);
