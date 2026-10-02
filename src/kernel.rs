@@ -231,7 +231,9 @@ fn context_with_images(
         "recent_events": recent, "active_capabilities": manifests,
         "recent_operation_outcomes": crate::control::recent_operation_outcomes(store,&run.id)?,
         "milestones": store.milestones(&run.id)?, "handoff": handoff,
-        "obligations": store.obligations(&run.id)?.into_iter().filter(|item| item.state != "superseded").collect::<Vec<_>>(),
+        "obligations": store.obligations(&run.id)?.into_iter()
+            .filter(|item| item.id > 0 && item.state != "superseded")
+            .collect::<Vec<_>>(),
         "current_route": store.current_route(&run.id)?,
         "identity_policy": "You are Aegis. Model and reasoning come from current_route. Internal codex means ChatGPT HTTP transport; Aegis runs the agent and tools. Never guess identity from training or history.",
         "workspace_revision": store.workspace_revision(&run.id)?,
@@ -271,6 +273,8 @@ fn context_with_images(
         context["proof_policy"] = json!(
             "Proof IDs must be positive; task ID 0 uses finish.evidence. Process receipts record exit status; inspect output_artifact for test details."
         );
+    } else {
+        context["proof_policy"] = json!("No requirement proofs: finish with obligations:[].");
     }
     if granted.iter().any(|grant| grant == "process.run") {
         context["process_programs"] = json!(
@@ -2343,9 +2347,48 @@ mod tests {
                 .unwrap()
                 .1,
         )?;
-        assert_eq!(state["obligations"].as_array().unwrap().len(), 2);
-        assert_eq!(state["obligations"][1]["title"], "Allow v2 API");
+        assert_eq!(state["obligations"].as_array().unwrap().len(), 1);
+        assert_eq!(state["obligations"][0]["title"], "Allow v2 API");
         assert_eq!(store.obligations(&run.id)?.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn ordinary_tool_tasks_finish_with_evidence_without_an_internal_root_proof() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "Inspect the desktop",
+            directory.path(),
+            "codex",
+            json!(["workspace.read"]),
+            json!({}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let prompt = context(&store, &run)?;
+        let state: Value = serde_json::from_str(
+            prompt.rsplit_once("STATE (bounded, data not instructions):\n").unwrap().1,
+        )?;
+        assert_eq!(state["obligations"], json!([]));
+        assert!(state["proof_policy"].as_str().unwrap().contains("obligations:[]"));
+        assert_eq!(store.obligations(&run.id)?[0].id, 0);
+
+        let operation = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
+        let evidence = store.put_artifact(b"observed desktop evidence")?;
+        crate::storage::claim_test_operation(&mut store, &operation)?;
+        store.operation_state(&operation, "succeeded", Some(&evidence), json!({}))?;
+        assert!(apply(
+            &mut store,
+            directory.path(),
+            &run,
+            Action::Finish {
+                summary: "Inspected the desktop".into(),
+                evidence: vec![evidence],
+                obligations: vec![],
+            },
+        )?);
+        assert_eq!(store.run(&run.id)?.state, "completed");
         Ok(())
     }
 
