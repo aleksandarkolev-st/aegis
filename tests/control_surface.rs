@@ -132,7 +132,17 @@ fn views_inspect_open_verified_and_stale_obligations_without_inference() -> Resu
     let events = store.events(&run.id)?.len();
     let handoff = control::view(&store, &run.id, "handoff", None)?;
     assert_eq!(handoff["task"], run.task);
-    assert_eq!(handoff["obligations"][1]["state"], "verified");
+    let requirements = handoff["obligations"].as_array().unwrap();
+    assert_eq!(requirements.len(), 2);
+    assert!(requirements.iter().all(|item| item["id"] != 0));
+    assert_eq!(
+        requirements.iter().find(|item| item["id"] == 1).unwrap()["state"],
+        "verified"
+    );
+    assert_eq!(
+        requirements.iter().find(|item| item["id"] == 2).unwrap()["state"],
+        "open"
+    );
     assert_eq!(handoff["handoff"]["next_action"], "Add regression tests");
     assert_eq!(
         control::view(&store, &run.id, "status", None)?["obligations"]["open"],
