@@ -13,7 +13,7 @@ Typing `/` at the task prompt opens the searchable command menu. Scroll or type 
 | `/evidence O3` | Artifact hashes, integrity, source operations, arguments, receipts, revisions and freshness |
 | `/verify` | Outstanding requirements, stale or invalid proofs, unresolved operations and acceptance blockers |
 | `/provider`, `/provider history` | Primary, current and fallback routes; transitions with reason and recorded turn |
-| `/budget` | Used, limit and remaining actions, model tokens, tool result tokens and wall seconds; provider input/cached/output when measured |
+| `/budget` | Recorded model responses, model tokens and tool-result tokens without aggregate caps; elapsed and remaining wall time; provider input/cached/output when measured |
 | `/handoff` | The normalized provider-neutral state used by the next model call |
 | `/pause` | Persist a pause request; finish the current safe action boundary, save a checkpoint and stop inference |
 | `/resume` | Continue the same run, contract, evidence, accounting and provider route |
@@ -34,14 +34,18 @@ An interactive task with an explicit `Requirements:` list shows its contract bef
 
 Piped terminal input preserves bounded bracketed multiline pastes as one request, including the explicit requirement list. An incomplete paste is rejected rather than starting its first line as a partial task.
 
+Legacy saved tasks without a complete reviewed contract must be reviewed locally before resuming, answering or completing. F3 offers **Review and adopt legacy task**; `/goal add` also opens that review. Adoption retains the original task and history, requires all saved requirements to remain covered, and starts a fresh ledger without carrying old proof into it. Remote resume and approval cannot bypass this review.
+
 The kernel saves its completion explanation in `run.completed`. It contains retained requirement states and evidence, operation/program/exit receipts, final revision, independent acceptance evidence and provider transitions. It can still be inspected after event archival and restart.
 
 ## Proof boundaries
 
 Failed operation receipts and their logs remain available through `/artifacts` and model artifact inspection for the owning run. The continuation state retains a bounded summary of recent receipts, including recent process failures, after context rotation and event archival. These summaries count toward tool result exposure; failed receipts cannot verify requirements or complete a task.
 
-Completion rechecks successful operation provenance, artifact integrity, active requirement states and current revisions. Dispatching a write advances the revision even when its outcome fails or is uncertain. Writes also stale proofs for unfinished tasks sharing the workspace. Unknown side effects require reconciliation before a pause can be acknowledged or completion accepted.
+Completion rechecks successful operation provenance, artifact integrity, active requirement states and current revisions. Claiming and finishing a write are separate freshness boundaries, even when its outcome fails or is uncertain. Multiple invalidation causes at one terminal transition advance the revision once. Writes also stale proofs for unfinished tasks sharing the workspace. Unknown side effects require reconciliation before a pause can be acknowledged or completion accepted.
 
 For paths observed by workspace read/write/patch tools, Aegis records bounded file digests and detects later external changes before verification, inference and completion. `/verify` reports those changes without mutating state. This watches at most 1,024 observed paths and bounds each file at 2 MiB. It does not watch unobserved dependencies or make an external filesystem transaction atomic.
+
+Process proof also uses a scoped workspace fingerprint at claim, terminal outcome, verification and completion. The snapshot bounds the scan to 100,000 entries and 512 MiB; internal metadata and conventional ignored generated directories are excluded, while tracked files remain included. A process result cannot prove the workspace if its snapshot changed during execution or could not be checked. A fresh read claim detects earlier observed changes before assigning its proof epoch. Neither check makes concurrent external filesystem changes atomic.
 
 Artifact provenance does not establish semantic coverage. Use an independent acceptance check for claims such as API compatibility and parser correctness. Arbitrary prose is retained in the immutable task but is not automatically decomposed into separate requirements. Completed historical runs retain their original verification record.

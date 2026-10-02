@@ -44,6 +44,8 @@ The Windows tests initially exposed native input splitting clipboard lines into 
 
 A later hosted output check passed with executable SHA-256 `81b19cbdca8025c6300a53ba047c45e5c000f03f118d4b697062c0ec455b0f8f`: both the durable output event and its foreground CLI display appeared before process success. The raw artifact retained all 70,033 bytes, and both model calls used GPT-6.1-sol/high. Receipt: `.arun/hosted-output-live-3iNe68/receipt.json`. This verifies the foreground runner and display execute concurrently, rather than replaying output after work ends.
 
+The subsequent library regression gate passed 377 tests with three hosted-only checks explicitly ignored. The control-surface, file-freshness and obligation-contract integration targets passed 12 tests. This includes rejection of process proof after an edit during execution, idempotent terminal invalidation, fresh proof after external changes, reviewed legacy adoption and unbounded aggregate usage accounting. Output sanitation now retains a bounded parser state for each operation so ANSI and OSC sequences split across live chunks cannot leak control fragments or hidden payload into the transcript.
+
 ## Further ideas
 
 Detailed transcript search, a visible steering queue, theme selection and syntax-aware code coloring need their own design and acceptance checks. Current code block formatting and diff colors should not be described as a complete syntax highlighter or transcript browser.
