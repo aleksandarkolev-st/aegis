@@ -34,6 +34,30 @@ pub enum Input {
     Exit,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum CommandMenuOutcome {
+    Selected(String),
+    Cancelled,
+    Interrupt,
+    TaskFinished,
+}
+
+enum MenuOutcome {
+    Selected(usize),
+    Cancelled,
+    Interrupt,
+    TaskFinished,
+}
+
+impl MenuOutcome {
+    fn selection(self) -> Option<usize> {
+        match self {
+            Self::Selected(index) => Some(index),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum Tone {
     Accent,
@@ -1575,14 +1599,28 @@ impl Terminal {
     }
 
     pub fn command_menu(&self) -> Result<Option<String>> {
-        self.command_menu_with_updates(|| Ok(None::<()>), |_| Ok(true))
+        Ok(
+            match self.command_menu_inner(false, || Ok(None::<()>), |_| Ok(true))? {
+                CommandMenuOutcome::Selected(command) => Some(command),
+                _ => None,
+            },
+        )
     }
 
     pub fn command_menu_with_updates<T>(
         &self,
         poll_updates: impl FnMut() -> Result<Option<T>>,
         render_updates: impl FnMut(T) -> Result<bool>,
-    ) -> Result<Option<String>> {
+    ) -> Result<CommandMenuOutcome> {
+        self.command_menu_inner(true, poll_updates, render_updates)
+    }
+
+    fn command_menu_inner<T>(
+        &self,
+        interrupt_on_ctrl_c: bool,
+        poll_updates: impl FnMut() -> Result<Option<T>>,
+        render_updates: impl FnMut(T) -> Result<bool>,
+    ) -> Result<CommandMenuOutcome> {
         let choices = crate::commands::COMMANDS
             .iter()
             .map(|(command, description)| format!("{command:<24} {description}"))
@@ -1591,20 +1629,39 @@ impl Terminal {
             "Slash commands ({}) · search or scroll · Enter fills the prompt",
             choices.len()
         );
-        Ok(self
-            .select_at_with_updates(&title, &choices, 0, poll_updates, render_updates)?
-            .map(|index| crate::commands::COMMANDS[index].0.to_owned()))
+        Ok(
+            match self.select_at_with_updates(
+                &title,
+                &choices,
+                0,
+                interrupt_on_ctrl_c,
+                poll_updates,
+                render_updates,
+            )? {
+                MenuOutcome::Selected(index) => {
+                    CommandMenuOutcome::Selected(crate::commands::COMMANDS[index].0.to_owned())
+                }
+                MenuOutcome::Cancelled => CommandMenuOutcome::Cancelled,
+                MenuOutcome::Interrupt => CommandMenuOutcome::Interrupt,
+                MenuOutcome::TaskFinished => CommandMenuOutcome::TaskFinished,
+            },
+        )
     }
 
     pub fn set_command_draft(&self, command: &str) {
-        self.set_input_draft(&selected_command_draft(command));
+        let _ = self.set_input_draft(&selected_command_draft(command));
     }
 
-    pub fn set_input_draft(&self, draft: &str) {
+    pub fn set_input_draft(&self, draft: &str) -> Result<()> {
+        let draft = normalize_paste(draft);
+        if !can_insert_input(0, draft.len()) {
+            anyhow::bail!("Input exceeds {MAX_INPUT_BYTES} bytes");
+        }
         let text: Vec<_> = draft.chars().collect();
         let caret = text.len();
         self.input_draft
             .replace(Some((self.input_prefix(), text, caret)));
+        Ok(())
     }
 
     fn clear_input_draft_for(&self, label: &str) {
@@ -1716,20 +1773,7 @@ impl Terminal {
             let composer_width = layout.composer_width;
             let max_input_rows = layout.max_input_rows;
             let available = layout.available;
-            let displayed: Vec<_> = text
-                .iter()
-                .map(|character| {
-                    if secret {
-                        '●'
-                    } else if *character == '\n' && !composer {
-                        '↵'
-                    } else if character.is_control() {
-                        ' '
-                    } else {
-                        *character
-                    }
-                })
-                .collect();
+            let displayed = displayed_input(&text, secret, composer);
             if measured_resize {
                 self.clear_input_for_resize(
                     screen_size,
@@ -2034,7 +2078,16 @@ impl Terminal {
                                 && draft_label == self.input_prefix() =>
                         {
                             self.finish_input(composer, None)?;
-                            let selected = self.command_menu()?.unwrap_or_else(|| "/".into());
+                            let selected = match self.command_menu_inner(
+                                interrupt_on_ctrl_c,
+                                &mut poll_updates,
+                                &mut render_updates,
+                            )? {
+                                CommandMenuOutcome::Selected(command) => command,
+                                CommandMenuOutcome::Cancelled => "/".into(),
+                                CommandMenuOutcome::Interrupt => return Ok(Input::Interrupt),
+                                CommandMenuOutcome::TaskFinished => return Ok(Input::TaskFinished),
+                            };
                             text = selected_command_draft(&selected).chars().collect();
                             caret = text.len();
                             draft_bytes = input_bytes(&text);
@@ -2096,7 +2149,16 @@ impl Terminal {
         choices: &[String],
         initial: usize,
     ) -> Result<Option<usize>> {
-        self.select_at_with_updates(title, choices, initial, || Ok(None::<()>), |_| Ok(true))
+        Ok(self
+            .select_at_with_updates(
+                title,
+                choices,
+                initial,
+                false,
+                || Ok(None::<()>),
+                |_| Ok(true),
+            )?
+            .selection())
     }
 
     fn select_at_with_updates<T>(
@@ -2104,14 +2166,22 @@ impl Terminal {
         title: &str,
         choices: &[String],
         initial: usize,
+        interrupt_on_ctrl_c: bool,
         poll_updates: impl FnMut() -> Result<Option<T>>,
         render_updates: impl FnMut(T) -> Result<bool>,
-    ) -> Result<Option<usize>> {
+    ) -> Result<MenuOutcome> {
         if choices.is_empty() {
-            return Ok(None);
+            return Ok(MenuOutcome::Cancelled);
         }
         if self.interactive {
-            return self.menu_with_updates(title, choices, initial, poll_updates, render_updates);
+            return self.menu_with_updates(
+                title,
+                choices,
+                initial,
+                interrupt_on_ctrl_c,
+                poll_updates,
+                render_updates,
+            );
         }
         self.message(Tone::Accent, "◇", title)?;
         for (index, choice) in choices.iter().enumerate() {
@@ -2122,14 +2192,14 @@ impl Terminal {
                 Input::Submit(value) => {
                     if let Ok(index) = value.trim().parse::<usize>() {
                         if (1..=choices.len()).contains(&index) {
-                            return Ok(Some(index - 1));
+                            return Ok(MenuOutcome::Selected(index - 1));
                         }
                     }
                     if value.trim().is_empty() {
-                        return Ok(Some(0));
+                        return Ok(MenuOutcome::Selected(0));
                     }
                 }
-                Input::Exit => return Ok(None),
+                Input::Exit => return Ok(MenuOutcome::Cancelled),
                 _ => {}
             }
         }
@@ -2140,9 +2210,10 @@ impl Terminal {
         title: &str,
         choices: &[String],
         initial: usize,
+        interrupt_on_ctrl_c: bool,
         mut poll_updates: impl FnMut() -> Result<Option<T>>,
         mut render_updates: impl FnMut(T) -> Result<bool>,
-    ) -> Result<Option<usize>> {
+    ) -> Result<MenuOutcome> {
         self.invalidate_home_snapshot();
         let _raw = RawMode::enter(true)?;
         let mut selected = initial.min(choices.len() - 1);
@@ -2155,10 +2226,20 @@ impl Terminal {
         let mut redraw_from_current_line = false;
         let mut last_update_poll = Instant::now();
         loop {
-            if let Some(resized) = pending_resize.take() {
+            let measured_resize = if let Some(resized) = pending_resize.take() {
                 screen_size = resized;
-            } else if let Some(measured) = TerminalSize::measured() {
+                false
+            } else {
+                let (measured, changed) =
+                    measured_terminal_resize(screen_size, TerminalSize::measured());
                 screen_size = measured;
+                changed
+            };
+            if measured_resize && rendered {
+                self.clear_menu_for_resize(rendered_rows)?;
+                rendered = false;
+                rendered_rows = 0;
+                redraw_from_current_line = true;
             }
             let width = screen_size.columns.min(u16::MAX as usize) as u16;
             let rows = menu_rows(screen_size.rows, choices.len());
@@ -2204,7 +2285,7 @@ impl Terminal {
                 if let Some(update) = poll_updates()? {
                     self.clear_menu(rows)?;
                     if !render_updates(update)? {
-                        return Ok(None);
+                        return Ok(MenuOutcome::TaskFinished);
                     }
                     rendered = false;
                     rendered_rows = 0;
@@ -2218,13 +2299,7 @@ impl Terminal {
                     let event = Event::Resize(width, height);
                     screen_size = TerminalSize::from_event(&event).unwrap_or(screen_size);
                     pending_resize = Some(screen_size);
-                    queue!(
-                        io::stdout(),
-                        cursor::MoveUp(rendered_rows.saturating_sub(1) as u16),
-                        cursor::MoveToColumn(0),
-                        Clear(ClearType::FromCursorDown)
-                    )?;
-                    io::stdout().flush()?;
+                    self.clear_menu_for_resize(rendered_rows)?;
                     rendered = false;
                     rendered_rows = 0;
                     redraw_from_current_line = true;
@@ -2242,18 +2317,18 @@ impl Terminal {
                         KeyCode::Enter => {
                             if let Some(index) = matches.get(selected) {
                                 self.clear_menu(rows)?;
-                                return Ok(Some(*index));
+                                return Ok(MenuOutcome::Selected(*index));
                             }
                         }
                         KeyCode::Esc => {
                             self.clear_menu(rows)?;
-                            return Ok(None);
+                            return Ok(MenuOutcome::Cancelled);
                         }
                         KeyCode::Char('c' | 'd')
                             if key.modifiers.contains(KeyModifiers::CONTROL) =>
                         {
                             self.clear_menu(rows)?;
-                            return Ok(None);
+                            return Ok(menu_control_outcome(key.code, interrupt_on_ctrl_c));
                         }
                         KeyCode::Char(digit) if digit.is_ascii_digit() && query.is_empty() => {
                             digits.push(digit);
@@ -2304,6 +2379,17 @@ impl Terminal {
             }
         }
         queue!(io::stdout(), cursor::MoveUp(rows as u16 + 1), cursor::Show)?;
+        io::stdout().flush()?;
+        Ok(())
+    }
+
+    fn clear_menu_for_resize(&self, rendered_rows: usize) -> Result<()> {
+        queue!(
+            io::stdout(),
+            cursor::MoveUp(rendered_rows.saturating_sub(1) as u16),
+            cursor::MoveToColumn(0),
+            Clear(ClearType::FromCursorDown)
+        )?;
         io::stdout().flush()?;
         Ok(())
     }
@@ -2411,11 +2497,13 @@ impl Terminal {
             }
             "operation.output" => {
                 let text = operation_stream_text(payload["text"].as_str().unwrap_or_default());
-                if text.is_empty() {
-                    Ok(())
-                } else {
-                    self.message(Tone::Quiet, "Output", &text)
+                if !text.is_empty() {
+                    self.message(Tone::Quiet, "Output", &text)?;
                 }
+                if let Some(notice) = operation_stream_notice(payload) {
+                    self.message(Tone::Quiet, "Output preview", notice)?;
+                }
+                Ok(())
             }
             "operation.succeeded" => {
                 let (tone, label, text) = result_summary(payload);
@@ -2708,6 +2796,36 @@ pub(crate) fn operation_output_preview(payload: &serde_json::Value) -> Option<(S
 
 fn operation_stream_text(text: &str) -> String {
     clean(&strip_terminal_sequences(text))
+}
+
+fn operation_stream_notice(payload: &serde_json::Value) -> Option<&'static str> {
+    (payload["truncated"] == true).then_some(
+        "Live preview reached its display limit. Full command output is saved as evidence when the command ends; inspect its output artifact for the remaining text.",
+    )
+}
+
+fn displayed_input(text: &[char], secret: bool, composer: bool) -> Vec<char> {
+    text.iter()
+        .map(|character| {
+            if secret {
+                '●'
+            } else if *character == '\n' {
+                if composer { '\n' } else { '↵' }
+            } else if character.is_control() {
+                ' '
+            } else {
+                *character
+            }
+        })
+        .collect()
+}
+
+fn menu_control_outcome(code: KeyCode, interrupt_on_ctrl_c: bool) -> MenuOutcome {
+    if code == KeyCode::Char('c') && interrupt_on_ctrl_c {
+        MenuOutcome::Interrupt
+    } else {
+        MenuOutcome::Cancelled
+    }
 }
 
 fn capability_search_text(payload: &serde_json::Value) -> String {
@@ -3165,6 +3283,63 @@ mod tests {
             operation_stream_text("ok\u{1b}[31m red\u{1b}[0m\n\u{202e}spoof"),
             "ok red\nspoof"
         );
+    }
+
+    #[test]
+    fn empty_truncation_event_still_displays_full_output_recovery_hint() {
+        let notice =
+            operation_stream_notice(&serde_json::json!({"text":"","truncated":true})).unwrap();
+        assert!(notice.contains("output artifact"));
+        assert!(operation_stream_notice(&serde_json::json!({"text":"normal output"})).is_none());
+    }
+
+    #[test]
+    fn composer_display_preserves_pasted_newlines_for_real_editor_layout() {
+        let text: Vec<_> = "first\n    second".chars().collect();
+        let displayed = displayed_input(&text, false, true);
+        let view = editor_view(&displayed, displayed.len(), 20, 4);
+        assert_eq!(view.rows, vec!["first", "    second"]);
+        assert_eq!(view.caret_row, 1);
+        assert_eq!(view.caret_column, 10);
+        assert_eq!(displayed_input(&text, false, false)[5], '↵');
+        assert!(
+            displayed_input(&text, true, true)
+                .iter()
+                .all(|character| *character == '●')
+        );
+    }
+
+    #[test]
+    fn initial_follow_draft_normalizes_paste_and_rejects_oversize_without_losing_prior_draft()
+    -> Result<()> {
+        let terminal = Terminal::default();
+        terminal.set_input_draft("first\r\n\tsecond\u{1b}[31m!\u{1b}[0m")?;
+        let saved = terminal.input_draft.borrow().clone().unwrap();
+        assert_eq!(saved.1.iter().collect::<String>(), "first\n    second!");
+        assert_eq!(saved.2, saved.1.len());
+        assert!(
+            terminal
+                .set_input_draft(&"x".repeat(MAX_INPUT_BYTES + 1))
+                .is_err()
+        );
+        assert_eq!(terminal.input_draft.borrow().as_ref(), Some(&saved));
+        Ok(())
+    }
+
+    #[test]
+    fn live_menu_control_c_propagates_interrupt_while_idle_and_control_d_cancel() {
+        assert!(matches!(
+            menu_control_outcome(KeyCode::Char('c'), true),
+            MenuOutcome::Interrupt
+        ));
+        assert!(matches!(
+            menu_control_outcome(KeyCode::Char('c'), false),
+            MenuOutcome::Cancelled
+        ));
+        assert!(matches!(
+            menu_control_outcome(KeyCode::Char('d'), true),
+            MenuOutcome::Cancelled
+        ));
     }
 
     #[test]

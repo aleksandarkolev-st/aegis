@@ -2290,7 +2290,7 @@ fn steer_from_follow(
     terminal.clear_activity()?;
     terminal.set_input_status("Steer this task · Enter sends · Shift+Enter adds a line");
     if !initial.is_empty() {
-        terminal.set_input_draft(initial);
+        terminal.set_input_draft(initial)?;
     }
     let label = terminal.input_prefix();
     loop {
@@ -2447,12 +2447,18 @@ fn run_follow_command_menu(
     progress: &mut FollowProgress,
 ) -> Result<bool> {
     terminal.clear_activity()?;
-    let Some(command) = terminal.command_menu_with_updates(
+    let outcome = terminal.command_menu_with_updates(
         || poll_follow_update(progress, store, id, terminal),
         |update| render_follow_update(terminal, update),
-    )?
-    else {
-        return Ok(true);
+    )?;
+    let command = match outcome {
+        crate::terminal::CommandMenuOutcome::Selected(command) => command,
+        crate::terminal::CommandMenuOutcome::Cancelled
+        | crate::terminal::CommandMenuOutcome::TaskFinished => return Ok(true),
+        crate::terminal::CommandMenuOutcome::Interrupt => {
+            request_follow_interrupt(terminal, store, id, interrupts)?;
+            return Ok(true);
+        }
     };
     steer_from_follow(
         root,
