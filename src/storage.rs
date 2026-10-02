@@ -574,6 +574,7 @@ impl Store {
         }
         store.connection.execute_batch("CREATE TABLE IF NOT EXISTS pause_requests (run_id TEXT PRIMARY KEY REFERENCES runs(id), pending INTEGER NOT NULL)")?;
         store.connection.execute_batch("CREATE TABLE IF NOT EXISTS observed_files (run_id TEXT NOT NULL REFERENCES runs(id), path TEXT NOT NULL, hash TEXT NOT NULL, PRIMARY KEY(run_id,path))")?;
+        store.connection.execute_batch("CREATE TABLE IF NOT EXISTS workspace_fingerprints (run_id TEXT PRIMARY KEY REFERENCES runs(id), fingerprint TEXT NOT NULL, revision INTEGER NOT NULL)")?;
         Ok(store)
     }
 
@@ -1551,6 +1552,39 @@ impl Store {
         allow_unknown_resolution: bool,
     ) -> Result<()> {
         let artifact_directory = self.artifacts.clone();
+        let existing = self.operation(&operation.id)?;
+        if existing.run_id != operation.run_id {
+            bail!("operation belongs to a different run");
+        }
+        let resolving_unknown = allow_unknown_resolution && existing.state == "outcome_unknown";
+        let mut fingerprint_capture: Option<std::result::Result<String, String>> = None;
+        if terminal_operation_state(state) && !resolving_unknown {
+            let run = self.run(&existing.run_id)?;
+            let needs_fingerprint = existing.capability == "process.run"
+                || (self
+                    .workspace_fingerprint_baseline(&existing.run_id)?
+                    .is_some()
+                    && (matches!(
+                        existing.capability.as_str(),
+                        "workspace.write" | "workspace.patch"
+                    ) || (existing.capability.starts_with("mcp.")
+                        && run.grants.as_array().is_some_and(|grants| {
+                            grants
+                                .iter()
+                                .any(|grant| grant.as_str() == Some("workspace.write"))
+                        }))));
+            if needs_fingerprint {
+                fingerprint_capture = Some(
+                    self.capture_workspace_fingerprint(&existing.run_id)
+                        .map_err(|error| format!("{error:#}")),
+                );
+            }
+        }
+        let mut detail = if detail.is_object() {
+            detail
+        } else {
+            json!({"detail":detail})
+        };
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1611,6 +1645,73 @@ impl Store {
             None
         };
         let previous = canonical.state.clone();
+        let mut fingerprint_to_save: Option<String> = None;
+        if terminal_operation_state(state)
+            && canonical.capability == "process.run"
+            && !resolving_unknown
+        {
+            match fingerprint_capture.as_ref() {
+                Some(Ok(fingerprint)) => {
+                    let baseline = crate::freshness::workspace_fingerprint_baseline(
+                        &transaction,
+                        &canonical.run_id,
+                    )?;
+                    if baseline
+                        .as_ref()
+                        .is_none_or(|(previous, _)| previous != fingerprint)
+                    {
+                        crate::obligations::invalidate_workspace(
+                            &transaction,
+                            &canonical.run_id,
+                            json!({
+                                "operation": canonical.id,
+                                "capability": canonical.capability,
+                                "reason": if baseline.is_none() {"process finished without a start fingerprint"} else {"scoped workspace changed while process.run was executing"},
+                                "fingerprint_scope": crate::freshness::WORKSPACE_FINGERPRINT_SCOPE
+                            }),
+                        )?;
+                        detail["workspace_fingerprint"] =
+                            json!("changed during process.run; this operation's evidence is stale");
+                    }
+                    fingerprint_to_save = Some(fingerprint.clone());
+                }
+                Some(Err(error)) => {
+                    crate::obligations::invalidate_workspace(
+                        &transaction,
+                        &canonical.run_id,
+                        json!({"operation":canonical.id,"capability":canonical.capability,"reason":"workspace fingerprint could not be checked after process.run"}),
+                    )?;
+                    detail["workspace_fingerprint_error"] = json!(error);
+                }
+                None => {
+                    crate::obligations::invalidate_workspace(
+                        &transaction,
+                        &canonical.run_id,
+                        json!({"operation":canonical.id,"capability":canonical.capability,"reason":"process.run finished without a usable workspace fingerprint"}),
+                    )?;
+                    detail["workspace_fingerprint_error"] =
+                        json!("fingerprint capture missing; operation evidence is stale");
+                }
+            }
+            if detail.is_object() {
+                detail["workspace_fingerprint_scope"] =
+                    json!(crate::freshness::WORKSPACE_FINGERPRINT_SCOPE);
+            }
+        } else if terminal_operation_state(state)
+            && fingerprint_capture.is_some()
+            && !resolving_unknown
+        {
+            if let Some(Ok(fingerprint)) = fingerprint_capture.as_ref() {
+                fingerprint_to_save = Some(fingerprint.clone());
+            } else if let Some(Err(error)) = fingerprint_capture.as_ref() {
+                crate::obligations::invalidate_workspace(
+                    &transaction,
+                    &canonical.run_id,
+                    json!({"operation":canonical.id,"capability":canonical.capability,"reason":"workspace fingerprint could not be refreshed after an Aegis write"}),
+                )?;
+                detail["workspace_fingerprint_error"] = json!(error);
+            }
+        }
         transaction.execute(
             "UPDATE operations SET state = ?2, artifact = COALESCE(?3, artifact) WHERE id = ?1",
             params![canonical.id, state, artifact],
@@ -1625,9 +1726,19 @@ impl Store {
             // attempt. Reconciliation resolves that same attempt, it does
             // not constitute another workspace mutation.
             if previous != "outcome_unknown" {
-                let may_have_run = state == "succeeded"
-                    || matches!(previous.as_str(), "dispatched" | "executing");
+                let may_have_run =
+                    state == "succeeded" || matches!(previous.as_str(), "dispatched" | "executing");
                 crate::obligations::record_operation(&transaction, &canonical, may_have_run)?;
+            }
+            if let Some(fingerprint) = fingerprint_to_save.as_deref() {
+                let revision =
+                    crate::freshness::workspace_revision(&transaction, &canonical.run_id)?;
+                crate::freshness::save_workspace_fingerprint(
+                    &transaction,
+                    &canonical.run_id,
+                    fingerprint,
+                    revision,
+                )?;
             }
         }
         append_event(
@@ -1641,6 +1752,22 @@ impl Store {
     }
 
     pub fn claim_operation(&mut self, operation: &Operation) -> Result<()> {
+        let existing = self.operation(&operation.id)?;
+        if existing.run_id != operation.run_id {
+            bail!("operation belongs to a different run");
+        }
+        let start_fingerprint = (existing.capability == "process.run")
+            .then(|| self.capture_workspace_fingerprint(&existing.run_id))
+            .transpose()?;
+        let has_workspace_write =
+            self.run(&existing.run_id)?
+                .grants
+                .as_array()
+                .is_some_and(|grants| {
+                    grants
+                        .iter()
+                        .any(|grant| grant.as_str() == Some("workspace.write"))
+                });
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1657,6 +1784,30 @@ impl Store {
         let Some(capability) = capability else {
             bail!("operation has already been claimed or is no longer dispatched");
         };
+        if let Some(fingerprint) = start_fingerprint.as_deref() {
+            let baseline =
+                crate::freshness::workspace_fingerprint_baseline(&transaction, &operation.run_id)?;
+            let missing_legacy_baseline = baseline.is_none()
+                && crate::freshness::workspace_has_process_evidence(
+                    &transaction,
+                    &operation.run_id,
+                )?;
+            let changed_before_start = baseline
+                .as_ref()
+                .is_some_and(|(previous, _)| previous != fingerprint);
+            if !has_workspace_write && (missing_legacy_baseline || changed_before_start) {
+                crate::obligations::invalidate_workspace(
+                    &transaction,
+                    &operation.run_id,
+                    json!({
+                        "operation": operation.id,
+                        "capability": capability,
+                        "reason": if missing_legacy_baseline {"existing process evidence had no start fingerprint"} else {"scoped workspace changed before process.run started"},
+                        "fingerprint_scope": crate::freshness::WORKSPACE_FINGERPRINT_SCOPE
+                    }),
+                )?;
+            }
+        }
         let started_revision = crate::obligations::claim_operation_revision(
             &transaction,
             &operation.run_id,
@@ -1669,6 +1820,16 @@ impl Store {
         )?;
         if changed != 1 {
             bail!("operation has already been claimed or is no longer dispatched");
+        }
+        if let Some(fingerprint) = start_fingerprint.as_deref() {
+            let revision =
+                started_revision.context("process.run claim has no workspace revision")?;
+            crate::freshness::save_workspace_fingerprint(
+                &transaction,
+                &operation.run_id,
+                fingerprint,
+                revision,
+            )?;
         }
         append_event(
             &transaction,
@@ -1880,6 +2041,53 @@ pub(crate) fn claim_test_operation(store: &mut Store, operation: &Operation) -> 
 mod tests {
     use super::*;
 
+    fn create_fingerprint_test_run(
+        store: &mut Store,
+        workspace: &Path,
+        grants: Value,
+    ) -> Result<Run> {
+        store.create_run(
+            "check process evidence freshness",
+            workspace,
+            "codex",
+            grants,
+            json!({
+                "filesystem_scopes": {
+                    "read": ["src/**"],
+                    "write": ["src/**"]
+                }
+            }),
+            "",
+        )
+    }
+
+    fn claim_process_test_operation(store: &mut Store, run_id: &str) -> Result<Operation> {
+        let operation = store.begin_operation(run_id, "process.run", json!({}), true)?;
+        claim_test_operation(store, &operation)?;
+        Ok(operation)
+    }
+
+    fn finish_process_test_operation(
+        store: &mut Store,
+        operation: &Operation,
+        output: &[u8],
+    ) -> Result<String> {
+        let artifact = store.put_artifact(output)?;
+        store.operation_state(
+            operation,
+            "succeeded",
+            Some(&artifact),
+            json!({"test_fixture":true}),
+        )?;
+        Ok(artifact)
+    }
+
+    fn prepare_scoped_workspace(workspace: &Path) -> Result<()> {
+        fs::create_dir_all(workspace.join("src"))?;
+        fs::write(workspace.join("src/lib.rs"), b"initial source")?;
+        Ok(())
+    }
+
     #[test]
     fn process_output_chunks_are_excluded_from_recent_model_context() -> Result<()> {
         let directory = tempfile::tempdir()?;
@@ -1902,6 +2110,137 @@ mod tests {
         let context = store.recent_context_events(&run.id, 12)?;
         assert!(context.iter().all(|event| event.kind != "operation.output"));
         assert!(context.iter().any(|event| event.kind == "model.failed"));
+        Ok(())
+    }
+
+    #[test]
+    fn process_evidence_is_invalidated_by_external_scoped_edits_and_can_be_refreshed() -> Result<()>
+    {
+        let workspace = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        prepare_scoped_workspace(workspace.path())?;
+        let mut store = Store::open(state.path())?;
+        let run =
+            create_fingerprint_test_run(&mut store, workspace.path(), json!(["process.run"]))?;
+
+        let first_operation = claim_process_test_operation(&mut store, &run.id)?;
+        let first_evidence =
+            finish_process_test_operation(&mut store, &first_operation, b"first test pass")?;
+        fs::write(workspace.path().join("src/lib.rs"), b"external source edit")?;
+        assert!(store
+            .validate_completion(&run.id, &[first_evidence.clone()])
+            .unwrap_err()
+            .to_string()
+            .contains("Scoped workspace content changed"));
+
+        let previous_revision = store.workspace_revision(&run.id)?.unwrap();
+        assert!(store.refresh_observed_files(&run.id)?);
+        assert!(store.workspace_revision(&run.id)?.unwrap() > previous_revision);
+        assert!(store
+            .validate_completion(&run.id, &[first_evidence])
+            .is_err());
+
+        let fresh_operation = claim_process_test_operation(&mut store, &run.id)?;
+        let fresh_evidence =
+            finish_process_test_operation(&mut store, &fresh_operation, b"fresh test pass")?;
+        store.validate_completion(&run.id, &[fresh_evidence])?;
+        Ok(())
+    }
+
+    #[test]
+    fn process_source_change_during_write_granted_test_makes_its_artifact_stale() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        prepare_scoped_workspace(workspace.path())?;
+        let mut store = Store::open(state.path())?;
+        let run = create_fingerprint_test_run(
+            &mut store,
+            workspace.path(),
+            json!(["process.run", "workspace.write"]),
+        )?;
+
+        let operation = claim_process_test_operation(&mut store, &run.id)?;
+        fs::write(workspace.path().join("src/lib.rs"), b"changed during test")?;
+        let stale_evidence =
+            finish_process_test_operation(&mut store, &operation, b"test output before edit")?;
+        assert!(store
+            .validate_completion(&run.id, &[stale_evidence])
+            .is_err());
+
+        let fresh_operation = claim_process_test_operation(&mut store, &run.id)?;
+        let fresh_evidence =
+            finish_process_test_operation(&mut store, &fresh_operation, b"test output after edit")?;
+        store.validate_completion(&run.id, &[fresh_evidence])?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_successful_aegis_workspace_write_rebaselines_process_freshness() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        prepare_scoped_workspace(workspace.path())?;
+        let mut store = Store::open(state.path())?;
+        let run = create_fingerprint_test_run(
+            &mut store,
+            workspace.path(),
+            json!(["process.run", "workspace.write"]),
+        )?;
+        let initial_operation = claim_process_test_operation(&mut store, &run.id)?;
+        let _ = finish_process_test_operation(&mut store, &initial_operation, b"initial test")?;
+
+        let write = store.begin_operation(
+            &run.id,
+            "workspace.write",
+            json!({"path":"src/lib.rs"}),
+            true,
+        )?;
+        claim_test_operation(&mut store, &write)?;
+        let contents = b"changed through Aegis workspace.write";
+        fs::write(workspace.path().join("src/lib.rs"), contents)?;
+        let receipt = json!({
+            "path":"src/lib.rs",
+            "sha256":hex::encode(Sha256::digest(contents))
+        });
+        let write_evidence = store.put_artifact(&serde_json::to_vec(&receipt)?)?;
+        store.operation_state(&write, "succeeded", Some(&write_evidence), json!({}))?;
+        store.validate_completion(&run.id, &[write_evidence])?;
+
+        let final_operation = claim_process_test_operation(&mut store, &run.id)?;
+        let final_evidence =
+            finish_process_test_operation(&mut store, &final_operation, b"final passing test")?;
+        store.validate_completion(&run.id, &[final_evidence])?;
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_successful_process_evidence_without_a_fingerprint_fails_closed() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        prepare_scoped_workspace(workspace.path())?;
+        let mut store = Store::open(state.path())?;
+        let run =
+            create_fingerprint_test_run(&mut store, workspace.path(), json!(["process.run"]))?;
+        let operation = claim_process_test_operation(&mut store, &run.id)?;
+        let evidence = finish_process_test_operation(&mut store, &operation, b"legacy test pass")?;
+        store.connection.execute(
+            "DELETE FROM workspace_fingerprints WHERE run_id=?1",
+            [&run.id],
+        )?;
+
+        assert!(store
+            .validate_completion(&run.id, &[evidence.clone()])
+            .unwrap_err()
+            .to_string()
+            .contains("predates scoped workspace fingerprinting"));
+        let prior_revision = store.workspace_revision(&run.id)?.unwrap();
+        assert!(store.refresh_observed_files(&run.id)?);
+        assert!(store.workspace_revision(&run.id)?.unwrap() > prior_revision);
+        assert!(store.validate_completion(&run.id, &[evidence]).is_err());
+
+        let fresh_operation = claim_process_test_operation(&mut store, &run.id)?;
+        let fresh_evidence =
+            finish_process_test_operation(&mut store, &fresh_operation, b"refreshed test pass")?;
+        store.validate_completion(&run.id, &[fresh_evidence])?;
         Ok(())
     }
 
