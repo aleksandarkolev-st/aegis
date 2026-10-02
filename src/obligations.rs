@@ -124,6 +124,7 @@ pub(crate) fn record_operation(
     transaction: &Transaction<'_>,
     operation: &Operation,
     may_have_run: bool,
+    workspace_already_invalidated: bool,
 ) -> Result<()> {
     let Some(current) = transaction
         .query_row(
@@ -135,7 +136,8 @@ pub(crate) fn record_operation(
     else {
         return Ok(());
     };
-    let invalidates = may_have_run
+    let invalidates = !workspace_already_invalidated
+        && may_have_run
         && might_mutate_workspace(transaction, &operation.run_id, &operation.capability)?;
     let revision = if invalidates {
         current
@@ -1609,7 +1611,7 @@ mod tests {
     #[test]
     fn failed_write_capable_operation_stales_prior_proofs_once() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let mut store = Store::open(directory.path())?;
+        let mut store = Store::open(&directory.path().join(".arun"))?;
         let run = store.create_run(
             "Refactor parser",
             directory.path(),
@@ -1634,6 +1636,10 @@ mod tests {
         assert_eq!(store.workspace_revision(&run.id)?, Some(1));
         let undispatched = store.begin_operation(&run.id, "workspace.write", json!({}), false)?;
         store.operation_state(&undispatched, "cancelled", None, json!({}))?;
+        assert_eq!(store.workspace_revision(&run.id)?, Some(1));
+        let undispatched_process =
+            store.begin_operation(&run.id, "process.run", json!({}), true)?;
+        store.operation_state(&undispatched_process, "cancelled", None, json!({}))?;
         assert_eq!(store.workspace_revision(&run.id)?, Some(1));
         Ok(())
     }

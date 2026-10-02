@@ -348,7 +348,8 @@ fn goal_add_and_targeted_replace_require_review_and_retain_original_contract() -
 #[test]
 fn archived_receipts_and_provider_turns_survive_completion() -> Result<()> {
     let directory = tempfile::tempdir()?;
-    let mut store = Store::open(directory.path())?;
+    let root = directory.path().join(".arun");
+    let mut store = Store::open(&root)?;
     let run = store.create_run("Check API\nRequirements:\n- preserve API",directory.path(),"codex",json!([]),json!({"provider_transport":"aegis-direct-v1","model":"primary","fallback_routes":[{"provider":"grok","model":"fallback"}]}),"")?;
     store.state(&run.id, "running", json!({}))?;
     let op = store.begin_operation(
@@ -378,7 +379,7 @@ fn archived_receipts_and_provider_turns_survive_completion() -> Result<()> {
     store.save_snapshot(&run.id)?;
     assert!(store.archive_history(&run.id)? > 0);
     drop(store);
-    let mut store = Store::open(directory.path())?;
+    let mut store = Store::open(&root)?;
     let proof = control::view(&store, &run.id, "evidence", Some("O1"))?;
     assert_eq!(
         proof["artifacts"][0]["operations"][0]["receipt"]["exit_code"],

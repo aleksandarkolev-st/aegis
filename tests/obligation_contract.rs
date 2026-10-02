@@ -103,7 +103,8 @@ fn parser_obligations_survive_replanning_provider_change_and_workspace_edit() ->
     let mut store = Store::open(directory.path())?;
     assert_eq!(store.current_route(&run.id)?, route);
     let edit = successful_operation(&mut store, &run.id, "workspace.write", b"parser edit")?;
-    assert_eq!(store.workspace_revision(&run.id)?, Some(1));
+    // Claim and terminal mutation are separate freshness boundaries.
+    assert_eq!(store.workspace_revision(&run.id)?, Some(2));
     assert_eq!(store.obligations(&run.id)?[1].state, "stale");
     assert_eq!(store.obligations(&run.id)?[2].state, "stale");
     assert!(store.verify_obligation(&run.id, 1, &[nesting]).is_err());
@@ -142,7 +143,7 @@ fn parser_obligations_survive_replanning_provider_change_and_workspace_edit() ->
             .into_iter()
             .skip(1)
             .all(|obligation| obligation.state == "verified"
-                && obligation.verified_revision == Some(1))
+                && obligation.verified_revision == Some(2))
     );
     Ok(())
 }

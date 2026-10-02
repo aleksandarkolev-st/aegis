@@ -1562,7 +1562,11 @@ impl Store {
         }
         let resolving_unknown = allow_unknown_resolution && existing.state == "outcome_unknown";
         let mut fingerprint_capture: Option<std::result::Result<String, String>> = None;
-        if terminal_operation_state(state) && !resolving_unknown {
+        if terminal_operation_state(state)
+            && !resolving_unknown
+            && (state == "succeeded"
+                || matches!(existing.state.as_str(), "dispatched" | "executing"))
+        {
             let run = self.run(&existing.run_id)?;
             let needs_fingerprint = existing.capability == "process.run"
                 || (self
@@ -1649,10 +1653,14 @@ impl Store {
             None
         };
         let previous = canonical.state.clone();
+        let may_have_run =
+            state == "succeeded" || matches!(previous.as_str(), "dispatched" | "executing");
+        let mut fingerprint_invalidated = false;
         let mut fingerprint_to_save: Option<String> = None;
         if terminal_operation_state(state)
             && canonical.capability == "process.run"
             && !resolving_unknown
+            && may_have_run
         {
             match fingerprint_capture.as_ref() {
                 Some(Ok(fingerprint)) => {
@@ -1674,6 +1682,7 @@ impl Store {
                                 "fingerprint_scope": crate::freshness::WORKSPACE_FINGERPRINT_SCOPE
                             }),
                         )?;
+                        fingerprint_invalidated = true;
                         detail["workspace_fingerprint"] =
                             json!("changed during process.run; this operation's evidence is stale");
                     }
@@ -1685,6 +1694,7 @@ impl Store {
                         &canonical.run_id,
                         json!({"operation":canonical.id,"capability":canonical.capability,"reason":"workspace fingerprint could not be checked after process.run"}),
                     )?;
+                    fingerprint_invalidated = true;
                     detail["workspace_fingerprint_error"] = json!(error);
                 }
                 None => {
@@ -1693,6 +1703,7 @@ impl Store {
                         &canonical.run_id,
                         json!({"operation":canonical.id,"capability":canonical.capability,"reason":"process.run finished without a usable workspace fingerprint"}),
                     )?;
+                    fingerprint_invalidated = true;
                     detail["workspace_fingerprint_error"] =
                         json!("fingerprint capture missing; operation evidence is stale");
                 }
@@ -1713,6 +1724,7 @@ impl Store {
                     &canonical.run_id,
                     json!({"operation":canonical.id,"capability":canonical.capability,"reason":"workspace fingerprint could not be refreshed after an Aegis write"}),
                 )?;
+                fingerprint_invalidated = true;
                 detail["workspace_fingerprint_error"] = json!(error);
             }
         }
@@ -1720,6 +1732,15 @@ impl Store {
             "UPDATE operations SET state = ?2, artifact = COALESCE(?3, artifact) WHERE id = ?1",
             params![canonical.id, state, artifact],
         )?;
+        if fingerprint_invalidated {
+            // Coalesce terminal invalidation causes, but do not let this
+            // operation's result prove a workspace it could not observe
+            // consistently. A retry receives a new claim epoch.
+            transaction.execute(
+                "UPDATE operations SET started_revision=NULL WHERE id=?1",
+                [&canonical.id],
+            )?;
+        }
         canonical.state = state.to_owned();
         if let Some(artifact) = artifact {
             canonical.artifact = Some(artifact.to_owned());
@@ -1730,9 +1751,12 @@ impl Store {
             // attempt. Reconciliation resolves that same attempt, it does
             // not constitute another workspace mutation.
             if previous != "outcome_unknown" {
-                let may_have_run =
-                    state == "succeeded" || matches!(previous.as_str(), "dispatched" | "executing");
-                crate::obligations::record_operation(&transaction, &canonical, may_have_run)?;
+                crate::obligations::record_operation(
+                    &transaction,
+                    &canonical,
+                    may_have_run,
+                    fingerprint_invalidated,
+                )?;
             }
             if let Some(fingerprint) = fingerprint_to_save.as_deref() {
                 let revision =
@@ -1760,6 +1784,12 @@ impl Store {
         if existing.run_id != operation.run_id {
             bail!("operation belongs to a different run");
         }
+        if existing.state != "dispatched" {
+            bail!("operation has already been claimed or is no longer dispatched");
+        }
+        // Advance external changes before assigning the new reader's epoch.
+        // Otherwise a valid fresh read would be invalidated by its own receipt.
+        self.refresh_observed_files(&existing.run_id)?;
         let start_fingerprint = (existing.capability == "process.run")
             .then(|| self.capture_workspace_fingerprint(&existing.run_id))
             .transpose()?;
@@ -2168,9 +2198,19 @@ mod tests {
         )?;
 
         let operation = claim_process_test_operation(&mut store, &run.id)?;
+        let claimed_revision = store.workspace_revision(&run.id)?.unwrap();
         fs::write(workspace.path().join("src/lib.rs"), b"changed during test")?;
         let stale_evidence =
             finish_process_test_operation(&mut store, &operation, b"test output before edit")?;
+        assert_eq!(
+            store.workspace_revision(&run.id)?,
+            Some(claimed_revision + 1)
+        );
+        store.operation_state(&operation, "succeeded", Some(&stale_evidence), json!({}))?;
+        assert_eq!(
+            store.workspace_revision(&run.id)?,
+            Some(claimed_revision + 1)
+        );
         assert!(
             store
                 .validate_completion(&run.id, &[stale_evidence])
