@@ -4,6 +4,10 @@ Status checked 2026-10-02 against the relay sources and the successful combined 
 
 ## Scope
 
+### Subsequent implementation audit
+
+The later Windows/current-account work extends the initial slice with the complete terminal slash catalog and task groups at the user's request. The updated combined gate passed 47 regular tests and both actual-executable infrastructure targets. Its metadata allowlist now contains eight tables; references to six below describe the earlier gate. `/help` and unknown slash input created no model request or run. The persistent Evolution stack is healthy and has generated its QR, but phone linking, carrier delivery and owner-only group creation remain live acceptance steps. See [the dated Windows/WhatsApp verification](windows-whatsapp-verification.md) for the installed build, native desktop checks and remaining account boundary.
+
 The first vertical slice in `plan-text.txt` has eight requirements:
 
 1. Aegis remote daemon connects outbound to JetStream.
