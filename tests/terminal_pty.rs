@@ -19,10 +19,10 @@ use windows_sys::Win32::System::Console::{
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-    GetExitCodeProcess, InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, InitializeProcThreadAttributeList,
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
@@ -145,6 +145,20 @@ impl Pty {
                 let executable = wide(env!("CARGO_BIN_EXE_arun"));
                 let mut command = wide(format!("\"{}\"", env!("CARGO_BIN_EXE_arun")));
                 let cwd = wide(workspace);
+                // Test colors independently of the invoking shell's NO_COLOR.
+                // This environment belongs only to the hidden child process.
+                let mut environment: Vec<_> = std::env::vars_os()
+                    .filter(|(key, _)| !key.to_string_lossy().eq_ignore_ascii_case("NO_COLOR"))
+                    .collect();
+                environment.sort_by_key(|(key, _)| key.to_string_lossy().to_lowercase());
+                let mut environment_block = Vec::<u16>::new();
+                for (key, value) in environment {
+                    environment_block.extend(key.encode_wide());
+                    environment_block.push('=' as u16);
+                    environment_block.extend(value.encode_wide());
+                    environment_block.push(0);
+                }
+                environment_block.push(0);
                 ensure!(
                     CreateProcessW(
                         executable.as_ptr(),
@@ -152,8 +166,8 @@ impl Pty {
                         null(),
                         null(),
                         0,
-                        EXTENDED_STARTUPINFO_PRESENT,
-                        null(),
+                        EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                        environment_block.as_ptr().cast(),
                         cwd.as_ptr(),
                         &startup.StartupInfo,
                         &mut process
@@ -753,6 +767,24 @@ fn actual_windows_follow_keeps_output_live_inside_steering_and_slash_picker() ->
     terminal.wait_screen("active follower", |screen| {
         screen.text().contains("Type/paste to steer")
     })?;
+    terminal.wait_screen("visible live clock and elapsed time", |screen| {
+        use chrono::Timelike;
+        screen.lines().iter().any(|line| {
+            let Some((_, clock)) = line.split_once(" elapsed · ") else {
+                return false;
+            };
+            let Some(clock) = clock.split_once(" UTC").map(|(time, _)| time) else {
+                return false;
+            };
+            let Ok(time) = chrono::NaiveTime::parse_from_str(clock, "%H:%M:%S") else {
+                return false;
+            };
+            let difference = (i64::from(time.num_seconds_from_midnight())
+                - i64::from(chrono::Utc::now().num_seconds_from_midnight()))
+            .abs();
+            difference.min(86400 - difference) <= 10
+        })
+    })?;
     terminal.send_keys("x")?;
     terminal.wait_screen("active steering composer", |screen| {
         screen.text().contains("Steer this task")
@@ -810,6 +842,31 @@ fn actual_windows_follow_keeps_output_live_inside_steering_and_slash_picker() ->
     terminal.wait_screen("completion feedback while editing", |screen| {
         screen.text().contains("LIVE_TASK_FINISHED") && screen.text().contains("Task finished")
     })?;
+    let finished_at = store
+        .events(&run.id)?
+        .into_iter()
+        .find(|event| event.kind == "run.answered")
+        .unwrap()
+        .created_at;
+    let expected_time = chrono::DateTime::from_timestamp(finished_at, 0)
+        .unwrap()
+        .format("%Y-%m-%d %H:%M:%S UTC")
+        .to_string();
+    terminal.wait_screen("completion timestamp and elapsed time", |screen| {
+        let text = screen.text();
+        text.contains(&format!("Completed {expected_time}")) && text.contains("Elapsed ")
+    })?;
+    let output = terminal.output.lock().unwrap().clone();
+    let output = String::from_utf8_lossy(&output);
+    let colors: std::collections::BTreeSet<_> = output
+        .split("\x1b[")
+        .filter_map(|suffix| suffix.split_once('m').map(|(parameters, _)| parameters))
+        .filter(|parameters| parameters.contains("38;2;") || parameters.contains("38;5;"))
+        .collect();
+    ensure!(
+        colors.len() >= 3,
+        "expected multiple actual foreground color roles, got {colors:?}"
+    );
     terminal.send_keys("\x15\x04")?;
     terminal.finish()?;
     drop(terminal);
