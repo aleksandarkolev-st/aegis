@@ -88,6 +88,91 @@ enum TranscriptMode {
     Markdown,
 }
 
+#[derive(Clone, Copy, Default)]
+enum StreamControl {
+    #[default]
+    Text,
+    Escape,
+    EscapeIntermediate,
+    Csi,
+    ControlString,
+    ControlStringEscape,
+}
+
+#[derive(Default)]
+struct StreamCleaner {
+    control: StreamControl,
+    previous_cr: bool,
+}
+
+impl StreamCleaner {
+    fn feed(&mut self, text: &str) -> String {
+        let mut output = String::new();
+        for character in text.chars() {
+            match self.control {
+                StreamControl::Text => match character {
+                    '\u{1b}' => self.control = StreamControl::Escape,
+                    '\u{009b}' => self.control = StreamControl::Csi,
+                    '\u{0090}' | '\u{0098}' | '\u{009d}' | '\u{009e}' | '\u{009f}' => {
+                        self.control = StreamControl::ControlString;
+                    }
+                    '\r' => {
+                        output.push('\n');
+                        self.previous_cr = true;
+                    }
+                    '\n' if self.previous_cr => self.previous_cr = false,
+                    _ => {
+                        output.push(character);
+                        self.previous_cr = false;
+                    }
+                },
+                StreamControl::Escape => {
+                    self.control = match character {
+                        '[' => StreamControl::Csi,
+                        ']' | 'P' | 'X' | '^' | '_' => StreamControl::ControlString,
+                        '\u{0020}'..='\u{002f}' => StreamControl::EscapeIntermediate,
+                        '\u{1b}' => StreamControl::Escape,
+                        _ => StreamControl::Text,
+                    };
+                }
+                StreamControl::EscapeIntermediate => {
+                    if ('\u{0030}'..='\u{007e}').contains(&character) {
+                        self.control = StreamControl::Text;
+                    } else if character == '\u{1b}' {
+                        self.control = StreamControl::Escape;
+                    }
+                }
+                StreamControl::Csi => {
+                    if ('\u{0040}'..='\u{007e}').contains(&character)
+                        || matches!(character, '\u{0018}' | '\u{001a}')
+                    {
+                        self.control = StreamControl::Text;
+                    } else if character == '\u{1b}' {
+                        self.control = StreamControl::Escape;
+                    }
+                }
+                StreamControl::ControlString => match character {
+                    '\u{0007}' | '\u{009c}' | '\u{0018}' | '\u{001a}' => {
+                        self.control = StreamControl::Text
+                    }
+                    '\u{1b}' => self.control = StreamControl::ControlStringEscape,
+                    _ => {}
+                },
+                StreamControl::ControlStringEscape => {
+                    self.control = match character {
+                        '\\' | '\u{0007}' | '\u{009c}' | '\u{0018}' | '\u{001a}' => {
+                            StreamControl::Text
+                        }
+                        '\u{1b}' => StreamControl::ControlStringEscape,
+                        _ => StreamControl::ControlString,
+                    };
+                }
+            }
+        }
+        normalize_paste(&output)
+    }
+}
+
 pub struct Terminal {
     pub interactive: bool,
     colors: bool,
@@ -97,6 +182,7 @@ pub struct Terminal {
     input_rows: std::cell::Cell<u16>,
     input_caret_row: std::cell::Cell<u16>,
     task_started_at: std::cell::Cell<Option<i64>>,
+    output_streams: std::cell::RefCell<std::collections::HashMap<String, StreamCleaner>>,
     input_draft: std::cell::RefCell<Option<(String, Vec<char>, usize)>>,
     input_status: std::cell::RefCell<String>,
     home_snapshot: std::cell::RefCell<Option<HomeSnapshot>>,
@@ -1035,6 +1121,7 @@ impl Default for Terminal {
             input_rows: std::cell::Cell::new(3),
             input_caret_row: std::cell::Cell::new(1),
             task_started_at: std::cell::Cell::new(None),
+            output_streams: std::cell::RefCell::new(std::collections::HashMap::new()),
             input_draft: std::cell::RefCell::new(None),
             input_status: std::cell::RefCell::new(String::new()),
             home_snapshot: std::cell::RefCell::new(None),
@@ -1556,6 +1643,7 @@ impl Terminal {
 
     pub fn set_task_started_at(&self, timestamp: Option<i64>) {
         self.task_started_at.set(timestamp);
+        self.output_streams.borrow_mut().clear();
     }
 
     fn completion_timing(&self, completed_at: i64) -> String {
@@ -2497,6 +2585,7 @@ impl Terminal {
     pub fn render_event(&self, event: &RunEvent) -> Result<()> {
         self.invalidate_home_snapshot();
         let payload = &event.payload;
+        self.finish_output_stream(&event.kind, payload);
         match event.kind.as_str() {
             "run.running" => {
                 if self.task_started_at.get().is_none() {
@@ -2599,7 +2688,7 @@ impl Terminal {
                 )
             }
             "operation.output" => {
-                let text = operation_stream_text(payload["text"].as_str().unwrap_or_default());
+                let text = self.output_stream_text(payload);
                 if !text.is_empty() {
                     self.transcript(Tone::Quiet, "Output", &text, TranscriptMode::Literal)?;
                 }
@@ -2723,6 +2812,38 @@ impl Terminal {
             ),
             "run.cancelled" => self.message(Tone::Warning, "Stopped", "Task cancelled"),
             _ => Ok(()),
+        }
+    }
+
+    fn output_stream_text(&self, payload: &serde_json::Value) -> String {
+        let id = payload["id"].as_str().unwrap_or_default();
+        let mut streams = self.output_streams.borrow_mut();
+        let output = streams
+            .entry(id.to_owned())
+            .or_default()
+            .feed(payload["text"].as_str().unwrap_or_default());
+        if payload["truncated"] == true || payload["partial"] == true {
+            streams.remove(id);
+        }
+        output
+    }
+
+    fn finish_output_stream(&self, kind: &str, payload: &serde_json::Value) {
+        if matches!(
+            kind,
+            "operation.succeeded"
+                | "operation.failed"
+                | "operation.cancelled"
+                | "operation.outcome_unknown"
+        ) {
+            self.output_streams
+                .borrow_mut()
+                .remove(payload["id"].as_str().unwrap_or_default());
+        } else if matches!(
+            kind,
+            "run.completed" | "run.answered" | "run.failed" | "run.cancelled" | "run.paused"
+        ) {
+            self.output_streams.borrow_mut().clear();
         }
     }
 }
@@ -3302,6 +3423,75 @@ fn format_clock_utc(timestamp: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stream_cleaner_keeps_controls_hidden_at_every_chunk_boundary() {
+        let input = "ok\u{1b}[31m red\u{1b}[0m\r\n\u{1b}]8;;private\u{1b}\\日本語\u{1b}]8;;\u{7}!\u{009d}hidden\u{009c} end";
+        for split in input
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain([input.len()])
+        {
+            let mut cleaner = StreamCleaner::default();
+            let output = cleaner.feed(&input[..split]) + &cleaner.feed(&input[split..]);
+            assert_eq!(output, "ok red\n日本語! end", "split {split}");
+        }
+    }
+
+    #[test]
+    fn stream_cleaner_is_isolated_per_operation_and_resets_at_terminal_events() {
+        let terminal = Terminal::default();
+        let chunk = |id: &str, text: &str| serde_json::json!({"id":id,"text":text});
+        assert_eq!(
+            terminal.output_stream_text(&chunk("a", "before\u{1b}]secret")),
+            "before"
+        );
+        assert_eq!(
+            terminal.output_stream_text(&chunk("b", "other\u{1b}[")),
+            "other"
+        );
+        assert_eq!(
+            terminal.output_stream_text(&chunk("a", "more secret\u{7}after")),
+            "after"
+        );
+        assert_eq!(
+            terminal.output_stream_text(&chunk("b", "31mvisible")),
+            "visible"
+        );
+        terminal.output_stream_text(&chunk("a", "\u{1b}]unfinished"));
+        terminal.finish_output_stream("operation.failed", &serde_json::json!({"id":"a"}));
+        assert_eq!(terminal.output_stream_text(&chunk("a", "fresh")), "fresh");
+        terminal.output_stream_text(&chunk("b", "\u{1b}]unfinished"));
+        terminal.set_task_started_at(Some(1));
+        assert_eq!(
+            terminal.output_stream_text(&chunk("b", "new task")),
+            "new task"
+        );
+        terminal.finish_output_stream("run.paused", &serde_json::json!({}));
+        assert!(terminal.output_streams.borrow().is_empty());
+    }
+
+    #[test]
+    fn incomplete_stream_controls_are_bounded_and_never_flushed_as_text() {
+        let terminal = Terminal::default();
+        terminal.output_stream_text(&serde_json::json!({"id":"a","text":"\u{1b}]"}));
+        assert!(
+            terminal
+                .output_stream_text(&serde_json::json!({"id":"a","text":"x".repeat(65536)}))
+                .is_empty()
+        );
+        assert!(
+            terminal
+                .output_stream_text(&serde_json::json!({"id":"a","text":"hidden","truncated":true}))
+                .is_empty()
+        );
+        assert!(terminal.output_streams.borrow().is_empty());
+        assert_eq!(
+            terminal
+                .output_stream_text(&serde_json::json!({"id":"a","text":"fresh","partial":true})),
+            "fresh"
+        );
+        assert!(terminal.output_streams.borrow().is_empty());
+    }
     use super::*;
 
     #[test]
