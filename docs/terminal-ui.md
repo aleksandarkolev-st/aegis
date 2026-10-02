@@ -54,6 +54,7 @@ The optimized Windows runtime was rebuilt and installed globally from the verifi
 - The release executable passed hosted GPT-6.1-sol/high streaming verification with both output events and foreground display observed before process success. Full output remained intact. Receipt: `.arun/hosted-output-live-oAffet/receipt.json`.
 - Private npm packing, file allowlisting, postinstall, command shim, binary equality and declined onboarding/sign-in passed. The fixture traps confirmed no native provider CLI ran. Receipt: `.arun/package-smoke-4mUNpH/receipt.json`. Global installation then exited successfully, and its executable hash was checked separately.
 - Twelve npm unit tests passed. These checks cover this Windows build and local installation; they do not certify a new public npm release or Linux builds.
+- The installed `aegis.cmd models chatgpt --refresh` returned GPT-6.1-sol first, with high reasoning among its advertised levels. This checks the account catalog rather than assuming availability from a static list.
 
 Open a new `aegis` session to load the rebuilt executable. An already running process retains its loaded image.
 
