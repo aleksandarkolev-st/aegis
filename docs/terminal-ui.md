@@ -27,14 +27,22 @@ These are product design choices, not a claim of feature parity. The reference c
 
 The live input correctness commit `7651a13` passed 41 focused terminal tests. Earlier tests exercised layout helpers but missed the actual composer newline mapping; the regression now covers that mapping. Typed picker outcomes distinguish cancellation, interruption and task completion.
 
-Real Windows pseudo-console tests and hosted GPT-6.1-sol/high verification are required before declaring the interactive work complete. Their results will be recorded here after execution.
+The Windows input repair passed 58 focused library tests. Three end-to-end tests also passed against a rebuilt executable through a real Windows pseudo-console (ConPTY):
+
+- Native Windows Terminal keyboard protocol: multiline Unicode paste stays in the composer until Enter; Shift+Enter and Ctrl+J insert visible lines; wrapping and resize reflow; the complete 39-command catalog scrolls and filters.
+- Raw VT input: multiline Unicode clipboard input stays in the composer without accidental task submission.
+- Active follower: output continues during steering and its nested command picker; a capped preview displays its artifact recovery notice; Ctrl+C durably requests operation interruption; completion feedback appears.
+
+These terminal tests use deterministic local fixtures. Hosted checks below exercise real model calls separately.
 
 Hosted checks completed using an actual rebuilt Aegis executable with SHA-256 `7bfc0b4c7c7d798f20f45bfb8249ab4f0b467f543bc6ebe9f0023ef089fafd2e`:
 
 - Parser task `148de391-4439-4c22-a75c-acba7eb61d11`: paused during real inference, resumed the same durable run, preserved its route and frozen contract, added nested expression support and regression tests, passed independent acceptance, and verified all four explicit requirements at revision 6. Fifteen recorded responses; 59,448 provider-reported tokens. Receipt: `.arun/hosted-control-live-WsYOCU/receipt.json`.
 - Output task: first output was durable before command success; the live preview reached its cap; the referenced raw artifact retained all 70,033 bytes, including the final marker beyond that cap. Requested model and high effort matched every recorded route. Receipt: `.arun/hosted-output-live-QL6BRc/receipt.json`. The verifier initially inspected the process receipt instead of its referenced output artifact; the corrected verifier audited the retained trial without another model run.
-- Real active-follower ConPTY check passed for output during typing, output inside the nested slash picker, durable Ctrl+C operation interruption and terminal completion feedback.
-- Real idle-composer ConPTY check exposed a Windows-specific failure: native crossterm converted multiline paste to Enter key events. This requires the Windows VT input repair and a passing rerun; pure editor tests are insufficient evidence.
+
+The Windows tests initially exposed native input splitting clipboard lines into Enter events and losing the first key during a temporary cursor-position read. The repaired input adapter owns one reader for the guided session, frames clipboard input atomically, and supports both negotiated native keyboard packets and raw VT input. The passing tests above cover the corrected build.
+
+A later hosted output check passed with executable SHA-256 `81b19cbdca8025c6300a53ba047c45e5c000f03f118d4b697062c0ec455b0f8f`: both the durable output event and its foreground CLI display appeared before process success. The raw artifact retained all 70,033 bytes, and both model calls used GPT-6.1-sol/high. Receipt: `.arun/hosted-output-live-3iNe68/receipt.json`. This verifies the foreground runner and display execute concurrently, rather than replaying output after work ends.
 
 ## Further ideas
 
