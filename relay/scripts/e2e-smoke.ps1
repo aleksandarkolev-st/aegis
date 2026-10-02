@@ -134,7 +134,10 @@ try {
     & cargo test --offline --manifest-path $relayManifest --config profile.dev.debug=0 --config profile.test.debug=0 -j 1 -- --test-threads=1
     if ($LASTEXITCODE -ne 0) { throw "The relay test suite failed against local PostgreSQL." }
 
-    & cargo test --offline --manifest-path $relayManifest --test local_smoke jetstream_remote_phone_lifecycle_uses_local_authority_and_isolates_devices -- --ignored --exact --nocapture --test-threads=1
+    & cargo test --offline --manifest-path $relayManifest --config profile.dev.debug=0 --config profile.test.debug=0 -j 1 --test binary_startup actual_relay_binary_uses_evolution_http_and_real_postgres_tls_nats -- --ignored --exact --nocapture --test-threads=1
+    if ($LASTEXITCODE -ne 0) { throw "The relay binary/Evolution HTTP/PostgreSQL/TLS NATS E2E failed." }
+
+    & cargo test --offline --manifest-path $relayManifest --config profile.dev.debug=0 --config profile.test.debug=0 -j 1 --test local_smoke jetstream_remote_phone_lifecycle_uses_local_authority_and_isolates_devices -- --ignored --exact --nocapture --test-threads=1
     if ($LASTEXITCODE -ne 0) { throw "The Aegis/relay phone lifecycle and NATS isolation E2E failed." }
 }
 finally {
