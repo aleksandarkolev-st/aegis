@@ -12,6 +12,9 @@ pub const COMMAND_TTL_SECONDS: i64 = 5 * 60;
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentCommand {
     Message { text: String },
+    /// A slash command handled by the local Aegis authority. The relay does not
+    /// reinterpret unknown slash input as a model task.
+    Slash { text: String },
     ListTasks,
     Status { task_id: Option<String> },
     Result { task_id: Option<String> },
@@ -96,12 +99,25 @@ pub fn parse_command(input: &str) -> Result<AgentCommand, CommandParseError> {
 
     match command {
         "tasks" | "/tasks" | "/list_tasks" if rest.is_empty() => Ok(AgentCommand::ListTasks),
+        "/tasks" if rest == "plan" => Ok(AgentCommand::Slash {
+            text: text.to_owned(),
+        }),
         "/status" => Ok(AgentCommand::Status {
             task_id: optional_id(rest)?,
         }),
         "/result" => Ok(AgentCommand::Result {
             task_id: optional_id(rest)?,
         }),
+        "/evidence"
+            if rest
+                .split_whitespace()
+                .next()
+                .is_some_and(obligation_reference) =>
+        {
+            Ok(AgentCommand::Slash {
+                text: text.to_owned(),
+            })
+        }
         "/evidence" => Ok(AgentCommand::Evidence {
             task_id: optional_id(rest)?,
         }),
@@ -114,7 +130,10 @@ pub fn parse_command(input: &str) -> Result<AgentCommand, CommandParseError> {
         "/resume" => Ok(AgentCommand::Resume {
             task_id: optional_id(rest)?,
         }),
-        "tasks" | "/tasks" | "/list_tasks" => Err(CommandParseError::InvalidSyntax),
+        "tasks" | "/list_tasks" => Err(CommandParseError::InvalidSyntax),
+        "/tasks" => Ok(AgentCommand::Slash {
+            text: text.to_owned(),
+        }),
         "/cancel" => Ok(AgentCommand::Cancel {
             task_id: optional_id(rest)?,
         }),
@@ -136,13 +155,22 @@ pub fn parse_command(input: &str) -> Result<AgentCommand, CommandParseError> {
                 text: body.to_owned(),
             })
         }
-        _ if text.starts_with('/') => Ok(AgentCommand::Message {
+        _ if text.starts_with('/') => Ok(AgentCommand::Slash {
             text: text.to_owned(),
         }),
         _ => Ok(AgentCommand::Message {
             text: text.to_owned(),
         }),
     }
+}
+
+fn obligation_reference(input: &str) -> bool {
+    input
+        .strip_prefix('O')
+        .or_else(|| input.strip_prefix('o'))
+        .is_some_and(|digits| {
+            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 pub fn normalize_text(input: &str) -> Result<String, CommandParseError> {
@@ -332,6 +360,18 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_command("/evidence O3").unwrap(),
+            AgentCommand::Slash {
+                text: "/evidence O3".into()
+            }
+        );
+        assert_eq!(
+            parse_command("/evidence o3").unwrap(),
+            AgentCommand::Slash {
+                text: "/evidence o3".into()
+            }
+        );
+        assert_eq!(
             parse_command("/pause t-abcdef").unwrap(),
             AgentCommand::Pause {
                 task_id: Some("t-abcdef".into())
@@ -354,6 +394,12 @@ mod tests {
             }
         );
         assert_eq!(parse_command("/tasks").unwrap(), AgentCommand::ListTasks);
+        assert_eq!(
+            parse_command("/tasks plan").unwrap(),
+            AgentCommand::Slash {
+                text: "/tasks plan".into()
+            }
+        );
         assert_eq!(
             parse_command("/list_tasks").unwrap(),
             AgentCommand::ListTasks
@@ -408,11 +454,33 @@ mod tests {
                 challenge_id: "challenge-9".to_owned()
             }
         );
+        for text in [
+            "/approve req-9",
+            "/goal add Requirement text",
+            "/help",
+            "/settings",
+            "/confirm O3",
+            "/back",
+            "/exit",
+        ] {
+            assert_eq!(
+                parse_command(text).unwrap(),
+                AgentCommand::Slash { text: text.into() },
+                "{text:?} must remain a slash command"
+            );
+        }
         assert_eq!(
-            parse_command("/approve req-9").unwrap(),
-            AgentCommand::Message {
-                text: "/approve req-9".to_owned()
+            parse_command("/goal add\r\nRequirements:\r\n- Preserve pasted text").unwrap(),
+            AgentCommand::Slash {
+                text: "/goal add\nRequirements:\n- Preserve pasted text".into()
             }
+        );
+        assert_eq!(
+            serde_json::to_value(AgentCommand::Slash {
+                text: "/goal add Requirements".into()
+            })
+            .unwrap(),
+            serde_json::json!({"type":"slash","text":"/goal add Requirements"})
         );
     }
 

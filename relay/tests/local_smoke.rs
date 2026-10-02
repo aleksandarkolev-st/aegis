@@ -577,6 +577,9 @@ fn aegis_request(envelope: &CommandEnvelope) -> AegisCommandEnvelope {
             text: text.clone(),
             task_id: None,
         },
+        AgentCommand::Slash { text } => AegisCommand::Slash {
+            text: text.clone(),
+        },
         AgentCommand::Status { task_id } => AegisCommand::Status {
             task_id: task_id.clone(),
         },
