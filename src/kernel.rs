@@ -1002,10 +1002,10 @@ fn perform_with_dispatch(
         return Ok(true);
     }
     let needs_remote_approval = run.budgets["remote_origin"] == true
-        && matches!(
+        && (operation.capability.starts_with("mcp.") || matches!(
             operation.capability.as_str(),
             "workspace.write" | "workspace.patch" | "process.run" | "network.fetch"
-        );
+        ));
     let mut authorization =
         crate::remote::authorize_operation_dispatch(store, &run.id, &operation.id)?;
     if needs_remote_approval && authorization == crate::remote::DispatchAuthorization::Ungated {
@@ -1969,6 +1969,17 @@ mod tests {
     fn resume_remote_test_run(store: &mut Store, run_id: &str) -> Result<()> {
         store.state(run_id, "ready", json!({"source":"remote_approval_test"}))?;
         store.state(run_id, "running", json!({"source":"remote_approval_test"}))?;
+        Ok(())
+    }
+
+    #[test]
+    fn remote_host_mcp_waits_for_an_exact_gate_before_native_dispatch() -> Result<()> {
+        let (directory, mut store, run, _) = remote_write_fixture()?;
+        let operation = store.begin_operation(&run.id, "mcp.windows-host.powershell", json!({"script":"Set-Content host.txt approved"}), false)?;
+        assert!(perform_with_dispatch(&mut store,directory.path(),&run,&operation,|_,_,_,_| -> Result<Value> { bail!("host access must wait for approval") })?);
+        assert_eq!(store.operation(&operation.id)?.state,"pending");
+        assert_eq!(store.event_count(&run.id,"operation.dispatched")?,0);
+        assert_eq!(store.event_count(&run.id,"approval.required")?,1);
         Ok(())
     }
 
