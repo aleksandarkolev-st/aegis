@@ -251,6 +251,22 @@ Explicitly trusted local servers can opt out with `arun mcp add fixture --truste
 
 The MCP transport caps each input line at 32 MiB, registry data at 16 MiB/8,192 tools/100 pages, and rejects repeated pagination cursors. Server stderr is not displayed in the terminal. These bounds protect the host-side protocol reader in addition to the server container's resource limits.
 
+## Windows PC access and WhatsApp
+
+The Windows npm package includes the native runtime, relay and local setup tools.
+
+```powershell
+aegis pc enable --trusted-host
+aegis whatsapp init
+aegis whatsapp start
+aegis whatsapp create-instance
+aegis whatsapp qr
+```
+
+Scan the saved QR from WhatsApp Linked devices. With your existing account, run `aegis whatsapp self-account`, then `aegis whatsapp pair` and send the printed code in **Message yourself**. Start task control with `aegis whatsapp daemon`. Send `/help` for all terminal commands or `/goal <task>` to start work. Task groups route commands to their own task; creation using only your account still needs live verification.
+
+PC access grants files, PowerShell, application launch, screenshots, mouse and keyboard to new tasks. Exact remote approval gates still apply. See [local Windows setup](relay/local/README.md) for startup, shutdown, private state and verification boundaries.
+
 ## Validation
 
 ```powershell

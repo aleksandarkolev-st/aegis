@@ -63,10 +63,18 @@ const packed = await command([npmCli, 'pack', '--offline', '--json', '--pack-des
 const [manifest] = JSON.parse(packed.stdout);
 assert.equal(manifest.name, 'aegis-arun');
 for (const entry of manifest.files) {
-  assert.match(entry.path, /^(?:package\.json|README\.md|bin\/[^/]+|scripts\/(?:install|platform)\.mjs|vendor\/[^/]+\/arun(?:\.exe)?)$/,
+  assert.match(entry.path, /^(?:package\.json|README\.md|bin\/[^/]+|scripts\/(?:(?:install|platform|windows-host|windows-host-install|whatsapp-cli)\.mjs|windows-host\.ps1)|relay\/README\.md|relay\/local\/(?:README\.md|compose\.yaml|local-remote\.ps1|make-nats-certs\.ps1|nats-server\.conf)|vendor\/[^/]+\/(?:arun(?:\.exe)?|aegis-relay\.exe))$/,
     `Unexpected packaged file: ${entry.path}`);
 }
 assert.ok(manifest.files.some(entry => entry.path === path.relative(root, bundled).split(path.sep).join('/')));
+for (const asset of ['scripts/windows-host.mjs', 'scripts/windows-host.ps1', 'scripts/windows-host-install.mjs', 'scripts/whatsapp-cli.mjs',
+  'relay/local/local-remote.ps1', 'relay/local/compose.yaml', 'relay/local/nats-server.conf', 'relay/local/make-nats-certs.ps1']) {
+  assert.ok(manifest.files.some(entry => entry.path === asset), `Missing setup asset: ${asset}`);
+}
+const relayFile = path.join(path.dirname(bundled), 'aegis-relay.exe');
+if (process.platform === 'win32') {
+  assert.equal(digest(await readFile(relayFile)), digest(await readFile(path.join(root, 'relay', 'target', 'release', 'aegis-relay.exe'))));
+}
 const tarball = path.join(directory, manifest.filename);
 const installed = await command([npmCli, 'install', '--offline', '--no-audit', '--no-fund', '--foreground-scripts', '--prefix', prefix, tarball]);
 assert.match(installed.stdout, /node scripts\/install\.mjs/);
@@ -76,6 +84,21 @@ const help = await command([npmCli, 'exec', '--offline', '--prefix', prefix, '--
 assert.match(help.stdout, /launch with no arguments for guided terminal tasks/);
 assert.match(help.stdout, /login\|probe <provider>/);
 const launcher = path.join(installedRoot, 'bin', 'aegis.mjs');
+const whatsappHelp = await command([launcher, 'whatsapp', 'help']);
+assert.match(whatsappHelp.stdout, /self-account/);
+assert.match(whatsappHelp.stdout, /Message yourself|self-chat/);
+const pcHelp = await command([launcher, 'pc', 'help']);
+assert.match(pcHelp.stdout, /enable --trusted-host/);
+if (process.platform === 'win32') {
+  assert.equal(digest(await readFile(path.join(path.dirname(binaryPath(installedRoot)), 'aegis-relay.exe'))), digest(await readFile(relayFile)));
+  const pcWorkspace = path.join(directory, 'pc-workspace');
+  await mkdir(pcWorkspace);
+  const enabled = await command([launcher, 'pc', 'enable', '--trusted-host', '--workspace', pcWorkspace]);
+  assert.match(enabled.stdout, /Registered 10 trusted Windows host tools/);
+  const profile = JSON.parse(await readFile(path.join(pcWorkspace, '.arun', 'profile.json'), 'utf8'));
+  assert.equal(profile.mcp_grants.length, 10);
+  assert.ok(profile.mcp_grants.every(grant => grant.startsWith('mcp:windows-host:')));
+}
 const onboarding = await command([launcher], { cwd: workspace, input: '3\n3\n', timeout: 10000 });
 assert.match(onboarding.stdout, /Choose your provider/);
 assert.match(onboarding.stdout, /Custom OpenAI-compatible endpoint/);
@@ -94,7 +117,8 @@ const receipt = {
   checks: ['offline pack file allowlist', 'offline private install with postinstall',
     'installed binary equality', 'npm command shim help', 'same-terminal onboarding decline',
     'owned sign-in decline', 'no provider CLI execution', 'no owned credentials created',
-    'no task created when setup is declined'],
+    'no task created when setup is declined', 'installed PC enable with exact host grants',
+    'installed WhatsApp help and self-contained controller assets', 'bundled relay equality'],
   not_verified: ['global installation', 'public release', 'other platforms', 'live inference', 'visual terminal quality'],
 };
 await writeFile(path.join(directory, 'receipt.json'), JSON.stringify(receipt, null, 2) + '\n');

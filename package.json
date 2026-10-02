@@ -6,7 +6,7 @@
   "license": "UNLICENSED",
   "engines": { "node": ">=20" },
   "bin": { "aegis": "bin/aegis.mjs", "arun": "bin/aegis.mjs" },
-  "files": ["bin", "scripts/install.mjs", "scripts/platform.mjs", "vendor", "README.md"],
+  "files": ["bin", "scripts/install.mjs", "scripts/platform.mjs", "scripts/windows-host.mjs", "scripts/windows-host.ps1", "scripts/windows-host-install.mjs", "scripts/whatsapp-cli.mjs", "relay/local", "vendor", "README.md"],
   "scripts": {
     "postinstall": "node scripts/install.mjs",
     "build:native": "node scripts/build-native.mjs",
