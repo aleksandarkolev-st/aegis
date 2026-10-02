@@ -29,6 +29,13 @@ The live input correctness commit `7651a13` passed 41 focused terminal tests. Ea
 
 Real Windows pseudo-console tests and hosted GPT-6.1-sol/high verification are required before declaring the interactive work complete. Their results will be recorded here after execution.
 
+Hosted checks completed using an actual rebuilt Aegis executable with SHA-256 `7bfc0b4c7c7d798f20f45bfb8249ab4f0b467f543bc6ebe9f0023ef089fafd2e`:
+
+- Parser task `148de391-4439-4c22-a75c-acba7eb61d11`: paused during real inference, resumed the same durable run, preserved its route and frozen contract, added nested expression support and regression tests, passed independent acceptance, and verified all four explicit requirements at revision 6. Fifteen recorded responses; 59,448 provider-reported tokens. Receipt: `.arun/hosted-control-live-WsYOCU/receipt.json`.
+- Output task: first output was durable before command success; the live preview reached its cap; the referenced raw artifact retained all 70,033 bytes, including the final marker beyond that cap. Requested model and high effort matched every recorded route. Receipt: `.arun/hosted-output-live-QL6BRc/receipt.json`. The verifier initially inspected the process receipt instead of its referenced output artifact; the corrected verifier audited the retained trial without another model run.
+- Real active-follower ConPTY check passed for output during typing, output inside the nested slash picker, durable Ctrl+C operation interruption and terminal completion feedback.
+- Real idle-composer ConPTY check exposed a Windows-specific failure: native crossterm converted multiline paste to Enter key events. This requires the Windows VT input repair and a passing rerun; pure editor tests are insufficient evidence.
+
 ## Further ideas
 
 Detailed transcript search, a visible steering queue, theme selection and syntax-aware code coloring need their own design and acceptance checks. Current code block formatting and diff colors should not be described as a complete syntax highlighter or transcript browser.
