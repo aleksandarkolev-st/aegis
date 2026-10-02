@@ -260,6 +260,7 @@ fn body(
     model_id: &str,
     prompt: &str,
     reasoning: Option<&str>,
+    images: &[crate::image::InputImage],
 ) -> Result<Value> {
     if !crate::catalog::valid_id(model_id) {
         bail!("Select a valid provider model before starting this task");
@@ -268,14 +269,25 @@ fn body(
         bail!("Invalid reasoning effort");
     }
     let mut body = match provider {
-        Provider::ChatGpt => json!({
-            "model": model_id,
-            "instructions": INSTRUCTIONS,
-            "input": [{"role":"user","content":[{"type":"input_text","text":prompt}]}],
-            "tools": [], "tool_choice":"none", "parallel_tool_calls":false,
-            "store":false, "stream":true,
-            "text":{"format":{"type":"json_schema","name":"runtime_action","strict":true,"schema":model::schema()?}}
-        }),
+        Provider::ChatGpt => {
+            let mut content = vec![json!({"type":"input_text","text":prompt})];
+            content.extend(
+                images
+                    .iter()
+                    .map(|image| json!({"type":"input_image","image_url":image.data_url()})),
+            );
+            json!({
+                "model": model_id,
+                "instructions": INSTRUCTIONS,
+                "input": [{"role":"user","content":content}],
+                "tools": [], "tool_choice":"none", "parallel_tool_calls":false,
+                "store":false, "stream":true,
+                "text":{"format":{"type":"json_schema","name":"runtime_action","strict":true,"schema":model::schema()?}}
+            })
+        }
+        Provider::Grok if !images.is_empty() => {
+            bail!("Visual inputs are not supported by the direct Grok route")
+        }
         Provider::Grok => json!({
             "model":model_id,
             "messages":[{"role":"system","content":INSTRUCTIONS},{"role":"user","content":prompt}],
@@ -298,6 +310,7 @@ pub struct Request<'request> {
     pub reasoning: Option<&'request str>,
     pub timeout: Duration,
     pub response_bytes: u64,
+    pub images: &'request [crate::image::InputImage],
 }
 
 pub fn call(
@@ -329,7 +342,13 @@ fn call_url(
     if provider == Provider::ChatGpt && credentials.account_id.is_none() {
         bail!("ChatGPT account selection is missing; sign in again");
     }
-    let body = body(provider, request.model, request.prompt, request.reasoning)?;
+    let body = body(
+        provider,
+        request.model,
+        request.prompt,
+        request.reasoning,
+        request.images,
+    )?;
     let bytes = request_bytes(
         provider,
         credentials,
@@ -971,7 +990,61 @@ mod tests {
             reasoning: Some("low"),
             timeout: Duration::from_secs(3),
             response_bytes: 8192,
+            images: &[],
         }
+    }
+
+    #[test]
+    fn chatgpt_request_sends_validated_image_as_input_image() -> Result<()> {
+        let image = crate::image::InputImage {
+            mime_type: "image/png".into(),
+            bytes: b"\x89PNG\r\n\x1a\nfixture".to_vec(),
+            artifact_hash: "a".repeat(64),
+            content_index: 0,
+        };
+        let images = [image];
+        let mut request = request();
+        request.images = &images;
+        let response = format!(
+            "data: {}\n\n",
+            completed(json!({"input_tokens":100,"output_tokens":20}))
+        );
+        let headers = format!("Content-Length: {}\r\n", response.len());
+        let (url, handle) = server("200 OK", &headers, response, Duration::ZERO)?;
+        call_url(Provider::ChatGpt, &credentials(), &request, url, || false)?;
+        let bytes = handle.join().unwrap()?;
+        let end = bytes
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap();
+        let sent: Value = serde_json::from_slice(&bytes[end + 4..])?;
+        let content = sent["input"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[0]["text"], request.prompt);
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(
+            content[1]["image_url"],
+            "data:image/png;base64,iVBORw0KGgpmaXh0dXJl"
+        );
+        assert!(!sent.to_string().contains(&"a".repeat(64)));
+        Ok(())
+    }
+
+    #[test]
+    fn grok_request_rejects_visual_inputs_explicitly() -> Result<()> {
+        let image = crate::image::InputImage {
+            mime_type: "image/png".into(),
+            bytes: b"\x89PNG\r\n\x1a\nfixture".to_vec(),
+            artifact_hash: "a".repeat(64),
+            content_index: 0,
+        };
+        assert!(
+            body(Provider::Grok, "model", "prompt", None, &[image])
+                .unwrap_err()
+                .to_string()
+                .contains("not supported")
+        );
+        Ok(())
     }
 
     #[test]
@@ -1535,7 +1608,7 @@ mod tests {
     #[test]
     fn direct_requests_have_only_the_aegis_schema_and_no_native_harness() -> Result<()> {
         for provider in [Provider::ChatGpt, Provider::Grok] {
-            let request = body(provider, "chosen-model", "bounded state", Some("low"))?;
+            let request = body(provider, "chosen-model", "bounded state", Some("low"), &[])?;
             let format = if provider == Provider::ChatGpt {
                 &request["text"]["format"]
             } else {
@@ -1552,14 +1625,14 @@ mod tests {
             assert!(!request.to_string().contains("multi_agent"));
             assert!(!request.to_string().contains("collaboration_mode"));
         }
-        let request = body(Provider::ChatGpt, "chosen-model", "state", None)?;
+        let request = body(Provider::ChatGpt, "chosen-model", "state", None, &[])?;
         assert!(request["tools"].as_array().unwrap().is_empty());
         assert_eq!(request["tool_choice"], "none");
         assert_eq!(request["store"], false);
         assert!(request["reasoning"].is_null());
         assert!(crate::tokenization::count(INSTRUCTIONS) < 100);
-        assert!(body(Provider::ChatGpt, "", "state", None).is_err());
-        assert!(body(Provider::Grok, "valid", "state", Some("invented")).is_err());
+        assert!(body(Provider::ChatGpt, "", "state", None, &[]).is_err());
+        assert!(body(Provider::Grok, "valid", "state", Some("invented"), &[]).is_err());
         Ok(())
     }
 

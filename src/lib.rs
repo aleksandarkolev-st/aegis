@@ -17,6 +17,7 @@ pub mod freshness;
 pub mod habits;
 pub mod history;
 pub mod identity;
+pub mod image;
 pub mod instructions;
 pub mod interrupt;
 pub mod kernel;

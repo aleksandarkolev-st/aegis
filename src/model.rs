@@ -177,7 +177,32 @@ pub fn call_configured(
     timeout: Duration,
     cancelled: impl Fn() -> bool,
 ) -> Result<Response> {
+    call_configured_with_images(
+        provider,
+        configuration,
+        prompt,
+        _directory,
+        timeout,
+        &[],
+        cancelled,
+    )
+}
+
+pub(crate) fn call_configured_with_images(
+    provider: &str,
+    configuration: &Value,
+    prompt: &str,
+    _directory: &Path,
+    timeout: Duration,
+    images: &[crate::image::InputImage],
+    cancelled: impl Fn() -> bool,
+) -> Result<Response> {
     let provider = crate::provider::canonical(provider);
+    if !images.is_empty() && provider != "codex" {
+        bail!(
+            "Visual inputs are currently supported only by direct ChatGPT routes; this task uses {provider}"
+        );
+    }
     let response_bytes = crate::budget::response_bytes(configuration)?;
     let reasoning = configuration
         .get("reasoning_effort")
@@ -279,6 +304,7 @@ pub fn call_configured(
             reasoning,
             timeout: remaining,
             response_bytes,
+            images,
         },
         interrupted,
     )
@@ -327,6 +353,35 @@ mod tests {
         .unwrap()
         .to_string();
         assert!(error.contains("Choose a model"));
+        Ok(())
+    }
+
+    #[test]
+    fn visual_inputs_fail_clearly_on_non_chatgpt_routes() -> Result<()> {
+        let image = crate::image::InputImage {
+            mime_type: "image/png".into(),
+            bytes: b"\x89PNG\r\n\x1a\nfixture".to_vec(),
+            artifact_hash: "a".repeat(64),
+            content_index: 0,
+        };
+        for provider in ["grok", "claude-api", "custom"] {
+            let error = call_configured_with_images(
+                provider,
+                &Value::Null,
+                "analyze this image",
+                Path::new("."),
+                Duration::from_secs(1),
+                std::slice::from_ref(&image),
+                || false,
+            )
+            .err()
+            .context("visual input unexpectedly accepted")?
+            .to_string();
+            assert!(
+                error.contains("only by direct ChatGPT routes"),
+                "{provider}: {error}"
+            );
+        }
         Ok(())
     }
 
