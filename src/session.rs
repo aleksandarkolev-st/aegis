@@ -45,6 +45,8 @@ struct Profile {
     network_scopes: Option<crate::network::NetworkScopes>,
     #[serde(default)]
     previous_run: Option<String>,
+    #[serde(default)]
+    mcp_grants: Vec<String>,
 }
 
 struct TaskSecret {
@@ -507,6 +509,7 @@ fn blank_profile(provider: String) -> Profile {
         filesystem_scopes: None,
         network_scopes: None,
         previous_run: None,
+        mcp_grants: Vec::new(),
     }
 }
 
@@ -1820,6 +1823,111 @@ fn save(root: &Path, profile: &Profile) -> Result<()> {
     Ok(())
 }
 
+fn apply_remote_preferences(profile: &mut Profile, preferences: &serde_json::Value) -> Result<()> {
+    use anyhow::bail;
+    if let Some(provider) = preferences["provider"].as_str() {
+        let provider = crate::provider::canonical(provider);
+        if !matches!(provider, "codex" | "grok") && provider != profile.provider {
+            bail!("Configure this provider's credentials and endpoint locally first");
+        }
+        if provider != profile.provider {
+            profile.endpoint = None;
+            profile.api_key_env = None;
+            profile.fallback_routes.clear();
+            profile.model = None;
+            profile.reasoning_effort = None;
+        }
+        profile.provider = provider.to_owned();
+    }
+    if let Some(model) = preferences["model"].as_str() {
+        if !crate::catalog::valid_id(model) {
+            bail!("Invalid model ID");
+        }
+        profile.model = Some(model.to_owned());
+    }
+    if let Some(effort) = preferences["reasoning_effort"].as_str() {
+        if !crate::catalog::valid_effort(effort) {
+            bail!("Invalid reasoning effort");
+        }
+        profile.reasoning_effort = Some(effort.to_owned());
+    }
+    if let Some(limits) = preferences.get("limits") {
+        let limits: crate::budget::Limits = serde_json::from_value(limits.clone())?;
+        limits.validate()?;
+        profile.limits = limits;
+    }
+    if let Some(write) = preferences["write"].as_bool() {
+        if write && !profile.write {
+            bail!("Enable file edits locally before enabling them from this phone");
+        }
+        profile.write = write;
+    }
+    Ok(())
+}
+
+pub(crate) fn remote_profile(
+    root: &Path,
+    preferences: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let mut profile: Profile = serde_json::from_slice(&fs::read(root.join("profile.json"))?)?;
+    apply_remote_preferences(&mut profile, preferences)?;
+    Ok(
+        json!({"provider": profile.provider, "model": profile.model, "reasoning_effort": profile.reasoning_effort,
+        "write": profile.write, "limits": profile.limits, "mcp_grants": profile.mcp_grants,
+        "container": profile.image, "filesystem_scopes": profile.filesystem_scopes,
+        "network_scopes": profile.network_scopes, "command_scopes": profile.command_scopes}),
+    )
+}
+
+pub(crate) fn remote_catalog(
+    root: &Path,
+    preferences: &serde_json::Value,
+    refresh: bool,
+) -> Result<crate::catalog::Catalog> {
+    let mut profile: Profile = serde_json::from_slice(&fs::read(root.join("profile.json"))?)?;
+    apply_remote_preferences(&mut profile, preferences)?;
+    if profile.provider == "claude-api" {
+        let key = profile
+            .api_key_env
+            .as_ref()
+            .and_then(|name| std::env::var(name).ok())
+            .ok_or_else(|| {
+                anyhow::anyhow!("The configured Claude API key is unavailable in the local daemon")
+            })?;
+        return Ok(crate::catalog::Catalog {
+            source: "Claude API account catalog".into(),
+            models: crate::claude_api::models(&key, || false)?,
+        });
+    }
+    if let Some(endpoint) = &profile.endpoint {
+        return Ok(crate::catalog::Catalog {
+            source: "Configured endpoint catalog".into(),
+            models: endpoint.models_with_cancel(None, || false)?,
+        });
+    }
+    if refresh {
+        crate::catalog::refresh_for_selection(&profile.provider, || false)
+    } else {
+        crate::catalog::for_selection(&profile.provider, || false)
+    }
+}
+
+fn add_profile_mcp_grants(root: &Path, profile: &Profile, grants: &mut Vec<String>) -> Result<()> {
+    let tools = Store::open(root)?.mcp_tools()?;
+    for permission in &profile.mcp_grants {
+        if !tools
+            .iter()
+            .any(|tool| permission == &format!("mcp:{}:{}", tool.server, tool.name))
+        {
+            anyhow::bail!("Configured MCP permission is unavailable: {permission}");
+        }
+        if !grants.contains(permission) {
+            grants.push(permission.clone());
+        }
+    }
+    Ok(())
+}
+
 /// Creates a remote-started task from the profile already saved locally.
 /// The phone supplies only task text; the workspace, model, limits, scopes and
 /// grants all come from this installation's configuration.
@@ -1828,6 +1936,16 @@ pub(crate) fn create_remote_task(
     workspace: &Path,
     task: &str,
     run_id: &str,
+) -> Result<crate::storage::Run> {
+    create_remote_task_with_preferences(root, workspace, task, run_id, &json!({}))
+}
+
+pub(crate) fn create_remote_task_with_preferences(
+    root: &Path,
+    workspace: &Path,
+    task: &str,
+    run_id: &str,
+    preferences: &serde_json::Value,
 ) -> Result<crate::storage::Run> {
     use anyhow::{Context, bail};
 
@@ -1867,12 +1985,14 @@ pub(crate) fn create_remote_task(
     if !metadata.is_file() {
         bail!("Aegis profile must be a regular file");
     }
-    let profile: Profile = serde_json::from_slice(
+    let mut profile: Profile = serde_json::from_slice(
         &std::fs::read(&profile_path).context("could not read the local Aegis profile")?,
     )
     .context("the local Aegis profile is invalid")?;
+    apply_remote_preferences(&mut profile, preferences)?;
 
     let mut grants = vec!["workspace.read".to_owned()];
+    add_profile_mcp_grants(root, &profile, &mut grants)?;
     if profile.write {
         grants.push("workspace.write".into());
     }
@@ -3814,6 +3934,7 @@ fn task(
     review_new_root_guidance(root, terminal, profile.filesystem_scopes.as_ref())?;
     let mut store = Store::open(root)?;
     let mut grants = vec!["workspace.read".to_owned()];
+    add_profile_mcp_grants(root, profile, &mut grants)?;
     if profile.write {
         grants.push("workspace.write".into());
     }
@@ -4579,6 +4700,7 @@ mod tests {
             filesystem_scopes: None,
             network_scopes: None,
             previous_run: None,
+            mcp_grants: Vec::new(),
         };
         save(directory.path(), &profile)?;
         profile.write = true;

@@ -10,6 +10,7 @@ const MAX_TEXT_BYTES: usize = 8 * 1024;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RelayCommand {
+    Slash { text: String },
     Message { text: String },
     ListTasks,
     Status { task_id: Option<String> },
@@ -68,7 +69,7 @@ impl RelayCommandEnvelope {
         {
             bail!("remote command expiry window is invalid");
         }
-        if let RelayCommand::Message { text } = &envelope.command
+        if let RelayCommand::Message { text } | RelayCommand::Slash { text } = &envelope.command
             && (text.trim().is_empty()
                 || text.len() > MAX_TEXT_BYTES
                 || text.chars().any(|character| {
@@ -82,6 +83,7 @@ impl RelayCommandEnvelope {
 
     pub fn local_envelope(&self) -> LocalEnvelope {
         let command = match &self.command {
+            RelayCommand::Slash { text } => LocalCommand::Slash { text: text.clone() },
             RelayCommand::Message { text } => LocalCommand::Message {
                 text: text.clone(),
                 task_id: None,

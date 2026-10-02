@@ -714,18 +714,27 @@ fn apply_relay_command(
     let envelope = relay.local_envelope();
     let mut receipt = authority.apply_from_authenticated_relay(&relay.actor_id, &envelope, now)?;
     if receipt.result["needs_task_creation"] == true {
-        let Command::Message {
-            text,
-            task_id: None,
-        } = &envelope.command
-        else {
-            bail!("only a new message can create a remote task");
+        let text = match &envelope.command {
+            Command::Message {
+                text,
+                task_id: None,
+            } => text.as_str(),
+            Command::Slash { text } => super::slash::goal_submission(text)
+                .context("slash command did not supply a goal")?,
+            _ => bail!("only a new message or goal can create a remote task"),
         };
         let run_id = stable_uuid(&format!(
             "run\0{}\0{}\0{}",
             config.installation_id, relay.actor_id, relay.request_id
         ));
-        crate::session::create_remote_task(root, &config.workspace, text, &run_id)?;
+        let preferences = super::slash::preferences(authority, &relay.actor_id)?;
+        crate::session::create_remote_task_with_preferences(
+            root,
+            &config.workspace,
+            text,
+            &run_id,
+            &preferences,
+        )?;
         authority.grant_run(&relay.actor_id, &run_id)?;
         authority.bind_selected_task(&relay.actor_id, &run_id)?;
         initialize_event_cursor(authority, &relay.actor_id, &run_id)?;
@@ -735,6 +744,16 @@ fn apply_relay_command(
         if receipt.result["needs_task_creation"] == true {
             bail!("new task could not be selected for its originating actor");
         }
+    }
+    if let RelayCommand::Slash { text } = &relay.command {
+        receipt = super::slash::execute(
+            root,
+            &config.workspace,
+            authority,
+            &relay.actor_id,
+            text,
+            receipt,
+        )?;
     }
     if let Some(run_id) = receipt.result["task_id"].as_str() {
         initialize_event_cursor(authority, &relay.actor_id, run_id)?;
@@ -752,7 +771,8 @@ fn apply_command_effects(
         return Ok(());
     };
     match &envelope.command {
-        RelayCommand::Message { .. } => {
+        RelayCommand::Slash { text } if super::slash::goal_submission(text).is_none() => Ok(()),
+        RelayCommand::Slash { .. } | RelayCommand::Message { .. } => {
             let run = Store::open(root)?.run(run_id)?;
             if matches!(run.state.as_str(), "ready" | "running") {
                 crate::kernel::spawn(root, run_id, None)?;
@@ -800,6 +820,10 @@ fn actor_enabled(authority: &Authority, actor_id: &str) -> Result<bool> {
 fn format_receipt(command: &RelayCommand, receipt: &super::Receipt) -> String {
     let result = &receipt.result;
     match command {
+        RelayCommand::Slash { .. } => result["reply"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| "Aegis accepted your goal.".into()),
         RelayCommand::Message { .. } => {
             let task = result["task_id"].as_str().unwrap_or("unknown");
             if result["interrupting_model"] == true {
@@ -891,6 +915,7 @@ fn short_task_label(task: &str) -> String {
 
 fn rejection_reply(command: &RelayCommand) -> String {
     match command {
+        RelayCommand::Slash { .. } => "Aegis could not apply that shortcut. Send /help for commands and syntax.".into(),
         RelayCommand::Message { .. } => "Aegis could not start or update that task. Check the local Aegis setup, then send the request again.".into(),
         RelayCommand::ListTasks => "Aegis could not list tasks right now.".into(),
         RelayCommand::Status { .. }

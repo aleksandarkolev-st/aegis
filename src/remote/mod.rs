@@ -9,6 +9,7 @@
 pub mod config;
 pub mod daemon;
 pub(crate) mod protocol;
+mod slash;
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
@@ -54,6 +55,9 @@ pub(crate) fn is_command_rejection(error: &anyhow::Error) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
+    Slash {
+        text: String,
+    },
     Message {
         text: String,
         task_id: Option<String>,
@@ -1124,6 +1128,35 @@ fn apply_command(
     command: &Command,
 ) -> Result<CommandApply> {
     match command {
+        Command::Slash { text } => {
+            if let Some(body) = slash::goal_submission(text) {
+                return apply_command(
+                    transaction,
+                    actor_id,
+                    request_id,
+                    now,
+                    &Command::Message {
+                        text: body.to_owned(),
+                        task_id: None,
+                    },
+                );
+            }
+            if matches!(text.trim(), "/new" | "/exit" | "/quit") {
+                transaction.execute(
+                    "DELETE FROM remote_selected_tasks WHERE actor_id=?1",
+                    [actor_id],
+                )?;
+                return Ok(CommandApply::Applied {
+                    result: json!({"reply": "Conversation detached. Send /goal followed by a task to start a new one. Saved tasks remain available in /sessions."}),
+                    task_id: None,
+                });
+            }
+            let task_id = resolve_actor_task(transaction, actor_id, None)?;
+            Ok(CommandApply::Applied {
+                result: json!({"slash_pending": true, "task_id": task_id}),
+                task_id,
+            })
+        }
         Command::ListTasks => {
             let tasks = authorized_runs_in_transaction(transaction, actor_id)?;
             Ok(CommandApply::Applied {
@@ -2095,6 +2128,16 @@ fn operation_intent_hash(operation: &crate::storage::Operation) -> Result<String
 }
 
 fn validate_request_shape(request: &CommandEnvelope) -> Result<()> {
+    if let Command::Slash { text } = &request.command {
+        if !text.starts_with('/')
+            || text.len() > 8192
+            || text
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t')
+        {
+            bail!("invalid remote slash command");
+        }
+    }
     if request.version != PROTOCOL_VERSION {
         bail!("unsupported remote command protocol version");
     }
