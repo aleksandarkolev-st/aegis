@@ -145,6 +145,17 @@ fn spawn(root: &Path, id: &str) -> Result<()> {
     kernel::spawn(root, id, None)
 }
 
+fn drive_with_output(root: &Path, id: &str) -> Result<()> {
+    thread::scope(|scope| {
+        let driver = scope.spawn(|| kernel::drive(root, id));
+        let output = attach(root, id);
+        driver
+            .join()
+            .map_err(|_| anyhow::anyhow!("foreground runner panicked"))??;
+        output
+    })
+}
+
 fn run(root: &Path, args: &[String]) -> Result<()> {
     let mut provider = "codex";
     let mut model = None;
@@ -401,11 +412,15 @@ fn run(root: &Path, args: &[String]) -> Result<()> {
             "model_seconds": 180, "model_response_bytes": model_response_bytes, "process_seconds": process_seconds, "container_image": image, "acceptance_check":acceptance_check, "command_scopes":command_scopes, "filesystem_scopes":filesystem_scopes, "network_scopes":network_scopes}),
         acceptance,
     )?;
-    println!("run: {} provider: {}", run.id, run.provider);
+    let provider_label = if run.provider == "codex" {
+        "chatgpt"
+    } else {
+        &run.provider
+    };
+    println!("run: {} provider: {}", run.id, provider_label);
     drop(store);
     if foreground {
-        kernel::drive(root, &run.id)?;
-        attach(root, &run.id)?;
+        drive_with_output(root, &run.id)?;
     } else {
         spawn(root, &run.id)?;
         println!(
@@ -541,8 +556,7 @@ fn execute() -> Result<()> {
             store.resume_paused(id)?;
             drop(store);
             if arguments.iter().any(|argument| argument == "--foreground") {
-                kernel::drive(&root, id)?;
-                attach(&root, id)
+                drive_with_output(&root, id)
             } else {
                 spawn(&root, id)?;
                 println!("resuming {id}");

@@ -51,6 +51,7 @@ async function command(argv) {
 }
 async function verify(events) {
   assert.ok(receipt.live_output_observed_before_exit, 'First marker was not observed before process success');
+  if (!verifyDirectory) assert.ok(receipt.foreground_output_observed_before_exit, 'Foreground CLI did not display the first marker before process success');
   assert.ok(events.some(event => event.kind === 'operation.output' && event.payload.truncated === true), 'Missing bounded live preview notice');
   const routes = events.filter(event => event.kind === 'model.started').map(event => event.payload.route);
   assert.ok(routes.length && routes.every(route => route.model === receipt.model && route.reasoning_effort === receipt.reasoning_effort), 'Recorded route differs from requested model/effort');
@@ -96,6 +97,9 @@ while (Date.now() < deadline) {
     if (chunk && !events.some(event => event.kind === 'operation.succeeded' && event.payload.id === chunk.payload.id)) {
       receipt.live_output_observed_before_exit = true;
       receipt.first_live_output_at = chunk.created_at;
+      if (runner.text().split(/\r?\n/).some(line => /^\s*(?:│\s*)?AEGIS_LIVE_START\s*$/.test(line))) {
+        receipt.foreground_output_observed_before_exit = true;
+      }
     }
     if (events.some(event => ['run.completed', 'run.failed', 'run.cancelled', 'run.paused', 'run.answered'].includes(event.kind))) break;
   }
