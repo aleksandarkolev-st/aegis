@@ -98,6 +98,9 @@ if (process.platform === 'win32') {
   const profile = JSON.parse(await readFile(path.join(pcWorkspace, '.arun', 'profile.json'), 'utf8'));
   assert.equal(profile.mcp_grants.length, 10);
   assert.ok(profile.mcp_grants.every(grant => grant.startsWith('mcp:windows-host:')));
+  const hostStatus = await command([launcher, 'pc', 'status'], { cwd: pcWorkspace });
+  assert.match(hostStatus.stdout, /mcp\.windows-host\.app_launch/);
+  assert.match(hostStatus.stdout, /mcp\.windows-host\.desktop_keyboard/);
 }
 const onboarding = await command([launcher], { cwd: workspace, input: '3\n3\n', timeout: 10000 });
 assert.match(onboarding.stdout, /Choose your provider/);

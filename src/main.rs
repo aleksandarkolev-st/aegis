@@ -42,7 +42,7 @@ fn usage() {
         "Web reads: --network-scopes <reviewed.json>; optional exact HTTPS domains are available in F7 settings."
     );
     println!(
-        "arun tasks|context|tools|artifacts <run-id> | mcp add <name> --image <local-image> [--allow-write] -- <command> [args...] | mcp add <name> --trusted-host -- <command> [args...]"
+        "arun tasks|context|tools|artifacts <run-id> | mcp list | mcp add <name> --image <local-image> [--allow-write] -- <command> [args...] | mcp add <name> --trusted-host -- <command> [args...]"
     );
     println!(
         "arun eval [--provider chatgpt|claude|grok] [--sizes 50,100,250,500] [--modes eager,lazy,artifact,durable] [--tasks read,log,repair] [--repeats 1] [--restart-at operation.executing|operation.succeeded|checkpoint.created] [--prepare-only] | eval-report <results.jsonl>"
@@ -496,6 +496,22 @@ fn execute() -> Result<()> {
             Ok(())
         }
         Some("mcp") => {
+            if required(1)? == "list" {
+                if arguments.len() != 2 {
+                    bail!("usage: arun mcp list");
+                }
+                let tools = Store::open(&root)?.mcp_tools()?;
+                if tools.is_empty() {
+                    println!("No MCP tools registered in this workspace.");
+                }
+                for tool in tools {
+                    println!(
+                        "mcp.{}.{}  grant: mcp:{}:{}",
+                        tool.server, tool.name, tool.server, tool.name
+                    );
+                }
+                return Ok(());
+            }
             if required(1)? != "add" {
                 bail!("use 'arun mcp add <name> --image <local-image> -- <command> [args...]'");
             }
