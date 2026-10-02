@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -3187,7 +3187,7 @@ fn sessions(
     secret: Option<&str>,
     task_secret: &mut Option<TaskSecret>,
 ) -> Result<()> {
-    let store = Store::open(root)?;
+    let mut store = Store::open(root)?;
     let runs = chat_heads(store.runs()?);
     if runs.is_empty() {
         terminal.message(
@@ -3213,7 +3213,7 @@ fn sessions(
     let Some(index) = terminal.select("Saved chats · type to search", &choices)? else {
         return Ok(());
     };
-    let Some(run) = selected.get(index) else {
+    let Some(run) = selected.get(index).map(|run| (**run).clone()) else {
         return Ok(());
     };
     terminal.message(Tone::Accent, "You", &crate::terminal::fit(&run.task, 2000))?;
@@ -3230,21 +3230,41 @@ fn sessions(
     ]
     .map(str::to_owned)
     .to_vec();
+    let legacy_contract_pending =
+        !run.is_terminal() && store.needs_legacy_contract_adoption(&run.id)?;
+    let adopt_index = if legacy_contract_pending {
+        let index = choices.len();
+        choices.push("Review and adopt legacy task".into());
+        Some(index)
+    } else {
+        None
+    };
+    let follow_index;
+    let continue_index;
+    let cancel_index;
     if !run.is_terminal() {
-        choices.extend(
-            [
-                "Follow task",
-                if crate::continuation::needed(run) {
-                    "Continue work as new direct task"
-                } else {
-                    "Resume task"
-                },
-                "Cancel task",
-            ]
-            .map(str::to_owned),
+        follow_index = Some(choices.len());
+        choices.push("Follow task".into());
+        continue_index = Some(choices.len());
+        choices.push(
+            if crate::continuation::needed(&run) {
+                "Continue work as new direct task"
+            } else {
+                "Resume task"
+            }
+            .into(),
         );
-    } else if crate::continuation::needed(run) {
+        cancel_index = Some(choices.len());
+        choices.push("Cancel task".into());
+    } else if crate::continuation::needed(&run) {
+        follow_index = None;
+        continue_index = Some(choices.len());
         choices.push("Continue work as new direct task".into());
+        cancel_index = None;
+    } else {
+        follow_index = None;
+        continue_index = None;
+        cancel_index = None;
     }
     choices.push("Back".into());
     match terminal.select("Chat actions", &choices)? {
@@ -3255,33 +3275,33 @@ fn sessions(
         }
         Some(1) => saved_messages(&store, &run.id, terminal)?,
         Some(2) => artifacts(root, &run.id, terminal)?,
-        Some(3) => chat_details(root, run, &store, terminal)?,
-        Some(4) if run.is_terminal() && crate::continuation::needed(run) => {
-            continue_legacy(root, &run.id, terminal, profile)?;
+        Some(3) => chat_details(root, &run, &store, terminal)?,
+        Some(index) if Some(index) == adopt_index => {
+            review_legacy_contract(root, &mut store, &run, false, terminal)?;
         }
-        Some(4) if !run.is_terminal() => {
+        Some(index) if Some(index) == follow_index => {
             follow(root, &run.id, terminal)?;
             recover_auth_after_follow(root, &run.id, terminal)?;
         }
-        Some(5) if !run.is_terminal() => {
-            if crate::continuation::needed(run) {
+        Some(index) if Some(index) == continue_index => {
+            if crate::continuation::needed(&run) {
                 return continue_legacy(root, &run.id, terminal, profile);
             }
             let current_route = store.current_route(&run.id)?;
-            let profile_credentials = run_secret_reference(profile, run).zip(secret);
+            let profile_credentials = run_secret_reference(profile, &run).zip(secret);
             if task_secret
                 .as_ref()
-                .is_none_or(|saved| !saved.matches(run, &current_route))
+                .is_none_or(|saved| !saved.matches(&run, &current_route))
                 && profile_credentials.is_none()
             {
-                if route_key_reference(run, &current_route).is_some() {
+                if route_key_reference(&run, &current_route).is_some() {
                     if let Some(key) =
                         field(terminal, "  Key for this saved task (hidden) › ", true)?
                     {
                         if (current_route.provider != "claude-api"
                             || crate::claude_api::validate_key(&key).is_ok())
                             && !key.trim().is_empty()
-                            && let Some(target) = route_secret_target(run, &current_route)
+                            && let Some(target) = route_secret_target(&run, &current_route)
                         {
                             *task_secret = Some(TaskSecret {
                                 run_id: run.id.clone(),
@@ -3294,20 +3314,20 @@ fn sessions(
             }
             let credentials = task_secret
                 .as_ref()
-                .filter(|saved| saved.matches(run, &current_route))
+                .filter(|saved| saved.matches(&run, &current_route))
                 .and_then(|saved| {
-                    route_key_reference(run, &current_route)
+                    route_key_reference(&run, &current_route)
                         .map(|reference| (reference, saved.value.as_str()))
                 })
                 .or(profile_credentials);
-            if route_key_reference(run, &current_route).is_some() && credentials.is_none() {
+            if route_key_reference(&run, &current_route).is_some() && credentials.is_none() {
                 terminal.message(Tone::Warning, "Key needed", "This saved task needs its provider key before it can resume. Open F3 again to continue.")?;
                 return Ok(());
             }
             resume(root, &run.id, terminal, credentials)?;
             recover_auth_after_follow(root, &run.id, terminal)?;
         }
-        Some(6) if !run.is_terminal() => {
+        Some(index) if Some(index) == cancel_index => {
             cancel_task(root, Some(&run.id), terminal)?;
         }
         _ => {}
@@ -3435,6 +3455,149 @@ fn supersede_obligation(
     Ok(())
 }
 
+fn legacy_contract_requirements(store: &Store, run: &crate::storage::Run) -> Result<Vec<String>> {
+    let mut requirements = Vec::new();
+    if let Some(saved) = run.budgets.get("obligations") {
+        let saved = saved
+            .as_array()
+            .context("saved task requirements are not a list")?;
+        for item in saved {
+            let title = item
+                .as_str()
+                .context("saved task requirement is not text")?
+                .trim();
+            if !requirements.iter().any(|existing| existing == title) {
+                requirements.push(title.to_owned());
+            }
+        }
+    }
+    for title in crate::obligations::from_task(&run.task)? {
+        if !requirements.contains(&title) {
+            requirements.push(title);
+        }
+    }
+    for item in store.obligations(&run.id)? {
+        if item.id > 0 && item.state != "superseded" && !requirements.contains(&item.title) {
+            requirements.push(item.title);
+        }
+    }
+    Ok(requirements)
+}
+
+fn review_legacy_contract(
+    root: &Path,
+    store: &mut Store,
+    run: &crate::storage::Run,
+    add_requirement: bool,
+    terminal: &mut Terminal,
+) -> Result<()> {
+    if run.is_terminal() {
+        return terminal.message(
+            Tone::Warning,
+            "Contract retained",
+            "Ended tasks remain history and cannot adopt a new contract.",
+        );
+    }
+    if kernel::is_active(root, &run.id)? || run.state == "running" {
+        return terminal.message(
+            Tone::Warning,
+            "Pause first",
+            "Wait for the task to pause before reviewing its saved contract.",
+        );
+    }
+    if !store.needs_legacy_contract_adoption(&run.id)? {
+        return terminal.message(
+            Tone::Quiet,
+            "Contract already reviewed",
+            "This task already has a reviewed contract.",
+        );
+    }
+
+    let sequence = store
+        .events(&run.id)?
+        .last()
+        .map(|event| event.seq)
+        .unwrap_or(0);
+    terminal.message(Tone::Accent, "Original saved task", &run.task)?;
+    let mut requirements = match legacy_contract_requirements(store, run) {
+        Ok(requirements) => requirements,
+        Err(error) => {
+            return terminal.message(
+                Tone::Warning,
+                "Requirements need repair",
+                &format!(
+                    "The saved request cannot be adopted as written: {error}. The original task remains unchanged and paused."
+                ),
+            );
+        }
+    };
+    if requirements.is_empty() {
+        terminal.message(
+            Tone::Quiet,
+            "Detected requirements",
+            "No explicit Requirements: bullets were saved. The original request will remain the task-level obligation.",
+        )?;
+    } else {
+        for (index, title) in requirements.iter().enumerate() {
+            terminal.message(Tone::Accent, &format!("Requirement {}", index + 1), title)?;
+        }
+    }
+
+    let addition_reason = if add_requirement {
+        let Some(title) = field(terminal, "Requirement to add", false)? else {
+            return Ok(());
+        };
+        let title = title.trim();
+        if requirements.iter().any(|existing| existing == title) {
+            return terminal.message(
+                Tone::Warning,
+                "Requirement already saved",
+                "Choose a different requirement or leave the legacy task unchanged.",
+            );
+        }
+        let Some(reason) = field(terminal, "Reason for adding this requirement", false)? else {
+            return Ok(());
+        };
+        requirements.push(title.to_owned());
+        Some(reason)
+    } else {
+        None
+    };
+
+    terminal.message(
+        Tone::Warning,
+        "Fresh contract review",
+        "Adoption keeps the original task and event history, opens these requirements, pauses the task, and excludes prior operation evidence from proof.",
+    )?;
+    if terminal.select(
+        "Adopt this reviewed contract?",
+        &["Leave task paused".into(), "Adopt reviewed contract".into()],
+    )? != Some(1)
+    {
+        return Ok(());
+    }
+    match store.adopt_legacy_contract(
+        &run.id,
+        sequence,
+        &run.task,
+        &requirements,
+        addition_reason.as_deref(),
+    ) {
+        Ok(revision) => terminal.message(
+            Tone::Success,
+            "Legacy task adopted",
+            &format!(
+                "The original task and history are retained. Its requirements are open at workspace revision {revision}; review the task in F3, then resume it when ready."
+            ),
+        ),
+        Err(error) => terminal.message(
+            Tone::Warning,
+            "Task remains paused",
+            &error.to_string(),
+        ),
+    }
+}
+
 fn edit_goal(
     root: &Path,
     id: &str,
@@ -3450,6 +3613,9 @@ fn edit_goal(
             "Contract retained",
             "Ended tasks cannot change requirements.",
         );
+    }
+    if command == "add" && store.needs_legacy_contract_adoption(id)? {
+        return review_legacy_contract(root, &mut store, &run, true, terminal);
     }
     if matches!(run.state.as_str(), "ready" | "running") || kernel::is_active(root, id)? {
         return terminal.message(

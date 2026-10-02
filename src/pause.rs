@@ -79,6 +79,7 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        crate::obligations::ensure_reviewed_contract(&transaction, id)?;
         let state: String =
             transaction.query_row("SELECT state FROM runs WHERE id=?1", [id], |row| row.get(0))?;
         if matches!(

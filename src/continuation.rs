@@ -165,7 +165,7 @@ pub fn commit(store: &mut Store, root: &Path, review: &Review) -> Result<Run> {
         .as_object_mut()
         .context("Invalid source task configuration")?
         .remove("endpoint");
-    let child = Run {
+    let mut child = Run {
         id: review.child_id.clone(),
         task: current.task.clone(),
         workspace: current.workspace.clone(),
@@ -176,6 +176,7 @@ pub fn commit(store: &mut Store, root: &Path, review: &Review) -> Result<Run> {
         state: "ready".into(),
         created_at: crate::storage::now(),
     };
+    crate::obligations::freeze_requirements(&child.task, &mut child.budgets)?;
     crate::acceptance::Check::from_run(&child)?;
     insert_run(&transaction, &child)?;
     append_event(
@@ -318,6 +319,42 @@ mod tests {
         )?;
         assert!(commit(&mut store, &root, &review).is_err());
         assert_eq!(store.runs()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn continuation_freezes_requirements_bullets_in_the_child_contract() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("state");
+        let mut store = Store::open(&root)?;
+        let source = source(&mut store, directory.path())?;
+        let task = "Repair the parser\nRequirements:\n- preserve nested expressions\n- test malformed input";
+        store.connection.execute(
+            "UPDATE runs SET task=?2 WHERE id=?1",
+            rusqlite::params![source.id, task],
+        )?;
+        let source = store.run(&source.id)?;
+        let review = prepare(
+            &store,
+            &source.id,
+            directory.path(),
+            "grok",
+            "new-model",
+            Some("high"),
+        )?;
+
+        let child = commit(&mut store, &root, &review)?;
+        let expected = json!(["preserve nested expressions", "test malformed input"]);
+        assert_eq!(child.budgets["obligations"], expected);
+        let obligations = store.obligations(&child.id)?;
+        assert_eq!(obligations.len(), 3);
+        assert_eq!(obligations[1].title, "preserve nested expressions");
+        assert_eq!(obligations[2].title, "test malformed input");
+        assert!(
+            obligations
+                .iter()
+                .all(|item| item.state == "open" && item.evidence.is_empty())
+        );
         Ok(())
     }
 

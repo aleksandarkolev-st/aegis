@@ -1371,6 +1371,8 @@ fn apply_command(
             if is_terminal(&state) {
                 return Err(reject_command("ended tasks cannot resume"));
             }
+            crate::obligations::ensure_reviewed_contract(transaction, &run_id)
+                .map_err(|error| reject_command(error.to_string()))?;
             let unknown: i64 = transaction.query_row(
                 "SELECT COUNT(*) FROM operations WHERE run_id=?1 AND state='outcome_unknown'",
                 [&run_id],
@@ -1454,6 +1456,10 @@ fn apply_command(
                 return Err(reject_command("approval challenge is unknown"));
             };
             require_actor_run(transaction, actor_id, &run_id)?;
+            if matches!(command, Command::ApproveOnce { .. }) {
+                crate::obligations::ensure_reviewed_contract(transaction, &run_id)
+                    .map_err(|error| reject_command(error.to_string()))?;
+            }
             if expires_at <= now {
                 return Err(reject_command("approval challenge has expired"));
             }
@@ -2920,6 +2926,102 @@ mod tests {
         assert_eq!(
             fixture.authority.store.run(&fixture.run_id)?.state,
             "cancelled"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn remote_resume_rejects_unreviewed_legacy_contract_before_ready_transition() -> Result<()> {
+        let mut fixture = Fixture::new()?;
+        fixture
+            .authority
+            .store
+            .state(&fixture.run_id, "paused", json!({"fixture":true}))?;
+        fixture
+            .authority
+            .store
+            .connection
+            .execute("DELETE FROM obligations WHERE run_id=?1", [&fixture.run_id])?;
+        fixture.authority.store.connection.execute(
+            "DELETE FROM workspace_revisions WHERE run_id=?1",
+            [&fixture.run_id],
+        )?;
+
+        let error = fixture
+            .apply(Command::Resume {
+                task_id: Some(fixture.run_id.clone()),
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reviewed contract"));
+        assert!(error.contains("F3"));
+        assert_eq!(
+            fixture.authority.store.run(&fixture.run_id)?.state,
+            "paused"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn remote_approval_cannot_resume_an_unreviewed_contract_but_denial_is_recorded() -> Result<()> {
+        let mut fixture = Fixture::new()?;
+        let operation = fixture.authority.store.begin_operation(
+            &fixture.run_id,
+            "workspace.read",
+            json!({"path":"src/lib.rs"}),
+            true,
+        )?;
+        let gate = ensure_remote_approval_gate(
+            &mut fixture.authority.store,
+            &fixture.run_id,
+            &operation.id,
+            test_now(),
+        )?;
+        fixture
+            .authority
+            .store
+            .connection
+            .execute("DELETE FROM obligations WHERE run_id=?1", [&fixture.run_id])?;
+        fixture.authority.store.connection.execute(
+            "DELETE FROM workspace_revisions WHERE run_id=?1",
+            [&fixture.run_id],
+        )?;
+
+        let error = fixture
+            .apply(Command::ApproveOnce {
+                challenge_id: gate.challenge_id.clone(),
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Open F3"));
+        assert_eq!(
+            fixture.authority.store.operation(&operation.id)?.state,
+            "pending"
+        );
+        assert_eq!(
+            fixture.authority.store.connection.query_row(
+                "SELECT state FROM remote_operation_gates WHERE challenge_id=?1",
+                [&gate.challenge_id],
+                |row| row.get::<_, String>(0),
+            )?,
+            "pending"
+        );
+
+        let denial = fixture.apply(Command::Deny {
+            challenge_id: gate.challenge_id.clone(),
+        })?;
+        assert_eq!(denial.result["decision"], "denied");
+        assert_eq!(
+            fixture.authority.store.connection.query_row(
+                "SELECT state FROM remote_operation_gates WHERE challenge_id=?1",
+                [&gate.challenge_id],
+                |row| row.get::<_, String>(0),
+            )?,
+            "denied"
+        );
+        assert_eq!(
+            fixture.authority.store.operation(&operation.id)?.state,
+            "pending"
         );
         Ok(())
     }

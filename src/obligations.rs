@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -159,6 +159,85 @@ pub(crate) fn record_operation(
     Ok(())
 }
 
+const LEGACY_CONTRACT_REVIEW: &str = "This saved task needs a reviewed contract before it can continue. Open F3 and choose 'Review and adopt legacy task', or use /goal add to review and adopt it locally.";
+
+pub(crate) fn reviewed_contract(connection: &Connection, run_id: &str) -> Result<bool> {
+    let root_is_valid: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM obligations WHERE run_id=?1 AND id=0 AND title='Task request')",
+        [run_id],
+        |row| row.get(0),
+    )?;
+    if !root_is_valid {
+        return Ok(false);
+    }
+    let has_revision: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workspace_revisions WHERE run_id=?1)",
+        [run_id],
+        |row| row.get(0),
+    )?;
+    if !has_revision {
+        return Ok(false);
+    }
+
+    let saved: Option<(String, String)> = connection
+        .query_row(
+            "SELECT task,budgets FROM runs WHERE id=?1",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((task, budgets)) = saved else {
+        return Ok(false);
+    };
+    let Ok(budgets) = serde_json::from_str::<Value>(&budgets) else {
+        return Ok(false);
+    };
+    // Current runs freeze this key at creation, including an empty list. Its
+    // absence distinguishes older runs that only happen to have a root row.
+    if !budgets.get("obligations").is_some_and(Value::is_array) {
+        return Ok(false);
+    }
+    let Ok(mut expected) = titles(&budgets) else {
+        return Ok(false);
+    };
+    let Ok(from_task) = from_task(&task) else {
+        return Ok(false);
+    };
+    for title in from_task {
+        if !expected.contains(&title) {
+            expected.push(title);
+        }
+    }
+    if expected.is_empty() {
+        return Ok(true);
+    }
+    let mut statement =
+        connection.prepare("SELECT title FROM obligations WHERE run_id=?1 AND id>0")?;
+    let retained = statement
+        .query_map([run_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(expected
+        .iter()
+        .all(|title| retained.iter().any(|saved| saved == title)))
+}
+
+pub(crate) fn ensure_reviewed_contract(connection: &Connection, run_id: &str) -> Result<()> {
+    if reviewed_contract(connection, run_id)? {
+        return Ok(());
+    }
+    let has_root: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM obligations WHERE run_id=?1 AND id=0)",
+        [run_id],
+        |row| row.get(0),
+    )?;
+    if has_root {
+        bail!(
+            "This task's contract ledger is incomplete. Review and adopt it locally from F3 before continuing."
+        );
+    }
+    bail!("{LEGACY_CONTRACT_REVIEW}");
+}
+
 fn might_mutate_workspace(
     connection: &rusqlite::Connection,
     run_id: &str,
@@ -167,21 +246,19 @@ fn might_mutate_workspace(
     Ok(match capability {
         "workspace.write" | "workspace.patch" => true,
         "process.run" => {
-            let grants: String = connection.query_row(
-                "SELECT grants FROM runs WHERE id = ?1",
-                [run_id],
-                |row| row.get(0),
-            )?;
+            let grants: String =
+                connection.query_row("SELECT grants FROM runs WHERE id = ?1", [run_id], |row| {
+                    row.get(0)
+                })?;
             serde_json::from_str::<Vec<String>>(&grants)?
                 .iter()
                 .any(|grant| grant == "workspace.write")
         }
         capability if capability.starts_with("mcp.") => {
-            let grants: String = connection.query_row(
-                "SELECT grants FROM runs WHERE id = ?1",
-                [run_id],
-                |row| row.get(0),
-            )?;
+            let grants: String =
+                connection.query_row("SELECT grants FROM runs WHERE id = ?1", [run_id], |row| {
+                    row.get(0)
+                })?;
             serde_json::from_str::<Vec<String>>(&grants)?
                 .iter()
                 .any(|grant| grant == "workspace.write")
@@ -334,7 +411,8 @@ pub(crate) fn validate_connection(connection: &rusqlite::Connection, run_id: &st
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    if obligations.len() <= 1 {
+    ensure_reviewed_contract(connection, run_id)?;
+    if obligations.len() == 1 {
         return Ok(());
     }
     let revision: i64 = connection.query_row(
@@ -420,6 +498,233 @@ pub(crate) fn current_evidence(
 }
 
 impl Store {
+    pub fn needs_legacy_contract_adoption(&self, run_id: &str) -> Result<bool> {
+        Ok(!reviewed_contract(&self.connection, run_id)?)
+    }
+
+    /// Adopt an older run only after the caller has reviewed its saved task and
+    /// explicitly supplied the complete requirement list to retain.
+    pub fn adopt_legacy_contract(
+        &mut self,
+        run_id: &str,
+        reviewed_sequence: i64,
+        reviewed_task: &str,
+        reviewed_requirements: &[String],
+        addition_reason: Option<&str>,
+    ) -> Result<i64> {
+        uuid::Uuid::parse_str(run_id).context("invalid run ID")?;
+        let database = std::path::Path::new(
+            self.connection
+                .path()
+                .context("Task database path missing")?,
+        );
+        let root = database.parent().context("Task database root missing")?;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(root.join(format!("run-{run_id}.lock")))?;
+        fs2::FileExt::try_lock_exclusive(&lock)
+            .context("Pause the task before reviewing and adopting its legacy contract")?;
+
+        let run = self.run(run_id)?;
+        if run.task != reviewed_task {
+            bail!("This saved task changed during review; review it again before adopting it");
+        }
+        if run.is_terminal() {
+            bail!("Ended tasks cannot adopt a new contract");
+        }
+        if run.state == "running" {
+            bail!("Pause the task before reviewing and adopting its legacy contract");
+        }
+        if reviewed_contract(&self.connection, run_id)? {
+            bail!("This task already has a reviewed contract");
+        }
+        let sequence: i64 = self.connection.query_row(
+            "SELECT last_seq FROM run_projection WHERE run_id=?1",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if sequence != reviewed_sequence {
+            bail!("This saved task changed during review; review it again before adopting it");
+        }
+
+        let unresolved: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM operations WHERE run_id=?1 AND state NOT IN ('succeeded','failed','cancelled')",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if unresolved > 0
+            || crate::obligations::workspace_mutation_in_flight(&self.connection, run_id)?
+        {
+            bail!(
+                "Reconcile unfinished operations and wait for workspace changes to stop before adopting this task"
+            );
+        }
+
+        let approved = titles(&serde_json::json!({"obligations":reviewed_requirements}))?;
+        let mut required = titles(&run.budgets)?;
+        for title in from_task(&run.task)? {
+            if !required.contains(&title) {
+                required.push(title);
+            }
+        }
+        let previous_obligations = self.obligations(run_id)?;
+        for item in previous_obligations
+            .iter()
+            .filter(|item| item.id > 0 && item.state != "superseded")
+        {
+            if !required.contains(&item.title) {
+                required.push(item.title.clone());
+            }
+        }
+        for title in &required {
+            if !approved.contains(title) {
+                bail!("The reviewed contract must retain this saved requirement: {title}");
+            }
+        }
+        let added: Vec<_> = approved
+            .iter()
+            .filter(|title| !required.contains(title))
+            .collect();
+        let addition_reason = addition_reason.map(str::trim);
+        if !added.is_empty()
+            && addition_reason.is_none_or(|reason| {
+                reason.is_empty() || reason.len() > 500 || crate::text::clean(reason) != reason
+            })
+        {
+            bail!("A new requirement needs a safe, explicit reason");
+        }
+
+        let fingerprint = self.capture_workspace_fingerprint(run_id)?;
+        let mut budgets = run.budgets.clone();
+        budgets["obligations"] = serde_json::json!(approved.clone());
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (task, current_budgets, current_state): (String, String, String) = transaction
+            .query_row(
+                "SELECT task,budgets,state FROM runs WHERE id=?1",
+                [run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        let current_sequence: i64 = transaction.query_row(
+            "SELECT last_seq FROM run_projection WHERE run_id=?1",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if task != run.task
+            || serde_json::from_str::<Value>(&current_budgets)? != run.budgets
+            || current_state != run.state
+            || current_sequence != reviewed_sequence
+        {
+            bail!("This saved task changed during review; review it again before adopting it");
+        }
+        if matches!(
+            current_state.as_str(),
+            "completed" | "answered" | "cancelled" | "failed"
+        ) || current_state == "running"
+        {
+            bail!("Pause the task before reviewing and adopting its legacy contract");
+        }
+        if reviewed_contract(&transaction, run_id)? {
+            bail!("This task already has a reviewed contract");
+        }
+        let unresolved: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM operations WHERE run_id=?1 AND state NOT IN ('succeeded','failed','cancelled')",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if unresolved > 0 || crate::obligations::workspace_mutation_in_flight(&transaction, run_id)?
+        {
+            bail!(
+                "Reconcile unfinished operations and wait for workspace changes to stop before adopting this task"
+            );
+        }
+
+        let old_revision: Option<i64> = transaction
+            .query_row(
+                "SELECT revision FROM workspace_revisions WHERE run_id=?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let revision = old_revision
+            .unwrap_or(0)
+            .checked_add(1)
+            .context("workspace revision overflow")?;
+        transaction.execute(
+            "INSERT INTO workspace_revisions(run_id,revision) VALUES (?1,?2)
+             ON CONFLICT(run_id) DO UPDATE SET revision=excluded.revision",
+            params![run_id, revision],
+        )?;
+        transaction.execute("DELETE FROM operation_revisions WHERE run_id=?1", [run_id])?;
+        transaction.execute(
+            "UPDATE operations SET started_revision=NULL WHERE run_id=?1",
+            [run_id],
+        )?;
+        transaction.execute(
+            "UPDATE milestones SET state='pending',evidence='[]' WHERE run_id=?1 AND state='completed'",
+            [run_id],
+        )?;
+        transaction.execute("DELETE FROM obligations WHERE run_id=?1", [run_id])?;
+        transaction.execute(
+            "INSERT INTO obligations(run_id,id,title,state,evidence) VALUES (?1,0,'Task request','open','[]')",
+            [run_id],
+        )?;
+        for (index, title) in approved.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO obligations(run_id,id,title,state,evidence) VALUES (?1,?2,?3,'open','[]')",
+                params![run_id, index as i64 + 1, title],
+            )?;
+        }
+        transaction.execute(
+            "UPDATE runs SET budgets=?2,state='paused' WHERE id=?1",
+            params![run_id, budgets.to_string()],
+        )?;
+        transaction.execute(
+            "UPDATE pause_requests SET pending=0 WHERE run_id=?1",
+            [run_id],
+        )?;
+        crate::freshness::save_workspace_fingerprint(&transaction, run_id, &fingerprint, revision)?;
+
+        let proposal: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM run_projection WHERE run_id=?1 AND proposal IS NOT NULL)",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if proposal {
+            append_event(
+                &transaction,
+                run_id,
+                "completion.resolved",
+                serde_json::json!({"outcome":"legacy_contract_adopted"}),
+            )?;
+        }
+        if current_state != "paused" {
+            append_event(
+                &transaction,
+                run_id,
+                "run.paused",
+                serde_json::json!({"reason":"paused for legacy contract review"}),
+            )?;
+        }
+        append_event(
+            &transaction,
+            run_id,
+            "legacy.contract.adopted",
+            serde_json::json!({
+                "previous_state":current_state,
+                "previous_obligations":previous_obligations.iter().map(|item| serde_json::json!({"id":item.id,"title":&item.title,"state":&item.state})).collect::<Vec<_>>(),
+                "requirements":approved,
+                "additional_requirement_reason":addition_reason,
+                "workspace_revision":revision,
+                "policy":"The original task and event history are retained. Previous operation artifacts remain historical and cannot prove the adopted contract."
+            }),
+        )?;
+        transaction.commit()?;
+        Ok(revision)
+    }
+
     pub fn add_obligation(&mut self, run_id: &str, title: &str, reason: &str) -> Result<i64> {
         let title = title.trim();
         titles(&serde_json::json!({"obligations":[title]}))?;
@@ -581,6 +886,7 @@ impl Store {
     }
 
     pub fn verify_obligations(&mut self, run_id: &str, proofs: &[Proof]) -> Result<()> {
+        ensure_reviewed_contract(&self.connection, run_id)?;
         self.refresh_observed_files(run_id)?;
         if proofs.is_empty() || proofs.len() > 20 {
             bail!("verify 1..20 explicit obligations at a time");
@@ -805,15 +1111,21 @@ mod tests {
             Some(&overlapping_artifact),
             json!({}),
         )?;
-        assert!(store
-            .verify_obligation(&reader.id, 1, &[early_artifact.clone()])
-            .is_err());
-        assert!(store
-            .validate_completion(&reader.id, &[early_artifact.clone()])
-            .is_err());
-        assert!(store
-            .complete_run(&reader.id, "done", &[early_artifact.clone()])
-            .is_err());
+        assert!(
+            store
+                .verify_obligation(&reader.id, 1, &[early_artifact.clone()])
+                .is_err()
+        );
+        assert!(
+            store
+                .validate_completion(&reader.id, &[early_artifact.clone()])
+                .is_err()
+        );
+        assert!(
+            store
+                .complete_run(&reader.id, "done", &[early_artifact.clone()])
+                .is_err()
+        );
 
         let edit_artifact = store.put_artifact(b"write result")?;
         store.operation_state(&edit, "succeeded", Some(&edit_artifact), json!({}))?;
@@ -821,12 +1133,16 @@ mod tests {
         store.verify_obligation(&editor.id, 1, &[edit_artifact.clone()])?;
         assert_eq!(store.obligations(&editor.id)?[1].state, "verified");
 
-        assert!(store
-            .verify_obligation(&reader.id, 1, &[early_artifact])
-            .is_err());
-        assert!(store
-            .verify_obligation(&reader.id, 1, &[overlapping_artifact])
-            .is_err());
+        assert!(
+            store
+                .verify_obligation(&reader.id, 1, &[early_artifact])
+                .is_err()
+        );
+        assert!(
+            store
+                .verify_obligation(&reader.id, 1, &[overlapping_artifact])
+                .is_err()
+        );
         assert_eq!(store.obligations(&reader.id)?[1].state, "open");
 
         let fresh_read = store.begin_operation(
@@ -1384,6 +1700,313 @@ mod tests {
         store.verify_obligation(&run.id, 1, &[current_evidence.clone()])?;
         store.complete_run(&run.id, "done", &[current_evidence])?;
         assert_eq!(store.run(&run.id)?.state, "completed");
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_adoption_preserves_history_and_requires_fresh_evidence() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        std::fs::write(workspace.join("source.txt"), b"saved source")?;
+        let root = directory.path().join("state");
+        let mut store = Store::open(&root)?;
+        let task = "Repair the saved parser\nRequirements:\n- preserve nested expressions\n- add regression tests";
+        let run = store.create_run(
+            task,
+            &workspace,
+            "custom",
+            json!(["workspace.read"]),
+            json!({"obligations":["preserve public API"]}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let operation = store.begin_operation(
+            &run.id,
+            "workspace.read",
+            json!({"path":"source.txt"}),
+            true,
+        )?;
+        let old_evidence = store.put_artifact(b"old successful source read")?;
+        crate::storage::claim_test_operation(&mut store, &operation)?;
+        store.operation_state(&operation, "succeeded", Some(&old_evidence), json!({}))?;
+        store.state(&run.id, "paused", json!({"fixture":true}))?;
+        let original_events = store.events(&run.id)?;
+
+        store
+            .connection
+            .execute("DELETE FROM obligations WHERE run_id=?1", [&run.id])?;
+        store
+            .connection
+            .execute("DELETE FROM workspace_revisions WHERE run_id=?1", [&run.id])?;
+        store.connection.execute(
+            "DELETE FROM workspace_fingerprints WHERE run_id=?1",
+            [&run.id],
+        )?;
+        assert!(store.needs_legacy_contract_adoption(&run.id)?);
+        let run = store.run(&run.id)?;
+        let mut requirements = run.budgets["obligations"]
+            .as_array()
+            .context("frozen requirements missing")?
+            .iter()
+            .map(|item| item.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        requirements.push("enforce stable output schema".into());
+        let sequence = original_events.last().unwrap().seq;
+        let revision = store.adopt_legacy_contract(
+            &run.id,
+            sequence,
+            &run.task,
+            &requirements,
+            Some("Keep the parser output compatible with its callers"),
+        )?;
+
+        let adopted = store.run(&run.id)?;
+        assert_eq!(adopted.task, task);
+        assert_eq!(adopted.state, "paused");
+        assert!(!store.needs_legacy_contract_adoption(&run.id)?);
+        assert_eq!(store.workspace_revision(&run.id)?, Some(revision));
+        assert_eq!(revision, 1);
+        let baseline: Option<(String, i64)> = store
+            .connection
+            .query_row(
+                "SELECT fingerprint,revision FROM workspace_fingerprints WHERE run_id=?1",
+                [&run.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (fingerprint, baseline_revision) = baseline.context("adoption fingerprint missing")?;
+        assert_eq!(baseline_revision, revision);
+        assert_eq!(fingerprint.len(), 64);
+
+        let obligations = store.obligations(&run.id)?;
+        assert_eq!(obligations.len(), requirements.len() + 1);
+        assert_eq!(obligations[0].id, 0);
+        assert!(
+            obligations
+                .iter()
+                .all(|item| item.state == "open" && item.evidence.is_empty())
+        );
+        assert_eq!(
+            serde_json::to_value(&store.events(&run.id)?[..original_events.len()])?,
+            serde_json::to_value(&original_events)?
+        );
+        assert_eq!(
+            store.events(&run.id)?.last().unwrap().kind,
+            "legacy.contract.adopted"
+        );
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT COUNT(*) FROM operation_revisions WHERE run_id=?1",
+                [&run.id],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0
+        );
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT started_revision FROM operations WHERE id=?1",
+                [&operation.id],
+                |row| row.get::<_, Option<i64>>(0),
+            )?,
+            None
+        );
+        store.state(&run.id, "running", json!({}))?;
+        assert!(
+            store
+                .verify_obligation(&run.id, 1, &[old_evidence])
+                .is_err()
+        );
+        let fresh_operation = store.begin_operation(
+            &run.id,
+            "workspace.read",
+            json!({"path":"source.txt"}),
+            true,
+        )?;
+        let fresh_evidence = store.put_artifact(b"fresh post-adoption read")?;
+        crate::storage::claim_test_operation(&mut store, &fresh_operation)?;
+        store.operation_state(
+            &fresh_operation,
+            "succeeded",
+            Some(&fresh_evidence),
+            json!({}),
+        )?;
+        let proofs = store
+            .obligations(&run.id)?
+            .into_iter()
+            .filter(|item| item.id > 0)
+            .map(|item| Proof {
+                id: item.id,
+                evidence: vec![fresh_evidence.clone()],
+            })
+            .collect::<Vec<_>>();
+        store.verify_obligations(&run.id, &proofs)?;
+        store.complete_run(&run.id, "done", &[fresh_evidence])?;
+        assert_eq!(store.run(&run.id)?.state, "completed");
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_runs_cannot_resume_answer_or_finish_before_adoption() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let mut store = Store::open(&directory.path().join("state"))?;
+        let run = store.create_run(
+            "Answer the saved request",
+            &workspace,
+            "custom",
+            json!([]),
+            json!({}),
+            "",
+        )?;
+        store.state(&run.id, "paused", json!({}))?;
+        store
+            .connection
+            .execute("DELETE FROM obligations WHERE run_id=?1", [&run.id])?;
+        store
+            .connection
+            .execute("DELETE FROM workspace_revisions WHERE run_id=?1", [&run.id])?;
+
+        let resume_error = store.resume_paused(&run.id).unwrap_err().to_string();
+        assert!(resume_error.contains("F3"));
+        assert_eq!(store.run(&run.id)?.state, "paused");
+        assert!(
+            store
+                .complete_run(&run.id, "done", &[])
+                .unwrap_err()
+                .to_string()
+                .contains("reviewed contract")
+        );
+        store.state(&run.id, "running", json!({}))?;
+        assert!(
+            store
+                .answer_run(&run.id, "old task answer")
+                .unwrap_err()
+                .to_string()
+                .contains("reviewed contract")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn partial_contract_ledger_is_rejected_and_can_be_adopted() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let mut store = Store::open(&directory.path().join("state"))?;
+        let task = "Repair parser\nRequirements:\n- preserve public API\n- add regression tests";
+        let run = store.create_run(task, &workspace, "custom", json!([]), json!({}), "")?;
+        store.state(&run.id, "paused", json!({}))?;
+        let sequence = store.events(&run.id)?.last().unwrap().seq;
+        let adopted_requirements = store.run(&run.id)?.budgets["obligations"]
+            .as_array()
+            .context("task requirements were not frozen")?
+            .iter()
+            .map(|item| item.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+
+        // A root row and workspace revision do not make a partial ledger safe.
+        store.connection.execute(
+            "DELETE FROM obligations WHERE run_id=?1 AND id=2",
+            [&run.id],
+        )?;
+        assert!(!reviewed_contract(&store.connection, &run.id)?);
+        assert!(store.needs_legacy_contract_adoption(&run.id)?);
+        let incomplete = ensure_reviewed_contract(&store.connection, &run.id)
+            .unwrap_err()
+            .to_string();
+        assert!(incomplete.contains("ledger is incomplete"));
+
+        let revision =
+            store.adopt_legacy_contract(&run.id, sequence, task, &adopted_requirements, None)?;
+        assert_eq!(revision, 1);
+        assert!(reviewed_contract(&store.connection, &run.id)?);
+        assert_eq!(store.obligations(&run.id)?.len(), 3);
+
+        // A missing task root is also treated as incomplete, even after adoption.
+        store.connection.execute(
+            "DELETE FROM obligations WHERE run_id=?1 AND id=0",
+            [&run.id],
+        )?;
+        assert!(!reviewed_contract(&store.connection, &run.id)?);
+        assert!(
+            ensure_reviewed_contract(&store.connection, &run.id)
+                .unwrap_err()
+                .to_string()
+                .contains("Open F3")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_adoption_rejects_stale_review_and_active_run_lock() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let root = directory.path().join("state");
+        let mut store = Store::open(&root)?;
+        let run = store.create_run(
+            "Review this saved task",
+            &workspace,
+            "custom",
+            json!([]),
+            json!({}),
+            "",
+        )?;
+        store.state(&run.id, "paused", json!({}))?;
+        store
+            .connection
+            .execute("DELETE FROM obligations WHERE run_id=?1", [&run.id])?;
+        let reviewed = store.run(&run.id)?;
+        let requirements = Vec::new();
+        let reviewed_sequence = store.events(&run.id)?.last().unwrap().seq;
+
+        let stale_task = store
+            .adopt_legacy_contract(
+                &run.id,
+                reviewed_sequence,
+                "Changed while the user reviewed it",
+                &requirements,
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(stale_task.contains("changed during review"));
+
+        store.event(&run.id, "review.changed", json!({}))?;
+        let stale_sequence = store
+            .adopt_legacy_contract(
+                &run.id,
+                reviewed_sequence,
+                &reviewed.task,
+                &requirements,
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(stale_sequence.contains("changed during review"));
+
+        let current_sequence = store.events(&run.id)?.last().unwrap().seq;
+        let lock_path = root.join(format!("run-{}.lock", run.id));
+        let held_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(lock_path)?;
+        fs2::FileExt::try_lock_exclusive(&held_lock)?;
+        let active = store
+            .adopt_legacy_contract(
+                &run.id,
+                current_sequence,
+                &reviewed.task,
+                &requirements,
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(active.contains("Pause the task"));
+        assert!(store.needs_legacy_contract_adoption(&run.id)?);
+        fs2::FileExt::unlock(&held_lock)?;
         Ok(())
     }
 }

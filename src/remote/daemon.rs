@@ -1011,7 +1011,14 @@ fn format_elapsed(seconds: i64) -> String {
 
 fn command_failure_reply(command: &RelayCommand, error: anyhow::Error) -> Result<String> {
     if super::is_command_rejection(&error) {
-        Ok(rejection_reply(command))
+        let message = error.to_string();
+        if message.contains("Open F3 and choose")
+            || message.contains("contract ledger is incomplete")
+        {
+            Ok(message)
+        } else {
+            Ok(rejection_reply(command))
+        }
     } else {
         // Internal SQLite, filesystem, profile, or process failures must leave
         // the JetStream message unacknowledged so the command can be retried.
@@ -1030,6 +1037,9 @@ fn maintain_remote_gates(root: &Path, authority: &mut Authority) -> Result<()> {
     drop(statement);
     super::expire_remote_approval_gates(&mut authority.store, now)?;
     for run_id in due {
+        if !crate::obligations::reviewed_contract(&authority.store.connection, &run_id)? {
+            continue;
+        }
         let run = authority.store.run(&run_id)?;
         if run.budgets["remote_origin"] == true
             && matches!(run.state.as_str(), "paused" | "waiting_recovery")
@@ -1579,6 +1589,14 @@ mod tests {
         let reply =
             command_failure_reply(&RelayCommand::Status { task_id: None }, rejection).unwrap();
         assert!(reply.contains("could not apply"));
+
+        let adoption = super::super::reject_command(
+            "This saved task needs a reviewed contract before it can continue. Open F3 and choose 'Review and adopt legacy task', or use /goal add to review and adopt it locally.",
+        );
+        let reply =
+            command_failure_reply(&RelayCommand::Resume { task_id: None }, adoption).unwrap();
+        assert!(reply.contains("Open F3"));
+        assert!(reply.contains("/goal add"));
 
         let transient = anyhow::anyhow!("temporary SQLite failure");
         let error =
