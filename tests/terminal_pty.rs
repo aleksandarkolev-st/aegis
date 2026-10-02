@@ -815,7 +815,25 @@ fn actual_windows_follow_keeps_output_live_inside_steering_and_slash_picker() ->
             && text.contains("display limit")
             && text.contains("output artifact")
     })?;
-    terminal.send_keys("\x15/")?;
+    terminal.send_keys("\x15STEER_KEEP_TASK\r")?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !store
+        .pending_steering(&run.id)?
+        .iter()
+        .any(|event| event.payload["text"] == "STEER_KEEP_TASK")
+    {
+        ensure!(
+            Instant::now() < deadline,
+            "Enter did not submit the steering message to the existing task. Screen:\n{}",
+            terminal.screen().text()
+        );
+        thread::sleep(Duration::from_millis(30));
+    }
+    ensure!(store.runs()?.len() == 1, "steering created a second task");
+    terminal.wait_screen("follower after steering submission", |screen| {
+        screen.text().contains("Type/paste to steer")
+    })?;
+    terminal.send_keys("/")?;
     terminal.wait_screen("nested steering slash picker", |screen| {
         screen.text().contains("/goal") && screen.text().contains("/model")
     })?;
@@ -841,6 +859,10 @@ fn actual_windows_follow_keeps_output_live_inside_steering_and_slash_picker() ->
         store.interrupt_requested(&run.id, arun::interrupt::Scope::Operation, &operation.id)?,
         "picker interruption targeted the wrong operation"
     );
+    terminal.send_keys("finish draft")?;
+    terminal.wait_screen("editing during task completion", |screen| {
+        screen.text().contains("Steer this task")
+    })?;
     store.state(
         &run.id,
         "answered",
