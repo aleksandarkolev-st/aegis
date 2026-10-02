@@ -423,6 +423,26 @@ pub(crate) fn call_with_access(
     allow_write: bool,
     operation_id: Option<&str>,
 ) -> Result<Value> {
+    call_with_timeout(
+        server,
+        workspace,
+        name,
+        arguments,
+        allow_write,
+        operation_id,
+        Duration::from_secs(30),
+    )
+}
+
+pub(crate) fn call_with_timeout(
+    server: &Server,
+    workspace: &Path,
+    name: &str,
+    arguments: Value,
+    allow_write: bool,
+    operation_id: Option<&str>,
+    timeout: Duration,
+) -> Result<Value> {
     let (command, mut container) = command(server, workspace, allow_write, operation_id)?;
     if let Some(container) = &mut container {
         container.started = true;
@@ -432,7 +452,7 @@ pub(crate) fn call_with_access(
         .context("MCP arguments must be an object")?
         .clone();
     runtime()?.block_on(async {
-        tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::time::timeout(timeout, async {
             let (mut child, transport) = transport(command)?;
             let client = ().serve(transport).await?;
             let tools = tools(client.peer()).await?;

@@ -455,13 +455,21 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
                     .iter()
                     .any(|grant| grant.as_str() == Some("workspace.write"))
             });
-            mcp::call_with_access(
+            let seconds = run.budgets["process_seconds"]
+                .as_u64()
+                .unwrap_or(60)
+                .min(crate::kernel::remaining_seconds(&store, &run)?);
+            if seconds == 0 {
+                bail!("MCP deadline exhausted before launch");
+            }
+            mcp::call_with_timeout(
                 &server,
                 workspace,
                 tool_name,
                 args.clone(),
                 allow_write,
                 Some(&operation.id),
+                Duration::from_secs(seconds),
             )
         }
         _ => bail!("unknown capability"),
