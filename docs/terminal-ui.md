@@ -57,6 +57,21 @@ The optimized Windows runtime was rebuilt and installed globally from the verifi
 
 Open a new `aegis` session to load the rebuilt executable. An already running process retains its loaded image.
 
+## Requirement audit
+
+| Requested behavior | Evidence |
+| --- | --- |
+| Visible tool/action output during work | Hosted release check observes both the event and printed marker before command success; full output artifact is checked separately |
+| Overflow wraps and pasted text stays intact | Installed ConPTY tests exercise Unicode paste, explicit lines, long-word wrapping, native and raw VT input, and no submission before Enter |
+| Steer and interrupt while work continues | Installed follower test renders new output during typing and its slash picker, then checks the durable operation interruption request; hosted parser check pauses and resumes real inference |
+| Fullscreen/resize responds | Actual pseudo-console width and height changes reflow the composer and picker; library cases cover height-only changes and clearing old rows |
+| More colors | Installed child runs with colors enabled and emits at least three distinct foreground palette roles; diff/code formatting tests check intended row styles |
+| Worked time, current time and completion time | Installed follower screen contains current UTC time and elapsed work time; completion displays the timestamp recorded in the durable event and elapsed time |
+| `/` reveals all choices and filters | Complete command-catalog integration check plus installed picker navigation through all 39 entries, filtering and resize |
+| No aggregate token or turn budgets | Library, usage-view, setup and token-budget integration checks; the real parser run records 15 responses and 59,448 tokens without task caps |
+| Own Aegis runtime and truthful identity | Direct transport request tests, persisted route identity tests and installed package traps reject native provider CLI execution |
+| Small atomic commits and subagents | Renderer, Windows input, foreground streaming, evidence repair, sanitizer and acceptance additions are separate commits; independent agents reviewed and exercised the input, UI and obligation paths |
+
 ## Further ideas
 
 Detailed transcript search, a visible steering queue, theme selection and syntax-aware code coloring need their own design and acceptance checks. Current code block formatting and diff colors should not be described as a complete syntax highlighter or transcript browser.
