@@ -10,6 +10,13 @@ use sqlx::{PgPool, postgres::PgPoolOptions};
 use thiserror::Error;
 use uuid::Uuid;
 
+pub(crate) fn outbound_message_hash(id: &str) -> Vec<u8> {
+    let mut hash = Sha256::new();
+    hash.update(b"aegis-outbound-message-id-v1\0");
+    hash.update(id.as_bytes());
+    hash.finalize().to_vec()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelBinding {
     pub id: Uuid,
@@ -25,6 +32,13 @@ pub struct ChannelBinding {
 pub struct DeliveryTarget {
     pub binding_id: Uuid,
     pub destination_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupReservation {
+    Create,
+    Ready(String),
+    Uncertain,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +72,53 @@ pub enum RepositoryError {
 
 #[async_trait]
 pub trait RelayRepository: Send + Sync {
+    async fn remember_outbound_message(
+        &self,
+        channel: &str,
+        destination: &str,
+        id: &str,
+    ) -> Result<(), RepositoryError> {
+        self.reserve_outbound_echo(channel, destination, &outbound_message_hash(id))
+            .await
+    }
+    async fn task_for_group(
+        &self,
+        _binding_id: Uuid,
+        _destination: &str,
+    ) -> Result<Option<String>, RepositoryError> {
+        Ok(None)
+    }
+    async fn reserve_task_group(
+        &self,
+        _binding_id: Uuid,
+        _task_id: &str,
+    ) -> Result<GroupReservation, RepositoryError> {
+        Ok(GroupReservation::Uncertain)
+    }
+    async fn save_task_group(
+        &self,
+        _binding_id: Uuid,
+        _task_id: &str,
+        _destination: &str,
+    ) -> Result<(), RepositoryError> {
+        Ok(())
+    }
+    async fn reserve_outbound_echo(
+        &self,
+        _channel: &str,
+        _destination: &str,
+        _hash: &[u8],
+    ) -> Result<(), RepositoryError> {
+        Ok(())
+    }
+    async fn is_outbound_echo(
+        &self,
+        _channel: &str,
+        _destination: &str,
+        _hash: &[u8],
+    ) -> Result<bool, RepositoryError> {
+        Ok(false)
+    }
     async fn claim_inbound_receipt(
         &self,
         channel: &str,
@@ -400,6 +461,73 @@ mod tests {
 
 #[async_trait]
 impl RelayRepository for PgRepository {
+    async fn remember_outbound_message(
+        &self,
+        channel: &str,
+        destination: &str,
+        id: &str,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query("INSERT INTO outbound_echoes(channel,destination_id,body_hash,expires_at) VALUES ($1,$2,$3,now()+interval '30 days') ON CONFLICT(channel,destination_id,body_hash) DO UPDATE SET expires_at=EXCLUDED.expires_at")
+            .bind(channel).bind(destination).bind(outbound_message_hash(id)).execute(&self.pool).await?;
+        Ok(())
+    }
+    async fn task_for_group(
+        &self,
+        binding_id: Uuid,
+        destination: &str,
+    ) -> Result<Option<String>, RepositoryError> {
+        Ok(sqlx::query_scalar("SELECT task_id FROM task_conversations WHERE binding_id=$1 AND destination_id=$2 AND state='ready'")
+            .bind(binding_id).bind(destination).fetch_optional(&self.pool).await?)
+    }
+
+    async fn reserve_task_group(
+        &self,
+        binding_id: Uuid,
+        task_id: &str,
+    ) -> Result<GroupReservation, RepositoryError> {
+        let inserted = sqlx::query("INSERT INTO task_conversations(binding_id,task_id,state) VALUES ($1,$2,'creating') ON CONFLICT DO NOTHING")
+            .bind(binding_id).bind(task_id).execute(&self.pool).await?.rows_affected();
+        if inserted == 1 {
+            return Ok(GroupReservation::Create);
+        }
+        let destination: Option<String> = sqlx::query_scalar("SELECT destination_id FROM task_conversations WHERE binding_id=$1 AND task_id=$2 AND state='ready'")
+            .bind(binding_id).bind(task_id).fetch_optional(&self.pool).await?.flatten();
+        Ok(destination
+            .map(GroupReservation::Ready)
+            .unwrap_or(GroupReservation::Uncertain))
+    }
+
+    async fn save_task_group(
+        &self,
+        binding_id: Uuid,
+        task_id: &str,
+        destination: &str,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query("UPDATE task_conversations SET destination_id=$3,state='ready' WHERE binding_id=$1 AND task_id=$2 AND state='creating'")
+            .bind(binding_id).bind(task_id).bind(destination).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn reserve_outbound_echo(
+        &self,
+        channel: &str,
+        destination: &str,
+        hash: &[u8],
+    ) -> Result<(), RepositoryError> {
+        sqlx::query("INSERT INTO outbound_echoes(channel,destination_id,body_hash,expires_at) VALUES ($1,$2,$3,now()+interval '15 minutes') ON CONFLICT(channel,destination_id,body_hash) DO UPDATE SET expires_at=EXCLUDED.expires_at")
+            .bind(channel).bind(destination).bind(hash).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn is_outbound_echo(
+        &self,
+        channel: &str,
+        destination: &str,
+        hash: &[u8],
+    ) -> Result<bool, RepositoryError> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM outbound_echoes WHERE channel=$1 AND destination_id=$2 AND body_hash=$3 AND expires_at>now())")
+            .bind(channel).bind(destination).bind(hash).fetch_one(&self.pool).await?)
+    }
     async fn claim_inbound_receipt(
         &self,
         channel: &str,
@@ -503,6 +631,9 @@ impl RelayRepository for PgRepository {
 
     async fn prune_expired_receipts(&self) -> Result<u64, RepositoryError> {
         let mut total = 0;
+        sqlx::query("DELETE FROM outbound_echoes WHERE expires_at<=now()")
+            .execute(&self.pool)
+            .await?;
         loop {
             let result = sqlx::query(
                 "WITH expired AS (SELECT receipt_id FROM delivery_receipts WHERE expires_at < now() ORDER BY expires_at LIMIT 1000 FOR UPDATE SKIP LOCKED) DELETE FROM delivery_receipts WHERE receipt_id IN (SELECT receipt_id FROM expired)",

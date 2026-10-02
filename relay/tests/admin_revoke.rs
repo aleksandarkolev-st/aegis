@@ -60,6 +60,8 @@ impl MessagingChannel for TestProvider {
             sender_id: fixture.sender_id,
             external_message_id: fixture.external_message_id,
             text: fixture.text,
+            conversation_id: None,
+            from_me: false,
         }))
     }
 

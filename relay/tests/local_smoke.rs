@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     process::{Child, Command, Stdio},
     sync::Mutex,
     time::Duration,
@@ -10,8 +10,8 @@ use aegis_relay::{
     channel::{ChannelCapabilities, ChannelError, ChannelId, ChannelMessage, MessagingChannel},
     http::{HttpState, router},
     repository::{
-        ChannelBinding, DeliveryTarget, InboundReceiptClaim, PgRepository, RelayRepository,
-        RepositoryError,
+        ChannelBinding, DeliveryTarget, GroupReservation, InboundReceiptClaim, PgRepository,
+        RelayRepository, RepositoryError,
     },
     service::{CommandTransport, TransportError},
 };
@@ -29,12 +29,16 @@ use axum::{
     serve,
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 #[derive(Default)]
 struct FakeProvider {
     sends: Mutex<Vec<(String, String, String)>>,
     ambiguous_first_send: Mutex<bool>,
+    groups: bool,
+    group_creations: Mutex<Vec<String>>,
+    fail_group: bool,
 }
 
 #[derive(Default)]
@@ -80,6 +84,18 @@ impl MessagingChannel for MockIMessageChannel {
 
 #[async_trait]
 impl MessagingChannel for FakeProvider {
+    fn task_groups(&self) -> bool {
+        self.groups
+    }
+
+    async fn create_task_group(&self, _owner: &str, task: &str) -> Result<String, ChannelError> {
+        let mut calls = self.group_creations.lock().unwrap();
+        calls.push(task.to_owned());
+        if self.fail_group {
+            return Err(ChannelError::Delivery);
+        }
+        Ok(format!("12036300000000{}@g.us", calls.len()))
+    }
     fn id(&self) -> ChannelId {
         ChannelId::WhatsApp
     }
@@ -110,6 +126,10 @@ impl MessagingChannel for FakeProvider {
             sender_id: String,
             external_message_id: String,
             text: String,
+            #[serde(default)]
+            conversation_id: Option<String>,
+            #[serde(default)]
+            from_me: bool,
         }
         let fixture: Fixture =
             serde_json::from_slice(raw_body).map_err(|_| ChannelError::InvalidRequest)?;
@@ -117,6 +137,8 @@ impl MessagingChannel for FakeProvider {
             sender_id: fixture.sender_id,
             external_message_id: fixture.external_message_id,
             text: fixture.text,
+            conversation_id: fixture.conversation_id,
+            from_me: fixture.from_me,
         }))
     }
 
@@ -140,6 +162,172 @@ impl MessagingChannel for FakeProvider {
             self.sends.lock().unwrap().len()
         )))
     }
+}
+
+#[tokio::test]
+async fn task_groups_route_commands_and_deduplicate_groups_and_own_echoes() {
+    let binding = ChannelBinding {
+        id: Uuid::new_v4(),
+        user_id: Uuid::new_v4(),
+        installation_id: Uuid::new_v4(),
+        channel: "whatsapp".into(),
+        actor_id: "owner".into(),
+        sender_id: "+4915112345678".into(),
+        destination_id: "+4915112345678".into(),
+    };
+    let repository = std::sync::Arc::new(FakeRepository::default());
+    *repository.binding.lock().unwrap() = Some(binding.clone());
+    *repository.notifications.lock().unwrap() = true;
+    let provider = std::sync::Arc::new(FakeProvider {
+        groups: true,
+        ..Default::default()
+    });
+    let transport = std::sync::Arc::new(FakeTransport::default());
+    let service = RelayService::new(repository.clone(), transport.clone(), provider.clone());
+    let event = AegisEvent {
+        event_id: Uuid::new_v4(),
+        installation_id: binding.installation_id,
+        actor_id: "owner".into(),
+        kind: RemoteEventKind::Reply,
+        task_id: Some("task-1".into()),
+        challenge_id: None,
+        expires_at: None,
+        display_detail: None,
+        reply_text: Some("Task one reply".into()),
+    };
+    service.deliver_event(&event).await.unwrap();
+    service.deliver_event(&event).await.unwrap();
+    service
+        .deliver_event(&AegisEvent {
+            event_id: Uuid::new_v4(),
+            ..event.clone()
+        })
+        .await
+        .unwrap();
+    service
+        .deliver_event(&AegisEvent {
+            event_id: Uuid::new_v4(),
+            task_id: Some("task-2".into()),
+            ..event.clone()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        provider.group_creations.lock().unwrap().as_slice(),
+        &["task-1", "task-2"]
+    );
+    let sends = provider.sends.lock().unwrap().clone();
+    assert_eq!(sends.len(), 3);
+    assert_eq!(sends[0].0, sends[1].0);
+    assert_ne!(sends[0].0, sends[2].0);
+    let mut headers = HeaderMap::new();
+    headers.insert("x-fake-auth", HeaderValue::from_static("local-fixture"));
+    let message = |id: &str, destination: &str, text: &str, own: bool| {
+        serde_json::to_vec(&serde_json::json!({
+        "sender_id":binding.sender_id,"external_message_id":id,"conversation_id":destination,"text":text,"from_me":own })).unwrap()
+    };
+    assert_eq!(
+        service
+            .handle_webhook(
+                &headers,
+                &message("owner-command", &sends[0].0, "/goal", true)
+            )
+            .await
+            .unwrap(),
+        InboundDisposition::Published
+    );
+    assert_eq!(
+        transport.commands.lock().unwrap()[0]
+            .conversation_task_id
+            .as_deref(),
+        Some("task-1")
+    );
+    assert_eq!(
+        service
+            .handle_webhook(&headers, &message("echo", &sends[0].0, &sends[0].1, true))
+            .await
+            .unwrap(),
+        InboundDisposition::Ignored
+    );
+    assert_eq!(
+        service
+            .handle_webhook(
+                &headers,
+                &message("unknown-group", "120363999999999@g.us", "/goal", true)
+            )
+            .await
+            .unwrap(),
+        InboundDisposition::Ignored
+    );
+    // Once the short body reservation expires, the returned provider ID still
+    // prevents a delayed outgoing webhook from becoming a new task command.
+    let body_hash = Sha256::digest(sends[0].1.as_bytes()).to_vec();
+    repository
+        .echoes
+        .lock()
+        .unwrap()
+        .retain(|(_, _, hash)| hash != &body_hash);
+    assert_eq!(
+        service
+            .handle_webhook(
+                &headers,
+                &message("provider-1", &sends[0].0, &sends[0].1, true)
+            )
+            .await
+            .unwrap(),
+        InboundDisposition::Ignored
+    );
+    assert_eq!(transport.commands.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn ambiguous_group_creation_falls_back_without_creating_a_second_group() {
+    let binding = ChannelBinding {
+        id: Uuid::new_v4(),
+        user_id: Uuid::new_v4(),
+        installation_id: Uuid::new_v4(),
+        channel: "whatsapp".into(),
+        actor_id: "owner".into(),
+        sender_id: "+4915112345678".into(),
+        destination_id: "+4915112345678".into(),
+    };
+    let repository = std::sync::Arc::new(FakeRepository::default());
+    *repository.binding.lock().unwrap() = Some(binding.clone());
+    *repository.notifications.lock().unwrap() = true;
+    let provider = std::sync::Arc::new(FakeProvider {
+        groups: true,
+        fail_group: true,
+        ..Default::default()
+    });
+    let service = RelayService::new(
+        repository,
+        std::sync::Arc::new(FakeTransport::default()),
+        provider.clone(),
+    );
+    let event = AegisEvent {
+        event_id: Uuid::new_v4(),
+        installation_id: binding.installation_id,
+        actor_id: "owner".into(),
+        kind: RemoteEventKind::TaskStarted,
+        task_id: Some("task-1".into()),
+        challenge_id: None,
+        expires_at: None,
+        display_detail: None,
+        reply_text: None,
+    };
+    service.deliver_event(&event).await.unwrap();
+    service
+        .deliver_event(&AegisEvent {
+            event_id: Uuid::new_v4(),
+            ..event
+        })
+        .await
+        .unwrap();
+    assert_eq!(provider.group_creations.lock().unwrap().len(), 1);
+    let sends = provider.sends.lock().unwrap();
+    assert_eq!(sends[0].0, binding.destination_id);
+    assert!(sends[0].1.contains("could not confirm group creation"));
+    assert_eq!(sends[1].0, binding.destination_id);
 }
 
 #[tokio::test]
@@ -252,10 +440,81 @@ struct FakeRepository {
     inbound_receipts: Mutex<HashSet<(String, String, String)>>,
     attempts: Mutex<Vec<(Uuid, Uuid)>>,
     notifications: Mutex<bool>,
+    task_groups: Mutex<HashMap<(Uuid, String), Option<String>>>,
+    echoes: Mutex<HashSet<(String, String, Vec<u8>)>>,
 }
 
 #[async_trait]
 impl RelayRepository for FakeRepository {
+    async fn task_for_group(
+        &self,
+        binding: Uuid,
+        destination: &str,
+    ) -> Result<Option<String>, RepositoryError> {
+        Ok(self
+            .task_groups
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|((id, task), group)| {
+                (*id == binding && group.as_deref() == Some(destination)).then(|| task.clone())
+            }))
+    }
+    async fn reserve_task_group(
+        &self,
+        binding: Uuid,
+        task: &str,
+    ) -> Result<GroupReservation, RepositoryError> {
+        let mut groups = self.task_groups.lock().unwrap();
+        match groups.entry((binding, task.to_owned())) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(None);
+                Ok(GroupReservation::Create)
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => Ok(entry
+                .get()
+                .clone()
+                .map(GroupReservation::Ready)
+                .unwrap_or(GroupReservation::Uncertain)),
+        }
+    }
+    async fn save_task_group(
+        &self,
+        binding: Uuid,
+        task: &str,
+        destination: &str,
+    ) -> Result<(), RepositoryError> {
+        self.task_groups
+            .lock()
+            .unwrap()
+            .insert((binding, task.to_owned()), Some(destination.to_owned()));
+        Ok(())
+    }
+    async fn reserve_outbound_echo(
+        &self,
+        channel: &str,
+        destination: &str,
+        hash: &[u8],
+    ) -> Result<(), RepositoryError> {
+        self.echoes.lock().unwrap().insert((
+            channel.to_owned(),
+            destination.to_owned(),
+            hash.to_vec(),
+        ));
+        Ok(())
+    }
+    async fn is_outbound_echo(
+        &self,
+        channel: &str,
+        destination: &str,
+        hash: &[u8],
+    ) -> Result<bool, RepositoryError> {
+        Ok(self.echoes.lock().unwrap().contains(&(
+            channel.to_owned(),
+            destination.to_owned(),
+            hash.to_vec(),
+        )))
+    }
     async fn claim_inbound_receipt(
         &self,
         channel: &str,
@@ -579,6 +838,7 @@ fn aegis_request(envelope: &CommandEnvelope) -> AegisCommandEnvelope {
         },
         AgentCommand::Slash { text } => AegisCommand::Slash {
             text: text.clone(),
+            task_id: envelope.conversation_task_id.clone(),
         },
         AgentCommand::Status { task_id } => AegisCommand::Status {
             task_id: task_id.clone(),
@@ -1462,6 +1722,33 @@ async fn jetstream_remote_phone_lifecycle_uses_local_authority_and_isolates_devi
     );
 
     let mut daemon = start_remote_daemon(&aegis_binary, &workspace, admin_token, &device_password)?;
+    let help = phone_command_reply(
+        &http,
+        &base_url,
+        &sender_id,
+        &provider,
+        "/help",
+        "Aegis commands (send /help",
+    )
+    .await?;
+    assert!(
+        help.contains("/models"),
+        "phone help should expose the local command catalog"
+    );
+
+    let unknown = phone_command_reply(
+        &http,
+        &base_url,
+        &sender_id,
+        &provider,
+        "/aegis-e2e-unknown",
+        "Unknown command:",
+    )
+    .await?;
+    assert!(unknown.contains("This was not sent to the model."));
+    assert!(fixture.requests.lock().unwrap().is_empty());
+    assert!(Store::open(&data_dir)?.runs()?.is_empty());
+
     post_phone_message(&http, &base_url, &sender_id, "Create phone-e2e.txt.").await?;
     let run_id = wait_until(Duration::from_secs(30), || {
         if let Some(status) = daemon.0.try_wait()? {
@@ -1482,7 +1769,10 @@ async fn jetstream_remote_phone_lifecycle_uses_local_authority_and_isolates_devi
             ))
             .into());
         }
-        Ok(recorded_phone_text(&provider, "/approve_once "))
+        Ok(recorded_phone_text(
+            &provider,
+            &format!("Aegis needs approval for task {run_id}:"),
+        ))
     })
     .await?;
     let challenge_id = approval_text
@@ -1490,6 +1780,14 @@ async fn jetstream_remote_phone_lifecycle_uses_local_authority_and_isolates_devi
         .and_then(|(_, suffix)| suffix.split_whitespace().next())
         .ok_or_else(|| std::io::Error::other("approval notification omitted its challenge"))?
         .to_owned();
+    Uuid::parse_str(&challenge_id)?;
+    // The approval event can arrive before the kernel projects its paused state.
+    // Wait for that safe boundary before asserting the exact pending intent.
+    wait_until(Duration::from_secs(15), || {
+        let store = Store::open(&data_dir)?;
+        Ok((store.run(&run_id)?.state == "waiting_recovery").then_some(()))
+    })
+    .await?;
     let pending_store = Store::open(&data_dir)?;
     let pending_run = pending_store.run(&run_id)?;
     let pending_writes = pending_store

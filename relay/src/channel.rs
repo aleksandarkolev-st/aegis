@@ -39,6 +39,8 @@ pub struct ChannelMessage {
     pub sender_id: String,
     pub external_message_id: String,
     pub text: String,
+    pub conversation_id: Option<String>,
+    pub from_me: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +79,18 @@ pub trait MessagingChannel: Send + Sync {
     fn id(&self) -> ChannelId;
 
     fn capabilities(&self) -> ChannelCapabilities;
+
+    fn task_groups(&self) -> bool {
+        false
+    }
+
+    async fn create_task_group(
+        &self,
+        _owner: &str,
+        _task_id: &str,
+    ) -> Result<String, ChannelError> {
+        Err(ChannelError::Unsupported)
+    }
 
     fn parse_inbound(
         &self,

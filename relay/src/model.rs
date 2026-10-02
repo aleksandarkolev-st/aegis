@@ -11,21 +11,45 @@ pub const COMMAND_TTL_SECONDS: i64 = 5 * 60;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentCommand {
-    Message { text: String },
+    Message {
+        text: String,
+    },
     /// A slash command handled by the local Aegis authority. The relay does not
     /// reinterpret unknown slash input as a model task.
-    Slash { text: String },
+    Slash {
+        text: String,
+    },
     ListTasks,
-    Status { task_id: Option<String> },
-    Result { task_id: Option<String> },
-    Evidence { task_id: Option<String> },
-    Details { task_id: Option<String> },
-    Pause { task_id: Option<String> },
-    Resume { task_id: Option<String> },
-    Cancel { task_id: Option<String> },
-    SelectTask { task_id: String },
-    ApproveOnce { challenge_id: String },
-    Deny { challenge_id: String },
+    Status {
+        task_id: Option<String>,
+    },
+    Result {
+        task_id: Option<String>,
+    },
+    Evidence {
+        task_id: Option<String>,
+    },
+    Details {
+        task_id: Option<String>,
+    },
+    Pause {
+        task_id: Option<String>,
+    },
+    Resume {
+        task_id: Option<String>,
+    },
+    Cancel {
+        task_id: Option<String>,
+    },
+    SelectTask {
+        task_id: String,
+    },
+    ApproveOnce {
+        challenge_id: String,
+    },
+    Deny {
+        challenge_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +65,8 @@ pub struct CommandEnvelope {
     pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub command: AgentCommand,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,7 +250,7 @@ impl AegisEvent {
             return Err("invalid actor id");
         }
         let needs_task = !matches!(self.kind, RemoteEventKind::Reply);
-        if needs_task != self.task_id.is_some() {
+        if needs_task && self.task_id.is_none() {
             return Err("event task_id does not match its type");
         }
         if self

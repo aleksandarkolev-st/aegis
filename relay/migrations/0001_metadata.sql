@@ -32,6 +32,25 @@ CREATE INDEX IF NOT EXISTS channel_bindings_installation_idx
 CREATE INDEX IF NOT EXISTS channel_bindings_actor_scope_idx
     ON channel_bindings (installation_id, actor_id, active);
 
+-- Conversation routing and echo digests are metadata. No command text or output
+-- is stored in these tables.
+CREATE TABLE IF NOT EXISTS task_conversations (
+    binding_id UUID NOT NULL REFERENCES channel_bindings(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL,
+    destination_id TEXT UNIQUE,
+    state TEXT NOT NULL CHECK (state IN ('creating', 'ready')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (binding_id, task_id)
+);
+
+CREATE TABLE IF NOT EXISTS outbound_echoes (
+    channel TEXT NOT NULL,
+    destination_id TEXT NOT NULL,
+    body_hash BYTEA NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (channel, destination_id, body_hash)
+);
+
 CREATE TABLE IF NOT EXISTS pairing_tokens (
     id UUID PRIMARY KEY,
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,

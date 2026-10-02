@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::{
     channel::{ChannelError, MessagingChannel},
     model::{AegisEvent, COMMAND_TTL_SECONDS, CommandEnvelope, normalize_text, parse_command},
-    repository::{DeliveryTarget, RelayRepository, RepositoryError},
+    repository::{DeliveryTarget, GroupReservation, RelayRepository, RepositoryError},
 };
 
 #[async_trait]
@@ -132,11 +132,36 @@ impl RelayService {
     ) -> Result<InboundDisposition, RelayError> {
         message.text = normalize_text(&message.text).map_err(|_| RelayError::InvalidMessage)?;
         let channel_id = self.channel.id().as_str();
+        let destination = message
+            .conversation_id
+            .as_deref()
+            .unwrap_or(&message.sender_id);
+        if message.from_me {
+            let known_id = self
+                .repository
+                .is_outbound_echo(
+                    channel_id,
+                    destination,
+                    &crate::repository::outbound_message_hash(&message.external_message_id),
+                )
+                .await?;
+            if known_id
+                || self
+                    .repository
+                    .is_outbound_echo(channel_id, destination, &echo_hash(&message.text))
+                    .await?
+            {
+                return Ok(InboundDisposition::Ignored);
+            }
+        }
         let existing = self
             .repository
             .lookup_binding(channel_id, &message.sender_id)
             .await?;
         if existing.is_none() {
+            if message.conversation_id.is_some() {
+                return Ok(InboundDisposition::Ignored);
+            }
             if let Some(code) = pairing_code(&message.text) {
                 if let Some(binding) = self
                     .repository
@@ -144,13 +169,12 @@ impl RelayService {
                     .await?
                 {
                     let text = "This account is paired with Aegis.";
-                    self.channel
-                        .send_text(&binding.destination_id, text, &message.external_message_id)
+                    self.send_text(&binding.destination_id, text, &message.external_message_id)
                         .await?;
                     return Ok(InboundDisposition::Paired);
                 }
             }
-            self.channel
+            self
                 .send_text(
                     &message.sender_id,
                     "Pair this account with Aegis using AEGIS <one-time-code> or /pair <one-time-code>.",
@@ -161,14 +185,21 @@ impl RelayService {
         }
 
         let binding = existing.expect("checked as present");
+        let conversation_task_id = if let Some(group) = &message.conversation_id {
+            let Some(task) = self.repository.task_for_group(binding.id, group).await? else {
+                return Ok(InboundDisposition::Ignored);
+            };
+            Some(task)
+        } else {
+            None
+        };
         if is_pairing_attempt(&message.text) {
-            self.channel
-                .send_text(
-                    &binding.destination_id,
-                    "This account is already paired with Aegis.",
-                    &message.external_message_id,
-                )
-                .await?;
+            self.send_text(
+                &binding.destination_id,
+                "This account is already paired with Aegis.",
+                &message.external_message_id,
+            )
+            .await?;
             return Ok(InboundDisposition::Paired);
         }
         let command = parse_command(&message.text).map_err(|_| RelayError::InvalidMessage)?;
@@ -190,6 +221,7 @@ impl RelayService {
             issued_at: now,
             expires_at: now + chrono::Duration::seconds(COMMAND_TTL_SECONDS),
             command,
+            conversation_task_id,
         };
         self.transport.publish(&envelope).await?;
         Ok(InboundDisposition::Published)
@@ -234,7 +266,7 @@ impl RelayService {
         &self,
         event: &AegisEvent,
         text: &str,
-        target: DeliveryTarget,
+        mut target: DeliveryTarget,
     ) -> Result<(), RelayError> {
         if self
             .repository
@@ -247,6 +279,36 @@ impl RelayService {
         {
             return Ok(());
         }
+        let mut text = text.to_owned();
+        if self.channel.task_groups()
+            && let Some(task) = &event.task_id
+        {
+            match self
+                .repository
+                .reserve_task_group(target.binding_id, task)
+                .await?
+            {
+                GroupReservation::Ready(group) => target.destination_id = group,
+                GroupReservation::Create => match self
+                    .channel
+                    .create_task_group(&target.destination_id, task)
+                    .await
+                {
+                    Ok(group) => {
+                        self.repository
+                            .save_task_group(target.binding_id, task, &group)
+                            .await?;
+                        target.destination_id = group;
+                    }
+                    Err(_) => {
+                        text = format!(
+                            "Aegis could not confirm group creation for this task. It will not create a duplicate automatically. You can control it here in the meantime.\n{text}"
+                        );
+                    }
+                },
+                GroupReservation::Uncertain => {}
+            }
+        }
         self.repository
             .record_delivery_attempt(
                 self.channel.id().as_str(),
@@ -255,8 +317,7 @@ impl RelayService {
             )
             .await?;
         match self
-            .channel
-            .send_text(&target.destination_id, text, &event.event_id.to_string())
+            .send_text(&target.destination_id, &text, &event.event_id.to_string())
             .await
         {
             Ok(provider_message_id) => {
@@ -282,6 +343,28 @@ impl RelayService {
             }
         }
     }
+
+    async fn send_text(
+        &self,
+        destination: &str,
+        text: &str,
+        key: &str,
+    ) -> Result<Option<String>, RelayError> {
+        self.repository
+            .reserve_outbound_echo(self.channel.id().as_str(), destination, &echo_hash(text))
+            .await?;
+        let id = self.channel.send_text(destination, text, key).await?;
+        if let Some(id) = &id {
+            self.repository
+                .remember_outbound_message(self.channel.id().as_str(), destination, id)
+                .await?;
+        }
+        Ok(id)
+    }
+}
+
+fn echo_hash(text: &str) -> Vec<u8> {
+    Sha256::digest(text.replace("\r\n", "\n").replace('\r', "\n").as_bytes()).to_vec()
 }
 
 fn pairing_code(text: &str) -> Option<&str> {
