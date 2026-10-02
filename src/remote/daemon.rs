@@ -679,9 +679,11 @@ async fn process_command(
         return Ok(());
     }
 
+    let mut reply_task_id = None;
     let reply =
         match apply_relay_command(root, config, authority, &envelope, Utc::now().timestamp()) {
             Ok(receipt) => {
+                reply_task_id = receipt.result["task_id"].as_str().map(str::to_owned);
                 apply_command_effects(root, authority, &envelope, &receipt)?;
                 format_receipt(&envelope.command, &receipt)
             }
@@ -691,12 +693,13 @@ async fn process_command(
         "reply\0{}\0{}\0{}",
         config.installation_id, envelope.actor_id, envelope.request_id
     ));
-    let event = AegisEvent::reply(
+    let mut event = AegisEvent::reply(
         &config.installation_id,
         &envelope.actor_id,
         &event_id,
         &reply,
     )?;
+    event.task_id = reply_task_id;
     transport.publish(&event).await?;
     if message.ack().await.is_err() {
         bail!("could not acknowledge applied remote command");
@@ -719,7 +722,7 @@ fn apply_relay_command(
                 text,
                 task_id: None,
             } => text.as_str(),
-            Command::Slash { text } => super::slash::goal_submission(text)
+            Command::Slash { text, .. } => super::slash::goal_submission(text)
                 .context("slash command did not supply a goal")?,
             _ => bail!("only a new message or goal can create a remote task"),
         };
@@ -1381,6 +1384,7 @@ mod tests {
             channel: "whatsapp".into(),
             sender_id: "+15551234567".into(),
             external_message_id: "provider-message-id".into(),
+            conversation_task_id: None,
             issued_at: now,
             expires_at: now + ChronoDuration::minutes(5),
             command: RelayCommand::Message {

@@ -57,6 +57,8 @@ pub(crate) fn is_command_rejection(error: &anyhow::Error) -> bool {
 pub enum Command {
     Slash {
         text: String,
+        #[serde(default)]
+        task_id: Option<String>,
     },
     Message {
         text: String,
@@ -1128,7 +1130,7 @@ fn apply_command(
     command: &Command,
 ) -> Result<CommandApply> {
     match command {
-        Command::Slash { text } => {
+        Command::Slash { text, task_id } => {
             if let Some(body) = slash::goal_submission(text) {
                 return apply_command(
                     transaction,
@@ -1137,7 +1139,7 @@ fn apply_command(
                     now,
                     &Command::Message {
                         text: body.to_owned(),
-                        task_id: None,
+                        task_id: task_id.clone(),
                     },
                 );
             }
@@ -1151,7 +1153,7 @@ fn apply_command(
                     task_id: None,
                 });
             }
-            let task_id = resolve_actor_task(transaction, actor_id, None)?;
+            let task_id = resolve_actor_task(transaction, actor_id, task_id.as_deref())?;
             Ok(CommandApply::Applied {
                 result: json!({"slash_pending": true, "task_id": task_id}),
                 task_id,
@@ -2128,7 +2130,10 @@ fn operation_intent_hash(operation: &crate::storage::Operation) -> Result<String
 }
 
 fn validate_request_shape(request: &CommandEnvelope) -> Result<()> {
-    if let Command::Slash { text } = &request.command {
+    if let Command::Slash { text, task_id } = &request.command {
+        if let Some(task_id) = task_id {
+            validate_task_reference(task_id)?;
+        }
         if !text.starts_with('/')
             || text.len() > 8192
             || text

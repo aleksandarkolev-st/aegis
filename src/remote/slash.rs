@@ -215,6 +215,13 @@ fn dispatch(
                 )
                 .optional()?
                 .context("No command reply to paginate")?;
+            if let (Some(task), Some(scope)) = (task, scope.as_deref()) {
+                if task != scope {
+                    bail!(
+                        "The last paged reply belongs to another chat. Run the command again in this chat"
+                    );
+                }
+            }
             if let Some(scope) = scope {
                 require_actor_run_connection(&authority.store.connection, actor, &scope)?;
             }
@@ -545,9 +552,46 @@ fn artifacts(store: &Store, task: &str, rest: &str) -> Result<String> {
 }
 
 fn snapshot(store: &Store, task: &str) -> Result<String> {
+    let sequence = if store.needs_legacy_contract_adoption(task)? {
+        Some(
+            store
+                .events(task)?
+                .last()
+                .map(|event| event.seq)
+                .unwrap_or(0),
+        )
+    } else {
+        None
+    };
     Ok(serde_json::to_string(
-        &json!({"requirements":store.obligations(task)?,"revision":store.workspace_revision(task)?}),
+        &json!({"task":store.run(task)?.task,"requirements":store.obligations(task)?,"revision":store.workspace_revision(task)?,"legacy_sequence":sequence}),
     )?)
+}
+
+fn legacy_requirements(store: &Store, task: &str, addition: &str) -> Result<Vec<String>> {
+    let run = store.run(task)?;
+    let mut titles: Vec<String> = run.budgets["obligations"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.as_str().map(str::to_owned))
+        .collect();
+    for title in crate::obligations::from_task(&run.task)?
+        .into_iter()
+        .chain(
+            store
+                .obligations(task)?
+                .into_iter()
+                .filter(|item| item.id > 0 && item.state != "superseded")
+                .map(|item| item.title),
+        )
+        .chain(std::iter::once(addition.trim().to_owned()))
+    {
+        if !titles.contains(&title) {
+            titles.push(title);
+        }
+    }
+    Ok(titles)
 }
 
 fn review(authority: &Authority, actor: &str, task: &str, text: &str) -> Result<String> {
@@ -573,8 +617,21 @@ fn review(authority: &Authority, actor: &str, task: &str, text: &str) -> Result<
         "INSERT INTO remote_command_reviews(token,actor_id,task_id,command,snapshot,expires_at) VALUES (?1,?2,?3,?4,?5,?6)",
         params![token,actor,task,text,snapshot(&authority.store,task)?,crate::storage::unix_time()+300],
     )?;
+    let legacy = if authority.store.needs_legacy_contract_adoption(task)? {
+        if !rest.trim().starts_with("add ") {
+            bail!("Use /goal add to review and adopt the full legacy contract first");
+        }
+        let requirements = legacy_requirements(&authority.store, task, title)?;
+        format!(
+            "\nThis legacy task will adopt the complete reviewed contract:\n{}\nOriginal task:\n{}",
+            requirements.join("\n"),
+            run.task
+        )
+    } else {
+        String::new()
+    };
     Ok(format!(
-        "Review for task {task}:\n{text}\nSend /confirm {token} within 5 minutes to apply this exact change, or /back to discard."
+        "Review for task {task}:\n{text}{legacy}\nSend /confirm {token} within 5 minutes to apply this exact change, or /back to discard."
     ))
 }
 
@@ -602,6 +659,23 @@ fn confirm(root: &Path, authority: &mut Authority, actor: &str, token: &str) -> 
     let (action, body) = rest.trim().split_once(char::is_whitespace).unwrap();
     let (title, reason) = body.split_once('|').unwrap();
     let reason = reason.trim();
+    if authority.store.needs_legacy_contract_adoption(&task)? {
+        if action != "add" {
+            bail!("Use /goal add to review and adopt the full legacy contract first");
+        }
+        let requirements = legacy_requirements(&authority.store, &task, title)?;
+        let sequence = serde_json::from_str::<Value>(&expected)?["legacy_sequence"]
+            .as_i64()
+            .context("Legacy review has no saved sequence; review it again")?;
+        authority.store.adopt_legacy_contract(
+            &task,
+            sequence,
+            &run.task,
+            &requirements,
+            Some(reason),
+        )?;
+        return Ok("Adopted the reviewed legacy contract. Send /goal to inspect it and /resume to continue.".into());
+    }
     let id = match action {
         "add" => authority
             .store
@@ -676,7 +750,10 @@ mod tests {
             request_id: uuid::Uuid::new_v4().to_string(),
             issued_at: crate::storage::unix_time(),
             expires_at: crate::storage::unix_time() + 300,
-            command: Command::Slash { text: text.into() },
+            command: Command::Slash {
+                text: text.into(),
+                task_id: None,
+            },
         };
         let help = request("/");
         let add = request("/memory add keep small commits");
@@ -714,6 +791,140 @@ mod tests {
         )?;
         assert_eq!(authority.store.project_memory(temp.path())?.len(), 1);
         assert!(authority.store.runs()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn group_commands_use_their_bound_task_without_changing_the_dm_selection() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join(".arun");
+        let mut authority = Authority::open(&root)?;
+        authority.register_actor("phone")?;
+        let mut tasks = Vec::new();
+        for title in ["DM task", "Group task", "Private task"] {
+            let run = authority.store.create_run(
+                title,
+                temp.path(),
+                "codex",
+                json!(["workspace.read"]),
+                json!({}),
+                "verify",
+            )?;
+            tasks.push(run.id);
+        }
+        authority.grant_run("phone", &tasks[0])?;
+        authority.grant_run("phone", &tasks[1])?;
+        authority.bind_selected_task("phone", &tasks[0])?;
+        let now = crate::storage::unix_time();
+        let request = CommandEnvelope {
+            version: 1,
+            installation_id: authority.installation_id().into(),
+            actor_id: "phone".into(),
+            request_id: uuid::Uuid::new_v4().to_string(),
+            issued_at: now,
+            expires_at: now + 300,
+            command: Command::Slash {
+                text: "/goal".into(),
+                task_id: Some(tasks[1].clone()),
+            },
+        };
+        let receipt = authority.apply_from_authenticated_relay("phone", &request, now)?;
+        let receipt = execute(
+            &root,
+            temp.path(),
+            &mut authority,
+            "phone",
+            "/goal",
+            receipt,
+        )?;
+        assert!(
+            receipt.result["reply"]
+                .as_str()
+                .unwrap()
+                .contains("Group task")
+        );
+        assert_eq!(authority.selected_task("phone")?, Some(tasks[0].clone()));
+        let private = CommandEnvelope {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            command: Command::Slash {
+                text: "/goal".into(),
+                task_id: Some(tasks[2].clone()),
+            },
+            ..request
+        };
+        assert!(
+            authority
+                .apply_from_authenticated_relay("phone", &private, now)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn phone_legacy_review_preserves_all_requirements_and_rejects_changed_history() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join(".arun");
+        let mut authority = Authority::open(&root)?;
+        authority.register_actor("phone")?;
+        let run = authority.store.create_run(
+            "Repair parser\nRequirements:\n- Keep Unicode",
+            temp.path(),
+            "codex",
+            json!(["workspace.read"]),
+            json!({"obligations":["Preserve API"]}),
+            "",
+        )?;
+        authority.store.state(&run.id, "paused", json!({}))?;
+        authority
+            .store
+            .connection
+            .execute("DELETE FROM obligations WHERE run_id=?1", [&run.id])?;
+        authority
+            .store
+            .connection
+            .execute("DELETE FROM workspace_revisions WHERE run_id=?1", [&run.id])?;
+        authority.grant_run("phone", &run.id)?;
+        schema(&authority)?;
+        let extract_token = |reply: String| {
+            reply
+                .split("/confirm ")
+                .nth(1)
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .to_owned()
+        };
+        let proposal = review(
+            &authority,
+            "phone",
+            &run.id,
+            "/goal add Cover failures | user requested",
+        )?;
+        for title in ["Preserve API", "Keep Unicode", "Cover failures"] {
+            assert!(proposal.contains(title));
+        }
+        let stale = extract_token(proposal);
+        authority
+            .store
+            .event(&run.id, "fixture.changed", json!({}))?;
+        assert!(confirm(&root, &mut authority, "phone", &stale).is_err());
+        let token = extract_token(review(
+            &authority,
+            "phone",
+            &run.id,
+            "/goal add Cover failures | user requested",
+        )?);
+        confirm(&root, &mut authority, "phone", &token)?;
+        assert!(!authority.store.needs_legacy_contract_adoption(&run.id)?);
+        let titles: Vec<_> = authority
+            .store
+            .obligations(&run.id)?
+            .into_iter()
+            .filter(|item| item.id > 0)
+            .map(|item| item.title)
+            .collect();
+        assert_eq!(titles, ["Preserve API", "Keep Unicode", "Cover failures"]);
         Ok(())
     }
 

@@ -1931,6 +1931,7 @@ fn add_profile_mcp_grants(root: &Path, profile: &Profile, grants: &mut Vec<Strin
 /// Creates a remote-started task from the profile already saved locally.
 /// The phone supplies only task text; the workspace, model, limits, scopes and
 /// grants all come from this installation's configuration.
+#[cfg(test)]
 pub(crate) fn create_remote_task(
     root: &Path,
     workspace: &Path,

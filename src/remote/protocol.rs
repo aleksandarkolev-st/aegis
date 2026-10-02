@@ -38,6 +38,8 @@ pub struct RelayCommandEnvelope {
     pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub command: RelayCommand,
+    #[serde(default)]
+    pub conversation_task_id: Option<String>,
 }
 
 impl RelayCommandEnvelope {
@@ -55,6 +57,9 @@ impl RelayCommandEnvelope {
         uuid::Uuid::parse_str(&envelope.envelope_id).context("invalid relay envelope ID")?;
         uuid::Uuid::parse_str(&envelope.request_id).context("invalid relay request ID")?;
         uuid::Uuid::parse_str(&envelope.installation_id).context("invalid installation ID")?;
+        if let Some(scope) = &envelope.conversation_task_id {
+            uuid::Uuid::parse_str(scope).context("invalid conversation task ID")?;
+        }
         if envelope.channel != "whatsapp"
             || !valid_actor(&envelope.actor_id)
             || envelope.sender_id.is_empty()
@@ -82,8 +87,11 @@ impl RelayCommandEnvelope {
     }
 
     pub fn local_envelope(&self) -> LocalEnvelope {
-        let command = match &self.command {
-            RelayCommand::Slash { text } => LocalCommand::Slash { text: text.clone() },
+        let mut command = match &self.command {
+            RelayCommand::Slash { text } => LocalCommand::Slash {
+                text: text.clone(),
+                task_id: self.conversation_task_id.clone(),
+            },
             RelayCommand::Message { text } => LocalCommand::Message {
                 text: text.clone(),
                 task_id: None,
@@ -120,6 +128,23 @@ impl RelayCommandEnvelope {
                 challenge_id: challenge_id.clone(),
             },
         };
+        if let Some(scope) = &self.conversation_task_id {
+            match &mut command {
+                LocalCommand::Message { task_id, .. }
+                | LocalCommand::Status { task_id }
+                | LocalCommand::Result { task_id }
+                | LocalCommand::Evidence { task_id }
+                | LocalCommand::Details { task_id }
+                | LocalCommand::Pause { task_id }
+                | LocalCommand::Resume { task_id }
+                | LocalCommand::Cancel { task_id } => {
+                    if task_id.is_none() {
+                        *task_id = Some(scope.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
         LocalEnvelope {
             version: 1,
             installation_id: self.installation_id.clone(),
@@ -261,6 +286,49 @@ mod tests {
     }
 
     #[test]
+    fn group_scope_is_frozen_into_local_commands() -> Result<()> {
+        let installation = uuid::Uuid::new_v4().to_string();
+        let task = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now();
+        let base = RelayCommandEnvelope {
+            envelope_id: uuid::Uuid::new_v4().to_string(),
+            request_id: uuid::Uuid::new_v4().to_string(),
+            installation_id: installation,
+            actor_id: "phone".into(),
+            channel: "whatsapp".into(),
+            sender_id: "+15551234567".into(),
+            external_message_id: "message.1".into(),
+            issued_at: now,
+            expires_at: now + chrono::Duration::minutes(5),
+            command: RelayCommand::Message {
+                text: "continue".into(),
+            },
+            conversation_task_id: Some(task.clone()),
+        };
+        assert_eq!(
+            base.local_envelope().command,
+            LocalCommand::Message {
+                text: "continue".into(),
+                task_id: Some(task.clone())
+            }
+        );
+        let slash = RelayCommandEnvelope {
+            command: RelayCommand::Slash {
+                text: "/goal".into(),
+            },
+            ..base
+        };
+        assert_eq!(
+            slash.local_envelope().command,
+            LocalCommand::Slash {
+                text: "/goal".into(),
+                task_id: Some(task)
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
     fn result_and_evidence_commands_map_to_the_local_authority() -> Result<()> {
         let installation_id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now();
@@ -289,6 +357,7 @@ mod tests {
                 issued_at: now,
                 expires_at: now + chrono::Duration::minutes(5),
                 command,
+                conversation_task_id: None,
             };
             assert_eq!(envelope.local_envelope().command, expected);
         }
