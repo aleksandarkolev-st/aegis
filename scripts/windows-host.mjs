@@ -157,12 +157,8 @@ export async function callTool(name, input = {}, workspace = process.cwd()) {
   }
   if (name === 'app_launch') {
     if (!path.isAbsolute(args.executable)) throw new Error('Executable must be an absolute path');
-    return new Promise((resolve, reject) => {
-      const child = spawn(args.executable, args.args ?? [], { cwd: absolute(args.cwd ?? '.'), windowsHide: !args.visible,
-        detached: true, stdio: 'ignore', shell: false });
-      child.on('error', reject);
-      child.on('spawn', () => { child.unref(); resolve(textResult({ pid: child.pid, visible: args.visible ?? false })); });
-    });
+    if (path.extname(args.executable).toLowerCase() !== '.exe' || !(await fs.stat(args.executable)).isFile()) throw new Error('Launch requires an existing .exe file');
+    return textResult(await native(name, { ...args, cwd: absolute(args.cwd ?? '.') }, workspace));
   }
   const nativeArgs = { ...args };
   if (name === 'desktop_screenshot') {

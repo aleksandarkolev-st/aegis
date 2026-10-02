@@ -60,7 +60,7 @@ async function client(t, cwd) {
     child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
   });
   await request('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'aegis-test', version: '1' } });
-  return { request, call: async (name, args = {}) => (await request('tools/call', { name, arguments: args })).result };
+  return { request, close, call: async (name, args = {}) => (await request('tools/call', { name, arguments: args })).result };
 }
 
 test('Windows host refuses implicit trust before exposing tools', async () => {
@@ -129,6 +129,43 @@ test('PowerShell timeout kills its hidden native descendant via owning job', { s
     await new Promise(resolve => setTimeout(resolve, 50));
   }
   assert.equal(alive, false, 'PowerShell invocation must not leave its native child alive');
+});
+
+test('app launch executes and survives the short-lived MCP server', { skip: !windows }, async t => {
+  const cwd = await scratch(t), rpc = await client(t, cwd);
+  const output = path.join(cwd, 'launch.json');
+  const quote = value => "'" + value.replaceAll("'", "''") + "'";
+  const command = `Start-Sleep -Seconds 2; [IO.File]::WriteAllText(${quote(output)},'executed')`;
+  const result = await rpc.call('app_launch', {
+    executable: path.join(process.env.SystemRoot, 'System32/WindowsPowerShell/v1.0/powershell.exe'),
+    args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', Buffer.from(command, 'utf16le').toString('base64')],
+  });
+  assert.equal(result.isError, false);
+  assert.ok(data(result).pid > 0);
+  await rpc.close();
+  let observed;
+  for (let attempt = 0; attempt < 50; attempt++) {
+    observed = await fs.readFile(output, 'utf8').catch(() => null);
+    if (observed) break;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  assert.equal(observed, 'executed', 'Spawn success alone does not prove execution or lifetime');
+});
+
+test('app launch preserves literal arguments through native Windows quoting', { skip: !windows }, async t => {
+  const cwd = await scratch(t), rpc = await client(t, cwd);
+  const output = path.join(cwd, 'argv.json');
+  const expected = ['', 'two words', 'quote"slash\\', 'trailing\\', "literal'", '$(whoami)&echo', '日本語🙂', 'line\nbreak'];
+  const script = `require('fs').writeFileSync(${JSON.stringify(output)}, JSON.stringify(process.argv.slice(1)))`;
+  const result = await rpc.call('app_launch', { executable: process.execPath, args: ['-e', script, ...expected] });
+  assert.equal(result.isError, false, JSON.stringify(result));
+  let observed;
+  for (let attempt = 0; attempt < 50; attempt++) {
+    try { observed = JSON.parse(await fs.readFile(output, 'utf8')); } catch {}
+    if (observed) break;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  assert.deepEqual(observed, expected);
 });
 
 test('actual desktop discovery and bounded screenshot return valid PNG with coordinate mapping', { skip: !windows }, async t => {

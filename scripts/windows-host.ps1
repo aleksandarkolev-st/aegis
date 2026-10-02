@@ -90,7 +90,37 @@ public static class AegisWindowsHost {
         IntPtr window = new IntPtr(number);
         if (!IsWindow(window)) throw new Exception("Window no longer exists");
         ShowWindow(window, 9);
+        if (GetForegroundWindow() == window) return;
         if (!SetForegroundWindow(window)) throw new Exception("Windows refused foreground activation");
+        for (int attempt = 0; attempt < 50; attempt++) {
+            if (GetForegroundWindow() == window) return;
+            Thread.Sleep(10);
+        }
+        throw new Exception("Window did not become foreground");
+    }
+    static string QuoteArgument(string value) {
+        StringBuilder quoted = new StringBuilder("\""); int slashes = 0;
+        foreach (char unit in value) {
+            if (unit == '\\') { slashes++; continue; }
+            if (unit == '"') { quoted.Append('\\', slashes * 2 + 1); quoted.Append('"'); }
+            else { quoted.Append('\\', slashes); quoted.Append(unit); }
+            slashes = 0;
+        }
+        quoted.Append('\\', slashes * 2); quoted.Append('"'); return quoted.ToString();
+    }
+    public static int Launch(string executable, string[] arguments, string cwd, bool visible) {
+        // ShellExecute starts an executable through Windows, not cmd/PowerShell
+        // interpretation. It avoids inheriting Node's kill-on-close child job.
+        ProcessStartInfo info = new ProcessStartInfo(executable);
+        info.UseShellExecute = true; info.WorkingDirectory = cwd;
+        info.WindowStyle = visible ? ProcessWindowStyle.Normal : ProcessWindowStyle.Hidden;
+        List<string> quoted = new List<string>();
+        foreach (string argument in arguments) quoted.Add(QuoteArgument(argument));
+        info.Arguments = String.Join(" ", quoted.ToArray());
+        using (Process child = Process.Start(info)) {
+            if (child == null) throw new Exception("Windows did not return a launched process");
+            return child.Id;
+        }
     }
     static void Send(Input input) {
         if (SendInput(1, new Input[] { input }, Marshal.SizeOf(typeof(Input))) != 1)
@@ -138,6 +168,10 @@ public static class AegisWindowsHost {
     [AegisWindowsHost]::BoundLifetime([int]$request.timeout_seconds, $request.action -eq 'powershell')
     $argsValue = $request.args
     switch ($request.action) {
+        'app_launch' {
+            $pidValue=[AegisWindowsHost]::Launch([string]$argsValue.executable,[string[]]@($argsValue.args),[string]$argsValue.cwd,[bool]$argsValue.visible)
+            $result=@{ pid=$pidValue; visible=[bool]$argsValue.visible }
+        }
         'powershell' {
             # Stream formatting instead of collecting arbitrarily large output.
             # The owning job terminates any spawned descendants when we exit.
