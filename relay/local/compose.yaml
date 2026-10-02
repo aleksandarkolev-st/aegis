@@ -1,0 +1,132 @@
+services:
+  relay-postgres:
+    image: postgres:17.6-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: aegis_relay
+      POSTGRES_USER: relay
+      POSTGRES_PASSWORD: ${RELAY_DATABASE_PASSWORD:?Run local-remote.ps1 init}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    ports:
+      - "127.0.0.1:${RELAY_DATABASE_PORT}:5432"
+    volumes:
+      - relay-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U relay -d aegis_relay"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  evolution-postgres:
+    image: postgres:17.6-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: evolution
+      POSTGRES_USER: evolution
+      POSTGRES_PASSWORD: ${EVOLUTION_DATABASE_PASSWORD:?Run local-remote.ps1 init}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    volumes:
+      - evolution-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U evolution -d evolution"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7.4.5-alpine
+    restart: unless-stopped
+    command: [redis-server, --appendonly, "yes"]
+    volumes:
+      - redis:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  nats:
+    image: nats:2.12.0-alpine
+    restart: unless-stopped
+    command: [-c, /etc/nats/nats-server.conf]
+    environment:
+      NATS_AUTH_TOKEN: ${NATS_AUTH_TOKEN}
+      AEGIS_NATS_DEVICE_USERNAME: ${AEGIS_NATS_DEVICE_USERNAME}
+      AEGIS_NATS_DEVICE_PASSWORD: ${AEGIS_NATS_DEVICE_PASSWORD}
+      AEGIS_NATS_DEVICE_EVENT_SUBJECT: ${AEGIS_NATS_DEVICE_EVENT_SUBJECT}
+      AEGIS_NATS_DEVICE_CONSUMER_INFO: ${AEGIS_NATS_DEVICE_CONSUMER_INFO}
+      AEGIS_NATS_DEVICE_CONSUMER_CREATE: ${AEGIS_NATS_DEVICE_CONSUMER_CREATE}
+      AEGIS_NATS_DEVICE_CONSUMER_NEXT: ${AEGIS_NATS_DEVICE_CONSUMER_NEXT}
+      AEGIS_NATS_DEVICE_ACK: ${AEGIS_NATS_DEVICE_ACK}
+      AEGIS_NATS_DEVICE_INBOX: ${AEGIS_NATS_DEVICE_INBOX}
+    ports:
+      - "127.0.0.1:${NATS_PORT}:4222"
+    volumes:
+      - ./nats-server.conf:/etc/nats/nats-server.conf:ro
+      - ${LOCAL_REMOTE_DIR}/nats-certs:/run/certs:ro
+      - jetstream:/data/jetstream
+    healthcheck:
+      test: [CMD-SHELL, "nc -z 127.0.0.1 4222"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  evolution:
+    image: evoapicloud/evolution-api:v2.3.7
+    restart: unless-stopped
+    depends_on:
+      evolution-postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${EVOLUTION_PORT}:8080"
+    volumes:
+      - evolution-instances:/evolution/instances
+    environment:
+      SERVER_URL: http://localhost:${EVOLUTION_PORT}
+      AUTHENTICATION_API_KEY: ${EVOLUTION_API_KEY}
+      AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES: "false"
+      DATABASE_PROVIDER: postgresql
+      DATABASE_CONNECTION_URI: postgresql://evolution:${EVOLUTION_DATABASE_PASSWORD}@evolution-postgres:5432/evolution?schema=public
+      DATABASE_CONNECTION_CLIENT_NAME: aegis_local
+      DATABASE_SAVE_DATA_INSTANCE: "true"
+      DATABASE_SAVE_DATA_NEW_MESSAGE: "false"
+      DATABASE_SAVE_MESSAGE_UPDATE: "false"
+      DATABASE_SAVE_DATA_CONTACTS: "false"
+      DATABASE_SAVE_DATA_CHATS: "false"
+      DATABASE_SAVE_DATA_LABELS: "false"
+      DATABASE_SAVE_DATA_HISTORIC: "false"
+      DATABASE_SAVE_IS_ON_WHATSAPP: "false"
+      CACHE_REDIS_ENABLED: "true"
+      CACHE_REDIS_URI: redis://redis:6379/0
+      CACHE_REDIS_PREFIX_KEY: aegis_local
+      CACHE_REDIS_SAVE_INSTANCES: "false"
+      CACHE_LOCAL_ENABLED: "false"
+      TELEMETRY_ENABLED: "false"
+      LOG_LEVEL: ERROR,WARN
+      LOG_BAILEYS: error
+      WEBHOOK_GLOBAL_ENABLED: "false"
+      CONFIG_SESSION_PHONE_CLIENT: Aegis
+      CONFIG_SESSION_PHONE_NAME: Chrome
+      DEL_INSTANCE: "false"
+      OPENAI_ENABLED: "false"
+      CHATWOOT_ENABLED: "false"
+      TYPEBOT_ENABLED: "false"
+      N8N_ENABLED: "false"
+      DIFY_ENABLED: "false"
+      EVOAI_ENABLED: "false"
+      S3_ENABLED: "false"
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:8080/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 4s
+      start_period: 30s
+      retries: 30
+
+volumes:
+  relay-postgres:
+  evolution-postgres:
+  redis:
+  jetstream:
+  evolution-instances:

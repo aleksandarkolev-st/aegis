@@ -6,7 +6,7 @@ The relay does not run code or make tool decisions. A channel adapter normalizes
 
 ## Stored data
 
-PostgreSQL contains only six metadata tables: users, installations, channel_bindings, pairing_tokens, delivery_receipts, and notification_preferences. Channel identity is stored independently of provider names, so a future adapter can reuse relay routing and delivery.
+PostgreSQL contains eight metadata tables: users, installations, channel_bindings, pairing_tokens, delivery_receipts, notification_preferences, task_conversations, and outbound_echoes. Conversation rows bind a group to one owner's task. Echo rows retain digests only: a short body reservation covers send/webhook races, and a returned provider message ID digest prevents delayed self-account echoes for 30 days. Channel identity is stored independently of provider names.
 
 - Pairing codes are random 256-bit values. PostgreSQL stores their SHA-256 hashes and 5-minute expiry; redemption is atomic and one time.
 - Each installation belongs to one relay user and can register multiple actor IDs. Pairing metadata keeps one current token row per actor; actor IDs are unique across installations and cannot be moved to another installation.
@@ -20,12 +20,13 @@ The AegisEvent schema accepts only task_started, progress, approval_required, bl
 
 ## Remote commands
 
-Only direct inbound user text is accepted. The provider adapter rejects groups, messages sent by the relay's WhatsApp account, status events, media-only messages, malformed sender IDs, and unauthenticated webhooks. Message text is line-ending normalized and capped at 8 KiB. It is never logged.
+The default adapter accepts direct incoming text and paired-owner messages in known task groups. Explicit self-account mode accepts only the linked owner's own self-chat and own messages in those groups. The local Windows setup remains inert until the linked owner is confirmed. Unrelated groups, other contacts in self-account mode, outbound reply echoes, status events, media-only messages, malformed sender IDs, and unauthenticated webhooks are ignored or rejected. Message text is line-ending normalized and capped at 8 KiB. It is never logged.
 
 An unpaired number can redeem a one-time code with either exact form: `/pair <code>` or `AEGIS <code>`. The command name is case-insensitive for the `AEGIS` form; the code must be one exact 43-character token with no trailing text. Pairing codes are consumed once. These prefixes are reserved for pairing and are not forwarded as ordinary messages.
 
 | WhatsApp text | Typed command |
 | --- | --- |
+| /help, /goal, /models, /settings and the terminal catalog | slash (executed locally by authenticated Aegis) |
 | Ordinary text or /message <text> | message |
 | /tasks or /list_tasks | list_tasks |
 | /status | status |
@@ -126,7 +127,7 @@ Required variables:
 | EVOLUTION_WEBHOOK_SECRET | Dedicated webhook token/HMAC secret, at least 32 characters. |
 | RELAY_BIND_ADDR | Defaults to 127.0.0.1:8787. |
 
-In production, bind the process to a private interface and expose the webhook through an HTTPS reverse proxy with request limits and authentication. Do not expose a plaintext or unauthenticated NATS listener. Database initialization creates only the six tables above.
+In production, bind the process to a private interface and expose the webhook through an HTTPS reverse proxy with request limits and authentication. Do not expose a plaintext or unauthenticated NATS listener. Database initialization creates the eight metadata tables above.
 
 ## Local services and smoke test
 
