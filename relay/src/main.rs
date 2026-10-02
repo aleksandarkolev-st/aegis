@@ -39,12 +39,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         )
         .await?,
     );
-    let provider = Arc::new(EvolutionAdapter::new(
+    let mut provider = EvolutionAdapter::new(
         &config.evolution_base_url,
         config.evolution_instance,
         config.evolution_api_key,
         config.evolution_webhook_secret,
-    )?);
+    )?;
+    if let Some(owner) = config.whatsapp_self_owner {
+        provider = provider.with_self_account(&owner)?;
+    } else if config.whatsapp_self_account_pending {
+        provider = provider.with_self_account_pending();
+    }
+    let provider = Arc::new(provider);
     let service = Arc::new(RelayService::new(
         Arc::new(repository.clone()),
         transport.clone(),

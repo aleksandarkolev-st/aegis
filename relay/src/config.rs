@@ -25,6 +25,8 @@ pub struct Config {
     pub evolution_instance: String,
     pub evolution_api_key: String,
     pub evolution_webhook_secret: Vec<u8>,
+    pub whatsapp_self_owner: Option<String>,
+    pub whatsapp_self_account_pending: bool,
 }
 
 impl Config {
@@ -42,6 +44,34 @@ impl Config {
         let evolution_instance = required("EVOLUTION_INSTANCE")?;
         let evolution_api_key = required("EVOLUTION_API_KEY")?;
         let evolution_webhook_secret = required("EVOLUTION_WEBHOOK_SECRET")?.into_bytes();
+        let self_account = match env::var("WHATSAPP_SELF_ACCOUNT").as_deref() {
+            Ok("true") => true,
+            Ok("false") | Err(_) => false,
+            _ => {
+                return Err(ConfigError::Invalid(
+                    "WHATSAPP_SELF_ACCOUNT (true or false)",
+                ));
+            }
+        };
+        let whatsapp_self_owner = if self_account {
+            Some(
+                crate::provider::normalize_phone(&required("WHATSAPP_SELF_OWNER_PHONE")?)
+                    .ok_or(ConfigError::Invalid("WHATSAPP_SELF_OWNER_PHONE"))?,
+            )
+        } else {
+            None
+        };
+        let whatsapp_self_account_pending =
+            match env::var("WHATSAPP_SELF_ACCOUNT_PENDING").as_deref() {
+                Ok("true") => true,
+                Ok("false") | Err(_) => false,
+                _ => return Err(ConfigError::Invalid("WHATSAPP_SELF_ACCOUNT_PENDING")),
+            };
+        if whatsapp_self_account_pending && self_account {
+            return Err(ConfigError::Invalid(
+                "WHATSAPP_SELF_ACCOUNT_PENDING (owner mode already enabled)",
+            ));
+        }
 
         if admin_token.len() < 32 {
             return Err(ConfigError::Invalid("RELAY_ADMIN_TOKEN"));
@@ -81,6 +111,8 @@ impl Config {
             evolution_instance,
             evolution_api_key,
             evolution_webhook_secret,
+            whatsapp_self_owner,
+            whatsapp_self_account_pending,
         })
     }
 }

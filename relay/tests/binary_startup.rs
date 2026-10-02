@@ -84,6 +84,42 @@ fn actual_relay_binary_rejects_missing_configuration() {
     );
 }
 
+#[test]
+fn actual_relay_binary_requires_valid_owner_before_self_account_network_startup() {
+    for owner in [None, Some("not-a-phone")] {
+        let mut command = binary_command();
+        command
+            .env_clear()
+            .env(
+                "DATABASE_URL",
+                "postgres://fixture:fixture@127.0.0.1/fixture?sslmode=require",
+            )
+            .env("NATS_URL", "tls://localhost:1")
+            .env(
+                "NATS_AUTH_TOKEN",
+                "fixture-nats-token-at-least-32-characters",
+            )
+            .env(
+                "RELAY_ADMIN_TOKEN",
+                "fixture-admin-token-at-least-32-characters",
+            )
+            .env("EVOLUTION_BASE_URL", "http://127.0.0.1:1/")
+            .env("EVOLUTION_INSTANCE", "fixture")
+            .env("EVOLUTION_API_KEY", "fixture")
+            .env(
+                "EVOLUTION_WEBHOOK_SECRET",
+                "fixture-webhook-secret-at-least-32-characters",
+            )
+            .env("WHATSAPP_SELF_ACCOUNT", "true");
+        if let Some(owner) = owner {
+            command.env("WHATSAPP_SELF_OWNER_PHONE", owner);
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("WHATSAPP_SELF_OWNER_PHONE"));
+    }
+}
+
 fn evolution_message(id: &str, phone: &str, text: &str) -> Value {
     json!({"event":"messages.upsert", "data": {
         "key":{"id":id,"fromMe":false,"remoteJid":"123456789@s.whatsapp.net",
@@ -426,6 +462,20 @@ async fn assert_metadata_only(pool: &sqlx::PgPool, secrets: &[&str]) -> TestResu
     let expected: BTreeMap<&str, Vec<&str>> = [
         ("users", vec!["created_at", "id"]),
         (
+            "task_conversations",
+            vec![
+                "binding_id",
+                "created_at",
+                "destination_id",
+                "state",
+                "task_id",
+            ],
+        ),
+        (
+            "outbound_echoes",
+            vec!["body_hash", "channel", "destination_id", "expires_at"],
+        ),
+        (
             "installations",
             vec!["created_at", "id", "last_seen_at", "user_id"],
         ),
@@ -514,6 +564,8 @@ async fn assert_metadata_only(pool: &sqlx::PgPool, secrets: &[&str]) -> TestResu
          UNION ALL SELECT 'channel_bindings', row_to_json(m)::text FROM channel_bindings m
          UNION ALL SELECT 'pairing_tokens', row_to_json(m)::text FROM pairing_tokens m
          UNION ALL SELECT 'delivery_receipts', row_to_json(m)::text FROM delivery_receipts m
+         UNION ALL SELECT 'task_conversations', row_to_json(m)::text FROM task_conversations m
+         UNION ALL SELECT 'outbound_echoes', row_to_json(m)::text FROM outbound_echoes m
          UNION ALL SELECT 'notification_preferences', row_to_json(m)::text FROM notification_preferences m",
     ).fetch_all(pool).await?;
     for (table, row) in rows {
