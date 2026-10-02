@@ -13,12 +13,21 @@ const binaryArgument = args[args.indexOf('--binary') + 1];
 assert.ok(args.includes('--live') && args.includes('--binary') && binaryArgument,
   'Use node scripts/live-control-smoke.mjs --live --binary <actual-installed-arun-binary>');
 const binary = path.resolve(binaryArgument);
+function option(name, fallback) {
+  const index = args.indexOf(name);
+  if (index < 0) return fallback;
+  assert.ok(args[index + 1] && !args[index + 1].startsWith('--'), `${name} needs a value`);
+  return args[index + 1];
+}
+const requestedModel = option('--model', 'gpt-6.1-sol');
+const requestedReasoning = option('--reasoning', 'high');
+assert.ok(['none', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(requestedReasoning), 'Invalid reasoning effort');
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const binaryHash = digest(await readFile(binary));
 const outputRoot = path.join(repository, '.arun');
 await mkdir(outputRoot, { recursive: true });
 const continuation = args.includes('--continue') ? path.resolve(args[args.indexOf('--continue') + 1]) : null;
-const directory = continuation ?? await mkdtemp(path.join(outputRoot, 'luna-control-live-'));
+const directory = continuation ?? await mkdtemp(path.join(outputRoot, 'hosted-control-live-'));
 const priorReceipt = continuation ? JSON.parse(await readFile(path.join(directory, 'receipt.json'), 'utf8')) : null;
 const workspace = path.join(directory, 'workspace');
 if (!continuation) await mkdir(workspace);
@@ -70,7 +79,11 @@ Requirements:
 - add regression tests
 - full test suite must pass`;
 await writeFile(path.join(directory, 'task.txt'), task + '\n');
-const receipt = priorReceipt ?? { directory, workspace, binary, binary_sha256: binaryHash, model: 'gpt-6-luna', reasoning_effort: 'low', acceptance_sha256: digest(JSON.stringify(acceptance)), phase: 'prepared', run_id: null };
+const receipt = priorReceipt ?? { directory, workspace, binary, binary_sha256: binaryHash, model: requestedModel, reasoning_effort: requestedReasoning, acceptance_sha256: digest(JSON.stringify(acceptance)), phase: 'prepared', run_id: null };
+if (priorReceipt) {
+  if (args.includes('--model')) assert.equal(receipt.model, requestedModel, 'Preserve the existing trial model');
+  if (args.includes('--reasoning')) assert.equal(receipt.reasoning_effort, requestedReasoning, 'Preserve the existing trial reasoning effort');
+}
 if (receipt.binary_sha256 !== binaryHash) {
   assert.ok(continuation && args.includes('--upgrade-binary'),'Use --upgrade-binary to record a reviewed runtime fix while retaining this run');
   (receipt.binary_history ??= []).push({ binary:receipt.binary, sha256:receipt.binary_sha256 });
@@ -105,7 +118,7 @@ assert.match(baseline.stderr, /Invalid expression|AssertionError/, 'Starter must
 receipt.phase = 'starter-rejected'; await save();
 console.log(`Prepared functional check: ${directory}`);
 
-const running = start(binary, ['run', task, '--provider', 'chatgpt', '--model', receipt.model, '--reasoning', 'low', '--allow-write', '--allow-process', 'node', '--command-scopes', commandScopes, '--image', 'node:22-alpine', '--acceptance', acceptanceFile, '--wall-seconds', '14400', '--foreground'], 'first-run');
+const running = start(binary, ['run', task, '--provider', 'chatgpt', '--model', receipt.model, '--reasoning', receipt.reasoning_effort, '--allow-write', '--allow-process', 'node', '--command-scopes', commandScopes, '--image', 'node:22-alpine', '--acceptance', acceptanceFile, '--wall-seconds', '14400', '--foreground'], 'first-run');
 const started = Date.now();
 while (!receipt.run_id) {
   const match = running.text().match(/run: ([0-9a-f-]{36})/);
@@ -115,7 +128,7 @@ while (!receipt.run_id) {
   await new Promise(resolve => setTimeout(resolve, 100));
 }
 receipt.phase = 'inference-running'; await save();
-console.log(`Actual Aegis run: ${receipt.run_id} / ${receipt.model} / low`);
+console.log(`Actual Aegis run: ${receipt.run_id} / ${receipt.model} / ${receipt.reasoning_effort}`);
 let firstEvents;
 while (true) {
   const text = await command(['replay', receipt.run_id], 'pause-observation');
@@ -138,7 +151,7 @@ assert.ok(inherited.process_programs.includes('node'),'The immutable trial must 
 assert.deepEqual(inherited.command_scopes,{ commands: [{ program:'node',args:['--test'] }] });
 assert.equal(inherited.task,task);
 assert.equal(inherited.current_route.model,receipt.model);
-assert.equal(inherited.current_route.reasoning_effort,'low');
+assert.equal(inherited.current_route.reasoning_effort,receipt.reasoning_effort);
 const contractHash = digest(JSON.stringify({ task:inherited.task,process_programs:inherited.process_programs,command_scopes:inherited.command_scopes,current_route:inherited.current_route }));
 if (receipt.contract_sha256) assert.equal(contractHash,receipt.contract_sha256,'Continuation contract changed');
 receipt.contract_sha256 = contractHash; await save();
