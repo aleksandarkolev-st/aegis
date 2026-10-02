@@ -46,6 +46,17 @@ A later hosted output check passed with executable SHA-256 `81b19cbdca8025c6300a
 
 The subsequent library regression gate passed 377 tests with three hosted-only checks explicitly ignored. The control-surface, file-freshness and obligation-contract integration targets passed 12 tests. This includes rejection of process proof after an edit during execution, idempotent terminal invalidation, fresh proof after external changes, reviewed legacy adoption and unbounded aggregate usage accounting. Output sanitation now retains a bounded parser state for each operation so ANSI and OSC sequences split across live chunks cannot leak control fragments or hidden payload into the transcript.
 
+## Installed Windows package
+
+The optimized Windows runtime was rebuilt and installed globally from the verified local npm tarball. `aegis.cmd --version` reports `aegis 0.1.0`. Its installed executable matches the release and packaged SHA-256 `3186b1ee3b6e2b2f6eeb3aae493d7914c1121fb3651ff7c7de734d75e9d13c1c`.
+
+- The three ConPTY tests passed again with `AEGIS_PTY_BINARY` pointing to the installed executable, including actual distinct foreground color roles, a current UTC clock, elapsed time and the persisted completion timestamp.
+- The release executable passed hosted GPT-6.1-sol/high streaming verification with both output events and foreground display observed before process success. Full output remained intact. Receipt: `.arun/hosted-output-live-oAffet/receipt.json`.
+- Private npm packing, file allowlisting, postinstall, command shim, binary equality and declined onboarding/sign-in passed. The fixture traps confirmed no native provider CLI ran. Receipt: `.arun/package-smoke-4mUNpH/receipt.json`. Global installation then exited successfully, and its executable hash was checked separately.
+- Twelve npm unit tests passed. These checks cover this Windows build and local installation; they do not certify a new public npm release or Linux builds.
+
+Open a new `aegis` session to load the rebuilt executable. An already running process retains its loaded image.
+
 ## Further ideas
 
 Detailed transcript search, a visible steering queue, theme selection and syntax-aware code coloring need their own design and acceptance checks. Current code block formatting and diff colors should not be described as a complete syntax highlighter or transcript browser.

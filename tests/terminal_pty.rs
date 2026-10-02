@@ -44,6 +44,13 @@ struct Pty {
 
 impl Pty {
     fn start(workspace: &std::path::Path, width: usize, height: usize) -> Result<Self> {
+        let binary = std::env::var_os("AEGIS_PTY_BINARY")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_arun").into());
+        ensure!(
+            binary.is_absolute() && binary.is_file(),
+            "terminal test binary must be an existing absolute path"
+        );
         unsafe {
             let mut input_read = null_mut();
             let mut input_write = null_mut();
@@ -142,8 +149,8 @@ impl Pty {
                 startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
                 startup.lpAttributeList = attribute_list;
                 let mut process: PROCESS_INFORMATION = zeroed();
-                let executable = wide(env!("CARGO_BIN_EXE_arun"));
-                let mut command = wide(format!("\"{}\"", env!("CARGO_BIN_EXE_arun")));
+                let executable = wide(&binary);
+                let mut command = wide(format!("\"{}\"", binary.display()));
                 let cwd = wide(workspace);
                 // Test colors independently of the invoking shell's NO_COLOR.
                 // This environment belongs only to the hidden child process.
