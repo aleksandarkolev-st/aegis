@@ -48,6 +48,10 @@ The subsequent library regression gate passed 377 tests with three hosted-only c
 
 ## Installed Windows package
 
+Final audit on 2026-10-02: the current optimized runtime, bundled executable and global installation match SHA-256 `eb9e652ffc7f0530e064f2ea59fd3aa01880587dd8f2ab1d70fa046c133c1773`. The current library gate passed 393 tests, with three hosted-only cases explicitly ignored. The setup, control-surface, token accounting and installed ConPTY targets passed 12 tests. The terminal follower check now submits an actual message with Enter and verifies it is queued on the original task, then exercises output during its slash picker, interruption, and completion during a new draft.
+
+The installed executable also completed a fresh GPT-6.1-sol/high streaming task: both durable output and foreground display appeared before process success; exactly one marker command succeeded; the full artifact retained all 70,033 bytes. Receipt: `.arun/hosted-output-live-OxFK71/receipt.json`. Private package receipt: `.arun/package-smoke-o0t4ZE/receipt.json`. The workspace profile selects GPT-6.1-sol/high and contains no aggregate token/action cap fields. The records below describe earlier verified builds.
+
 The optimized Windows runtime was rebuilt and installed globally from the verified local npm tarball. `aegis.cmd --version` reports `aegis 0.1.0`. Its installed executable matches the release and packaged SHA-256 `3186b1ee3b6e2b2f6eeb3aae493d7914c1121fb3651ff7c7de734d75e9d13c1c`.
 
 - The three ConPTY tests passed again with `AEGIS_PTY_BINARY` pointing to the installed executable, including actual distinct foreground color roles, a current UTC clock, elapsed time and the persisted completion timestamp.
@@ -64,7 +68,7 @@ Open a new `aegis` session to load the rebuilt executable. An already running pr
 | --- | --- |
 | Visible tool/action output during work | Hosted release check observes both the event and printed marker before command success; full output artifact is checked separately |
 | Overflow wraps and pasted text stays intact | Installed ConPTY tests exercise Unicode paste, explicit lines, long-word wrapping, native and raw VT input, and no submission before Enter |
-| Steer and interrupt while work continues | Installed follower test renders new output during typing and its slash picker, then checks the durable operation interruption request; hosted parser check pauses and resumes real inference |
+| Steer and interrupt while work continues | Installed follower test submits steering to the existing task, renders output during typing and its slash picker, and checks the targeted durable interruption request; kernel tests verify pending messages enter model context; hosted parser check pauses and resumes real inference |
 | Fullscreen/resize responds | Actual pseudo-console width and height changes reflow the composer and picker; library cases cover height-only changes and clearing old rows |
 | More colors | Installed child runs with colors enabled and emits at least three distinct foreground palette roles; diff/code formatting tests check intended row styles |
 | Worked time, current time and completion time | Installed follower screen contains current UTC time and elapsed work time; completion displays the timestamp recorded in the durable event and elapsed time |
