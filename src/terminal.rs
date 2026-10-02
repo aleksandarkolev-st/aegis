@@ -66,6 +66,27 @@ pub enum Tone {
     Warning,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TranscriptStyle {
+    Plain,
+    Code,
+    DiffHeader,
+    DiffAdded,
+    DiffRemoved,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TranscriptRow {
+    text: String,
+    style: TranscriptStyle,
+}
+
+#[derive(Clone, Copy)]
+enum TranscriptMode {
+    Literal,
+    Markdown,
+}
+
 pub struct Terminal {
     pub interactive: bool,
     colors: bool,
@@ -1071,6 +1092,9 @@ impl Terminal {
     }
 
     pub fn message(&self, tone: Tone, label: &str, text: &str) -> Result<()> {
+        if !matches!(tone, Tone::Warning) && has_code_fence(text) {
+            return self.transcript(tone, label, text, TranscriptMode::Markdown);
+        }
         self.invalidate_home_snapshot();
         let mut output = io::stdout();
         let width = terminal::size()
@@ -1108,6 +1132,57 @@ impl Terminal {
             queue!(output, SetForegroundColor(self.color(tone)))?;
         }
         write!(output, "  {text}\r\n")?;
+        if self.colors {
+            queue!(output, ResetColor)?;
+        }
+        output.flush()?;
+        Ok(())
+    }
+
+    fn transcript(&self, tone: Tone, label: &str, text: &str, mode: TranscriptMode) -> Result<()> {
+        self.invalidate_home_snapshot();
+        let columns = TerminalSize::current().columns.saturating_sub(1).max(1);
+        let heading = if self.interactive {
+            fit_graphemes(&clean(label), columns.saturating_sub(2))
+        } else {
+            clean(label)
+        };
+        let mut output = io::stdout();
+        if self.colors {
+            queue!(
+                output,
+                SetForegroundColor(self.color(tone)),
+                SetAttribute(Attribute::Bold)
+            )?;
+        }
+        write!(output, "  {heading}\r\n")?;
+        if self.colors {
+            queue!(output, SetAttribute(Attribute::Reset), ResetColor)?;
+        }
+        // Explicit gutters distinguish tool output from Aegis prose. Keep the
+        // content literal so indentation and spaces in code survive wrapping.
+        let gutter = if columns >= 8 { "    │ " } else { "" };
+        let content_width = if self.interactive {
+            columns.saturating_sub(gutter.width()).max(1)
+        } else {
+            usize::MAX
+        };
+        for row in transcript_rows(text, content_width, mode) {
+            if self.colors {
+                queue!(output, SetForegroundColor(self.color(Tone::Quiet)))?;
+            }
+            write!(output, "{gutter}")?;
+            if self.colors {
+                let row_tone = match row.style {
+                    TranscriptStyle::Plain => tone,
+                    TranscriptStyle::Code | TranscriptStyle::DiffHeader => Tone::Accent,
+                    TranscriptStyle::DiffAdded => Tone::Success,
+                    TranscriptStyle::DiffRemoved => Tone::Warning,
+                };
+                queue!(output, SetForegroundColor(self.color(row_tone)))?;
+            }
+            write!(output, "{}\r\n", row.text)?;
+        }
         if self.colors {
             queue!(output, ResetColor)?;
         }
@@ -2434,9 +2509,12 @@ impl Terminal {
             "capability.search" => {
                 self.message(Tone::Accent, "Discover", &capability_search_text(payload))
             }
-            "artifact.inspected" => {
-                self.message(Tone::Quiet, "Inspect", &artifact_inspection_text(payload))
-            }
+            "artifact.inspected" => self.transcript(
+                Tone::Quiet,
+                "Inspect",
+                &artifact_inspection_text(payload),
+                TranscriptMode::Literal,
+            ),
             "obligation.verified" => self.message(
                 Tone::Success,
                 "Requirement verified",
@@ -2498,7 +2576,7 @@ impl Terminal {
             "operation.output" => {
                 let text = operation_stream_text(payload["text"].as_str().unwrap_or_default());
                 if !text.is_empty() {
-                    self.message(Tone::Quiet, "Output", &text)?;
+                    self.transcript(Tone::Quiet, "Output", &text, TranscriptMode::Literal)?;
                 }
                 if let Some(notice) = operation_stream_notice(payload) {
                     self.message(Tone::Quiet, "Output preview", notice)?;
@@ -2509,7 +2587,7 @@ impl Terminal {
                 let (tone, label, text) = result_summary(payload);
                 self.message(tone, label, &text)?;
                 if let Some((label, preview)) = operation_output_preview(payload) {
-                    self.message(Tone::Quiet, &label, &preview)?;
+                    self.transcript(Tone::Quiet, &label, &preview, TranscriptMode::Literal)?;
                 }
                 Ok(())
             }
@@ -2602,7 +2680,7 @@ impl Terminal {
                         .unwrap_or("Operation needs review"),
                 )?;
                 if let Some((label, preview)) = operation_output_preview(payload) {
-                    self.message(Tone::Quiet, &label, &preview)?;
+                    self.transcript(Tone::Quiet, &label, &preview, TranscriptMode::Literal)?;
                 }
                 Ok(())
             }
@@ -2712,7 +2790,7 @@ pub(crate) fn operation_output_preview(payload: &serde_json::Value) -> Option<(S
     const MAX_DISPLAY_CHARACTERS: usize = 2400;
     let preview = &payload["detail"]["output_preview"];
     let preview_text = |value: &serde_json::Value| {
-        let mut text = clean(value["text"].as_str().unwrap_or_default());
+        let mut text = normalize_paste(value["text"].as_str().unwrap_or_default());
         if value["truncated"] == true {
             text.push_str("\n…");
         }
@@ -2795,7 +2873,118 @@ pub(crate) fn operation_output_preview(payload: &serde_json::Value) -> Option<(S
 }
 
 fn operation_stream_text(text: &str) -> String {
-    clean(&strip_terminal_sequences(text))
+    normalize_paste(text)
+}
+
+fn code_fence(line: &str) -> Option<(char, usize, &str)> {
+    let indentation = line
+        .chars()
+        .take_while(|character| *character == ' ')
+        .count();
+    if indentation > 3 {
+        return None;
+    }
+    let line = &line[indentation..];
+    let marker = line.chars().next()?;
+    if !matches!(marker, '`' | '~') {
+        return None;
+    }
+    let count = line
+        .chars()
+        .take_while(|character| *character == marker)
+        .count();
+    (count >= 3).then(|| (marker, count, line[count..].trim()))
+}
+
+fn has_code_fence(text: &str) -> bool {
+    text.lines().any(|line| code_fence(line).is_some())
+}
+
+fn transcript_rows(text: &str, width: usize, mode: TranscriptMode) -> Vec<TranscriptRow> {
+    let text = normalize_paste(text);
+    let is_diff = text.lines().any(|line| {
+        line.starts_with("diff --git ") || (line.starts_with("@@ ") && line.contains(" @@"))
+    });
+    let mut fence: Option<(char, usize, bool)> = None;
+    let mut rows = Vec::new();
+    for line in text.split_terminator('\n') {
+        let mut style = if fence.is_some() {
+            TranscriptStyle::Code
+        } else {
+            TranscriptStyle::Plain
+        };
+        let mut fence_line = false;
+        if matches!(mode, TranscriptMode::Markdown) {
+            if let Some((marker, length, info)) = code_fence(line) {
+                if let Some((open_marker, open_length, _)) = fence {
+                    if marker == open_marker && length >= open_length && info.is_empty() {
+                        fence = None;
+                        fence_line = true;
+                    }
+                } else {
+                    fence = Some((marker, length, matches!(info, "diff" | "patch")));
+                    fence_line = true;
+                }
+            }
+        }
+        if fence_line {
+            style = TranscriptStyle::DiffHeader;
+        } else if fence.is_some_and(|(_, _, diff)| diff)
+            || (is_diff && matches!(mode, TranscriptMode::Literal))
+        {
+            style = if line.starts_with("diff ")
+                || line.starts_with("index ")
+                || line.starts_with("@@")
+                || line.starts_with("--- ")
+                || line.starts_with("+++ ")
+            {
+                TranscriptStyle::DiffHeader
+            } else if line.starts_with('+') {
+                TranscriptStyle::DiffAdded
+            } else if line.starts_with('-') {
+                TranscriptStyle::DiffRemoved
+            } else {
+                TranscriptStyle::Code
+            };
+        }
+        let fragments = if matches!(mode, TranscriptMode::Markdown)
+            && matches!(style, TranscriptStyle::Plain)
+        {
+            wrap_text(line, width, width)
+        } else {
+            wrap_literal_line(line, width)
+        };
+        rows.extend(
+            fragments
+                .into_iter()
+                .map(|text| TranscriptRow { text, style }),
+        );
+    }
+    rows
+}
+
+fn wrap_literal_line(line: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = vec![String::new()];
+    let mut occupied = 0;
+    for grapheme in line.graphemes(true) {
+        let size = grapheme.width();
+        if size > width {
+            if occupied == width {
+                rows.push(String::new());
+            }
+            rows.last_mut().unwrap().push('?');
+            occupied = rows.last().unwrap().width();
+            continue;
+        }
+        if occupied + size > width {
+            rows.push(String::new());
+            occupied = 0;
+        }
+        rows.last_mut().unwrap().push_str(grapheme);
+        occupied += size;
+    }
+    rows
 }
 
 fn operation_stream_notice(payload: &serde_json::Value) -> Option<&'static str> {
@@ -3161,6 +3350,89 @@ mod tests {
             vec!["first", "", "second"]
         );
         assert_eq!(wrap_text("日", 1, 1), vec!["?"]);
+    }
+
+    #[test]
+    fn tool_transcript_wraps_literal_indentation_spaces_and_graphemes_without_loss() {
+        let line = "    fn 👩🏽‍💻_日本語() { e\u{301}(); }  ";
+        let rows = transcript_rows(line, 12, TranscriptMode::Literal);
+        assert_eq!(
+            rows.iter().map(|row| row.text.as_str()).collect::<String>(),
+            line
+        );
+        assert!(rows.iter().all(|row| row.text.width() <= 12));
+        assert!(rows.iter().any(|row| row.text.contains("👩🏽‍💻")));
+        assert_eq!(wrap_literal_line("日", 1), vec!["?"]);
+        assert_eq!(wrap_literal_line("", 1), vec![""]);
+        let terminated = transcript_rows("first\n\n", 12, TranscriptMode::Literal);
+        assert_eq!(
+            terminated
+                .iter()
+                .map(|row| row.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", ""]
+        );
+    }
+
+    #[test]
+    fn markdown_transcript_preserves_code_and_closes_only_matching_fences() {
+        let rows = transcript_rows(
+            "A short intro\n````rust\n\tlet value = \"日本語\";  \n```\n````\nEnd",
+            80,
+            TranscriptMode::Markdown,
+        );
+        assert_eq!(rows[0].style, TranscriptStyle::Plain);
+        assert_eq!(rows[1].style, TranscriptStyle::DiffHeader);
+        assert_eq!(rows[2].text, "    let value = \"日本語\";  ");
+        assert_eq!(rows[2].style, TranscriptStyle::Code);
+        assert_eq!(rows[3].style, TranscriptStyle::Code);
+        assert_eq!(rows[4].style, TranscriptStyle::DiffHeader);
+        assert_eq!(rows[5].style, TranscriptStyle::Plain);
+        assert!(!has_code_fence("    ```rust"));
+        assert!(has_code_fence("  ~~~python"));
+        assert_eq!(
+            transcript_rows("```rust", 80, TranscriptMode::Literal)[0].style,
+            TranscriptStyle::Plain
+        );
+    }
+
+    #[test]
+    fn unified_diff_transcript_colors_headers_and_changes_without_coloring_negative_logs() {
+        let rows = transcript_rows(
+            "diff --git a/main.rs b/main.rs\n--- a/main.rs\n+++ b/main.rs\n@@ -1 +1 @@\n-old\n+new\n context",
+            80,
+            TranscriptMode::Literal,
+        );
+        assert!(
+            rows[..4]
+                .iter()
+                .all(|row| row.style == TranscriptStyle::DiffHeader)
+        );
+        assert_eq!(rows[4].style, TranscriptStyle::DiffRemoved);
+        assert_eq!(rows[5].style, TranscriptStyle::DiffAdded);
+        assert_eq!(rows[6].style, TranscriptStyle::Code);
+        let log = transcript_rows("-123\n+ready", 80, TranscriptMode::Literal);
+        assert!(log.iter().all(|row| row.style == TranscriptStyle::Plain));
+        let fenced = transcript_rows(
+            "~~~diff\n-before\n+after\n~~~\n- prose",
+            80,
+            TranscriptMode::Markdown,
+        );
+        assert_eq!(fenced[1].style, TranscriptStyle::DiffRemoved);
+        assert_eq!(fenced[2].style, TranscriptStyle::DiffAdded);
+        assert_eq!(fenced[4].style, TranscriptStyle::Plain);
+    }
+
+    #[test]
+    fn transcript_preview_expands_tabs_and_strips_complete_terminal_sequences() {
+        let payload = serde_json::json!({"detail":{"output_preview":{"kind":"text","source":"file","preview":{"text":"\tlet x = 1;\u{1b}[2J\r\n\u{202e}safe"}}}});
+        let (_, preview) = operation_output_preview(&payload).unwrap();
+        assert_eq!(preview, "    let x = 1;\nsafe");
+        let rows = transcript_rows(&preview, 80, TranscriptMode::Literal);
+        assert_eq!(
+            rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
+            vec!["    let x = 1;", "safe"]
+        );
     }
 
     #[test]
