@@ -144,6 +144,9 @@ pub(crate) fn append_event(
     } else {
         0
     };
+    let estimated = if payload["usage"]["source"] == "estimated" { tokens }else{0};
+    let unclassified = if tokens>0 && payload["usage"]["source"] != "estimated" && payload["usage"]["source"] != "provider" { tokens }else{0};
+    transaction.execute("INSERT INTO usage_source_projection(run_id,estimated_tokens,unclassified_tokens) VALUES (?1,?2,?3) ON CONFLICT(run_id) DO UPDATE SET estimated_tokens=MIN(9223372036854775807,estimated_tokens+excluded.estimated_tokens),unclassified_tokens=MIN(9223372036854775807,unclassified_tokens+excluded.unclassified_tokens)",params![run_id,estimated,unclassified])?;
     transaction.execute("UPDATE run_projection SET last_seq = last_seq + 1,
         model_tokens = MIN(9223372036854775807, model_tokens + ?2),
         started_at = CASE WHEN ?3 = 'run.running' THEN COALESCE(started_at, ?4) ELSE started_at END,
@@ -156,6 +159,7 @@ pub(crate) fn append_event(
         ON CONFLICT(run_id, kind) DO UPDATE SET count = count + 1",
         params![run_id, kind],
     )?;
+    crate::questions::track_state(transaction, run_id, kind, &payload)?;
     Ok(())
 }
 
@@ -287,24 +291,20 @@ fn validate_completed_milestone_evidence(
     run_id: &str,
     milestones: &[Milestone],
 ) -> Result<()> {
-    let revision: Option<i64> = connection
-        .query_row(
-            "SELECT revision FROM workspace_revisions WHERE run_id = ?1",
-            [run_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(revision) = revision else {
-        return Ok(());
-    };
     for milestone in milestones.iter().filter(|item| item.state == "completed") {
         if milestone.evidence.is_empty() {
             bail!("completed milestone requires evidence");
         }
         for hash in &milestone.evidence {
-            if !crate::obligations::current_evidence(connection, run_id, revision, hash)? {
+            let successful: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM operations AS operation WHERE operation.run_id = ?1 AND operation.state = 'succeeded' AND (operation.artifact = ?2 OR EXISTS (SELECT 1 FROM operation_artifacts AS linked WHERE linked.operation_id = operation.id AND linked.hash = ?2)))",
+                params![run_id, hash],
+                |row| row.get(0),
+            )?;
+            if !successful {
                 bail!(
-                    "completed milestone evidence is no longer successful and current for this run"
+                    "completed milestone {:?} requires successful operation evidence from this run: {hash}",
+                    milestone.title
                 );
             }
         }
@@ -502,6 +502,7 @@ impl Store {
                 COMMIT;",
             )?;
         }
+        crate::questions::ensure_schema(&connection)?;
         let store = Self {
             connection,
             artifacts,
@@ -576,7 +577,46 @@ impl Store {
         store.connection.execute_batch("CREATE TABLE IF NOT EXISTS pause_requests (run_id TEXT PRIMARY KEY REFERENCES runs(id), pending INTEGER NOT NULL)")?;
         store.connection.execute_batch("CREATE TABLE IF NOT EXISTS observed_files (run_id TEXT NOT NULL REFERENCES runs(id), path TEXT NOT NULL, hash TEXT NOT NULL, PRIMARY KEY(run_id,path))")?;
         store.connection.execute_batch("CREATE TABLE IF NOT EXISTS workspace_fingerprints (run_id TEXT PRIMARY KEY REFERENCES runs(id), fingerprint TEXT NOT NULL, revision INTEGER NOT NULL)")?;
+        store.restore_usage_sources()?;
+        crate::questions::restore_waits(&store)?;
         Ok(store)
+    }
+
+    fn restore_usage_sources(&self) -> Result<()> {
+        self.connection.execute_batch("CREATE TABLE IF NOT EXISTS usage_source_projection (run_id TEXT PRIMARY KEY REFERENCES runs(id),estimated_tokens INTEGER NOT NULL DEFAULT 0,unclassified_tokens INTEGER NOT NULL DEFAULT 0)")?;
+        let missing: bool=self.connection.query_row("SELECT EXISTS(SELECT 1 FROM runs WHERE id NOT IN (SELECT run_id FROM usage_source_projection))",[],|row|row.get(0))?;
+        if !missing { return Ok(()); }
+        let ids=self.connection.prepare("SELECT id FROM runs WHERE id NOT IN (SELECT run_id FROM usage_source_projection)")?.query_map([],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        for id in ids {
+          loop {
+            // events() opens its own consistent replay transaction, including archives.
+            let events=self.events(&id)?;
+            let observed_sequence=events.last().map(|event|event.seq).unwrap_or(0);
+            let mut estimated=0_u64;
+            let mut unclassified=0_u64;
+            for event in events.iter().filter(|event|matches!(event.kind.as_str(),"model.response"|"model.failed")) {
+                let tokens=event.payload["usage"]["input_tokens"].as_u64().unwrap_or(0).saturating_add(event.payload["usage"]["output_tokens"].as_u64().unwrap_or(0));
+                match event.payload["usage"]["source"].as_str() {
+                    Some("provider")=>{},
+                    Some("estimated")=>estimated=estimated.saturating_add(tokens).min(i64::MAX as u64),
+                    _=>unclassified=unclassified.saturating_add(tokens).min(i64::MAX as u64),
+                }
+            }
+            let transaction=rusqlite::Transaction::new_unchecked(&self.connection,TransactionBehavior::Immediate)?;
+            let restored:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM usage_source_projection WHERE run_id=?1)",[&id],|row|row.get(0))?;
+            if restored { break; }
+            let current_sequence:i64=transaction.query_row("SELECT last_seq FROM run_projection WHERE run_id=?1",[&id],|row|row.get(0))?;
+            if current_sequence!=observed_sequence {continue;}
+            transaction.execute("INSERT INTO usage_source_projection(run_id,estimated_tokens,unclassified_tokens) VALUES (?1,?2,?3)",params![id,estimated as i64,unclassified as i64])?;
+            transaction.commit()?;
+            break;
+          }
+        }
+        Ok(())
+    }
+
+    pub fn usage_source_tokens(&self, id: &str) -> Result<(u64,u64)> {
+        Ok(self.connection.query_row("SELECT COALESCE((SELECT estimated_tokens FROM usage_source_projection WHERE run_id=?1),0),COALESCE((SELECT unclassified_tokens FROM usage_source_projection WHERE run_id=?1),0)",[id],|row|Ok((row.get(0)?,row.get(1)?)))?)
     }
 
     pub fn create_run(
@@ -800,7 +840,7 @@ impl Store {
 
     pub fn recent_context_events(&self, run_id: &str, limit: i64) -> Result<Vec<Event>> {
         let mut statement = self.connection.prepare(
-            "SELECT seq, kind, payload, created_at FROM events WHERE run_id = ?1 AND kind NOT IN ('model.started','operation.dispatched','operation.executing','operation.output') ORDER BY seq DESC LIMIT ?2",
+            "SELECT seq, kind, payload, created_at FROM events WHERE run_id = ?1 AND kind NOT IN ('model.started','model.activity','operation.dispatched','operation.executing','operation.output') ORDER BY seq DESC LIMIT ?2",
         )?;
         let rows = statement.query_map(params![run_id, limit.max(0)], |row| {
             let payload: String = row.get(2)?;
@@ -1191,6 +1231,27 @@ impl Store {
         Ok(hash)
     }
 
+    pub(crate) fn plan_checkpoint_required(&self, run_id: &str) -> Result<bool> {
+        let milestones = self.milestones(run_id)?;
+        if milestones.is_empty() || (milestones.len() == 1 && milestones[0].title == "Task request")
+        {
+            return Ok(false);
+        }
+        if milestones
+            .iter()
+            .any(|milestone| milestone.state != "completed" || milestone.evidence.is_empty())
+        {
+            return Ok(true);
+        }
+        if validate_completed_milestone_evidence(&self.connection, run_id, &milestones).is_err() {
+            return Ok(true);
+        }
+        Ok(
+            validate_completed_milestone_artifacts(&self.connection, &self.artifacts, &milestones)
+                .is_err(),
+        )
+    }
+
     pub fn validate_completion(&self, run_id: &str, evidence: &[String]) -> Result<()> {
         self.validate_completion_except_operation(run_id, evidence, None)
     }
@@ -1202,6 +1263,7 @@ impl Store {
         allowed_operation: Option<&str>,
     ) -> Result<()> {
         crate::obligations::ensure_reviewed_contract(&self.connection, run_id)?;
+        crate::questions::validate_resolved(&self.connection, run_id)?;
         self.check_observed_files(run_id)?;
         if crate::obligations::workspace_mutation_in_flight(&self.connection, run_id)? {
             bail!("completion waits for mutating operations in the shared workspace");
@@ -1257,6 +1319,7 @@ impl Store {
                 row.get(0)
             })?;
         crate::obligations::ensure_reviewed_contract(&transaction, run_id)?;
+        crate::questions::validate_resolved(&transaction, run_id)?;
         let operations: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM operations WHERE run_id = ?1",
             [run_id],
@@ -1375,6 +1438,7 @@ impl Store {
             bail!("workspace mutation started before completion could be committed");
         }
         crate::obligations::validate_connection(&transaction, run_id)?;
+        crate::questions::validate_resolved(&transaction, run_id)?;
         crate::obligations::validate_finish_evidence(&transaction, run_id, evidence)?;
         let mut milestones = {
             let mut statement = transaction.prepare(
@@ -2828,7 +2892,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_milestones_require_current_evidence_at_save_and_completion() -> Result<()> {
+    fn historical_progress_survives_edits_but_final_evidence_must_be_current() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let mut store = Store::open(directory.path())?;
         let run = store.create_run(
@@ -2845,18 +2909,19 @@ mod tests {
         let old_evidence = store.put_artifact(b"revision zero proof")?;
         claim_test_operation(&mut store, &initial_read)?;
         store.operation_state(&initial_read, "succeeded", Some(&old_evidence), json!({}))?;
-        let mut checkpoint = Handoff {
+        let checkpoint = Handoff {
             decisions: vec![],
             unresolved: vec![],
             next_action: "finish repair".into(),
             milestones: vec![Milestone {
-                title: "Repair is verified".into(),
+                title: "Inspected original code".into(),
                 state: "completed".into(),
                 evidence: vec![old_evidence.clone()],
             }],
         };
         store.save_checkpoint(&run.id, &checkpoint)?;
         assert_eq!(store.workspace_revision(&run.id)?, Some(0));
+        assert!(!store.plan_checkpoint_required(&run.id)?);
 
         let mutation = store.begin_operation(&run.id, "workspace.write", json!({}), true)?;
         store.operation_state(&mutation, "dispatched", None, json!({}))?;
@@ -2864,6 +2929,7 @@ mod tests {
         let mutation_receipt = store.put_artifact(b"workspace changed")?;
         store.operation_state(&mutation, "succeeded", Some(&mutation_receipt), json!({}))?;
         assert_eq!(store.workspace_revision(&run.id)?, Some(2));
+        assert!(!store.plan_checkpoint_required(&run.id)?);
 
         let final_read = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
         let unrelated_fresh_evidence = store.put_artifact(b"unrelated fresh proof")?;
@@ -2875,23 +2941,77 @@ mod tests {
             json!({}),
         )?;
         assert_ne!(old_evidence, unrelated_fresh_evidence);
+        store.save_checkpoint(&run.id, &checkpoint)?;
         assert!(
             store
-                .validate_completion(&run.id, &[unrelated_fresh_evidence.clone()])
+                .validate_completion(&run.id, &[old_evidence.clone()])
                 .is_err()
         );
-        assert!(store.save_checkpoint(&run.id, &checkpoint).is_err());
         assert!(
             store
-                .complete_run(&run.id, "done", &[unrelated_fresh_evidence.clone()])
+                .complete_run(
+                    &run.id,
+                    "done",
+                    &[old_evidence.clone(), unrelated_fresh_evidence.clone()]
+                )
                 .is_err()
         );
         assert_eq!(store.run(&run.id)?.state, "running");
-
-        checkpoint.milestones[0].evidence = vec![unrelated_fresh_evidence.clone()];
-        store.save_checkpoint(&run.id, &checkpoint)?;
+        drop(store);
+        let mut store = Store::open(directory.path())?;
+        assert_eq!(store.last_checkpoint(&run.id)?, Some(checkpoint));
+        assert!(!store.plan_checkpoint_required(&run.id)?);
+        store.validate_completion(&run.id, &[unrelated_fresh_evidence.clone()])?;
         store.complete_run(&run.id, "done", &[unrelated_fresh_evidence])?;
         assert_eq!(store.run(&run.id)?.state, "completed");
+        Ok(())
+    }
+
+    #[test]
+    fn historical_progress_rechecks_success_and_run_ownership() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run("work", directory.path(), "custom", json!([]), json!({}), "")?;
+        let other = store.create_run(
+            "other",
+            directory.path(),
+            "custom",
+            json!([]),
+            json!({}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        store.state(&other.id, "running", json!({}))?;
+        let operation = store.begin_operation(&run.id, "workspace.read", json!({}), true)?;
+        let proof = store.put_artifact(b"past result")?;
+        claim_test_operation(&mut store, &operation)?;
+        store.operation_state(&operation, "succeeded", Some(&proof), json!({}))?;
+        let checkpoint = Handoff {
+            decisions: vec![],
+            unresolved: vec![],
+            next_action: "finish".into(),
+            milestones: vec![Milestone {
+                title: "Inspected".into(),
+                state: "completed".into(),
+                evidence: vec![proof],
+            }],
+        };
+        assert!(store.save_checkpoint(&other.id, &checkpoint).is_err());
+        store.save_checkpoint(&run.id, &checkpoint)?;
+        store.connection.execute(
+            "UPDATE operations SET state = 'failed' WHERE id = ?1",
+            [&operation.id],
+        )?;
+        assert!(store.plan_checkpoint_required(&run.id)?);
+        assert!(store.save_checkpoint(&run.id, &checkpoint).is_err());
+        assert!(
+            validate_completed_milestone_evidence(
+                &store.connection,
+                &run.id,
+                &checkpoint.milestones
+            )
+            .is_err()
+        );
         Ok(())
     }
 

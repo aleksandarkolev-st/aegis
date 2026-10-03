@@ -15,6 +15,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/provider", "Inspect the current task's provider"),
     ("/provider history", "Inspect provider transitions"),
     ("/budget", "Inspect usage and task time"),
+    ("/metrics", "Tokens, verification and efficiency"),
     ("/handoff", "Inspect the next model's continuation state"),
     ("/pause", "Pause the selected task safely"),
     ("/resume", "Resume the selected saved task"),

@@ -5,13 +5,146 @@ use arun::storage::Store;
 use serde_json::json;
 use std::{path::PathBuf, process::Command};
 
+#[path = "support/http.rs"]
+mod http;
+
+fn native_runtime() -> (String, PathBuf) {
+    let binary = std::env::var("AEGIS_WINDOWS_HOST_BINARY")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_arun").into());
+    let script = std::env::var_os("AEGIS_WINDOWS_HOST_SCRIPT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/windows-host.mjs")
+        });
+    (binary, script)
+}
+
+#[test]
+fn native_powershell_output_is_saved_and_displayed_before_completion() -> Result<()> {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::{Duration, Instant};
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join(".arun");
+    let (binary, script) = native_runtime();
+    let registered = Command::new(&binary)
+        .args(["mcp", "add", "windows-host", "--trusted-host", "node"])
+        .arg(script)
+        .arg("--trusted-host")
+        .current_dir(directory.path())
+        .output()?;
+    assert!(
+        registered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&registered.stderr)
+    );
+    let requests = Arc::new(AtomicUsize::new(0));
+    let observed = requests.clone();
+    let endpoint = http::Endpoint::start(move |body| {
+        let state = http::state(body)?;
+        let action = match observed.fetch_add(1, Ordering::SeqCst) {
+            0 => json!({"kind":"invoke","capability":"mcp.windows-host.powershell","args":{
+                "script":"[Console]::WriteLine(('NATIVE_' + 'LIVE_Київ_🦀')); $end = [DateTime]::UtcNow.AddSeconds(12); while (!(Test-Path 'release.txt')) { if ([DateTime]::UtcNow -gt $end) { throw 'Fixture release deadline' }; Start-Sleep -Milliseconds 25 }; [Console]::WriteLine('RELEASED')",
+                "timeout_seconds":15}}),
+            1 => {
+                json!({"kind":"finish","summary":"Native output verified","evidence":[state["recent_operation_outcomes"][0]["artifact"]]})
+            }
+            _ => anyhow::bail!("unexpected additional model request"),
+        };
+        Ok((
+            200,
+            json!({"choices":[{"message":{"content":action.to_string()}}],"usage":{"prompt_tokens":10,"completion_tokens":2}}),
+        ))
+    })?;
+    let display = directory.path().join("foreground.log");
+    let file = std::fs::File::create(&display)?;
+    let mut command = Command::new(&binary);
+    command
+        .current_dir(directory.path())
+        .args([
+            "run",
+            "Show native output while execution continues",
+            "--provider",
+            "custom",
+            "--endpoint",
+            &endpoint.url,
+            "--model",
+            "fixture",
+            "--mode",
+            "eager",
+            "--allow-write",
+            "--allow-mcp",
+            "windows-host:powershell",
+            "--foreground",
+        ])
+        .stdout(file.try_clone()?)
+        .stderr(file);
+    let mut child = arun::process::spawn(command)?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let marker = "NATIVE_LIVE_Київ_🦀";
+    loop {
+        if let Ok(store) = Store::open(&root) {
+            if let Some(run) = store.runs()?.first() {
+                let saved = store.events(&run.id)?.iter().any(|event| {
+                    event.kind == "operation.output"
+                        && event.payload["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains(marker))
+                });
+                let shown = std::fs::read_to_string(&display)?.contains(marker);
+                if saved && shown {
+                    assert!(
+                        child.try_wait()?.is_none(),
+                        "command exited before live output was observed"
+                    );
+                    let operations = store.operations(&run.id)?;
+                    assert_eq!(operations.len(), 1);
+                    assert!(
+                        operations[0].artifact.is_none(),
+                        "live preview must precede completed evidence"
+                    );
+                    break;
+                }
+            }
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline && child.try_wait()?.is_none(),
+            "native live output missing: {}",
+            std::fs::read_to_string(&display)?
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    std::fs::write(directory.path().join("release.txt"), "release")?;
+    while child.try_wait()?.is_none() {
+        anyhow::ensure!(
+            Instant::now() < deadline + Duration::from_secs(10),
+            "foreground failed to finish"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        child.wait()?.success(),
+        "{}",
+        std::fs::read_to_string(&display)?
+    );
+    endpoint.finish()?;
+    let store = Store::open(&root)?;
+    let run = store.runs()?.remove(0);
+    assert_eq!(run.state, "completed");
+    assert_eq!(store.operations(&run.id)?.len(), 1);
+    assert_eq!(store.model_tokens(&run.id)?, 24);
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    Ok(())
+}
+
 #[test]
 fn actual_aegis_worker_executes_only_the_frozen_windows_host_grant() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let root = directory.path().join(".arun");
-    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/windows-host.mjs");
-    let binary = env!("CARGO_BIN_EXE_arun");
-    let registration = Command::new(binary)
+    let (binary, script) = native_runtime();
+    let registration = Command::new(&binary)
         .args(["mcp", "add", "windows-host", "--trusted-host", "node"])
         .arg(&script)
         .arg("--trusted-host")
@@ -37,7 +170,7 @@ fn actual_aegis_worker_executes_only_the_frozen_windows_host_grant() -> Result<(
     let operation = store.begin_operation_versioned(&run.id, "mcp.windows-host.powershell", tool.version,
         json!({"script":"[IO.File]::WriteAllText((Join-Path (Get-Location).Path 'worker-proof.txt'), 'trusted worker ✓', [Text.UTF8Encoding]::new($false)); [Console]::WriteLine('HOST_WORKER_OK')"}), false)?;
     store.operation_state(&operation, "dispatched", None, json!({}))?;
-    let execution = Command::new(binary)
+    let execution = Command::new(&binary)
         .arg("worker")
         .arg(&root)
         .arg(&operation.id)
@@ -68,7 +201,7 @@ fn actual_aegis_worker_executes_only_the_frozen_windows_host_grant() -> Result<(
     let denied = store.begin_operation_versioned(&ungranted.id, "mcp.windows-host.powershell", tool.version,
         json!({"script":"[IO.File]::WriteAllText((Join-Path (Get-Location).Path 'ungranted.txt'), 'forbidden')"}), false)?;
     store.operation_state(&denied, "dispatched", None, json!({}))?;
-    let denial = Command::new(binary)
+    let denial = Command::new(&binary)
         .arg("worker")
         .arg(&root)
         .arg(&denied.id)
@@ -92,7 +225,7 @@ fn actual_aegis_worker_executes_only_the_frozen_windows_host_grant() -> Result<(
         json!({"script":"Start-Sleep -Seconds 31; [Console]::WriteLine('LONG_HOST_COMMAND_OK')","timeout_seconds":40}), false,
     )?;
     store.operation_state(&slow, "dispatched", None, json!({}))?;
-    let result = Command::new(binary)
+    let result = Command::new(&binary)
         .arg("worker")
         .arg(&root)
         .arg(&slow.id)

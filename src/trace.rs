@@ -8,6 +8,7 @@ pub struct Metrics {
     pub model_turns: usize,
     pub failed_model_turns: usize,
     pub unaccounted_model_attempts: usize,
+    pub not_dispatched_model_attempts: usize,
     pub model_tokens: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -117,6 +118,8 @@ pub fn metrics(events: &[Event]) -> Metrics {
                 let input = event.payload["usage"]["input_tokens"].as_u64();
                 let output = event.payload["usage"]["output_tokens"].as_u64();
                 accounted_failures += usize::from(input.is_some() && output.is_some());
+                summary.not_dispatched_model_attempts += usize::from(
+                    input.is_none() && output.is_none() && event.payload["request_dispatched"] == false);
                 summary.input_tokens = summary.input_tokens.saturating_add(input.unwrap_or(0));
                 summary.output_tokens = summary.output_tokens.saturating_add(output.unwrap_or(0));
                 summary.cached_input_tokens = summary.cached_input_tokens.saturating_add(
@@ -159,7 +162,7 @@ pub fn metrics(events: &[Event]) -> Metrics {
     }
     summary.unaccounted_model_attempts = summary
         .model_attempts
-        .saturating_sub(summary.model_turns + accounted_failures)
+        .saturating_sub(summary.model_turns + accounted_failures + summary.not_dispatched_model_attempts)
         + missing_response_usage;
     if let (Some(first), Some(last)) = (events.first(), events.last()) {
         summary.wall_seconds = (last.created_at - first.created_at).max(0);

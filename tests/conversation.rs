@@ -65,7 +65,8 @@ fn guided_greeting_and_followup_use_one_request_each_without_file_edits() -> Res
             };
             assert_eq!(body["reasoning_effort"], "low");
             let prompt = body["messages"][0]["content"].as_str().unwrap();
-            assert!(prompt.contains("Never create files"));
+            assert!(prompt.contains("Do not manufacture tool evidence"));
+            assert!(prompt.contains("Use ask_user whenever intent or a decision is unclear"));
             assert!(prompt.contains("REVIEWED REPOSITORY GUIDANCE"));
             assert!(prompt.contains("Keep greeting replies conversational"));
             if turn == 1 {

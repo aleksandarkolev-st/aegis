@@ -21,6 +21,7 @@ Still open: semantic verification beyond artifact provenance; robust extraction 
 ## Obligations
 
 - A run has a durable, ordered obligation ledger separate from model-authored milestones. The original task and approved obligations are immutable contract inputs; checkpoints may replace milestones but cannot delete or rewrite obligations.
+- Milestones preserve past progress backed by intact same-run successful-operation artifacts. For example, inspecting the original code remains a completed plan step after implementation edits. Milestone evidence may therefore be historical; it cannot substitute for current obligation verification or current final completion evidence.
 - Each obligation has a stable ID, title, state (`open`, `verified`, `stale`, or `superseded`), evidence references, the workspace revision at verification, and an audit trail. A replacement retains the predecessor and requires a user-approved reason and new obligation ID. The model has no supersede action.
 - Completion requires every non-superseded obligation to be verified at the current workspace revision, plus the existing successful-operation evidence and any independent acceptance check. A conversational answer remains explicitly unverified and cannot replace started tool work.
 - Verification must bind evidence to the same run and revision. A passing test receipt is not proof of an unrelated semantic claim; configured external acceptance or user review is needed when that distinction matters. The kernel must never label arbitrary operation evidence as semantic proof on its own.

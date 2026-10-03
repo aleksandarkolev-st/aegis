@@ -153,7 +153,7 @@ pub(crate) fn resume(store: &mut Store, root: &Path, run: &Run) -> Result<bool> 
             return Ok(true);
         }
         authorized_check(store, run, &operation)?;
-        kernel::cleanup_container(&operation);
+        kernel::cleanup_container(store, &operation);
         store.event(
             &run.id,
             "acceptance.started",

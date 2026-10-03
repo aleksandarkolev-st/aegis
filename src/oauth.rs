@@ -581,6 +581,14 @@ mod tests {
         provider: Provider,
         replies: Vec<Reply>,
     ) -> Result<(AuthClient, std::thread::JoinHandle<Result<Vec<String>>>)> {
+        fixture_with_on_request(provider, replies, None)
+    }
+
+    fn fixture_with_on_request(
+        provider: Provider,
+        replies: Vec<Reply>,
+        on_request: Option<Box<dyn Fn() -> Result<()> + Send>>,
+    ) -> Result<(AuthClient, std::thread::JoinHandle<Result<Vec<String>>>)> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
         let origin = Url::parse(&format!("http://{}/", listener.local_addr()?))?;
@@ -627,6 +635,9 @@ mod tests {
                     }
                 }
                 requests.push(String::from_utf8(bytes)?);
+                if let Some(on_request) = &on_request {
+                    on_request()?;
+                }
                 std::thread::sleep(response.delay);
                 let header = format!(
                     "HTTP/1.1 {}\r\n{}Connection: close\r\n\r\n",
@@ -921,21 +932,28 @@ mod tests {
             vault.save(&initial)?;
             let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let observer_cancelled = cancelled.clone();
-            let observer = std::thread::spawn(move || -> Result<()> {
-                wait_for_refresh_claim(&Vault::new(root), provider)?;
+            let on_request = Box::new(move || -> Result<()> {
+                // Dispatch happens after the durable claim. Observe it at the
+                // server boundary rather than racing a separate polling thread.
+                assert!(
+                    Vault::new(root.clone())
+                        .load(AuthClient::new(provider)?.name())?
+                        .unwrap()
+                        .refresh_token
+                        .is_none()
+                );
                 observer_cancelled.store(true, std::sync::atomic::Ordering::Release);
                 Ok(())
             });
-            let mut response = reply("200 OK", tokens(provider, "selected-account")?);
-            response.delay = Duration::from_millis(300);
-            let (client, worker) = fixture(provider, vec![response])?;
+            let response = reply("200 OK", tokens(provider, "selected-account")?);
+            let (client, worker) =
+                fixture_with_on_request(provider, vec![response], Some(on_request))?;
             let error = client
                 .credentials(&vault, || {
                     cancelled.load(std::sync::atomic::Ordering::Acquire)
                 })
                 .err()
                 .context("Cancelled refresh must not accept the foreground request")?;
-            observer.join().unwrap()?;
             assert!(error.to_string().contains("safely saved"));
             assert!(!error.to_string().contains("rotated-private-refresh"));
             assert_eq!(

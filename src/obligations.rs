@@ -345,13 +345,14 @@ pub(crate) fn invalidate_workspace(
             "UPDATE workspace_revisions SET revision=?2 WHERE run_id=?1",
             params![id, next],
         )?;
-        transaction.execute(
+        let stale_obligations = transaction.execute(
             "UPDATE obligations SET state='stale' WHERE run_id=?1 AND state='verified'",
             [&id],
         )?;
         let mut payload = detail.clone();
         payload["revision"] = serde_json::json!(next);
         payload["source_run"] = serde_json::json!(source);
+        payload["stale_obligations"] = serde_json::json!(stale_obligations);
         append_event(transaction, &id, "workspace.revision", payload)?;
     }
     Ok(())

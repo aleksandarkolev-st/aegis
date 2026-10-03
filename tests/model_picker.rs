@@ -523,6 +523,7 @@ fn approve_local_fallback(key: Option<&str>) -> Result<()> {
                 Err(error) => return Err(error.into()),
             }
         };
+        stream.set_nonblocking(false)?;
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         let mut request = Vec::new();
         let mut buffer = [0; 1024];

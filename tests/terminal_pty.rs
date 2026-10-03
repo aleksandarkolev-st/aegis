@@ -544,6 +544,13 @@ impl Screen {
                 2 => self.cells[self.row].fill(String::new()),
                 _ => {}
             },
+            'X' => {
+                // ConPTY uses ECH for partial redraws. Ignoring it retains old
+                // footer/draft text and can make a correct composer look corrupt.
+                let start = self.column.min(max_column);
+                let end = start.saturating_add(amount).min(max_column + 1);
+                self.cells[self.row][start..end].fill(String::new());
+            }
             's' => self.saved = (self.row, self.column),
             'u' => (self.row, self.column) = self.saved,
             _ => {}
@@ -574,6 +581,14 @@ impl Screen {
     fn text(&self) -> String {
         self.lines().join("\n")
     }
+}
+
+#[test]
+fn terminal_screen_erases_stale_characters_in_conpty_partial_redraws() {
+    let screen = Screen::decode("OLD_FOOTER\rnew\x1b[7X", (20, 3), &[]);
+    assert_eq!(screen.lines()[0], "new");
+    let screen = Screen::decode("abcd\r\x1b[2C\x1b[X", (20, 3), &[]);
+    assert_eq!(screen.lines()[0], "ab d");
 }
 
 #[test]
@@ -652,7 +667,7 @@ fn actual_windows_terminal_preserves_multiline_drafts_and_resizes_command_picker
     })?;
     terminal.send_key(35, 0, 0)?; // End exposes the last entry of the complete catalog.
     terminal.wait_screen("last slash command is reachable", |screen| {
-        screen.text().contains("Slash commands (39)") && screen.text().contains("/quit")
+        screen.text().contains(&format!("Slash commands ({})", arun::commands::COMMANDS.len())) && screen.text().contains("/quit")
     })?;
     terminal.send_key(36, 0, 0)?;
     terminal.send_keys("reason")?;
@@ -737,6 +752,8 @@ fn actual_windows_follow_keeps_output_live_inside_steering_and_slash_picker() ->
         "",
     )?;
     store.state(&run.id, "running", serde_json::json!({}))?;
+    store.event(&run.id, "model.started", serde_json::json!({}))?;
+    store.event(&run.id, "model.response", serde_json::json!({"usage":{"input_tokens":12000,"output_tokens":345,"cached_input_tokens":0,"source":"provider"},"elapsed_ms":1000}))?;
     let operation = store.begin_operation(
         &run.id,
         "process.run",
@@ -774,6 +791,12 @@ fn actual_windows_follow_keeps_output_live_inside_steering_and_slash_picker() ->
     terminal.wait_screen("active follower", |screen| {
         screen.text().contains("Type/paste to steer")
     })?;
+    terminal.wait_screen(
+        "composer visible before the first typed character",
+        |screen| {
+            screen.text().contains("Steer this task") && screen.text().contains("Type a message")
+        },
+    )?;
     terminal.wait_screen("visible live clock and elapsed time", |screen| {
         use chrono::Timelike;
         screen.lines().iter().any(|line| {
@@ -795,6 +818,31 @@ fn actual_windows_follow_keeps_output_live_inside_steering_and_slash_picker() ->
     terminal.send_keys("x")?;
     terminal.wait_screen("active steering composer", |screen| {
         screen.text().contains("Steer this task")
+    })?;
+    terminal.wait_screen("activity remains visible while composing", |screen| {
+        screen.text().contains("elapsed")
+            && screen.text().contains("UTC")
+            && screen.text().contains("Steer this task")
+    })?;
+    terminal.wait_screen("reported tokens stay visible while composing", |screen| {
+        screen.text().contains("12345t") && screen.text().contains("0/1 verified")
+    })?;
+    store.event(&run.id, "model.started", serde_json::json!({}))?;
+    terminal.wait_screen("in-flight usage is marked pending", |screen| {
+        screen.text().contains("12345t") && screen.text().contains("usage pending")
+    })?;
+    store.event(&run.id, "model.response", serde_json::json!({"usage":{"input_tokens":1000,"output_tokens":655,"cached_input_tokens":500,"source":"provider"},"elapsed_ms":500}))?;
+    terminal.wait_screen("reported tokens update while draft remains open", |screen| {
+        screen.text().contains("14000t") && screen.text().contains("Steer this task")
+    })?;
+    store.event(
+        &run.id,
+        "model.activity",
+        serde_json::json!({"kind":"reasoning_summary","text":"PUBLIC_SUMMARY_WHILE_TYPING"}),
+    )?;
+    terminal.wait_screen("provider summary remains live while typing", |screen| {
+        screen.text().contains("PUBLIC_SUMMARY_WHILE_TYPING")
+            && screen.text().contains("Steer this task")
     })?;
     store.event(
         &run.id,
@@ -833,6 +881,25 @@ fn actual_windows_follow_keeps_output_live_inside_steering_and_slash_picker() ->
     terminal.wait_screen("follower after steering submission", |screen| {
         screen.text().contains("Type/paste to steer")
     })?;
+    store.ask_user(&run.id, "QUESTION_FIXTURE_OUTPUT_FORMAT?")?;
+    terminal.wait_screen(
+        "pending question is visible beside the composer",
+        |screen| {
+            screen
+                .text()
+                .contains("Answer: QUESTION_FIXTURE_OUTPUT_FORMAT?")
+        },
+    )?;
+    terminal.send_keys("JSON_FIXTURE_ANSWER\r")?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !store.pending_questions(&run.id)?.is_empty() {
+        ensure!(
+            Instant::now() < deadline,
+            "Question answer was not saved on the original task"
+        );
+        thread::sleep(Duration::from_millis(30));
+    }
+    ensure!(store.event_count(&run.id, "user.question_answered")? == 1);
     terminal.send_keys("/")?;
     terminal.wait_screen("nested steering slash picker", |screen| {
         screen.text().contains("/goal") && screen.text().contains("/model")
@@ -869,7 +936,7 @@ fn actual_windows_follow_keeps_output_live_inside_steering_and_slash_picker() ->
         serde_json::json!({"summary":"LIVE_TASK_FINISHED"}),
     )?;
     terminal.wait_screen("completion feedback while editing", |screen| {
-        screen.text().contains("LIVE_TASK_FINISHED") && screen.text().contains("Task finished")
+        screen.text().contains("LIVE_TASK_FINISHED") && screen.text().contains("Reply finished")
     })?;
     let finished_at = store
         .events(&run.id)?
@@ -905,7 +972,7 @@ fn actual_windows_follow_keeps_output_live_inside_steering_and_slash_picker() ->
         "terminal input created a second task"
     );
     ensure!(
-        store.event_count(&run.id, "model.started")? == 0,
+        store.event_count(&run.id, "model.started")? == 2,
         "fixture unexpectedly invoked a model"
     );
     Ok(())

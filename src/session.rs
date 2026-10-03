@@ -2290,21 +2290,66 @@ struct FollowProgress {
     task_started_at: Option<i64>,
     phase: String,
     context_status: crate::terminal::ContextStatus,
+    follow_started: Instant,
 }
 
 fn follow_task_is_active(state: &str) -> bool {
     matches!(state, "ready" | "running")
 }
 
+fn follow_end_label(state: &str) -> &'static str {
+    match state {
+        "completed" => "Task completed",
+        "answered" => "Reply finished",
+        "waiting_recovery" => "Task needs recovery",
+        "paused" => "Task paused",
+        "cancelled" => "Task cancelled",
+        "failed" => "Task failed",
+        "blocked" => "Task blocked",
+        _ => "Runner stopped",
+    }
+}
+
 fn poll_follow_update(
+    root: &Path,
     progress: &mut FollowProgress,
     store: &Store,
     id: &str,
     terminal: &Terminal,
 ) -> Result<Option<(Vec<crate::storage::Event>, bool)>> {
     let events = progress.poll(store, id, terminal)?;
-    let active = follow_task_is_active(&store.run(id)?.state);
-    if events.is_some() || !active {
+    let state = store.run(id)?.state;
+    let waiting = store.waiting_for_answer(id)?;
+    let active = follow_task_is_active(&state) || waiting;
+    if state == "ready" && !kernel::is_active(root, id)? {
+        kernel::spawn(root, id, None)?;
+    }
+    if waiting {
+        progress.phase = "Awaiting your answer".into();
+    }
+    let runner_missing = active
+        && !waiting
+        && progress.follow_started.elapsed() > Duration::from_secs(3)
+        && !kernel::is_active(root, id)?;
+    let elapsed = progress
+        .task_started_at
+        .map(|start| {
+            Duration::from_secs(crate::storage::unix_time().saturating_sub(start).max(0) as u64)
+        })
+        .unwrap_or_else(|| progress.follow_started.elapsed());
+    let changed = terminal.live_input_activity_with_metrics(
+        &progress.phase,
+        elapsed,
+        &progress.context_status,
+        &crate::run_metrics::LiveMetrics::load(store, id)?,
+    );
+    if let Some(question) = store.pending_questions(id)?.first() {
+        terminal.set_input_status(&format!("Answer: {} · Enter sends", question.text));
+    }
+    if runner_missing {
+        return Ok(Some((vec![], false)));
+    }
+    if events.is_some() || !active || changed {
         Ok(Some((events.unwrap_or_default(), active)))
     } else {
         Ok(None)
@@ -2335,6 +2380,7 @@ impl FollowProgress {
             task_started_at,
             phase: "Starting task".into(),
             context_status: crate::terminal::ContextStatus::default(),
+            follow_started: Instant::now(),
         })
     }
 
@@ -2368,6 +2414,7 @@ impl FollowProgress {
                     self.context_status.schema_count = event.payload["schema_count"].as_u64();
                 }
                 "checkpoint.created" => self.context_status.checkpoint_at = Some(event.created_at),
+                "model.pre_dispatch_retry" => self.phase = "Retrying connection".into(),
                 "acceptance.started" => self.phase = "Verifying acceptance".into(),
                 "operation.pending" => {
                     self.phase = format!(
@@ -2419,7 +2466,7 @@ fn steer_from_follow(
         match terminal.steering_input_with_updates(
             &label,
             &[],
-            || poll_follow_update(progress, store, id, terminal),
+            || poll_follow_update(root, progress, store, id, terminal),
             |update| render_follow_update(terminal, update),
         )? {
             Input::Submit(message) => {
@@ -2429,17 +2476,26 @@ fn steer_from_follow(
             Input::Interrupt => request_follow_interrupt(terminal, store, id, interrupts)?,
             Input::TaskFinished => {
                 terminal.set_input_status("");
+                let state = store.run(id)?.state;
                 terminal.message(
                     Tone::Quiet,
-                    "Task finished",
+                    follow_end_label(&state),
                     "Your unfinished text is saved in the prompt.",
                 )?;
                 return Ok(true);
             }
             Input::Exit => {
                 terminal.set_input_status("");
-                return Ok(true);
+                terminal.message(
+                    Tone::Quiet,
+                    "Detached",
+                    "Your task keeps running. Reopen sessions to follow it.",
+                )?;
+                return Ok(false);
             }
+            Input::Checkpoint => checkpoint_view(root, Some(id), terminal)?,
+            Input::CancelTask => cancel_task(root, Some(id), terminal)?,
+            Input::Help => help(terminal)?,
             _ => {
                 terminal.set_input_status("");
                 return Ok(true);
@@ -2570,7 +2626,7 @@ fn run_follow_command_menu(
 ) -> Result<bool> {
     terminal.clear_activity()?;
     let outcome = terminal.command_menu_with_updates(
-        || poll_follow_update(progress, store, id, terminal),
+        || poll_follow_update(root, progress, store, id, terminal),
         |update| render_follow_update(terminal, update),
     )?;
     let command = match outcome {
@@ -2605,23 +2661,19 @@ fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
             progress.render(terminal, events)?;
         }
         let run = store.run(id)?;
-        if !follow_task_is_active(&run.state) {
+        let waiting = store.waiting_for_answer(id)?;
+        if run.state == "ready" && !kernel::is_active(root, id)? {
+            kernel::spawn(root, id, None)?;
+        }
+        if !follow_task_is_active(&run.state) && !waiting {
             terminal.clear_activity()?;
             if let Some(events) = progress.poll(&store, id, terminal)? {
                 progress.render(terminal, events)?;
             }
-            terminal.message(
-                Tone::Quiet,
-                "",
-                &format!(
-                    "{} model tokens · {}",
-                    store.model_tokens(id)?,
-                    chat_state(&run.state)
-                ),
-            )?;
+            terminal.message(Tone::Quiet, "Task metrics", &crate::run_metrics::display(&crate::run_metrics::report(&store, id)?))?;
             return Ok(());
         }
-        if started.elapsed() > Duration::from_secs(3) && !kernel::is_active(root, id)? {
+        if !waiting && started.elapsed() > Duration::from_secs(3) && !kernel::is_active(root, id)? {
             terminal.clear_activity()?;
             terminal.message(
                 Tone::Warning,
@@ -2629,6 +2681,36 @@ fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
                 "The runner stopped. Open sessions to resume safely.",
             )?;
             return Ok(());
+        }
+        if terminal.interactive {
+            let elapsed = progress
+                .task_started_at
+                .map(|start| {
+                    Duration::from_secs(
+                        crate::storage::unix_time().saturating_sub(start).max(0) as u64
+                    )
+                })
+                .unwrap_or_else(|| started.elapsed());
+            terminal.live_input_activity_with_metrics(
+                &progress.phase,
+                elapsed,
+                &progress.context_status,
+                &crate::run_metrics::LiveMetrics::load(&store, id)?,
+            );
+            let keep_following = steer_from_follow(
+                root,
+                terminal,
+                &mut store,
+                id,
+                "",
+                &mut interrupts,
+                &mut progress,
+            )?;
+            terminal.clear_input_activity();
+            if !keep_following {
+                return Ok(());
+            }
+            continue;
         }
         terminal.activity(
             &progress.phase,
@@ -4403,6 +4485,18 @@ pub fn interactive(root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ending_input_does_not_claim_paused_or_interrupted_work_completed() {
+        assert_eq!(follow_end_label("completed"), "Task completed");
+        assert_eq!(follow_end_label("answered"), "Reply finished");
+        assert_eq!(follow_end_label("waiting_recovery"), "Task needs recovery");
+        assert_eq!(follow_end_label("paused"), "Task paused");
+        assert_eq!(follow_end_label("running"), "Runner stopped");
+        assert_eq!(follow_end_label("failed"), "Task failed");
+        assert_eq!(follow_end_label("cancelled"), "Task cancelled");
+        assert_eq!(follow_end_label("blocked"), "Task blocked");
+    }
 
     #[test]
     fn follow_input_closes_when_the_run_is_terminal() {

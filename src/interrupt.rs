@@ -38,8 +38,34 @@ impl Store {
             transaction.query_row("SELECT state FROM runs WHERE id=?1", [run_id], |row| {
                 row.get(0)
             })?;
-        if !matches!(state.as_str(), "ready" | "running") {
+        let answering_wait = crate::questions::waiting_for_answer(&transaction, run_id)?;
+        if !matches!(state.as_str(), "ready" | "running") && !answering_wait {
             bail!("task is no longer active; message was not queued");
+        }
+
+        let question: Option<String> = transaction.query_row(
+            "SELECT id FROM user_questions WHERE run_id=?1 AND answer IS NULL ORDER BY created_at,rowid LIMIT 1",
+            [run_id], |row| row.get(0)).optional()?;
+        if let Some(id) = question {
+            transaction.execute(
+                "UPDATE user_questions SET answer=?2 WHERE id=?1 AND run_id=?3 AND answer IS NULL",
+                params![id, message, run_id],
+            )?;
+            append_event(
+                &transaction,
+                run_id,
+                "user.question_answered",
+                json!({"id":id,"text":message}),
+            )?;
+        }
+        if answering_wait {
+            transaction.execute("UPDATE runs SET state='ready' WHERE id=?1", [run_id])?;
+            append_event(
+                &transaction,
+                run_id,
+                "run.ready",
+                json!({"reason":"user answered the pending question"}),
+            )?;
         }
 
         append_event(

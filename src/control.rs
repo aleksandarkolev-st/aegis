@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use crate::storage::{Run, Store};
 
 pub const VIEWS: &[&str] = &[
-    "goal", "contract", "status", "why", "evidence", "verify", "provider", "budget", "handoff",
+    "goal", "contract", "status", "why", "evidence", "verify", "provider", "budget", "handoff", "metrics",
 ];
 
 pub fn obligation_id(text: &str) -> Result<i64> {
@@ -91,29 +91,9 @@ fn usage(store: &Store, run: &Run) -> Result<Value> {
     ] {
         result[name] = json!({"used":used,"limit":limit,"remaining":used.zip(limit).map(|(used,limit)|limit.saturating_sub(used))});
     }
-    let events = store.events(&run.id)?;
-    let mut input = 0u64;
-    let mut output = 0u64;
-    let mut cached = 0u64;
-    let mut measured = false;
-    let mut measured_cache = false;
-    for event in events
-        .iter()
-        .filter(|event| matches!(event.kind.as_str(), "model.response" | "model.failed"))
-    {
-        if let Some(tokens) = event.payload["usage"]["input_tokens"].as_u64() {
-            input = input.saturating_add(tokens);
-            measured = true;
-        }
-        if let Some(tokens) = event.payload["usage"]["output_tokens"].as_u64() {
-            output = output.saturating_add(tokens);
-        }
-        if let Some(tokens) = event.payload["usage"]["cached_input_tokens"].as_u64() {
-            cached = cached.saturating_add(tokens);
-            measured_cache = true;
-        }
-    }
-    result["provider_usage"] = json!({"input":measured.then_some(input),"output":measured.then_some(output),"cached_input":measured_cache.then_some(cached),"note":"Cached input is included in input. Missing provider receipts remain unmeasured."});
+    let metrics=crate::run_metrics::report(store,&run.id)?;
+    let tokens=&metrics["tokens"];
+    result["provider_usage"] = json!({"input":tokens["input"],"output":tokens["output"],"cached_input":tokens["cached_input"],"estimated":tokens["estimated_total"],"unclassified":tokens["unclassified_total"],"usage_complete":tokens["usage_complete"],"note":"Cached input is included in input. Missing provider receipts remain unmeasured; estimates and legacy totals are separate."});
     result["tool_result_metric"] = json!(crate::tokenization::ENCODING);
     Ok(result)
 }
@@ -287,6 +267,7 @@ pub fn view(store: &Store, run_id: &str, command: &str, argument: Option<&str>) 
             )
         }
         "budget" => usage(store, &run),
+        "metrics" => crate::run_metrics::report(store, run_id),
         "handoff" => crate::kernel::normalized_handoff(store, &run),
         _ => bail!("Unknown control view"),
     }
@@ -355,6 +336,7 @@ fn route_label(route: &Value) -> String {
 }
 
 pub fn display(command: &str, value: &Value) -> String {
+    if command == "metrics" { return crate::run_metrics::display(value); }
     if matches!(command, "goal" | "contract") && value["history"].is_array() {
         return display("goal_history", value);
     }

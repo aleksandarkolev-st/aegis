@@ -185,6 +185,8 @@ pub struct Terminal {
     output_streams: std::cell::RefCell<std::collections::HashMap<String, StreamCleaner>>,
     input_draft: std::cell::RefCell<Option<(String, Vec<char>, usize)>>,
     input_status: std::cell::RefCell<String>,
+    input_activity: std::cell::RefCell<String>,
+    animation_started: Instant,
     home_snapshot: std::cell::RefCell<Option<HomeSnapshot>>,
     skin: Box<dyn crate::ui::Skin>,
 }
@@ -236,6 +238,20 @@ impl ContextStatus {
             "{context} · {} ops · {} artifacts",
             self.operations, self.artifacts
         )
+    }
+}
+
+fn live_metrics_title(activity: &str, label: &str, elapsed: Duration, metrics: &crate::run_metrics::LiveMetrics, width: usize) -> String {
+    let proof = if metrics.requirements > 0 { format!(" · {}/{} verified", metrics.verified, metrics.requirements) }else{String::new()};
+    let estimated = if metrics.estimated_tokens>0 { format!(" + ~{}t",metrics.estimated_tokens) }else{String::new()};
+    let legacy = if metrics.unclassified_tokens>0 { format!(" + {}t?",metrics.unclassified_tokens) }else{String::new()};
+    let usage = format!("{}t{estimated}{legacy}{proof}{}", metrics.reported_tokens, if metrics.usage_pending {" · usage pending"}else{""});
+    if width >= 100 {
+        fit(&format!("{activity} · {usage}"), width)
+    } else if width >= 55 {
+        fit(&format!("{} · {} elapsed · {usage}", fit(label, 12), format_duration(elapsed)), width)
+    } else {
+        fit(&format!("{usage} · {}", format_duration(elapsed)), width)
     }
 }
 
@@ -1124,6 +1140,8 @@ impl Default for Terminal {
             output_streams: std::cell::RefCell::new(std::collections::HashMap::new()),
             input_draft: std::cell::RefCell::new(None),
             input_status: std::cell::RefCell::new(String::new()),
+            input_activity: std::cell::RefCell::new(String::new()),
+            animation_started: Instant::now(),
             home_snapshot: std::cell::RefCell::new(None),
             skin: Box::new(crate::ui::UiOptions::default()),
         }
@@ -1607,6 +1625,68 @@ impl Terminal {
         self.input_status.replace(clean(status));
     }
 
+    pub fn clear_input_activity(&self) {
+        self.input_activity.replace(String::new());
+    }
+
+    pub fn live_input_activity(
+        &self,
+        label: &str,
+        elapsed: Duration,
+        tokens: u64,
+        context: &ContextStatus,
+    ) -> bool {
+        self.live_input_activity_with_metrics(label, elapsed, context, &crate::run_metrics::LiveMetrics { reported_tokens: tokens, ..Default::default() })
+    }
+
+    pub fn live_input_activity_with_metrics(
+        &self,
+        label: &str,
+        elapsed: Duration,
+        context: &ContextStatus,
+        metrics: &crate::run_metrics::LiveMetrics,
+    ) -> bool {
+        let phase = if label.contains("Thinking") {
+            crate::ui::Phase::Thinking
+        } else {
+            crate::ui::Phase::Working
+        };
+        let tick = if self.animations {
+            (self.animation_started.elapsed().as_millis()
+                / self.skin.frame_interval().as_millis().max(1)) as u64
+        } else {
+            0
+        };
+        let width = TerminalSize::current().columns.saturating_sub(8);
+        let (activity, _) = activity_lines(
+            &self.skin.frame(phase, tick),
+            label,
+            elapsed,
+            crate::storage::unix_time(),
+            metrics.reported_tokens,
+            context,
+            self.skin.show_context(),
+            width,
+        );
+        let activity = live_metrics_title(&activity, label, elapsed, metrics, width);
+        let tips = [
+            "Type/paste to steer · ^C interrupt · ^D detach",
+            "Enter sends · Shift+Enter adds a line · / commands",
+            "/checkpoint shows saved progress · /evidence shows proof",
+            "/context shows usage · /tools shows available tools",
+            "/metrics shows tokens, verification and efficiency",
+        ];
+        let status = format!(
+            "Steer this task · {}",
+            tips[(self.animation_started.elapsed().as_secs() / 12) as usize % tips.len()]
+        );
+        let changed =
+            *self.input_activity.borrow() != activity || *self.input_status.borrow() != status;
+        self.input_activity.replace(activity);
+        self.input_status.replace(status);
+        changed
+    }
+
     pub fn clear_activity(&self) -> Result<()> {
         self.invalidate_home_snapshot();
         self.activity_view.replace(None);
@@ -1678,7 +1758,7 @@ impl Terminal {
         };
         let interval = self.skin.frame_interval().as_millis().max(1);
         let tick = if self.animations {
-            (elapsed.as_millis() / interval) as u64
+            (self.animation_started.elapsed().as_millis() / interval) as u64
         } else {
             0
         };
@@ -1984,10 +2064,11 @@ impl Terminal {
                     } else {
                         self.input_status.borrow().clone()
                     };
-                    let (buffer, origin) = crate::widgets::composer(
+                    let (buffer, origin) = crate::widgets::composer_with_activity(
                         &layout.composer_prefix,
                         &editor.rows,
                         &status,
+                        &self.input_activity.borrow(),
                         composer_width,
                         &self.skin.palette(),
                     );
@@ -2441,8 +2522,13 @@ impl Terminal {
             }
             let matches = menu_matches(choices, &query);
             selected = selected.min(matches.len().saturating_sub(1));
+            let menu_title = if self.input_activity.borrow().is_empty() {
+                title.to_owned()
+            } else {
+                format!("{title} · {}", self.input_activity.borrow().trim())
+            };
             let buffer = crate::widgets::menu(
-                title,
+                &menu_title,
                 choices,
                 &matches,
                 selected,
@@ -2640,8 +2726,16 @@ impl Terminal {
                 &obligation_event_text("obligation.superseded", payload),
             ),
             "workspace.revision" => self.message(
-                Tone::Warning,
-                "Evidence may be stale",
+                if payload["stale_obligations"] == 0 {
+                    Tone::Quiet
+                } else {
+                    Tone::Warning
+                },
+                if payload["stale_obligations"] == 0 {
+                    "Workspace check"
+                } else {
+                    "Recheck evidence"
+                },
                 &workspace_revision_text(payload),
             ),
             "model.response" => {
@@ -2651,6 +2745,16 @@ impl Terminal {
                     Ok(())
                 }
             }
+            "model.activity" => self.transcript(
+                Tone::Quiet,
+                if payload["kind"] == "reasoning_summary" {
+                    "Reasoning summary"
+                } else {
+                    "Model update"
+                },
+                payload["text"].as_str().unwrap_or_default(),
+                TranscriptMode::Literal,
+            ),
             "operation.pending" => {
                 let args = &payload["arguments"];
                 let detail = args["path"]
@@ -2685,7 +2789,37 @@ impl Terminal {
                         if label == "Tool" { capability } else { "" },
                         fit(&detail, 160)
                     ),
-                )
+                )?;
+                if capability == "process.run" {
+                    let args = args["args"]
+                        .as_array()
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|item| item.as_str())
+                                .map(str::to_owned)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let command = std::iter::once(args_program(payload))
+                        .chain(
+                            args.into_iter()
+                                .map(|arg| serde_json::to_string(&arg).unwrap_or_default()),
+                        )
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    self.transcript(Tone::Quiet, "Command", &command, TranscriptMode::Literal)?;
+                } else if capability == "mcp.windows-host.powershell" {
+                    if let Some(script) = args["script"].as_str() {
+                        self.transcript(
+                            Tone::Quiet,
+                            "PowerShell",
+                            &script.chars().take(2400).collect::<String>(),
+                            TranscriptMode::Literal,
+                        )?;
+                    }
+                }
+                Ok(())
             }
             "operation.output" => {
                 let text = self.output_stream_text(payload);
@@ -2759,10 +2893,34 @@ impl Terminal {
                 "Checkpoint",
                 payload["next_action"].as_str().unwrap_or_default(),
             ),
-            "action.rejected" | "model.failed" => self.message(
+            "user.question" => self.message(
+                Tone::Accent,
+                "Question for you",
+                &format!(
+                    "{}\nType your answer below; independent work can continue.",
+                    payload["text"].as_str().unwrap_or_default()
+                ),
+            ),
+            "user.question_answered" => self.message(
+                Tone::Success,
+                "Answer saved",
+                "Your answer will guide this same task.",
+            ),
+            "action.rejected" | "model.failed" => {
+                let mut detail =
+                    friendly_error(payload["error"].as_str().unwrap_or("Action failed"));
+                if payload["response_shape"]["json"].is_boolean() {
+                    detail.push(' ');
+                    detail.push_str(crate::direct::format_recovery_hint(
+                        &payload["response_shape"],
+                    ));
+                }
+                self.message(Tone::Warning, "!", &detail)
+            }
+            "model.pre_dispatch_retry" => self.message(
                 Tone::Warning,
-                "!",
-                &friendly_error(payload["error"].as_str().unwrap_or("Action failed")),
+                "Retrying connection",
+                &format!("Request failed before dispatch. Same route retry {}/{} in {}ms; original task deadline remains.", event.payload["attempt"], event.payload["limit"], event.payload["delay_ms"]),
             ),
             "model.format_retry" => self.message(
                 Tone::Quiet,
@@ -3216,9 +3374,26 @@ fn workspace_revision_text(payload: &serde_json::Value) -> String {
         .as_str()
         .unwrap_or("workspace operation");
     let revision = payload["revision"].as_i64().unwrap_or_default();
-    format!(
-        "{capability} advanced the workspace to revision {revision}; recheck verified requirements before finishing"
-    )
+    let reason = if payload["phase"] == "claimed" {
+        "may change files; previous evidence is invalidated before execution"
+    } else {
+        "workspace evidence refreshed after execution or a detected change"
+    };
+    let requirements = match payload["stale_obligations"].as_u64() {
+        Some(0) => "no verified requirements need rechecking".to_owned(),
+        Some(count) => {
+            format!("recheck {count} previously verified requirement(s) before finishing")
+        }
+        None => "recheck verified requirements before finishing".to_owned(),
+    };
+    format!("{capability}: {reason} · revision {revision}; {requirements}")
+}
+
+fn args_program(payload: &serde_json::Value) -> String {
+    payload["arguments"]["program"]
+        .as_str()
+        .unwrap_or("command")
+        .to_owned()
 }
 
 fn model_action_preview(action: &serde_json::Value) -> Option<(&'static str, String)> {
@@ -3868,7 +4043,8 @@ mod tests {
 
         let revision = serde_json::json!({"capability":"workspace.patch","revision":8});
         let revision_text = workspace_revision_text(&revision);
-        assert!(revision_text.contains("workspace.patch advanced the workspace to revision 8"));
+        assert!(revision_text.contains("workspace.patch:"));
+        assert!(revision_text.contains("revision 8"));
         assert!(revision_text.contains("recheck verified requirements"));
     }
 
@@ -3935,6 +4111,21 @@ mod tests {
         assert!(compact_footer.contains("01:02:03Z"));
         assert!(compact_footer.contains("^C"));
         assert!(compact_footer.contains("^D"));
+    }
+
+    #[test]
+    fn composer_metrics_preserve_tips_clock_and_exact_reported_tokens() {
+        let terminal = Terminal::default();
+        let metrics = crate::run_metrics::LiveMetrics { reported_tokens: 12345, verified: 2, requirements: 3, usage_pending: false, ..Default::default() };
+        terminal.live_input_activity_with_metrics("Thinking", Duration::from_secs(65), &ContextStatus::default(), &metrics);
+        assert!(terminal.input_activity.borrow().contains("12345t"));
+        assert!(terminal.input_status.borrow().contains("Steer this task"));
+        let text = live_metrics_title("Thinking · 1m 05s elapsed · 01:02:03 UTC", "Thinking", Duration::from_secs(65), &metrics, 102);
+        assert!(text.contains("UTC") && text.contains("12345t") && text.contains("2/3 verified"));
+        let text = live_metrics_title("", "Thinking", Duration::from_secs(65), &metrics, 40);
+        assert!(text.contains("12345t") && text.contains("2/3 verified") && text.width() <= 40);
+        let pending = crate::run_metrics::LiveMetrics { usage_pending: true, ..metrics };
+        assert!(live_metrics_title("", "Thinking", Duration::ZERO, &pending, 102).contains("usage pending"));
     }
 
     #[test]

@@ -10,6 +10,9 @@ use sha2::{Digest, Sha256};
 use crate::filesystem::FileScopes;
 use crate::storage::Run;
 
+pub(crate) const TEXT_BUDGET: usize = 65_536;
+const MAX_REQUEST: usize = 65_536;
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Request {
@@ -41,27 +44,30 @@ fn request(arguments: &Value) -> Result<Request> {
     if request.files.is_empty() || request.files.len() > 8 {
         bail!("read batch needs one to eight requested files");
     }
-    let mut total = 0;
     let mut paths = std::collections::HashSet::new();
     for slice in &request.files {
         if slice.path.len() > 128 || crate::filesystem::path_name(&slice.path)? != slice.path {
             bail!("batch paths need portable forward-slash names of at most 128 UTF-8 bytes");
         }
-        if !paths.insert(&slice.path)
-            || slice.length == 0
-            || slice.length > 3000
-            || slice.offset > 2 * 1024 * 1024
-        {
+        if !paths.insert((&slice.path, slice.offset)) {
             bail!(
-                "batch paths must be unique; length is 1..3000 and offset is at most 2097152 Unicode characters"
+                "duplicate read range for {} at offset {}; request each starting range once",
+                slice.path,
+                slice.offset
             );
         }
-        total += slice.length;
-    }
-    if total > 3000 {
-        bail!(
-            "a batch selects at most 3000 Unicode characters across all files; request smaller ranges"
-        );
+        if slice.length == 0 || slice.length > MAX_REQUEST {
+            bail!(
+                "requested length for {} must be 1..65536 Unicode characters; output is paginated automatically",
+                slice.path
+            );
+        }
+        if slice.offset > 2 * 1024 * 1024 {
+            bail!(
+                "offset for {} exceeds 2097152 Unicode characters",
+                slice.path
+            );
+        }
     }
     Ok(request)
 }
@@ -90,6 +96,7 @@ pub(crate) fn read(run: &Run, arguments: &Value) -> Result<Value> {
         write: Vec::new(),
     });
     let mut selected = Vec::new();
+    let mut remaining = TEXT_BUDGET;
     for slice in request.files {
         let path = scopes.checked_path(Path::new(&run.workspace), &slice.path, false)?;
         let mut content = String::new();
@@ -106,8 +113,9 @@ pub(crate) fn read(run: &Run, arguments: &Value) -> Result<Value> {
         let text: String = content
             .chars()
             .skip(slice.offset)
-            .take(slice.length)
+            .take(slice.length.min(remaining))
             .collect();
+        remaining -= text.chars().count();
         selected.push(Selection {
             path: slice.path,
             sha256: hex::encode(Sha256::digest(content.as_bytes())),
@@ -123,8 +131,8 @@ pub(crate) fn read(run: &Run, arguments: &Value) -> Result<Value> {
 }
 
 pub(crate) fn mapped(result: &Value) -> Result<Value> {
-    if serde_json::to_vec(result)?.len() > 32768 {
-        bail!("selected read result exceeds 32768 serialized UTF-8 bytes");
+    if serde_json::to_vec(result)?.len() > 524288 {
+        bail!("selected read result exceeds 524288 serialized UTF-8 bytes");
     }
     let selections: Vec<Selection> = serde_json::from_value(result["selected"].clone())
         .context("invalid selected read result")?;
@@ -136,7 +144,7 @@ pub(crate) fn mapped(result: &Value) -> Result<Value> {
     for selection in &selections {
         if selection.path.len() > 128
             || crate::filesystem::path_name(&selection.path)? != selection.path
-            || !paths.insert(&selection.path)
+            || !paths.insert((&selection.path, selection.offset))
         {
             bail!("invalid selected read path");
         }
@@ -157,8 +165,8 @@ pub(crate) fn mapped(result: &Value) -> Result<Value> {
         }
         characters += length;
     }
-    if characters > 3000 {
-        bail!("selected read text exceeds 3000 Unicode characters");
+    if characters > TEXT_BUDGET {
+        bail!("selected read text exceeds 65536 Unicode characters");
     }
     Ok(serde_json::to_value(selections)?)
 }

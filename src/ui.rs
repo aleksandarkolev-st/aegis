@@ -94,7 +94,7 @@ impl Default for UiOptions {
             mascot: Mascot::Pip,
             motion: true,
             colors: true,
-            frame_millis: 400,
+            frame_millis: 160,
             blocks: vec![
                 WelcomeBlock::Mascot,
                 WelcomeBlock::Provider,
@@ -237,10 +237,47 @@ impl Skin for UiOptions {
             .into();
         }
         let frames = match (self.mascot, phase) {
-            (Mascot::Pip, Phase::Thinking) => ["<o.o>", "<o.o>", "<o.->", "<o.o>"],
-            (Mascot::Pip, _) => ["<o.o>", "<^.^>", "<o.o>", "<^.^>"],
-            (Mascot::Byte, _) => ["[o.o]", "[o.O]", "[O.o]", "[o.o]"],
-            (Mascot::Orbit, _) => ["-o-", "\\o/", "|o|", "/o\\"],
+            (Mascot::Pip, Phase::Thinking) => [
+                "<o.o> ·  ",
+                "<o.o> ·· ",
+                "<o.-> ···",
+                "<o.o>  ··",
+                "<o.o>   ·",
+                "<o.o>    ",
+                "<-.o> ·  ",
+                "<o.o> ·· ",
+            ],
+            (Mascot::Pip, _) => [
+                "<o.o> ▱▱▱",
+                "<^.^> ▰▱▱",
+                "<o.o> ▱▰▱",
+                "<^.^> ▱▱▰",
+                "<o.o> ▱▰▱",
+                "<^.^> ▰▱▱",
+                "<o.o> ▱▱▱",
+                "<^.^> ▱▱▱",
+            ],
+            (Mascot::Byte, Phase::Thinking) => [
+                "[o.o] ·  ",
+                "[o.O] ·· ",
+                "[O.o] ···",
+                "[o.o]  ··",
+                "[o.o]   ·",
+                "[o.O]    ",
+                "[O.o] ·  ",
+                "[o.o] ·· ",
+            ],
+            (Mascot::Byte, _) => [
+                "[o.o] ▰▱▱",
+                "[o.O] ▱▰▱",
+                "[O.o] ▱▱▰",
+                "[o.o] ▱▰▱",
+                "[o.o] ▰▱▱",
+                "[o.O] ▱▰▱",
+                "[O.o] ▱▱▰",
+                "[o.o] ▱▰▱",
+            ],
+            (Mascot::Orbit, _) => ["-o-", "\\o/", "|o|", "/o\\", "-o-", "\\o/", "|o|", "/o\\"],
             (Mascot::Off, _) => unreachable!(),
         };
         frames[tick as usize % frames.len()].into()

@@ -5,8 +5,8 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, bail};
+use serde_json::{Value, json};
 
 use crate::storage::{Operation, Run, Store};
 use crate::{capability, mcp};
@@ -336,6 +336,37 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
                 bail!("empty search query");
             }
             let remote_origin = run.budgets["remote_origin"] == true;
+            if let Some(relative) = args.get("path").and_then(Value::as_str) {
+                if remote_origin && crate::filesystem::remote_secret_path(relative) {
+                    bail!("remote search cannot read a secret path");
+                }
+                let scopes = file_scopes.clone().unwrap_or(crate::filesystem::FileScopes {
+                    read: vec!["**".into()],
+                    write: Vec::new(),
+                });
+                let path = scopes.checked_path(workspace, relative, false)?;
+                let metadata = fs::metadata(&path)?;
+                if !metadata.is_file() || metadata.len() > MAX_FILE {
+                    bail!("search path must be a regular UTF-8 file of at most 2 MiB");
+                }
+                let mut content = String::new();
+                File::open(path)?.take(MAX_FILE + 1).read_to_string(&mut content)?;
+                if content.len() as u64 > MAX_FILE {
+                    bail!("search source grew beyond 2 MiB");
+                }
+                let mut matches = Vec::new();
+                let mut truncated = false;
+                for (number, line) in content.lines().enumerate() {
+                    if line.contains(query) {
+                        if matches.len() == 100 {
+                            truncated = true;
+                            break;
+                        }
+                        matches.push(json!({"path":relative,"line":number + 1,"text":line.chars().take(300).collect::<String>()}));
+                    }
+                }
+                return Ok(json!({"matches":matches,"truncated":truncated}));
+            }
             let mut pending = vec![workspace.to_path_buf()];
             let mut matches = Vec::new();
             while let Some(directory) = pending.pop() {
@@ -462,7 +493,7 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
             if seconds == 0 {
                 bail!("MCP deadline exhausted before launch");
             }
-            mcp::call_with_timeout(
+            mcp::call_with_output(
                 &server,
                 workspace,
                 tool_name,
@@ -470,6 +501,10 @@ pub fn execute(root: &Path, operation_id: &str) -> Result<Value> {
                 allow_write,
                 Some(&operation.id),
                 Duration::from_secs(seconds),
+                Some(&mut |text, truncated| {
+                    store.event(&operation.run_id, "operation.output",
+                    json!({"id":operation.id,"stream":"mcp","text":crate::text::clean(text),"truncated":truncated}))
+                }),
             )
         }
         _ => bail!("unknown capability"),
@@ -532,7 +567,7 @@ fn execute_container(
         )?;
         if oversized || cancelled || interrupted || started.elapsed() >= deadline {
             child.kill()?;
-            crate::kernel::cleanup_container(operation);
+            crate::kernel::cleanup_container(store, operation);
             if interrupted {
                 bail!("operation interrupted by user");
             }
@@ -628,18 +663,20 @@ mod tests {
             false,
         )?;
         store.operation_state(&operation, "dispatched", None, json!({}))?;
-        assert!(execute(&root, &operation.id)
-            .unwrap_err()
-            .to_string()
-            .contains("budget exhausted"));
+        assert!(
+            execute(&root, &operation.id)
+                .unwrap_err()
+                .to_string()
+                .contains("budget exhausted")
+        );
         assert_eq!(store.operation(&operation.id)?.state, "dispatched");
         assert!(!directory.path().join("fixture.txt").exists());
         Ok(())
     }
 
     #[test]
-    fn remote_reads_block_secret_files_but_search_filters_and_local_reads_remain_configured(
-    ) -> Result<()> {
+    fn remote_reads_block_secret_files_but_search_filters_and_local_reads_remain_configured()
+    -> Result<()> {
         let directory = tempfile::tempdir()?;
         let root = directory.path().join(".arun");
         fs::write(directory.path().join(".env"), "canary-secret")?;
@@ -875,10 +912,12 @@ mod tests {
             false,
         )?;
         store.operation_state(&operation, "dispatched", None, json!({}))?;
-        assert!(execute(&root, &operation.id)
-            .unwrap_err()
-            .to_string()
-            .starts_with("invalid arguments"));
+        assert!(
+            execute(&root, &operation.id)
+                .unwrap_err()
+                .to_string()
+                .starts_with("invalid arguments")
+        );
         assert_eq!(store.operation(&operation.id)?.state, "dispatched");
         assert!(!directory.path().join("fixture.txt").exists());
         Ok(())
@@ -948,10 +987,12 @@ mod tests {
                 false,
             )?;
             store.operation_state(&operation, "dispatched", None, json!({}))?;
-            assert!(execute(&root, &operation.id)
-                .unwrap_err()
-                .to_string()
-                .starts_with("program is not explicitly granted"));
+            assert!(
+                execute(&root, &operation.id)
+                    .unwrap_err()
+                    .to_string()
+                    .starts_with("program is not explicitly granted")
+            );
             assert_eq!(store.operation(&operation.id)?.state, "dispatched");
         }
         assert_eq!(store.event_count(&run.id, "operation.executing")?, 0);
@@ -984,10 +1025,12 @@ mod tests {
                 false,
             )?;
             store.operation_state(&operation, "dispatched", None, json!({}))?;
-            assert!(execute(&root, &operation.id)
-                .unwrap_err()
-                .to_string()
-                .contains("exact command scopes"));
+            assert!(
+                execute(&root, &operation.id)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("exact command scopes")
+            );
             assert_eq!(store.operation(&operation.id)?.state, "dispatched");
         }
         assert_eq!(store.event_count(&run.id, "operation.executing")?, 0);
@@ -1019,29 +1062,34 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert!(args.windows(2).any(|pair| pair == ["--network", "none"]));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--tmpfs", "/tmp:rw,noexec,size=256m"]));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--tmpfs", "/tmp/target:rw,exec,size=512m"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--tmpfs", "/tmp:rw,noexec,size=256m"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--tmpfs", "/tmp/target:rw,exec,size=512m"])
+        );
         assert!(args.iter().any(|argument| argument == "--pull=never"));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--env", &format!("ARUN_OPERATION_ID={}", operation.id)]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--env", &format!("ARUN_OPERATION_ID={}", operation.id)])
+        );
         assert!(args.windows(2).any(|pair| pair
             == [
                 "--env",
                 &format!("ARUN_IDEMPOTENCY_KEY={}", operation.idempotency_key)
             ]));
         assert!(args.iter().any(|argument| argument.ends_with(",readonly")));
-        assert!(args
-            .iter()
-            .any(|argument| argument.starts_with("/workspace/.arun:")));
+        assert!(
+            args.iter()
+                .any(|argument| argument.starts_with("/workspace/.arun:"))
+        );
         assert_eq!(args.last().unwrap(), "test");
-        assert!(args
-            .iter()
-            .any(|argument| argument.starts_with("/workspace/.git:")));
+        assert!(
+            args.iter()
+                .any(|argument| argument.starts_with("/workspace/.git:"))
+        );
         Ok(())
     }
 
@@ -1054,9 +1102,11 @@ mod tests {
         fs::create_dir(directory.path().join(".aegis"))?;
         let mut masked = Command::new("docker");
         mask_metadata(&mut masked, directory.path())?;
-        assert!(masked
-            .get_args()
-            .any(|argument| argument == "/workspace/.aegis:rw,noexec,size=1m"));
+        assert!(
+            masked
+                .get_args()
+                .any(|argument| argument == "/workspace/.aegis:rw,noexec,size=1m")
+        );
         fs::write(directory.path().join(".git"), "gitdir: ../private")?;
         assert!(mask_metadata(&mut command, directory.path()).is_err());
         fs::remove_file(directory.path().join(".git"))?;

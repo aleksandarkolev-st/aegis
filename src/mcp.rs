@@ -5,8 +5,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use rmcp::{
-    ServiceExt,
-    model::{CallToolRequestParams, PaginatedRequestParams},
+    ClientHandler, RoleClient, ServiceExt,
+    model::{
+        CallToolRequest, CallToolRequestParams, ClientRequest, PaginatedRequestParams,
+        ProgressNotificationParam, ProgressToken, ServerResult,
+    },
+    service::NotificationContext,
     transport::ConfigureCommandExt,
 };
 use serde::{Deserialize, Serialize};
@@ -318,6 +322,36 @@ pub fn discover(server: &Server, workspace: &Path) -> Result<Vec<Tool>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn progress_preview_correlates_tokens_and_bounds_utf8_bytes_and_messages() {
+        use super::*;
+        let token = ProgressToken(rmcp::model::NumberOrString::Number(7));
+        let mut message = ProgressMessage {
+            token: ProgressToken(rmcp::model::NumberOrString::Number(8)),
+            text: "🦀".repeat(20_000),
+            truncated: false,
+        };
+        let mut preview = ProgressPreview::default();
+        assert!(preview.accept(&token, &message).is_none());
+        assert_eq!(preview.bytes, 0);
+        message.token = token.clone();
+        let (text, truncated) = preview.accept(&token, &message).unwrap();
+        assert_eq!(text.len(), 64 * 1024);
+        assert!(truncated && text.ends_with('🦀'));
+        assert!(preview.accept(&token, &message).is_none());
+        message.text = "x".into();
+        preview = ProgressPreview::default();
+        for _ in 0..127 {
+            assert_eq!(preview.accept(&token, &message), Some(("x", false)));
+        }
+        assert_eq!(preview.accept(&token, &message), Some(("x", true)));
+        assert!(preview.accept(&token, &message).is_none());
+        assert_eq!(text_prefix(&format!("{}🦀", "x".repeat(8191)), 8192), 8191);
+        preview = ProgressPreview::default();
+        message.truncated = true;
+        assert_eq!(preview.accept(&token, &message), Some(("x", true)));
+        assert!(preview.accept(&token, &message).is_none());
+    }
     use super::*;
 
     #[test]
@@ -443,6 +477,97 @@ pub(crate) fn call_with_timeout(
     operation_id: Option<&str>,
     timeout: Duration,
 ) -> Result<Value> {
+    call_with_output(
+        server,
+        workspace,
+        name,
+        arguments,
+        allow_write,
+        operation_id,
+        timeout,
+        None,
+    )
+}
+
+struct ProgressClient {
+    sender: tokio::sync::mpsc::Sender<ProgressMessage>,
+}
+
+struct ProgressMessage {
+    token: ProgressToken,
+    text: String,
+    truncated: bool,
+}
+
+fn text_prefix(text: &str, limit: usize) -> usize {
+    let mut end = text.len().min(limit);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
+#[derive(Default)]
+struct ProgressPreview {
+    bytes: usize,
+    messages: usize,
+    capped: bool,
+}
+
+impl ProgressPreview {
+    fn accept<'a>(
+        &mut self,
+        token: &ProgressToken,
+        message: &'a ProgressMessage,
+    ) -> Option<(&'a str, bool)> {
+        if &message.token != token || self.capped || (message.text.is_empty() && !message.truncated)
+        {
+            return None;
+        }
+        let end = text_prefix(&message.text, (64 * 1024_usize).saturating_sub(self.bytes));
+        self.messages += 1;
+        self.bytes += end;
+        self.capped = message.truncated
+            || end < message.text.len()
+            || self.messages >= 128
+            || self.bytes >= 64 * 1024;
+        Some((&message.text[..end], self.capped))
+    }
+}
+
+impl ClientHandler for ProgressClient {
+    async fn on_progress(
+        &self,
+        params: ProgressNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) {
+        if let Some(mut message) = params.message {
+            // Bound each queued message too, independently of the display budget.
+            let end = text_prefix(&message, 8192);
+            let truncated = end < message.len();
+            message.truncate(end);
+            let _ = self
+                .sender
+                .send(ProgressMessage {
+                    token: params.progress_token,
+                    text: message,
+                    truncated,
+                })
+                .await;
+        }
+    }
+}
+
+pub(crate) fn call_with_output(
+    server: &Server,
+    workspace: &Path,
+    name: &str,
+    arguments: Value,
+    allow_write: bool,
+    operation_id: Option<&str>,
+    timeout: Duration,
+    mut output: Option<&mut dyn FnMut(&str, bool) -> Result<()>>,
+) -> Result<Value> {
     let (command, mut container) = command(server, workspace, allow_write, operation_id)?;
     if let Some(container) = &mut container {
         container.started = true;
@@ -454,17 +579,54 @@ pub(crate) fn call_with_timeout(
     runtime()?.block_on(async {
         tokio::time::timeout(timeout, async {
             let (mut child, transport) = transport(command)?;
-            let client = ().serve(transport).await?;
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+            let client = ProgressClient {
+                sender,
+            }
+            .serve(transport)
+            .await?;
             let tools = tools(client.peer()).await?;
             if !tools.iter().any(|tool| tool.name == name) {
                 bail!("MCP server does not expose this tool");
             }
-            let result = client
-                .call_tool(CallToolRequestParams::new(name.to_owned()).with_arguments(arguments))
-                .await?;
+            let request = CallToolRequestParams::new(name.to_owned()).with_arguments(arguments);
+            let result = {
+                // rmcp assigns its own token when sending; correlate with the
+                // returned handle rather than a token placed in request metadata.
+                let handle = client.peer().send_cancellable_request(
+                    ClientRequest::CallToolRequest(CallToolRequest::new(request)),
+                    Default::default(),
+                ).await?;
+                let token = handle.progress_token.clone();
+                let call = handle.await_response();
+            tokio::pin!(call);
+            let mut preview = ProgressPreview::default();
+                let mut emit = |message: ProgressMessage| -> Result<()> {
+                if let Some((text, truncated)) = preview.accept(&token, &message) {
+                    if let Some(callback) = output.as_deref_mut() {
+                        callback(text, truncated)?;
+                    }
+                }
+                Ok(())
+            };
+            let result = loop {
+                tokio::select! {
+                    result = &mut call => break result?,
+                    message = receiver.recv() => if let Some(message) = message { emit(message)?; },
+                }
+            };
+            while let Ok(message) = receiver.try_recv() {
+                emit(message)?;
+            }
+            drop(receiver);
+            result
+            };
             client.cancel().await?;
             let _ = child.kill().await;
-            serde_json::to_value(result).map_err(Into::into)
+            match result {
+                ServerResult::CallToolResult(result) => serde_json::to_value(result).map_err(Into::into),
+                _ => bail!("MCP tool returned an unsupported response"),
+            }
         })
         .await
         .context("MCP tool call timed out")?

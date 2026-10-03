@@ -54,7 +54,10 @@ fn process_output_is_virtualized_and_state_is_masked() -> Result<()> {
         json!({"operation":operation.id,"key":operation.idempotency_key})
     );
     assert!(bytes.len() > 2_000_000);
-    assert!(result.to_string().len() < 1000);
+    // The receipt includes a bounded 1,200-character preview; the complete
+    // two-megabyte output must remain only in the referenced artifact.
+    assert!(result["preview"].as_str().unwrap().chars().count() <= 1200);
+    assert!(result.to_string().len() < 2000);
     assert_eq!(
         std::fs::read_to_string(directory.path().join(".git/config"))?,
         "HOST_GIT_SECRET"

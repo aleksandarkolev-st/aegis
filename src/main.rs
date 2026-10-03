@@ -24,7 +24,7 @@ fn usage() {
     );
     println!("arun interrupt <run-id> operation|model");
     println!(
-        "arun goal|contract|status|why|verify|budget|handoff <run-id> | evidence <run-id> [O3] | provider <run-id> [history] | goal <run-id> history | pause <run-id> | models <provider> [--refresh]"
+        "arun goal|contract|status|why|verify|budget|metrics|handoff <run-id> | evidence <run-id> [O3] | provider <run-id> [history] | goal <run-id> history | pause <run-id> | models <provider> [--refresh]"
     );
     println!(
         "Provider capture budget: --model-response-bytes <1024..33554432> (default 8388608); also available in F7 custom budgets."
@@ -583,10 +583,7 @@ fn execute() -> Result<()> {
             println!("aegis {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Some(
-            "goal" | "contract" | "status" | "why" | "evidence" | "verify" | "provider" | "budget"
-            | "handoff",
-        ) => {
+        Some(view) if arun::control::VIEWS.contains(&view) => {
             println!(
                 "{}",
                 arun::control::display(

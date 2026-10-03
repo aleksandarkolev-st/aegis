@@ -168,7 +168,7 @@ fn views_inspect_open_verified_and_stale_obligations_without_inference() -> Resu
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    child.stdin.take().unwrap().write_all(b"/goal\n/status\n/why\n/evidence O1\n/verify\n/provider history\n/budget\n/handoff\n/quit\n")?;
+    child.stdin.take().unwrap().write_all(b"/goal\n/status\n/why\n/evidence O1\n/verify\n/provider history\n/budget\n/metrics\n/handoff\n/quit\n")?;
     let output = child.wait_with_output()?;
     assert!(
         output.status.success(),
@@ -181,6 +181,11 @@ fn views_inspect_open_verified_and_stale_obligations_without_inference() -> Resu
         "{text}"
     );
     assert!(text.contains("O2 remains open"));
+    assert!(text.contains("Tokens:") && text.contains("Verified requirements: 1/2"),"{text}");
+    let metrics_cli=Command::new(env!("CARGO_BIN_EXE_arun"))
+        .current_dir(directory.path()).args(["metrics",&run.id]).output()?;
+    assert!(metrics_cli.status.success(),"{}",String::from_utf8_lossy(&metrics_cli.stderr));
+    assert!(String::from_utf8_lossy(&metrics_cli.stdout).contains("Verified requirements: 1/2"));
     assert!(text.contains(&hash));
     assert_eq!(store.event_count(&run.id, "model.started")?, 0);
     let edit = store.begin_operation(&run.id, "workspace.write", json!({}), false)?;

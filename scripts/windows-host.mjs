@@ -5,6 +5,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { StringDecoder } from 'node:string_decoder';
 
 const helper = fileURLToPath(new URL('./windows-host.ps1', import.meta.url));
 const MAX_MESSAGE = 2 * 1024 * 1024;
@@ -94,7 +95,7 @@ function killTree(child) {
   killer.on('error', () => child.kill());
 }
 
-async function native(action, args, workspace) {
+async function native(action, args, workspace, onOutput = null) {
   const seconds = args.timeout_seconds ?? (action === 'powershell' ? 60 : 10);
   const limit = args.max_output_bytes ?? (action === 'powershell' ? 32768 : 131072);
   return new Promise((resolve, reject) => {
@@ -105,13 +106,23 @@ async function native(action, args, workspace) {
     children.add(child);
     let stdout = Buffer.alloc(0), stderr = Buffer.alloc(0), stdoutBytes = 0, stderrBytes = 0, timedOut = false;
     const append = (current, chunk) => Buffer.concat([current, chunk.subarray(0, Math.max(0, limit - current.length))]);
-    child.stdout.on('data', bytes => { stdoutBytes += bytes.length; stdout = append(stdout, bytes); });
-    child.stderr.on('data', bytes => { stderrBytes += bytes.length; stderr = append(stderr, bytes); });
+    const decoders = { stdout: new StringDecoder('utf8'), stderr: new StringDecoder('utf8') };
+    const emit = (stream, text) => {
+      if (action !== 'powershell' || !onOutput) return;
+      for (let offset = 0; offset < text.length;) {
+        let end = Math.min(offset + 2048, text.length);
+        if (end < text.length && text.charCodeAt(end - 1) >= 0xd800 && text.charCodeAt(end - 1) <= 0xdbff) end--;
+        onOutput(stream, text.slice(offset, end)); offset = end;
+      }
+    };
+    child.stdout.on('data', bytes => { stdoutBytes += bytes.length; const retained = bytes.subarray(0, Math.max(0, limit - stdout.length)); stdout = append(stdout, bytes); emit('stdout', decoders.stdout.write(retained)); });
+    child.stderr.on('data', bytes => { stderrBytes += bytes.length; const retained = bytes.subarray(0, Math.max(0, limit - stderr.length)); stderr = append(stderr, bytes); emit('stderr', decoders.stderr.write(retained)); });
     const timer = setTimeout(() => { timedOut = true; killTree(child); }, (seconds + 2) * 1000);
     child.stdin.on('error', () => {});
     child.on('error', error => { clearTimeout(timer); children.delete(child); reject(error); });
     child.on('close', code => {
       clearTimeout(timer); children.delete(child);
+      emit('stdout', decoders.stdout.end()); emit('stderr', decoders.stderr.end());
       if (action === 'powershell') resolve({ exit_code: code, timed_out: timedOut || code === 124,
         stdout: stdout.toString('utf8'), stderr: stderr.toString('utf8'),
         stdout_bytes: stdoutBytes, stderr_bytes: stderrBytes,
@@ -124,7 +135,7 @@ async function native(action, args, workspace) {
 }
 
 const textResult = result => ({ content: [{ type: 'text', text: JSON.stringify(result) }], isError: false });
-export async function callTool(name, input = {}, workspace = process.cwd()) {
+export async function callTool(name, input = {}, workspace = process.cwd(), onOutput = null) {
   const args = validate(name, input);
   const absolute = name => path.resolve(workspace, name);
   if (name === 'file_read') {
@@ -176,7 +187,7 @@ export async function callTool(name, input = {}, workspace = process.cwd()) {
         { type: 'image', mimeType: 'image/png', data: bytes.toString('base64') }], isError: false };
     } catch (error) { await fs.unlink(output).catch(() => {}); throw error; }
   }
-  const result = await native(name, nativeArgs, absolute(args.cwd ?? '.'));
+  const result = await native(name, nativeArgs, absolute(args.cwd ?? '.'), onOutput);
   const reply = textResult(result);
   if (name === 'powershell') reply.isError = result.exit_code !== 0 || result.timed_out;
   return reply;
@@ -198,7 +209,13 @@ export async function serve() {
     else if (request.method === 'ping') result = {};
     else if (request.method === 'tools/list') result = { tools };
     else if (request.method === 'tools/call') {
-      try { result = await callTool(request.params?.name, request.params?.arguments ?? {}); }
+      const token = request.params?._meta?.progressToken;
+      let progress = 0;
+      const onOutput = typeof token === 'string' || typeof token === 'number'
+        ? (stream, text) => send({ jsonrpc: '2.0', method: 'notifications/progress', params: {
+          progressToken: token, progress: ++progress, message: stream === 'stderr' ? `[stderr] ${text}` : text,
+        } }) : null;
+      try { result = await callTool(request.params?.name, request.params?.arguments ?? {}, process.cwd(), onOutput); }
       catch (error) { result = { content: [{ type: 'text', text: error.message }], isError: true }; }
     } else { send({ jsonrpc: '2.0', id: request.id, error: { code: -32601, message: 'Method not found' } }); return; }
     send({ jsonrpc: '2.0', id: request.id, result });

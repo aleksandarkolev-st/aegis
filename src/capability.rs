@@ -20,16 +20,16 @@ pub fn registry() -> Vec<Manifest> {
         Manifest {
             id: "workspace.search".into(),
             version: 1,
-            purpose: "Find text in repository files by literal substring".into(),
+            purpose: "Find a literal substring in repository files. Set path to search one exact relative file, e.g. path=README.md and query=## for its headings.".into(),
             permission: "workspace.read".into(),
             side_effect: "none".into(),
             cost: 2,
-            input_schema: json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}),
+            input_schema: json!({"type":"object","additionalProperties":false,"properties":{"query":{"type":"string"},"path":{"type":"string","minLength":1,"maxLength":128,"description":"Optional exact relative file; omit to search the workspace."}},"required":["query"]}),
         },
         Manifest {
             id: "workspace.read".into(),
             version: 1,
-            purpose: "Read a UTF-8 workspace file; artifact-backed modes map complete files <=1024 characters directly".into(),
+            purpose: "Read a UTF-8 workspace file. Complete files through 65536 Unicode characters enter context directly, ready to use without inspecting the artifact. Larger files remain artifact-backed; use read_batch for bounded ranges.".into(),
             permission: "workspace.read".into(),
             side_effect: "none".into(),
             cost: 1,
@@ -38,11 +38,11 @@ pub fn registry() -> Vec<Manifest> {
         Manifest {
             id: "workspace.read_batch".into(),
             version: 1,
-            purpose: "Read selected Unicode character ranges from up to eight UTF-8 files in one operation; at most 3000 text characters total. Requested ranges enter the next context directly with whole-file SHA256 and next_offset, avoiding a separate inspection turn. Large full files remain artifact-backed via workspace.read.".into(),
+            purpose: "Read up to eight UTF-8 file ranges. Output automatically paginates at 65536 actual Unicode characters total; larger requested ranges are valid. Text enters context directly: use it without inspect_result. Continue only missing text using next_offset, not the previous offset. Distinct offsets of the same file are allowed.".into(),
             permission: "workspace.read".into(),
             side_effect: "none".into(),
             cost: 2,
-            input_schema: json!({"type":"object","additionalProperties":false,"properties":{"files":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","additionalProperties":false,"properties":{"path":{"type":"string","minLength":1,"maxLength":128},"offset":{"type":"integer","minimum":0,"maximum":2097152},"length":{"type":"integer","minimum":1,"maximum":3000}},"required":["path","length"]}}},"required":["files"]}),
+            input_schema: json!({"type":"object","additionalProperties":false,"properties":{"files":{"type":"array","minItems":1,"maxItems":8,"uniqueItems":true,"items":{"type":"object","additionalProperties":false,"properties":{"path":{"type":"string","minLength":1,"maxLength":128},"offset":{"type":"integer","minimum":0,"maximum":2097152},"length":{"type":"integer","minimum":1,"maximum":65536,"description":"Requested Unicode characters; no aggregate-request arithmetic required. Output stops at 65536 actual characters total. next_offset is the first unread character; when a later file receives no text, resume at its unchanged offset."}},"required":["path","length"]}}},"required":["files"]}),
         },
         Manifest {
             id: "workspace.write".into(),

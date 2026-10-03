@@ -234,7 +234,7 @@ impl Endpoint {
         let bytes = runtime.block_on(async {
             let client = Client::builder().timeout(timeout).connect_timeout(timeout.min(Duration::from_secs(20)))
                 .redirect(reqwest::redirect::Policy::none()).build()?;
-            let mut request = client.post(url).json(&body);
+            let mut request = client.post(url).json(&model::request_body(&body));
             if let Some(key) = &key { request = request.bearer_auth(key); }
             let fetch = async {
                 let mut response = request.send().await.map_err(|error| {
@@ -288,6 +288,7 @@ impl Endpoint {
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
                 source: "provider".into(),
+                cached_input_reported: usage.pointer("/prompt_tokens_details/cached_tokens").and_then(Value::as_u64).is_some(),
             })
         });
         let text = envelope
@@ -313,6 +314,7 @@ impl Endpoint {
             output_tokens: (raw.chars().count() as u64).div_ceil(4),
             cached_input_tokens: 0,
             source: "estimated".into(),
+            cached_input_reported: false,
         });
         Ok(Response {
             action,

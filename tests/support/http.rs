@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
@@ -16,9 +16,24 @@ pub struct Endpoint {
 
 impl Endpoint {
     pub fn start(
-        mut respond: impl FnMut(&Value) -> Result<(u16, Value)> + Send + 'static,
+        respond: impl FnMut(&Value) -> Result<(u16, Value)> + Send + 'static,
     ) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
+        Self::from_listener(listener, respond)
+    }
+
+    #[allow(dead_code)]
+    pub fn start_at(
+        address: SocketAddr,
+        respond: impl FnMut(&Value) -> Result<(u16, Value)> + Send + 'static,
+    ) -> Result<Self> {
+        Self::from_listener(TcpListener::bind(address)?, respond)
+    }
+
+    fn from_listener(
+        listener: TcpListener,
+        mut respond: impl FnMut(&Value) -> Result<(u16, Value)> + Send + 'static,
+    ) -> Result<Self> {
         listener.set_nonblocking(true)?;
         let url = format!("http://{}/v1", listener.local_addr()?);
         let stopped = Arc::new(AtomicBool::new(false));

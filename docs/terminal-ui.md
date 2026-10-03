@@ -1,6 +1,32 @@
 # Aegis terminal UI
 
-Research checked: 2026-10-02. This document records implemented behavior and verification, separately from future ideas.
+Research checked: 2026-10-03. This document records implemented behavior and verification, separately from future ideas.
+
+The October 4 build is globally installed with executable SHA-256 `b93d30f9e0dc1846def6fc085e64cd36ab37a40125dda36f026b988fe69f2bf0`. Final installed checks passed four real ConPTY cases, two native host cases and two crash-recovery cases: `.arun/read-loop-global-pty-20261004.log`, `.arun/read-loop-global-host-20261004.log` and `.arun/read-loop-global-recovery-20261004.log`. The complete source suite passed 554 tests with 11 explicit ignores across 64 targets, and all 13 npm checks passed. See [the README exploration repair](readme-read-loop-2026-10-04.md) and `.arun/read-loop-installed-20261004.json`. Older hashes below describe historical trials.
+
+## Persistent input and live activity
+
+Following a running task opens the composer immediately. Live output continues during typing and the slash picker. The input border retains activity, elapsed time and the current UTC clock, with phase-specific animation and rotating keyboard tips. `AEGIS_REDUCED_MOTION=1` keeps animation static. Enter submits steering to the existing task; Ctrl+D detaches, Ctrl+C targets interruption, and F9 opens cancellation confirmation.
+
+Closing the composer reports the actual saved state. Interrupted work says `Task needs recovery`, paused work says `Task paused`, and only completed work says `Task completed`; a conversational response says `Reply finished`.
+
+Commands display their literal arguments; trusted PowerShell previews display the script and readable stdout/stderr. Large output retains its artifact recovery path. Precautionary workspace revision changes say whether any verified requirements actually became stale.
+
+Native PowerShell stdout/stderr now appears during execution through bounded, request-correlated MCP progress notifications. Preview is limited to 64 KiB or 128 messages; final tool receipts remain execution evidence. A model-response pause identifies an exhausted response deadline or task wall deadline when applicable.
+
+Public provider reasoning summaries and commentary appear as they arrive, before final action processing. Hidden internal reasoning is unavailable. Progress narration is not verification evidence. ChatGPT requests summary output when reasoning is enabled; providers that do not supply summaries can still display commands and execution results.
+
+Token usage remains in the live composer border while typing and using the slash picker. `t` counts provider-reported input plus output, `~t` marks custom-endpoint estimates, and `t?` marks legacy usage whose source is unclassified. Cached input belongs to input and is not added again. An outstanding request shows `usage pending`; counts update only from durable receipts. Current requirement verification appears alongside usage and stops counting proof during an in-flight workspace mutation or after the workspace revision changes.
+
+`/metrics` opens the detailed report without inference. The installed build also exposes `aegis metrics <run-id>` from the shell. The same report appears when a task ends in the interactive follower: input/output/cached usage, estimates, missing receipts, current requirement evidence, independent acceptance, tool outcomes, elapsed time, output tokens per second of recorded request time, and tokens per completed task. Missing usage or timing prevents an exact efficiency ratio. Historical acceptance with stale evidence is labelled accordingly. These figures describe observed work; requirement coverage is not a model confidence score. Live elapsed time and usage stay visible while the detailed report remains available on demand.
+
+Connection retries appear in the timeline and live phase. Only typed connection failures before dispatch receive up to three same-route retries, with 1/2/4-second backoff and the original deadline. A pause or cancellation interrupts backoff. Dispatched requests without usage are retained as unknown and do not qualify for this retry.
+
+Action-shaped JSON and code-fenced commentary are omitted from the progress feed. Only the provider's validated final action can create an operation; command history and results come from committed operation events. Commentary cannot execute a command.
+
+Aegis asks when intent or a decision is unclear, while continuing independent work. Pending questions remain visible beside input and survive restart. Enter answers the oldest pending question and steers the same task. A question wait can resume after its answer; unrelated recovery pauses still require reconciliation. Unanswered questions prevent completion.
+
+The privately installed Windows executable with SHA-256 `b0d8cd3bf447276d82dae2898199bace042b9f4db37621239aa24e36dd1676c2` passed three real ConPTY tests and one screen-decoder regression twice: `.arun/question-archive-private-pty-corrected-20261002.log` and `.arun/question-archive-private-pty-stability-20261002.log`. These cover immediate input visibility, activity while typing, streamed public-summary rendering, a pinned question and submission on the original task. The UI cases use local fixtures; the matching hosted GPT-6 Luna/medium streaming receipt is `.arun/hosted-output-live-EQ9vu5/receipt.json`. On 2026-10-03 the previously running older process was absent; global installation succeeded with the same binary hash, and all four terminal checks passed against the global executable: `.arun/question-archive-global-pty-20261003.log`.
 
 ## Reference patterns
 
@@ -72,7 +98,7 @@ Open a new `aegis` session to load the rebuilt executable. An already running pr
 | Fullscreen/resize responds | Actual pseudo-console width and height changes reflow the composer and picker; library cases cover height-only changes and clearing old rows |
 | More colors | Installed child runs with colors enabled and emits at least three distinct foreground palette roles; diff/code formatting tests check intended row styles |
 | Worked time, current time and completion time | Installed follower screen contains current UTC time and elapsed work time; completion displays the timestamp recorded in the durable event and elapsed time |
-| `/` reveals all choices and filters | Complete command-catalog integration check plus installed picker navigation through all 39 entries, filtering and resize |
+| `/` reveals all choices and filters | Complete command-catalog integration check plus installed picker navigation through all 40 entries, including `/metrics`, filtering and resize |
 | No aggregate token or turn budgets | Library, usage-view, setup and token-budget integration checks; the real parser run records 15 responses and 59,448 tokens without task caps |
 | Own Aegis runtime and truthful identity | Direct transport request tests, persisted route identity tests and installed package traps reject native provider CLI execution |
 | Small atomic commits and subagents | Renderer, Windows input, foreground streaming, evidence repair, sanitizer and acceptance additions are separate commits; independent agents reviewed and exercised the input, UI and obligation paths |

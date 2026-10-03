@@ -8,6 +8,9 @@ use serde_json::Value;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Action {
+    AskUser {
+        query: String,
+    },
     SearchCapabilities {
         query: String,
     },
@@ -56,6 +59,8 @@ pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
+    #[serde(default)]
+    pub cached_input_reported: bool,
     pub source: String,
 }
 
@@ -66,10 +71,121 @@ pub struct Response {
     pub usage: Option<Usage>,
 }
 
-const SCHEMA: &str = r#"{"type":"object","properties":{"kind":{"type":"string","enum":["search_capabilities","invoke","inspect_result","checkpoint","verify_obligations","finish","blocked"]},"query":{"type":"string"},"capability":{"type":"string"},"args":{"type":"string"},"artifact":{"type":"string"},"checkpoint":{"type":"string"},"summary":{"type":"string"},"evidence":{"type":"array","items":{"type":"string"}},"obligations":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer"},"evidence":{"type":"array","items":{"type":"string"}}},"required":["id","evidence"],"additionalProperties":false}},"reason":{"type":"string"}},"required":["kind","query","capability","args","artifact","checkpoint","summary","evidence","obligations","reason"],"additionalProperties":false}"#;
+const SCHEMA: &str = r#"{"type":"object","properties":{"kind":{"type":"string","enum":["ask_user","search_capabilities","invoke","inspect_result","checkpoint","verify_obligations","finish","blocked"]},"query":{"type":"string"},"capability":{"type":"string"},"args":{"type":"string"},"artifact":{"type":"string"},"checkpoint":{"type":"string"},"summary":{"type":"string"},"evidence":{"type":"array","items":{"type":"string"}},"obligations":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer"},"evidence":{"type":"array","items":{"type":"string"}}},"required":["id","evidence"],"additionalProperties":false}},"reason":{"type":"string"}},"required":["kind","query","capability","args","artifact","checkpoint","summary","evidence","obligations","reason"],"additionalProperties":false}"#;
 
 pub(crate) fn schema() -> Result<Value> {
-    Ok(serde_json::from_str(SCHEMA)?)
+    let mut schema: Value = serde_json::from_str(SCHEMA)?;
+    schema["properties"]["args"]["description"] = serde_json::json!(
+        "Invoke metadata encoded as a JSON object string. Use \"{}\" when empty. Omit content/script when supplied through args_text."
+    );
+    schema["properties"]["artifact"]["description"] = serde_json::json!("For inspect_result, use the exact successful operation artifact field from a receipt or read_history.artifact. A file sha256 is a content digest, not an artifact handle. Never invent or shorten IDs.");
+    schema["properties"]["args_text_field"] = serde_json::json!({"type":"string","enum":["","content","script"],"description":"For invoke with file content or a script, select its argument name here. Otherwise empty."});
+    schema["properties"]["args_text"] = serde_json::json!({"type":"string","description":"The selected content/script as a plain string, with only this outer JSON escaping. Never encode it inside args as well."});
+    let required = schema["required"]
+        .as_array_mut()
+        .context("action schema required fields")?;
+    required.push(serde_json::json!("args_text_field"));
+    required.push(serde_json::json!("args_text"));
+    Ok(schema)
+}
+
+/// Only provider request schemas need decision-first property order. Persisted
+/// values keep serde_json's existing canonical map order and contract hashes.
+pub(crate) fn request_body(body: &Value) -> impl Serialize + '_ {
+    WireValue {
+        value: body,
+        scope: SchemaScope::Root,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SchemaScope {
+    Root,
+    Text,
+    Format,
+    ResponseFormat,
+    JsonSchema,
+    Schema,
+    Properties,
+    Other,
+}
+
+impl SchemaScope {
+    fn child(self, key: &str) -> Self {
+        match (self, key) {
+            (Self::Root, "text") => Self::Text,
+            (Self::Text, "format") => Self::Format,
+            (Self::Format, "schema") => Self::Schema,
+            (Self::Root, "response_format") => Self::ResponseFormat,
+            (Self::ResponseFormat, "json_schema") => Self::JsonSchema,
+            (Self::JsonSchema, "schema") => Self::Schema,
+            (Self::Schema, "properties") => Self::Properties,
+            _ => Self::Other,
+        }
+    }
+}
+
+struct WireValue<'a> {
+    value: &'a Value,
+    scope: SchemaScope,
+}
+
+impl Serialize for WireValue<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        const ORDER: &[&str] = &[
+            "kind",
+            "capability",
+            "args_text_field",
+            "args_text",
+            "args",
+            "query",
+            "artifact",
+            "checkpoint",
+            "summary",
+            "evidence",
+            "obligations",
+            "reason",
+        ];
+        match self.value {
+            Value::Object(fields) => {
+                let mut output = serializer.serialize_map(Some(fields.len()))?;
+                if matches!(self.scope, SchemaScope::Properties) {
+                    for key in ORDER {
+                        if let Some(value) = fields.get(*key) {
+                            output.serialize_entry(key, value)?;
+                        }
+                    }
+                }
+                for (key, value) in fields {
+                    if matches!(self.scope, SchemaScope::Properties)
+                        && ORDER.contains(&key.as_str())
+                    {
+                        continue;
+                    }
+                    output.serialize_entry(
+                        key,
+                        &WireValue {
+                            value,
+                            scope: self.scope.child(key),
+                        },
+                    )?;
+                }
+                output.end()
+            }
+            Value::Array(values) => {
+                let mut output = serializer.serialize_seq(Some(values.len()))?;
+                for value in values {
+                    output.serialize_element(&WireValue {
+                        value,
+                        scope: SchemaScope::Other,
+                    })?;
+                }
+                output.end()
+            }
+            _ => self.value.serialize(serializer),
+        }
+    }
 }
 
 pub(crate) fn parse_action(raw: &str) -> Result<Action> {
@@ -109,6 +225,36 @@ pub(crate) fn parse_action(raw: &str) -> Result<Action> {
                 value[key] = serde_json::from_str(contents)
                     .with_context(|| format!("invalid {key} JSON"))?;
             }
+        }
+        // Large code/script strings need only the outer JSON escaping. The resulting
+        // argument object still passes the ordinary capability/grant/schema checks.
+        let text_field = value
+            .get("args_text_field")
+            .map(|field| field.as_str().context("args_text_field must be a string"))
+            .transpose()?
+            .unwrap_or("")
+            .to_owned();
+        let text = value
+            .get("args_text")
+            .map(|text| text.as_str().context("args_text must be a string"))
+            .transpose()?
+            .unwrap_or("")
+            .to_owned();
+        if text_field.is_empty() {
+            if !text.is_empty() {
+                bail!("args_text requires a selected field");
+            }
+        } else {
+            if value["kind"] != "invoke" || !matches!(text_field.as_str(), "content" | "script") {
+                bail!("separated argument text requires invoke and content or script");
+            }
+            let arguments = value["args"]
+                .as_object_mut()
+                .context("separated text requires object args")?;
+            if arguments.contains_key(&text_field) {
+                bail!("conflicting argument text fields");
+            }
+            arguments.insert(text_field, Value::String(text));
         }
         return serde_json::from_value(value).context("invalid model action");
     }
@@ -196,6 +342,28 @@ pub(crate) fn call_configured_with_images(
     timeout: Duration,
     images: &[crate::image::InputImage],
     cancelled: impl Fn() -> bool,
+) -> Result<Response> {
+    call_configured_with_progress(
+        provider,
+        configuration,
+        prompt,
+        _directory,
+        timeout,
+        images,
+        cancelled,
+        &|_, _| Ok(()),
+    )
+}
+
+pub(crate) fn call_configured_with_progress(
+    provider: &str,
+    configuration: &Value,
+    prompt: &str,
+    _directory: &Path,
+    timeout: Duration,
+    images: &[crate::image::InputImage],
+    cancelled: impl Fn() -> bool,
+    progress: &dyn Fn(&str, &str) -> Result<()>,
 ) -> Result<Response> {
     let provider = crate::provider::canonical(provider);
     if !images.is_empty() && provider != "codex" {
@@ -295,7 +463,7 @@ pub(crate) fn call_configured_with_images(
     if remaining.is_zero() {
         bail!("Model request deadline elapsed during sign-in refresh");
     }
-    crate::direct::call(
+    crate::direct::call_with_progress(
         provider,
         &credentials,
         &crate::direct::Request {
@@ -307,12 +475,77 @@ pub(crate) fn call_configured_with_images(
             images,
         },
         interrupted,
+        progress,
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wire_schema_decides_action_and_text_before_arguments_without_changing_persisted_values()
+    -> Result<()> {
+        for mut body in [
+            serde_json::json!({"text":{"format":{"schema":schema()?}}}),
+            serde_json::json!({"response_format":{"json_schema":{"schema":schema()?}}}),
+        ] {
+            body["unrelated"] = serde_json::json!({"properties":{"z":2,"a":1},"prompt":"quoted \"schema\" Київ\\path"});
+            let canonical = serde_json::to_vec(&body)?;
+            let wire = serde_json::to_string(&request_body(&body))?;
+            assert_eq!(serde_json::from_str::<Value>(&wire)?, body);
+            assert_eq!(serde_json::to_vec(&body)?, canonical);
+            assert!(wire.contains("\"properties\":{\"kind\":"));
+            let kind = wire.find("\"kind\":{").unwrap();
+            let capability = wire.find("\"capability\":{").unwrap();
+            let selector = wire.find("\"args_text_field\":{").unwrap();
+            let text = wire.find("\"args_text\":{").unwrap();
+            let args = wire.find("\"args\":{").unwrap();
+            assert!(kind < capability && capability < selector && selector < text && text < args);
+            assert!(wire.contains("\"properties\":{\"a\":1,\"z\":2}"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn separated_code_text_round_trips_without_a_second_json_escape_layer() -> Result<()> {
+        let text =
+            "const path = 'C:\\windows\\a';\nconst json = {\"quote\": '\"', unicode: 'Київ 🦀'};\n"
+                .repeat(1000);
+        for (capability, field, arguments) in [
+            (
+                "workspace.write",
+                "content",
+                serde_json::json!({"path":"code.mjs"}),
+            ),
+            (
+                "mcp.windows-host.powershell",
+                "script",
+                serde_json::json!({"timeout_seconds":30}),
+            ),
+        ] {
+            let raw = serde_json::json!({"kind":"invoke","capability":capability,"args":arguments.to_string(),"args_text_field":field,"args_text":text});
+            let mut expected = arguments;
+            expected[field] = Value::String(text.clone());
+            assert_eq!(
+                parse_action(&raw.to_string())?,
+                Action::Invoke {
+                    capability: capability.into(),
+                    args: expected
+                }
+            );
+        }
+        for invalid in [
+            serde_json::json!({"kind":"invoke","capability":"workspace.write","args":"{}","args_text_field":"path","args_text":"outside"}),
+            serde_json::json!({"kind":"invoke","capability":"workspace.write","args":"{\"content\":\"first\"}","args_text_field":"content","args_text":"second"}),
+            serde_json::json!({"kind":"invoke","capability":"workspace.write","args":"{}","args_text_field":"","args_text":"orphan"}),
+            serde_json::json!({"kind":"finish","summary":"done","evidence":[],"args_text_field":"script","args_text":"unexpected"}),
+        ] {
+            assert!(parse_action(&invalid.to_string()).is_err());
+        }
+        assert_eq!(schema()?["additionalProperties"], false);
+        Ok(())
+    }
 
     #[test]
     fn native_execution_and_implicit_legacy_transport_are_not_available() -> Result<()> {

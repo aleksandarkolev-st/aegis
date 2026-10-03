@@ -789,7 +789,7 @@ fn custom_endpoint_completes_a_kernel_run_without_persisting_its_key() -> Result
 #[test]
 fn requested_artifact_tail_reaches_the_next_model_request_without_inline_output() -> Result<()> {
     for query in [
-        "@slice 5000 100",
+        "@slice 70000 100",
         "unique_tail_evidence",
         "@find UNIQUE_TAIL_EVIDENCE",
     ] {
@@ -802,7 +802,7 @@ fn artifact_tail_scenario(query: &str) -> Result<()> {
     let directory = tempfile::tempdir()?;
     fs::write(
         directory.path().join("long.txt"),
-        format!("{}UNIQUE_TAIL_EVIDENCE", "x".repeat(5000)),
+        format!("{}UNIQUE_TAIL_EVIDENCE", "x".repeat(70000)),
     )?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     listener.set_nonblocking(true)?;
@@ -858,9 +858,9 @@ fn artifact_tail_scenario(query: &str) -> Result<()> {
                     if query.starts_with("@slice ") {
                         assert_eq!(excerpt, "UNIQUE_TAIL_EVIDENCE");
                     } else {
-                        assert!(excerpt.contains("char 4920"));
+                        assert!(excerpt.contains("char 69920"));
                     }
-                    assert!(!prompt.contains(&"x".repeat(5000)));
+                    assert!(!prompt.contains(&"x".repeat(70000)));
                     json!({"kind":"finish","summary":"tail independently observed","evidence":[artifact()?]})
                 }
             };

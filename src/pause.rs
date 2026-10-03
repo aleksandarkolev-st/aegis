@@ -123,15 +123,17 @@ pub(crate) fn boundary(store: &mut Store, id: &str) -> Result<bool> {
         return Ok(false);
     }
     // Preserve the model's actual checkpoint and milestones; no invented next action.
-    let checkpoint = store
-        .last_checkpoint(id)?
-        .unwrap_or(crate::model::Checkpoint {
+    // An existing checkpoint is historical context; stopping must not rewrite
+    // the model's plan or create another checkpoint merely to acknowledge pause.
+    if store.last_checkpoint(id)?.is_none() {
+        let checkpoint = crate::model::Checkpoint {
             decisions: vec![],
             unresolved: vec!["User paused before a next action was checkpointed".into()],
             next_action: "Inspect saved run state and continue the original task".into(),
             milestones: store.milestones(id)?,
-        });
-    store.save_checkpoint(id, &checkpoint)?;
+        };
+        store.save_checkpoint(id, &checkpoint)?;
+    }
     let paused = store.acknowledge_pause(id)?;
     if paused {
         store.save_snapshot(id)?;

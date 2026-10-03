@@ -29,7 +29,7 @@ fn small_file_reads_reach_the_next_decision_without_an_inspection_turn() -> Resu
                     state["result_policy"]
                         .as_str()
                         .unwrap()
-                        .contains("mapped read content is ready to use")
+                    .contains("ready to use")
                 );
                 let result = state["recent_events"]
                     .as_array()

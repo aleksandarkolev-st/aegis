@@ -6,6 +6,106 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 #[test]
+fn large_requested_batches_paginate_actual_unicode_text_and_allow_distinct_file_ranges()
+-> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let text = "🦊".repeat(70_000);
+    fs::write(directory.path().join("README.md"), &text)?;
+    fs::write(directory.path().join("package.json"), "{}")?;
+    let root = directory.path().join(".arun");
+    let mut store = Store::open(&root)?;
+    let run = store.create_run(
+        "read",
+        directory.path(),
+        "fixture",
+        json!(["workspace.read"]),
+        json!({}),
+        "",
+    )?;
+    store.state(&run.id, "running", json!({}))?;
+    let execute = |store: &mut Store, arguments| -> Result<serde_json::Value> {
+        let operation = store.begin_operation(&run.id, "workspace.read_batch", arguments, true)?;
+        store.operation_state(&operation, "dispatched", None, json!({}))?;
+        worker::execute(&root, &operation.id)
+    };
+    let result = execute(
+        &mut store,
+        json!({"files":[{"path":"README.md","length":65536},{"path":"package.json","length":4000}]}),
+    )?;
+    assert_eq!(
+        result["selected"][0]["text"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count(),
+        65_536
+    );
+    assert_eq!(result["selected"][0]["next_offset"], 65_536);
+    assert_eq!(result["selected"][0]["total_characters"], 70_000);
+    assert_eq!(result["selected"][1]["text"], "");
+    assert_eq!(result["selected"][1]["next_offset"], 0);
+    let rest = execute(
+        &mut store,
+        json!({"files":[{"path":"README.md","offset":65536,"length":65536},{"path":"package.json","length":4000}]}),
+    )?;
+    assert_eq!(rest["selected"][0]["next_offset"], 70_000);
+    assert_eq!(rest["selected"][1]["text"], "{}");
+    let ranges = execute(
+        &mut store,
+        json!({"files":[{"path":"README.md","offset":0,"length":1600},{"path":"README.md","offset":4000,"length":1600},{"path":"README.md","offset":8000,"length":1600}]}),
+    )?;
+    assert_eq!(ranges["selected"][2]["next_offset"], 9600);
+    assert_eq!(ranges["selected"].as_array().unwrap().len(), 3);
+    Ok(())
+}
+
+#[test]
+fn file_scoped_search_excludes_other_files_and_checks_permissions_before_execution() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    fs::write(
+        directory.path().join("README.md"),
+        "# Project\n## Install\n## Usage\n",
+    )?;
+    fs::write(directory.path().join("other.md"), "## Unrelated")?;
+    let root = directory.path().join(".arun");
+    let mut store = Store::open(&root)?;
+    let run = store.create_run(
+        "headings",
+        directory.path(),
+        "fixture",
+        json!(["workspace.read"]),
+        json!({"filesystem_scopes":{"read":["README.md"],"write":[]}}),
+        "",
+    )?;
+    store.state(&run.id, "running", json!({}))?;
+    let op = store.begin_operation(
+        &run.id,
+        "workspace.search",
+        json!({"path":"README.md","query":"##"}),
+        true,
+    )?;
+    store.operation_state(&op, "dispatched", None, json!({}))?;
+    let result = worker::execute(&root, &op.id)?;
+    assert_eq!(result["matches"].as_array().unwrap().len(), 2);
+    assert!(
+        result["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["path"] == "README.md")
+    );
+    let denied = store.begin_operation(
+        &run.id,
+        "workspace.search",
+        json!({"path":"other.md","query":"##"}),
+        true,
+    )?;
+    store.operation_state(&denied, "dispatched", None, json!({}))?;
+    assert!(worker::execute(&root, &denied.id).is_err());
+    Ok(())
+}
+
+#[test]
 fn selected_reads_are_bounded_unicode_exact_and_read_only() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let root = directory.path().join(".arun");

@@ -110,12 +110,24 @@ pub fn composer(
     width: u16,
     palette: &Palette,
 ) -> (Buffer, u16) {
+    composer_with_activity(prefix, lines, status, "", width, palette)
+}
+
+pub fn composer_with_activity(
+    prefix: &str,
+    lines: &[String],
+    status: &str,
+    activity: &str,
+    width: u16,
+    palette: &Palette,
+) -> (Buffer, u16) {
     let input_height = lines.len().max(1).min(u16::MAX as usize - 2) as u16;
     let area = Rect::new(0, 0, width, input_height + 2);
     let mut buffer = Buffer::empty(area);
     let border = Block::bordered()
         .border_type(BorderType::Rounded)
         .padding(Padding::horizontal(1))
+        .title_top(format!(" {} ", crate::text::clean(activity)))
         .title_bottom(format!(" {} ", crate::text::clean(status)))
         .border_style(Style::new().fg(rgb(palette.quiet)));
     let inner = border.inner(area);

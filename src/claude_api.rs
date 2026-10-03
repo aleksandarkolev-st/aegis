@@ -287,6 +287,7 @@ fn usage(envelope: &Value) -> Result<Usage> {
         input_tokens,
         output_tokens,
         cached_input_tokens,
+        cached_input_reported: receipt["cache_read_input_tokens"].as_u64().is_some(),
         source: "provider".into(),
     })
 }
