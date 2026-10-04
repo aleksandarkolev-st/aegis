@@ -127,7 +127,11 @@ pub(crate) fn observe(
         || outcome["result"]["isError"] == true;
     // Equivalent failures are the same blocker even if a retry changes its
     // arguments. Successful exploratory actions still retain their full key.
-    let signature_action = if failed { json!({"failure":true}) } else { key_action.clone() };
+    let signature_action = if failed {
+        json!({"failure":true})
+    } else {
+        key_action.clone()
+    };
     let signature = digest(&json!({"action":signature_action,"outcome":outcome,"epoch":epoch}));
     let transaction = store.connection.unchecked_transaction()?;
     let previous: Option<(String, i64)> = transaction
@@ -188,18 +192,39 @@ mod tests {
     fn changed_retry_arguments_cannot_disguise_the_same_permission_blocker() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let mut store = Store::open(directory.path())?;
-        let run = store.create_run("Explore", directory.path(), "custom", json!([]), json!({}), "")?;
+        let run = store.create_run(
+            "Explore",
+            directory.path(),
+            "custom",
+            json!([]),
+            json!({}),
+            "",
+        )?;
         store.state(&run.id, "running", json!({}))?;
         for retry in 0..8 {
-            observe(&mut store, &run, &Action::Invoke {
-                capability: format!("unavailable.{retry}"), args: json!({"retry":retry}),
-            }, Some("capability not granted"))?;
+            observe(
+                &mut store,
+                &run,
+                &Action::Invoke {
+                    capability: format!("unavailable.{retry}"),
+                    args: json!({"retry":retry}),
+                },
+                Some("capability not granted"),
+            )?;
         }
         assert_eq!(store.run(&run.id)?.state, "waiting_recovery");
         assert_eq!(store.event_count(&run.id, "loop.stalled")?, 1);
         store.state(&run.id, "running", json!({}))?;
         store.steer(&run.id, "Use the newly granted alternate approach")?;
-        observe(&mut store, &run, &Action::Invoke { capability: "alternate".into(), args: json!({}) }, Some("capability not granted"))?;
+        observe(
+            &mut store,
+            &run,
+            &Action::Invoke {
+                capability: "alternate".into(),
+                args: json!({}),
+            },
+            Some("capability not granted"),
+        )?;
         assert_eq!(store.run(&run.id)?.state, "running");
         Ok(())
     }

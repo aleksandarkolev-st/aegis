@@ -1,7 +1,10 @@
 use anyhow::{Result, ensure};
 use arun::{kernel, storage::Store};
 use serde_json::json;
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 #[path = "support/http.rs"]
 mod http;
 
@@ -26,19 +29,29 @@ fn summary_omission_cannot_remove_constraints_from_model_prompts_after_restart()
             }
             1 => {
                 ensure!(state["compacted_task_owner_messages"][0]["text"] == constraint);
-                ensure!(!state["working_memory"]["summary"].as_str().unwrap().contains("public APIs"));
+                ensure!(
+                    !state["working_memory"]["summary"]
+                        .as_str()
+                        .unwrap()
+                        .contains("public APIs")
+                );
                 json!({"kind":"finish","summary":"Exploration reply with owner constraints still available","evidence":[]})
             }
             _ => anyhow::bail!("Unexpected model request"),
         };
-        Ok((200,json!({"choices":[{"message":{"content":action.to_string()}}],"usage":{"prompt_tokens":10,"completion_tokens":2}})))
+        Ok((
+            200,
+            json!({"choices":[{"message":{"content":action.to_string()}}],"usage":{"prompt_tokens":10,"completion_tokens":2}}),
+        ))
     })?;
     let mut store = Store::open(&root)?;
     let run = store.create_run("Explore", directory.path(), "custom", json!([]), json!({"mode":"durable","model":"fixture","endpoint":{"base_url":endpoint.url,"api_key_env":null}}), "")?;
     store.steer(&run.id, constraint)?;
     kernel::drive(&root, &run.id)?;
     ensure!(store.run(&run.id)?.state == "paused");
-    for _ in 0..1100 { store.event(&run.id,"telemetry",json!({}))?; }
+    for _ in 0..1100 {
+        store.event(&run.id, "telemetry", json!({}))?;
+    }
     store.maintain_history(&run.id)?;
     store.resume_paused(&run.id)?;
     drop(store);

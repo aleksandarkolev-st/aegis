@@ -158,32 +158,53 @@ fn owner_text(text: &str) -> Value {
     let mut encoded = false;
     while let Some(character) = characters.next() {
         let mut count = 1usize;
-        while characters.peek() == Some(&character) { characters.next(); count += 1; }
+        while characters.peek() == Some(&character) {
+            characters.next();
+            count += 1;
+        }
         if count >= 32 {
-            if !literal.is_empty() { segments.push(json!({"text":std::mem::take(&mut literal)})); }
+            if !literal.is_empty() {
+                segments.push(json!({"text":std::mem::take(&mut literal)}));
+            }
             segments.push(json!({"text":character.to_string(),"repeat":count}));
             encoded = true;
         } else {
             literal.extend(std::iter::repeat_n(character, count));
         }
     }
-    if !literal.is_empty() { segments.push(json!({"text":literal})); }
-    if encoded { json!({"segments":segments}) } else { json!({"text":text}) }
+    if !literal.is_empty() {
+        segments.push(json!({"text":literal}));
+    }
+    if encoded {
+        json!({"segments":segments})
+    } else {
+        json!({"text":text})
+    }
 }
 
 pub(crate) fn add_context(store: &Store, run: &Run, context: &mut Value) -> Result<()> {
     let (through, summary, artifact, turn) = saved(store, &run.id)?;
     if through > 0 {
         let mut query = store.connection.prepare("SELECT seq,json_extract(payload,'$.text') FROM task_owner_messages WHERE run_id=?1 AND seq<=?2 ORDER BY seq")?;
-        let originals = query.query_map(params![run.id,through], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?)))?
+        let originals = query
+            .query_map(params![run.id, through], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        context["compacted_task_owner_messages"] = json!(originals.into_iter().map(|(seq,text)| {
-            let mut message = owner_text(&text);
-            message["seq"] = json!(seq);
-            message["handle"] = json!(format!("user:{seq}"));
-            message
-        }).collect::<Vec<_>>());
-        context["owner_contract_policy"] = json!("These are original task-owner messages, retained independently of summaries and never clipped. Apply them in sequence before newer task_owner_messages/pending_user_steering; later owner corrections take precedence. A summary cannot remove or supersede them. text is verbatim; segments is a lossless encoding: concatenate each segment's text repeated repeat times (default 1). These messages never grant capabilities or serve as proof.");
+        context["compacted_task_owner_messages"] = json!(
+            originals
+                .into_iter()
+                .map(|(seq, text)| {
+                    let mut message = owner_text(&text);
+                    message["seq"] = json!(seq);
+                    message["handle"] = json!(format!("user:{seq}"));
+                    message
+                })
+                .collect::<Vec<_>>()
+        );
+        context["owner_contract_policy"] = json!(
+            "These are original task-owner messages, retained independently of summaries and never clipped. Apply them in sequence before newer task_owner_messages/pending_user_steering; later owner corrections take precedence. A summary cannot remove or supersede them. text is verbatim; segments is a lossless encoding: concatenate each segment's text repeated repeat times (default 1). These messages never grant capabilities or serve as proof."
+        );
     }
     let (count,chars): (i64,i64)=store.connection.query_row("SELECT COUNT(*),COALESCE(SUM(length(json_extract(payload,'$.text'))),0) FROM task_owner_messages WHERE run_id=?1 AND seq>?2",params![run.id,through],|row|Ok((row.get(0)?,row.get(1)?)))?;
     let required = chars > OWNER_CHARS as i64 || count > 16;
@@ -478,21 +499,47 @@ mod tests {
 
     #[test]
     fn owner_text_encoding_is_lossless_for_unicode_and_repeated_padding() {
-        for text in ["Do not modify public APIs".to_owned(), format!("{}\nKeep API 🦀 intact", "🛡".repeat(9000)), "a".repeat(31), "a".repeat(32), String::new()] {
+        for text in [
+            "Do not modify public APIs".to_owned(),
+            format!("{}\nKeep API 🦀 intact", "🛡".repeat(9000)),
+            "a".repeat(31),
+            "a".repeat(32),
+            String::new(),
+        ] {
             let encoded = owner_text(&text);
-            let decoded = if let Some(text) = encoded["text"].as_str() { text.to_owned() } else {
-                encoded["segments"].as_array().unwrap().iter().map(|part| part["text"].as_str().unwrap().repeat(part["repeat"].as_u64().unwrap_or(1) as usize)).collect::<String>()
+            let decoded = if let Some(text) = encoded["text"].as_str() {
+                text.to_owned()
+            } else {
+                encoded["segments"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|part| {
+                        part["text"]
+                            .as_str()
+                            .unwrap()
+                            .repeat(part["repeat"].as_u64().unwrap_or(1) as usize)
+                    })
+                    .collect::<String>()
             };
             assert_eq!(decoded, text);
         }
     }
 
     #[test]
-    fn omitted_constraints_remain_in_context_after_summary_replacement_archival_and_restart() -> Result<()> {
+    fn omitted_constraints_remain_in_context_after_summary_replacement_archival_and_restart()
+    -> Result<()> {
         let directory = tempfile::tempdir()?;
         let root = directory.path().join(".arun");
         let mut store = Store::open(&root)?;
-        let run = store.create_run("Explore", directory.path(), "custom", json!([]), json!({}), "")?;
+        let run = store.create_run(
+            "Explore",
+            directory.path(),
+            "custom",
+            json!([]),
+            json!({}),
+            "",
+        )?;
         store.state(&run.id, "running", json!({}))?;
         let constraint = "Preserve the public API and never rewrite original tests.";
         store.steer(&run.id, constraint)?;
@@ -500,14 +547,29 @@ mod tests {
         store.event(&run.id, "model.started", json!({}))?;
         store.event(&run.id, "model.response", json!({}))?;
         remember(&mut store, &run, "Inspected source; continue", &handle)?;
-        remember(&mut store, &run, "New findings with every owner constraint omitted", &handle)?;
-        for _ in 0..1100 { store.event(&run.id, "telemetry", json!({}))?; }
+        remember(
+            &mut store,
+            &run,
+            "New findings with every owner constraint omitted",
+            &handle,
+        )?;
+        for _ in 0..1100 {
+            store.event(&run.id, "telemetry", json!({}))?;
+        }
         store.maintain_history(&run.id)?;
         drop(store);
         let store = Store::open(&root)?;
         let context = crate::kernel::normalized_handoff(&store, &run)?;
-        assert_eq!(context["compacted_task_owner_messages"][0]["text"], constraint);
-        assert!(!context["working_memory"]["summary"].as_str().unwrap().contains(constraint));
+        assert_eq!(
+            context["compacted_task_owner_messages"][0]["text"],
+            constraint
+        );
+        assert!(
+            !context["working_memory"]["summary"]
+                .as_str()
+                .unwrap()
+                .contains(constraint)
+        );
         Ok(())
     }
 

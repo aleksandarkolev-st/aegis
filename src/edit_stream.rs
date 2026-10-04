@@ -218,9 +218,13 @@ impl Watch {
             let mut start = 0;
             while start < diff.len() {
                 let mut end = start.saturating_add(MAX_DIFF_CHUNK).min(diff.len());
-                while !diff.is_char_boundary(end) { end -= 1; }
+                while !diff.is_char_boundary(end) {
+                    end -= 1;
+                }
                 // Prefer complete lines; a single long line can span chunks.
-                if end < diff.len() && let Some(newline) = diff[start..end].rfind('\n') {
+                if end < diff.len()
+                    && let Some(newline) = diff[start..end].rfind('\n')
+                {
                     end = start + newline + 1;
                 }
                 store.event(&operation.run_id, "operation.diff", json!({
@@ -568,24 +572,47 @@ mod tests {
             format!("{}\nFINAL_MARKER\n", "🦀".repeat(20_000)),
         )?;
         watch.poll(&mut store, &op, true)?;
-        let chunks: Vec<_> = store.events(&run.id)?.into_iter().filter(|e| e.kind == "operation.diff").collect();
+        let chunks: Vec<_> = store
+            .events(&run.id)?
+            .into_iter()
+            .filter(|e| e.kind == "operation.diff")
+            .collect();
         assert!(chunks.len() > 1);
         for event in &chunks {
             assert!(event.payload["text"].as_str().unwrap().len() <= MAX_DIFF_CHUNK);
             assert_eq!(event.payload["truncated"], false);
         }
-        let full = String::from_utf8(store.artifact(chunks[0].payload["artifact"].as_str().unwrap())?)?;
-        assert_eq!(chunks.iter().map(|e|e.payload["text"].as_str().unwrap()).collect::<String>(), full);
+        let full =
+            String::from_utf8(store.artifact(chunks[0].payload["artifact"].as_str().unwrap())?)?;
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|e| e.payload["text"].as_str().unwrap())
+                .collect::<String>(),
+            full
+        );
         assert!(full.contains("+FINAL_MARKER\n"));
         let through = chunks.last().unwrap().seq;
         // More than 128 subsequent changes must continue to arrive live.
         for index in 0..140 {
-            fs::write(dir.path().join("code.rs"), format!("later edit {index} ??\n"))?;
+            fs::write(
+                dir.path().join("code.rs"),
+                format!("later edit {index} ??\n"),
+            )?;
             watch.poll(&mut store, &op, true)?;
         }
-        let later: Vec<_> = store.events_since(&run.id, through)?.into_iter().filter(|e|e.kind == "operation.diff").collect();
+        let later: Vec<_> = store
+            .events_since(&run.id, through)?
+            .into_iter()
+            .filter(|e| e.kind == "operation.diff")
+            .collect();
         assert!(later.len() >= 140);
-        assert!(later.last().unwrap().payload["text"].as_str().unwrap().contains("+later edit 139 ??\n"));
+        assert!(
+            later.last().unwrap().payload["text"]
+                .as_str()
+                .unwrap()
+                .contains("+later edit 139 ??\n")
+        );
         Ok(())
     }
 }
