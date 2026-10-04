@@ -14,6 +14,10 @@ use std::{
 #[path = "support/http.rs"]
 mod http;
 
+fn tested_binary() -> String {
+    std::env::var("AEGIS_LIVE_EDITS_BINARY").unwrap_or_else(|_| env!("CARGO_BIN_EXE_arun").into())
+}
+
 fn response(action: serde_json::Value) -> Result<(u16, serde_json::Value)> {
     Ok((
         200,
@@ -44,7 +48,7 @@ fn writes_and_patch_removals_display_diffs_without_an_extra_model_request() -> R
             _ => anyhow::bail!("unexpected model request"),
         }
     })?;
-    let output = Command::new(env!("CARGO_BIN_EXE_arun"))
+    let output = Command::new(tested_binary())
         .current_dir(directory.path())
         .args([
             "run",
@@ -107,9 +111,13 @@ fn native_shell_edits_create_and_delete_files_before_the_tool_finishes() -> Resu
     let root = directory.path().join(".arun");
     fs::write(directory.path().join("code.rs"), "old code\n")?;
     fs::write(directory.path().join("removed.rs"), "removed code\n")?;
-    let binary = env!("CARGO_BIN_EXE_arun");
-    let host = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/windows-host.mjs");
-    let registration = Command::new(binary)
+    let binary = tested_binary();
+    let host = std::env::var_os("AEGIS_LIVE_EDITS_HOST_SCRIPT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/windows-host.mjs")
+        });
+    let registration = Command::new(&binary)
         .current_dir(directory.path())
         .args(["mcp", "add", "windows-host", "--trusted-host", "node"])
         .arg(host)
@@ -138,7 +146,7 @@ fn native_shell_edits_create_and_delete_files_before_the_tool_finishes() -> Resu
     })?;
     let log = directory.path().join(".arun/foreground.log");
     let file = fs::File::create(&log)?;
-    let mut command = Command::new(binary);
+    let mut command = Command::new(&binary);
     command
         .current_dir(directory.path())
         .args([

@@ -1,0 +1,30 @@
+# Live code diffs and native interaction verification
+
+Exploration remains intentional work. No read, turn or aggregate token cap was added. The runtime now displays actual file changes as unified diffs during a task: green `+` lines, red `-` lines, context and file headers. Writes and patches show their changes immediately; command observers also detect file creation and deletion before a long-running tool finishes. This does not stream speculative code tokens before the model submits an action. Observation is bounded and is not execution proof; [the terminal UI contract](terminal-ui.md) records its limits.
+
+Commit `aa37a31` adds the live diff path and keeps its events out of model context. Commit `692e00c` repairs a separate discovery issue found during the hosted trial: repeated filler words and inflected verbs could rank read tools above explicitly requested write, patch and PowerShell tools. Discovery now deduplicates terms, normalizes common operation words, gives specific tool-name matches more weight, and omits immediately negated keywords. Permission filtering still precedes ranking.
+
+The globally installed executable, release executable and privately tested package all match SHA-256 `7d4d608006449561ddd5f7afe69233d197a0e92a8ecc6391504cffe6ba4b8bdd`. The offline package receipt is `.arun/package-smoke-i6QACb/receipt.json`. Global installation exited zero; `aegis --version` returned `aegis 0.1.0`. Open a new session to load the new executable.
+
+## Current evidence
+
+- The live-diff source suite passed 561 Rust tests, with 11 explicit ignores across 66 targets, before the discovery follow-up: `.arun/live-edits-all-targets-20261004.log`. After that follow-up, the complete library and MCP/control/evaluation-registry regressions passed 425 tests, with three explicit hosted-only ignores: `.arun/live-edits-discovery-regressions-20261004.log`. These are separate validation scopes.
+- All 13 npm tests and all 12 offline package checks passed. Four ConPTY tests passed against the private installed package, then four ConPTY and two live-edit cases passed against the actual global executable and installed native helper: `.arun/live-edits-private-pty-20261004.log` and `.arun/live-edits-global-20261004.log`.
+- The direct-write/patch case verifies that additions and function removals display before committed operation success, with no extra model request. The native PowerShell case waits for an external test release after each modification, creation and deletion. Both a durable diff event and printed output must be observed while the same tool remains alive and has no successful receipt yet.
+- The ConPTY follower case renders additions and removals during an open draft and its slash picker. Existing steering submission, question-answer, interruption, resize and input-preservation assertions also pass.
+
+## Hosted exploration, follow-up and answer
+
+`examples/native_interaction_probe.rs --live <binary> [model]` creates an isolated CSV project and preserves its original tests. It asks Aegis to explore, ask a separator question, repair quoting, remove an obsolete helper, add regressions and run the tests through the native PowerShell tool. The controller adds a newline requirement during an active model turn and answers the pending question after both source and tests have been read, including equivalent batched reads. It preserves its own source, executable/helper hashes, fixture hashes, logs and receipt. Hosted inference requires explicit `--live`.
+
+The release-build run `9c2f39e2-03f7-4096-8761-e5cc6fd3387c` completed in 163 seconds. Its receipt is `.arun/native-interaction-KTJvBI/receipt.json`, with events, metrics and independent grader/test logs in the same directory. It recorded 20 model attempts, 18 usage receipts, 73,452 reported tokens, eight successful tool operations, two live diffs and no uncertain effects. Two interrupted attempts have unreported usage; exact total-token efficiency remains unknown. A rejected checkpoint incorrectly treated the user's answer as milestone evidence; the model corrected it and completed with current requirement evidence.
+
+The answer arrived while the original task was running. The same runner continued after both steering interruptions, preserved the original task and model route, repaired comma/quote/CR/LF handling, removed the obsolete export and left the original tests and manifest unchanged. A separate Node grader passed seven CSV cases plus export-removal verification, and an independent `node --test` run passed all four tests. This external acceptance is distinct from the task's runtime requirement coverage; no in-task independent acceptance check was configured. Archived question-wait resumption is covered separately by `tests/user_questions.rs` and question projection regressions.
+
+## Retained unsuccessful diagnostics
+
+- `.arun/native-interaction-F4zmyR/` stopped at the sandbox's private sign-in lock restriction before a hosted response. The permitted rerun used the saved account outside that filesystem restriction.
+- `.arun/native-interaction-kdUD2V/` intentionally withheld the separator answer until a blocked action. The model continued redundant exploration instead of blocking promptly; the trial was explicitly cancelled after 21 attempts. This remains an unresolved model behavior observation, not a passing trial or a reason to cap legitimate exploration.
+- `.arun/native-interaction-X5xWcS/` correctly read the two fixtures in a batch and reached a question wait. The controller mistakenly counted only individual reads and withheld the answer; the trial was explicitly cancelled, and the checker was corrected to accept equivalent batched exploration. Its failed receipt remains intact.
+
+The successful trial proves the tested native interaction and diff behavior. It does not establish universal long-horizon reliability. Earlier multi-hour endurance trials remain pinned to their own executables in [the endurance report](native-endurance.md); this release has not received a fresh multi-hour trial.
