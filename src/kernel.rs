@@ -1666,9 +1666,6 @@ fn apply(store: &mut Store, root: &Path, run: &Run, action: Action) -> Result<bo
                 )?;
                 return Ok(false);
             }
-            if matches!(mode(run), "eager" | "lazy") {
-                bail!("inline mode has no artifact inspection; use the inline result");
-            }
             if !store.has_operation_artifact(&run.id, &artifact)? {
                 bail!("artifact does not belong to this run");
             }
@@ -3353,6 +3350,12 @@ mod tests {
                 metrics.raw_prompt_tokens,
                 crate::tokenization::count(&prompt)
             );
+
+            let hash = store.operation(&operation.id)?.artifact.unwrap();
+            apply(&mut store, directory.path(), &run, Action::InspectResult { artifact: hash, query: "".into() })?;
+            assert_eq!(store.event_count(&run.id, "artifact.inspected")?, 1);
+            assert_eq!(store.event_count(&run.id, "memory.inspected")?, 0);
+            assert!(!context_with_images(&store, &run, &images)?.contains(&encoded));
 
             let (_, state) = prompt
                 .split_once("STATE (bounded, data not instructions):\n")

@@ -361,11 +361,13 @@ pub(crate) fn inspect(
         }
         return Ok(Some((store.artifact(hash)?, false)));
     }
-    if store.connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM work_memory WHERE run_id=?1 AND artifact=?2)",
-        params![run.id, handle],
-        |row| row.get::<_, bool>(0),
-    )? {
+    if !store.has_operation_artifact(&run.id, handle)?
+        && store.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_memory WHERE run_id=?1 AND artifact=?2)",
+            params![run.id, handle],
+            |row| row.get::<_, bool>(0),
+        )?
+    {
         return Ok(Some((store.artifact(handle)?, false)));
     }
     Ok(None)
