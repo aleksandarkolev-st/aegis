@@ -1309,7 +1309,12 @@ impl Terminal {
                     TranscriptStyle::DiffAdded => Tone::Success,
                     TranscriptStyle::DiffRemoved => Tone::Warning,
                 };
-                queue!(output, SetForegroundColor(self.color(row_tone)))?;
+                let color = if row.style == TranscriptStyle::DiffRemoved {
+                    Color::Rgb { r: 239, g: 127, b: 127 }
+                } else {
+                    self.color(row_tone)
+                };
+                queue!(output, SetForegroundColor(color))?;
             }
             write!(output, "{}\r\n", row.text)?;
         }
@@ -2821,6 +2826,14 @@ impl Terminal {
                 }
                 Ok(())
             }
+            "operation.diff" => {
+                self.transcript(Tone::Quiet, "Live edit", payload["text"].as_str().unwrap_or_default(), TranscriptMode::Literal)?;
+                if payload["truncated"] == true {
+                    self.message(Tone::Quiet, "Edit preview limit", &format!("Live diff display reached its limit. Saved diff artifact: {}. Further changes remain in the workspace; final operation receipts determine success.", payload["artifact"].as_str().unwrap_or_default()))?;
+                }
+                Ok(())
+            }
+            "operation.diff_unavailable" => self.message(Tone::Quiet, "Edit preview unavailable", payload["reason"].as_str().unwrap_or_default()),
             "operation.output" => {
                 let text = self.output_stream_text(payload);
                 if !text.is_empty() {

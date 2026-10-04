@@ -948,6 +948,13 @@ fn dispatch(
     }
     let run = store.run(&operation.run_id)?;
     remove_provider_keys(&mut command, &run)?;
+    let mut edits = match crate::edit_stream::Watch::start(&run, operation) {
+        Ok(watch) => watch,
+        Err(error) => {
+            store.event(&operation.run_id, "operation.diff_unavailable", json!({"id":operation.id,"reason":error.to_string()}))?;
+            None
+        }
+    };
     let mut child = crate::process::spawn(command)?;
     let start = Instant::now();
     let mut tail = ProcessOutputTail::default();
@@ -967,6 +974,12 @@ fn dispatch(
                 )?);
             }
         };
+        if let Some(watch) = &mut edits {
+            if let Err(error) = watch.poll(store, operation, status.is_some()) {
+                store.event(&operation.run_id, "operation.diff_unavailable", json!({"id":operation.id,"reason":error.to_string()}))?;
+                edits = None;
+            }
+        }
         if let Some(status) = status {
             if let Some(path) = &process_output {
                 if let Err(error) = drain_process_output(store, operation, path, &mut tail, true) {

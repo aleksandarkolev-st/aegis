@@ -10,6 +10,7 @@ pub mod continuation;
 pub mod control;
 pub mod direct;
 pub mod endpoint;
+mod edit_stream;
 pub mod evaluation;
 pub mod evaluation_report;
 pub mod filesystem;

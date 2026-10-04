@@ -852,6 +852,14 @@ fn actual_windows_follow_keeps_output_live_inside_steering_and_slash_picker() ->
     terminal.wait_screen("live output while draft is open", |screen| {
         screen.text().contains("LIVE_WHILE_TYPING")
     })?;
+    store.event(&run.id, "operation.diff", serde_json::json!({
+        "id":operation.id,"path":"code.rs",
+        "text":"diff --git a/code.rs b/code.rs\n--- a/code.rs\n+++ b/code.rs\n@@ -1 +1 @@\n-REMOVED_WHILE_TYPING\n+ADDED_WHILE_TYPING\n"
+    }))?;
+    terminal.wait_screen("live additions and removals while composing", |screen| {
+        let text = screen.text();
+        text.contains("-REMOVED_WHILE_TYPING") && text.contains("+ADDED_WHILE_TYPING") && text.contains("Steer this task")
+    })?;
     store.event(
         &run.id,
         "operation.output",
@@ -911,6 +919,14 @@ fn actual_windows_follow_keeps_output_live_inside_steering_and_slash_picker() ->
     )?;
     terminal.wait_screen("live output while slash picker is open", |screen| {
         screen.text().contains("LIVE_INSIDE_PICKER") && screen.text().contains("/goal")
+    })?;
+    store.event(&run.id, "operation.diff", serde_json::json!({
+        "id":operation.id,"path":"code.rs",
+        "text":"diff --git a/code.rs b/code.rs\n--- a/code.rs\n+++ b/code.rs\n@@ -1 +1 @@\n-REMOVED_INSIDE_PICKER\n+ADDED_INSIDE_PICKER\n"
+    }))?;
+    terminal.wait_screen("live additions and removals inside the slash picker", |screen| {
+        let text = screen.text();
+        text.contains("-REMOVED_INSIDE_PICKER") && text.contains("+ADDED_INSIDE_PICKER") && text.contains("/goal")
     })?;
     terminal.send_key(67, 3, 8)?;
     let deadline = Instant::now() + Duration::from_secs(5);

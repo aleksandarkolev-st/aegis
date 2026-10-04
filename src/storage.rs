@@ -840,7 +840,7 @@ impl Store {
 
     pub fn recent_context_events(&self, run_id: &str, limit: i64) -> Result<Vec<Event>> {
         let mut statement = self.connection.prepare(
-            "SELECT seq, kind, payload, created_at FROM events WHERE run_id = ?1 AND kind NOT IN ('model.started','model.activity','operation.dispatched','operation.executing','operation.output') ORDER BY seq DESC LIMIT ?2",
+            "SELECT seq, kind, payload, created_at FROM events WHERE run_id = ?1 AND kind NOT IN ('model.started','model.activity','operation.dispatched','operation.executing','operation.output','operation.diff','operation.diff_unavailable') ORDER BY seq DESC LIMIT ?2",
         )?;
         let rows = statement.query_map(params![run_id, limit.max(0)], |row| {
             let payload: String = row.get(2)?;
