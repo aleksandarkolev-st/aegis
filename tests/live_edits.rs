@@ -135,7 +135,7 @@ fn native_shell_edits_create_and_delete_files_before_the_tool_finishes() -> Resu
         match observed.fetch_add(1, Ordering::SeqCst) {
             0 => response(
                 json!({"kind":"invoke","capability":"mcp.windows-host.powershell","args":{
-                "script":"function Wait-Release($stage) { $end = [DateTime]::UtcNow.AddSeconds(20); while (!(Test-Path \".arun/release-$stage\")) { if ([DateTime]::UtcNow -gt $end) { throw 'Release deadline' }; Start-Sleep -Milliseconds 25 } }; [IO.File]::WriteAllText((Join-Path (Get-Location).Path 'code.rs'), \"new code`n\"); Wait-Release 1; [IO.File]::WriteAllText((Join-Path (Get-Location).Path 'added.rs'), \"added code`n\"); Wait-Release 2; Remove-Item -LiteralPath 'removed.rs'; Wait-Release 3",
+                "script":"function Wait-Release($stage) { $end = [DateTime]::UtcNow.AddSeconds(20); while (!(Test-Path \".arun/release-$stage\")) { if ([DateTime]::UtcNow -gt $end) { throw 'Release deadline' }; Start-Sleep -Milliseconds 25 } }; [IO.File]::WriteAllText((Join-Path (Get-Location).Path 'code.rs'), \"new code`n\"); Wait-Release 1; [IO.File]::WriteAllText((Join-Path (Get-Location).Path 'added.rs'), \"added code`n\"); Wait-Release 2; Remove-Item -LiteralPath 'removed.rs'; Wait-Release 3; [IO.File]::WriteAllText((Join-Path (Get-Location).Path 'large.rs'), ((\"padding`n\" * 14000) + \"LARGE_DIFF_TAIL`n\")); Wait-Release 4; [IO.File]::WriteAllText((Join-Path (Get-Location).Path 'large.rs'), \"late change after large diff`n\"); Wait-Release 5",
                 "timeout_seconds":60}}),
             ),
             1 => {
@@ -178,6 +178,8 @@ fn native_shell_edits_create_and_delete_files_before_the_tool_finishes() -> Resu
         (1, vec!["-old code", "+new code"]),
         (2, vec!["+++ b/added.rs", "+added code"]),
         (3, vec!["+++ /dev/null", "-removed code"]),
+        (4, vec!["+LARGE_DIFF_TAIL"]),
+        (5, vec!["+late change after large diff"]),
     ] {
         let deadline = Instant::now() + Duration::from_secs(18);
         loop {
@@ -223,11 +225,12 @@ fn native_shell_edits_create_and_delete_files_before_the_tool_finishes() -> Resu
     let store = Store::open(&root)?;
     let run = store.runs()?.remove(0);
     assert_eq!(run.state, "completed");
-    assert_eq!(store.event_count(&run.id, "operation.diff")?, 3);
+    assert!(store.event_count(&run.id, "operation.diff")? > 6);
     assert_eq!(calls.load(Ordering::SeqCst), 3);
     assert_eq!(store.model_tokens(&run.id)?, 36);
     assert_eq!(fs::read_to_string(directory.path().join("code.rs"))?, "new code\n");
     assert_eq!(fs::read_to_string(directory.path().join("added.rs"))?, "added code\n");
     assert!(!directory.path().join("removed.rs").exists());
+    assert_eq!(fs::read_to_string(directory.path().join("large.rs"))?, "late change after large diff\n");
     Ok(())
 }
