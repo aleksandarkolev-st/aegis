@@ -162,6 +162,7 @@ pub(crate) fn append_event(
     crate::questions::track_state(transaction, run_id, kind, &payload)?;
     let seq: i64 = transaction.query_row("SELECT last_seq FROM run_projection WHERE run_id=?1",[run_id],|row|row.get(0))?;
     crate::steering::track(transaction,run_id,seq,kind,&payload,timestamp)?;
+    crate::memory::track(transaction,run_id,seq,kind,&payload)?;
     Ok(())
 }
 
@@ -506,6 +507,7 @@ impl Store {
         }
         crate::questions::ensure_schema(&connection)?;
         crate::steering::ensure_schema(&connection)?;
+        crate::memory::ensure_schema(&connection)?;
         let store = Self {
             connection,
             artifacts,
@@ -583,6 +585,7 @@ impl Store {
         store.restore_usage_sources()?;
         crate::questions::restore_waits(&store)?;
         crate::steering::restore(&store)?;
+        crate::memory::restore(&store)?;
         Ok(store)
     }
 
@@ -1210,7 +1213,7 @@ impl Store {
             &transaction,
             run_id,
             "checkpoint.created",
-            json!({"artifact": hash, "next_action": checkpoint.next_action}),
+            json!({"artifact": hash, "next_action": checkpoint.next_action,"memory_preview":checkpoint.decisions.join("\n").chars().take(1600).collect::<String>()}),
         )?;
         transaction.commit()?;
         Ok(hash)

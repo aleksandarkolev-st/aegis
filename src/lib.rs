@@ -25,6 +25,7 @@ pub mod kernel;
 pub mod learning;
 pub mod mcp;
 pub mod model;
+mod memory;
 pub mod network;
 pub mod oauth;
 pub mod obligations;

@@ -25,6 +25,10 @@ pub enum Action {
     Checkpoint {
         checkpoint: Checkpoint,
     },
+    Remember {
+        summary: String,
+        artifact: String,
+    },
     VerifyObligations {
         obligations: Vec<crate::obligations::Proof>,
     },
@@ -75,6 +79,7 @@ const SCHEMA: &str = r#"{"type":"object","properties":{"kind":{"type":"string","
 
 pub(crate) fn schema() -> Result<Value> {
     let mut schema: Value = serde_json::from_str(SCHEMA)?;
+    schema["properties"]["kind"]["enum"].as_array_mut().context("action kinds")?.push(serde_json::json!("remember"));
     schema["properties"]["args"]["description"] = serde_json::json!(
         "JSON object string; empty metadata is \"{}\". Omit fields supplied by args_text or args_edits."
     );
