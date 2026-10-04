@@ -1324,6 +1324,7 @@ impl Store {
     ) -> Result<()> {
         crate::obligations::ensure_reviewed_contract(&self.connection, run_id)?;
         crate::questions::validate_resolved(&self.connection, run_id)?;
+        crate::steering::validate_consumed(&self.connection, run_id)?;
         self.check_observed_files(run_id)?;
         if crate::obligations::workspace_mutation_in_flight(&self.connection, run_id)? {
             bail!("completion waits for mutating operations in the shared workspace");
@@ -1380,6 +1381,7 @@ impl Store {
             })?;
         crate::obligations::ensure_reviewed_contract(&transaction, run_id)?;
         crate::questions::validate_resolved(&transaction, run_id)?;
+        crate::steering::validate_consumed(&transaction, run_id)?;
         let operations: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM operations WHERE run_id = ?1",
             [run_id],
@@ -1500,6 +1502,7 @@ impl Store {
         crate::obligations::validate_connection(&transaction, run_id)?;
         crate::questions::validate_resolved(&transaction, run_id)?;
         crate::obligations::validate_finish_evidence(&transaction, run_id, evidence)?;
+        crate::steering::validate_consumed(&transaction, run_id)?;
         let mut milestones = {
             let mut statement = transaction.prepare(
                 "SELECT title, state, evidence FROM milestones WHERE run_id = ?1 ORDER BY position",

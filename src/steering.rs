@@ -1,5 +1,5 @@
 //! Task-owner messages survive delivery, archival, and driver restarts.
-use anyhow::Result;
+use anyhow::{Result, bail};
 use rusqlite::{Connection, Transaction, params};
 use serde_json::Value;
 
@@ -65,6 +65,17 @@ pub(crate) fn restore(store: &Store) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn validate_consumed(connection: &Connection, run_id: &str) -> Result<()> {
+    let pending: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_owner_messages WHERE run_id=?1 AND delivered=0)",
+        [run_id], |row| row.get(0),
+    )?;
+    if pending {
+        bail!("task-owner messages arrived after the last model request; read them before finishing");
+    }
+    Ok(())
+}
+
 impl Store {
     pub(crate) fn steering_messages(&self, run_id: &str, delivered: bool) -> Result<Vec<Event>> {
         let mut query = self.connection.prepare("SELECT seq,payload,created_at FROM task_owner_messages WHERE run_id=?1 AND delivered=?2 ORDER BY seq")?;
@@ -81,6 +92,41 @@ impl Store {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn late_messages_prevent_both_reply_and_tool_completion_until_delivered() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(".arun");
+        let mut store = Store::open(&root)?;
+        let mut mailbox = Store::open(&root)?;
+        for tools in [false, true] {
+            let run = store.create_run("Inspect", directory.path(), "custom", json!([]), json!({}), "")?;
+            store.state(&run.id, "running", json!({}))?;
+            let mut evidence = Vec::new();
+            if tools {
+                let operation = store.begin_operation(&run.id, "mcp.fixture.inspect", json!({}), true)?;
+                crate::storage::claim_test_operation(&mut store, &operation)?;
+                let hash = store.put_artifact(b"inspection result")?;
+                store.operation_state(&operation, "succeeded", Some(&hash), json!({}))?;
+                evidence.push(hash);
+            }
+            store.event(&run.id, "model.started", json!({}))?;
+            store.event(&run.id, "model.response", json!({}))?;
+            mailbox.steer(&run.id, "Also inspect the edge case before finishing")?;
+            let finish = if tools { store.complete_run(&run.id, "Inspected", &evidence) } else { store.answer_run(&run.id, "Reply") };
+            assert!(finish.unwrap_err().to_string().contains("task-owner messages"));
+            assert_eq!(store.run(&run.id)?.state, "running");
+            drop(store);
+            store = Store::open(&root)?;
+            assert_eq!(store.pending_steering(&run.id)?.len(), 1);
+            store.event(&run.id, "model.started", json!({}))?;
+            store.event(&run.id, "model.response", json!({}))?;
+            if tools { store.complete_run(&run.id, "Inspected", &evidence)?; } else { store.answer_run(&run.id, "Reply")?; }
+            assert!(store.run(&run.id)?.is_terminal());
+            assert!(store.pending_steering(&run.id)?.is_empty());
+        }
+        Ok(())
+    }
 
     #[test]
     fn mailbox_and_delivered_constraints_survive_archival_restart_and_migration() -> Result<()> {

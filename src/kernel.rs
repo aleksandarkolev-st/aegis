@@ -1848,6 +1848,7 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
         return Ok(());
     }
     if crate::identity::is_question(&run.task)
+        && store.pending_steering(run_id)?.is_empty()
         && crate::acceptance::Check::from_run(&run)?.is_none()
         && store.operations(run_id)?.is_empty()
         && store.obligations(run_id)?.iter().all(|item| item.id == 0)
