@@ -148,7 +148,16 @@ fn mapped_mcp_text(capability: &str, result: &Value) -> Option<Value> {
                     let mut receipt = json!({"exit_code":value["exit_code"],"timed_out":value["timed_out"],
                         "stdout_bytes":value["stdout_bytes"],"stderr_bytes":value["stderr_bytes"],
                         "stdout_truncated":value["stdout_truncated"],"stderr_truncated":value["stderr_truncated"]});
-                    for field in ["stdout", "stderr"] {
+                    // A verbose source dump must not hide the diagnostic from a
+                    // failed command behind the shared mapping allowance.
+                    let streams = if value["exit_code"].as_i64().is_some_and(|code| code != 0)
+                        || value["timed_out"] == true
+                    {
+                        ["stderr", "stdout"]
+                    } else {
+                        ["stdout", "stderr"]
+                    };
+                    for field in streams {
                         let source = crate::text::clean(value[field].as_str().unwrap_or_default());
                         let mut characters = source.chars();
                         let excerpt: String = characters.by_ref().take(remaining).collect();
@@ -358,6 +367,9 @@ fn context_with_images(
         "conversation": conversation,
     });
     let reads = read_history(store, &run.id)?;
+    if granted.iter().any(|grant| grant == "workspace.read") {
+        context["file_tool_policy"] = json!("For repository text, discover workspace.read/read_batch; for requested edits, discover workspace.write/patch when granted. These return structured file content and avoid shell quoting layers. Use native shell tools for commands. Exploration alone does not require edits. Use mapped output without inspecting it again.");
+    }
     if !reads.is_empty() {
         context["read_history"] = json!(reads);
         context["read_policy"] = json!("Read history lists already fetched artifacts/ranges, including archived work. It is historical metadata, not proof that a file is unchanged. Use mapped text without inspecting it again. Exploratory tasks should gather relevant information and findings until the requested exploration is satisfied; do not invent an edit requirement. For requested edits, read the target and necessary references, then write and verify. Prefer workspace.read for a whole target through 65536 characters; read_batch paginates larger needed ranges at 65536 actual characters. Continue from next_offset. Scope heading/reference searches with path. When rewriting documentation, preserve factual availability, publication, platform and provider limitations; shorter prose cannot turn a pending feature into a supported one.");
@@ -3102,6 +3114,20 @@ mod tests {
             assert_eq!(mapped["text_complete"], !source_truncated && output.chars().count()+12 <= MAPPED_TOOL_CHARACTERS);
             assert!(mapped["command"]["stdout"].as_str().unwrap().chars().count()+mapped["command"]["stderr"].as_str().unwrap().chars().count() <= MAPPED_TOOL_CHARACTERS);
         }
+    }
+
+    #[test]
+    fn failed_command_mapping_keeps_diagnostics_ahead_of_verbose_stdout() {
+        let result = json!({"isError":true,"content":[{"type":"text","text":json!({
+            "exit_code":1,"timed_out":false,"stdout":"source dump\n".repeat(1000),
+            "stderr":"AssertionError at verify.mjs:31: incorrect expectation\n",
+            "stdout_truncated":false,"stderr_truncated":false
+        }).to_string()}]});
+        let mapped = mapped_mcp_text("mcp.windows-host.powershell",&result).unwrap();
+        assert_eq!(mapped["command"]["stderr"],"AssertionError at verify.mjs:31: incorrect expectation\n");
+        assert_eq!(mapped["text_complete"],false);
+        assert_eq!(mapped["isError"],true);
+        assert!(mapped["command"]["stdout"].as_str().unwrap().len() < 4000);
     }
 
     #[test]
