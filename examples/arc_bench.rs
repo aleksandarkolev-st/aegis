@@ -78,13 +78,14 @@ fn control(bridge: &Path, session: &Path, operation: &str, value: &str) -> Resul
     serde_json::from_slice(&fs::read(stdout)?).context("ARC controller reply is invalid")
 }
 
-fn ready(record: &Value, binary: &str, plan: &str, bridge: &str, runtime: &str) -> bool {
+fn ready(record: &Value, binary: &str, plan: &Value, bridge: &str, runtime: &str) -> bool {
     record["implementation_complete"] == true
         && record["functional_verified"] == true
         && record["installed_ux_verified"] == true
         && record["pending"].as_array().is_some_and(Vec::is_empty)
         && record["benchmark_binary_sha256"] == binary
-        && record["plan_sha256"] == plan
+        && plan.is_string()
+        && record["plan_sha256"] == *plan
         && record["bridge_sha256"] == bridge
         && record["aegis_binary_sha256"] == runtime
 }
@@ -96,6 +97,7 @@ fn main() -> Result<()> {
     let mut competition = false;
     let mut reviewed = None;
     let mut runtime = None;
+    let mut plan = None;
     let mut backend = "chatgpt".to_owned();
     let mut model = "gpt-5.5".to_owned();
     let mut games = Vec::<String>::new();
@@ -114,6 +116,7 @@ fn main() -> Result<()> {
                 match flag {
                     "--ready" => reviewed = Some(PathBuf::from(value)),
                     "--aegis" => runtime = Some(dunce::canonicalize(value)?),
+                    "--plan" => plan = Some(PathBuf::from(value)),
                     "--provider" => backend = value.clone(),
                     "--model" => model = value.clone(),
                     "--games" => games = value.split(',').map(str::to_owned).collect(),
@@ -152,7 +155,10 @@ fn main() -> Result<()> {
         bail!("invalid bounded ARC configuration; competition selects all discovered games");
     }
     let binary_hash = hash(&fs::read(std::env::current_exe()?)?);
-    let plan_hash = hash(include_bytes!("../plan.txt"));
+    let plan = match plan.as_deref() {
+        Some(path) => json!(hash(&fs::read(path).context("ARC plan file is unavailable")?)),
+        None => Value::Null,
+    };
     let bridge_hash = hash(BRIDGE.as_bytes());
     let mut attestation = Value::Null;
     if run {
@@ -167,7 +173,7 @@ fn main() -> Result<()> {
         if !ready(
             &attestation,
             &binary_hash,
-            &plan_hash,
+            &plan,
             &bridge_hash,
             &hash(&fs::read(runtime)?),
         ) {
@@ -189,7 +195,7 @@ fn main() -> Result<()> {
     let session = dunce::canonicalize(session)?;
     let bridge = root.join("bridge.mjs");
     fs::write(&bridge, BRIDGE)?;
-    let manifest = json!({"kind":"arc-agi-3-online-v1","prepare_only":!run,"competition_mode":competition,"benchmark_binary_sha256":binary_hash,"plan_sha256":plan_hash,"bridge_sha256":bridge_hash,"readiness":attestation,"provider":backend,"provider_version":null,"provider_transport":"aegis-direct-v1","native_provider_cli_started":false,"model":model,"requested_games":games,"move_limit_per_game":moves,"seconds_per_game":seconds,"cold_start":true,"policy":"Authoritative closed server scorecard; public subset is not an official competition score. Aegis uses direct provider HTTP, not a native agent CLI. Reset only after GAME_OVER, each game once. API actions and normalized/model token receipts are distinct metrics. No automatic uncertain-move retry or in-flight score polling."});
+    let manifest = json!({"kind":"arc-agi-3-online-v1","prepare_only":!run,"competition_mode":competition,"benchmark_binary_sha256":binary_hash,"plan_sha256":plan,"bridge_sha256":bridge_hash,"readiness":attestation,"provider":backend,"provider_version":null,"provider_transport":"aegis-direct-v1","native_provider_cli_started":false,"model":model,"requested_games":games,"move_limit_per_game":moves,"seconds_per_game":seconds,"cold_start":true,"policy":"Authoritative closed server scorecard; public subset is not an official competition score. Aegis uses direct provider HTTP, not a native agent CLI. Reset only after GAME_OVER, each game once. API actions and normalized/model token receipts are distinct metrics. No automatic uncertain-move retry or in-flight score polling."});
     fs::write(
         root.join("experiment.json"),
         serde_json::to_vec_pretty(&manifest)?,
@@ -367,11 +373,20 @@ mod tests {
 
     #[test]
     fn incomplete_reviews_and_changed_builds_cannot_start_arc() {
+        let plan = json!("plan");
         let mut review = json!({"implementation_complete":true,"functional_verified":true,"installed_ux_verified":true,"pending":[],"benchmark_binary_sha256":"binary","plan_sha256":"plan","bridge_sha256":"bridge","aegis_binary_sha256":"runtime"});
-        assert!(ready(&review, "binary", "plan", "bridge", "runtime"));
-        assert!(!ready(&review, "binary", "plan", "changed", "runtime"));
+        assert!(ready(&review, "binary", &plan, "bridge", "runtime"));
+        assert!(!ready(&review, "binary", &plan, "changed", "runtime"));
         review["pending"] = json!(["Claude verification"]);
-        assert!(!ready(&review, "binary", "plan", "bridge", "runtime"));
-        assert!(!ready(&Value::Null, "binary", "plan", "bridge", "runtime"));
+        assert!(!ready(&review, "binary", &plan, "bridge", "runtime"));
+        assert!(!ready(&Value::Null, "binary", &plan, "bridge", "runtime"));
+    }
+
+    #[test]
+    fn an_absent_plan_cannot_satisfy_the_arc_readiness_gate() {
+        let review = json!({"implementation_complete":true,"functional_verified":true,"installed_ux_verified":true,"pending":[],"benchmark_binary_sha256":"binary","plan_sha256":"plan","bridge_sha256":"bridge","aegis_binary_sha256":"runtime"});
+        // Preparation runs without a plan; a gated run must never treat that as a match.
+        assert!(!ready(&review, "binary", &Value::Null, "bridge", "runtime"));
+        assert!(!ready(&review, "binary", &json!("changed"), "bridge", "runtime"));
     }
 }

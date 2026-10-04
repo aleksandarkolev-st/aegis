@@ -64,6 +64,16 @@ fn reviewed_reference(path: &Path, attestation: &Value) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn readiness(record: &Value, binary: &str, plan: &Value) -> bool {
+    record["implementation_complete"] == true
+        && record["functional_verified"] == true
+        && record["installed_ux_verified"] == true
+        && record["benchmark_binary_sha256"] == binary
+        && plan.is_string()
+        && record["plan_sha256"] == *plan
+        && record["pending"].as_array().is_some_and(Vec::is_empty)
+}
+
 fn record(log: &mut File, event: Value) -> Result<()> {
     writeln!(log, "{event}")?;
     log.sync_all()?;
@@ -422,6 +432,7 @@ fn main() -> Result<()> {
     let mut node_version = Value::Null;
     let mut ready = None;
     let mut aegis = None;
+    let mut plan = None;
     let mut codex_reference = None;
     let mut model = "gpt-5.5".to_owned();
     let mut image = "node:22-alpine".to_owned();
@@ -465,6 +476,7 @@ fn main() -> Result<()> {
         match flag {
             "--ready" => ready = Some(PathBuf::from(value)),
             "--aegis" => aegis = Some(dunce::canonicalize(value)?),
+            "--plan" => plan = Some(PathBuf::from(value)),
             "--codex-reference" => codex_reference = Some(PathBuf::from(value)),
             "--model" => model = value.clone(),
             "--node" => node = Some(dunce::canonicalize(value)?),
@@ -532,7 +544,12 @@ fn main() -> Result<()> {
         bail!("--node requires --windows-native");
     }
     let binary = hash(&fs::read(std::env::current_exe()?)?);
-    let plan = hash(include_bytes!("../plan.txt"));
+    let plan = match plan.as_deref() {
+        Some(path) => json!(hash(
+            &fs::read(path).context("benchmark plan file is unavailable")?
+        )),
+        None => Value::Null,
+    };
     let mut attestation = Value::Null;
     let mut codex_version = Value::Null;
     if run_agents {
@@ -553,13 +570,7 @@ fn main() -> Result<()> {
                 bail!("readiness record exceeds 8192 bytes");
             }
             attestation = serde_json::from_slice(&fs::read(ready)?)?;
-            if attestation["implementation_complete"] != true
-                || attestation["functional_verified"] != true
-                || attestation["installed_ux_verified"] != true
-                || attestation["benchmark_binary_sha256"] != binary
-                || attestation["plan_sha256"] != plan
-                || !attestation["pending"].as_array().is_some_and(Vec::is_empty)
-            {
+            if !readiness(&attestation, &binary, &plan) {
                 bail!("readiness gate incomplete or binary/plan changed; no agent calls started");
             }
         }
@@ -1084,5 +1095,18 @@ mod tests {
         assert_eq!(partial["harnesses"]["aegis"]["reported_tokens"],90);
         events[5]["execution"]["elapsed_ms"]=Value::Null;
         assert!(summarize(&events)["harnesses"]["aegis"]["ms_per_accepted_task"].is_null());
+    }
+
+    #[test]
+    fn an_absent_or_changed_plan_cannot_satisfy_the_readiness_gate() {
+        let mut record = json!({"implementation_complete":true,"functional_verified":true,"installed_ux_verified":true,"pending":[],"benchmark_binary_sha256":"binary","plan_sha256":"plan"});
+        assert!(readiness(&record, "binary", &json!("plan")));
+        // Preparation runs without a plan; a gated run must never treat that as a match.
+        assert!(!readiness(&record, "binary", &Value::Null));
+        assert!(!readiness(&record, "binary", &json!("changed")));
+        assert!(!readiness(&record, "changed", &json!("plan")));
+        record["pending"] = json!(["Production readiness audit"]);
+        assert!(!readiness(&record, "binary", &json!("plan")));
+        assert!(!readiness(&Value::Null, "binary", &json!("plan")));
     }
 }
