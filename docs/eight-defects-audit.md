@@ -1,0 +1,27 @@
+# Eight reported runtime defects
+
+Audit date: 2026-10-05. Scope: the eight findings in the attached `pasted-text-1.txt`.
+
+| Finding | Result and authoritative regression coverage | Primary commit |
+| --- | --- | --- |
+| Image discovery grows with archived output | `image_sources` indexes visual candidates transactionally. Lookup reads a bounded window without loading all events or operations. `image::tests::image_lookup_is_independent_of_twelve_thousand_archived_outputs_even_after_migration` covers tasks with and without images, restart and legacy migration. Its control corrupts an archive so full replay fails while ten image lookups still succeed. | `51d3b64` |
+| Pauses consume the deadline | A durable clock excludes safe pause intervals from both model and worker deadlines, preserves the original allowance and freezes terminal duration. `pause::tests` covers archival, migration, repeated resume, real active-time exhaustion and displayed budgets. `tests/pause.rs` resumes the native runner after a simulated 7,200-second pause and verifies another model request under the unchanged contract. | `39ae9f5`, `82e321c` |
+| Retry arguments bypass stall detection | Failure signatures use the outcome and observation epoch without model retry arguments. `progress::tests::changed_retry_arguments_cannot_disguise_the_same_permission_blocker` changes arguments and capability labels across eight equivalent errors, produces one durable stall and verifies new owner input resets the epoch. Other progress tests preserve novel exploratory queries and detect cycling known results. | `a587d3a` |
+| Summaries drop owner constraints | Covered original owner messages remain in model context independently of summaries. `memory::tests::omitted_constraints_remain_in_context_after_summary_replacement_archival_and_restart` intentionally omits constraints in successive summaries. `tests/memory_constraints.rs` checks the actual subsequent HTTP prompt after pause, archival and restart. Lossless Unicode segment round trips and existing large-answer endurance fixtures also pass. | `94e9b8d` |
+| Failed commands prove completion | `commit_result` classifies `process.run` as failed unless its exit status is integer zero. `kernel::tests::process_failure_receipts_are_diagnostics_never_completion_proof` covers exit code 7, absent status and a successful zero control, with no independent acceptance check. Failed receipts remain inspectable but cannot verify an explicit obligation or complete a task. | `63bb2f7` |
+| Late instructions become unread terminal mail | Conversational replies and evidence-backed completion both validate mailbox delivery within the terminal transaction. `steering::tests::late_messages_prevent_both_reply_and_tool_completion_until_delivered` queues through a second SQLite connection after the model response, rejects finish, restarts and permits finish only after the next request receives the message. Existing archival/mailbox tests preserve delivery semantics. | `7685459` |
+| Malformed screenshots prevent recovery | Intact but malformed image receipts are quarantined with a persistent diagnostic. `tests/visual_recovery.rs` verifies inference can ask for a replacement and still run on another resume. `image::tests::malformed_image_is_quarantined_without_reusing_older_screenshots` covers archive/restart, single rejection recording, no old-image substitution and valid replacement. The corrupted-artifact regression still stops before inference. | `887ada9` |
+| Live diffs stop after 64 KiB or 128 updates | Diffs emit complete UTF-8 chunks of at most 64 KiB, with full artifacts and offsets. `edit_stream::tests::preview_is_utf8_bounded_and_full_diff_artifact_survives` reconstructs the full diff and verifies 140 later updates. `tests/live_edits.rs` observes the tail of a large native edit and a subsequent edit in both the log and terminal while the worker is still running, before its receipt exists. | `faeb73b`, `a282acd` |
+
+Original owner text remains subject to the overall context limit; a model summary cannot silently discard it to fit. File/scope/snapshot limits still apply to live observations. Tool receipt provenance establishes neither arbitrary semantic correctness nor model compliance with instructions. Historical completed runs retain their original verification records.
+
+The runtime changes were committed separately. The pre-existing README publication edit was excluded from these commits.
+
+## Final validation
+
+- Runtime source through `82e321c`: `cargo test --offline --all-targets -- --test-threads=1` passed 601 tests, with zero failures and 11 optional ignores across 69 result blocks. Full receipt: [final all-target log](../.arun/eight-defects-final-all-targets-20261004.log). The first full run also passed 600 tests before the final clock migration/display follow-up; [earlier receipt](../.arun/eight-defects-all-targets-20261004.log).
+- `npm test` passed all 13 package tests.
+- `git diff --check` passed. Scoped `rustfmt --check --edition 2024` passed for `src/pause.rs`, `src/image.rs`, `src/progress.rs`, `src/memory.rs`, `src/edit_stream.rs`, `tests/pause.rs`, `tests/memory_constraints.rs` and `tests/visual_recovery.rs`.
+- The optional hosted-model and Docker tests remain ignored; they are not claimed as executed. The Windows native edit, rendering and recovery suites ran successfully.
+
+All eight attachment findings have implementation and current regression evidence. Documentation-only commits after `82e321c` do not change the tested runtime source.
