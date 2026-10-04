@@ -279,6 +279,7 @@ fn completion_explanation_is_saved_with_the_terminal_event() -> Result<()> {
     operation_fixture::claim_fixture_operation(&mut store, &op.id)?;
     store.operation_state(&op, "succeeded", Some(&hash), json!({}))?;
     store.verify_obligation(&run.id, 1, &[hash.clone()])?;
+    store.save_checkpoint(&run.id, &serde_json::from_value(json!({"decisions":[],"unresolved":[],"next_action":"Report results","milestones":[{"title":"Inspect API","state":"completed","evidence":[hash.clone()]}]}))?)?;
     store.complete_run(&run.id, "API inspected", &[hash.clone()])?;
     let completed = store
         .events(&run.id)?
@@ -293,6 +294,8 @@ fn completion_explanation_is_saved_with_the_terminal_event() -> Result<()> {
         completed.payload["completion"]["requirements"][1]["state"],
         "verified"
     );
+    assert_eq!(completed.payload["completion"]["milestones"][0]["title"], "Inspect API");
+    assert!(control::display_completion(&completed.payload["completion"]).contains("[completed] Inspect API"));
     assert!(
         control::display_completion(&completed.payload["completion"])
             .contains("O1 Read API · verified · revision 0")
@@ -358,6 +361,34 @@ fn goal_add_and_targeted_replace_require_review_and_retain_original_contract() -
         }
     }
     Ok(())
+}
+
+#[test]
+fn completion_overview_distinguishes_outputs_commands_and_legacy_reports() {
+    let report = json!({
+        "milestones":[{"title":"Task request","state":"completed"},{"title":"Improve summary","state":"completed"}],
+        "requirements":[],"workspace_revision":2,
+        "artifacts":[
+            {"artifact":"write-proof","operations":[{"capability":"workspace.patch","arguments":{"path":"src/control.rs"},"state":"succeeded"}],"receipt":{}},
+            {"artifact":"read-proof","operations":[{"capability":"workspace.read","arguments":{"path":"README.md"},"state":"succeeded"}],"receipt":{}},
+            {"artifact":"test-proof","operations":[{"capability":"process.run","arguments":{"program":"cargo","args":["test","--test","control_surface"]},"state":"succeeded"}],"receipt":{"exit_code":0}},
+            {"artifact":"failed-write","operations":[{"capability":"workspace.write","arguments":{"path":"missing.rs"},"state":"failed"}],"receipt":{}},
+            {"artifact":"unknown-exit","operations":[{"capability":"process.run","arguments":{"program":"checker","args":[]},"state":"succeeded"}],"receipt":{}}
+        ]
+    });
+    let text = control::display_completion(&report);
+    assert!(text.contains("Work completed\n  [completed] Improve summary"), "{text}");
+    assert!(!text.contains("Task request"));
+    let outputs = text.split("Files written or edited (recorded evidence)\n").nth(1).unwrap().split("Commands run").next().unwrap();
+    assert!(outputs.contains("src/control.rs"));
+    assert!(!outputs.contains("README.md") && !outputs.contains("missing.rs"));
+    assert!(text.contains("cargo \"test\" \"--test\" \"control_surface\" · exit 0"), "{text}");
+    assert!(text.contains("  checker\n") && !text.contains("checker · exit"));
+    assert_eq!(text.matches("Evidence sources").count(), 1);
+    let legacy = control::display_completion(&json!({"requirements":[{"id":1,"title":"Old goal","state":"verified","revision":0,"evidence":["old-proof"]}],"workspace_revision":0}));
+    assert!(legacy.contains("O1 Old goal · verified · revision 0"));
+    assert!(legacy.contains("artifact old-proof"));
+    assert!(!legacy.contains("Work completed"));
 }
 
 #[test]

@@ -319,8 +319,14 @@ pub(crate) fn completion_report(
         let operations=sources.into_iter().map(|(id,capability,args,state,revision)|Ok(json!({"id":id,"capability":capability,"arguments":safe_arguments(&capability,serde_json::from_str::<Value>(&args)?),"state":state,"revision":revision}))).collect::<Result<Vec<Value>>>()?;
         artifacts.push(json!({"artifact":hash,"operations":operations,"receipt":receipt}));
     }
+    let mut statement = connection.prepare(
+        "SELECT title,state,evidence FROM milestones WHERE run_id=?1 ORDER BY position",
+    )?;
+    let milestones = statement.query_map([run_id], |row| {
+        Ok(json!({"title":row.get::<_,String>(0)?,"state":row.get::<_,String>(1)?,"evidence":serde_json::from_str::<Value>(&row.get::<_,String>(2)?).unwrap_or(Value::Null)}))
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(
-        json!({"requirements":items,"workspace_revision":revision,"acceptance":acceptance,"provider_transitions":transitions.into_values().collect::<Vec<_>>(),"artifacts":artifacts,"verification_scope":"Successful operation provenance at the recorded revision; configured independent acceptance when present."}),
+        json!({"milestones":milestones,"requirements":items,"workspace_revision":revision,"acceptance":acceptance,"provider_transitions":transitions.into_values().collect::<Vec<_>>(),"artifacts":artifacts,"verification_scope":"Successful operation provenance at the recorded revision; configured independent acceptance when present."}),
     )
 }
 
@@ -523,6 +529,47 @@ fn transition_position(value: &Value) -> String {
 
 pub fn display_completion(value: &Value) -> String {
     let mut lines = Vec::new();
+    let milestones: Vec<_> = value["milestones"].as_array().into_iter().flatten()
+        .filter(|item| item["title"] != "Task request").collect();
+    if !milestones.is_empty() {
+        lines.push("Work completed".into());
+        for item in milestones {
+            lines.push(format!("  [{}] {}", item["state"].as_str().unwrap_or("unknown"), item["title"].as_str().unwrap_or_default()));
+        }
+    }
+    let mut files = std::collections::BTreeSet::new();
+    let mut validations = std::collections::BTreeSet::new();
+    for artifact in value["artifacts"].as_array().into_iter().flatten() {
+        for source in artifact["operations"].as_array().into_iter().flatten() {
+            if source["state"] != "succeeded" { continue; }
+            let capability = source["capability"].as_str().unwrap_or_default();
+            if matches!(capability, "workspace.write" | "workspace.patch") {
+                if let Some(path) = source["arguments"]["path"].as_str() {
+                    files.insert(path.to_owned());
+                }
+            }
+            if capability == "process.run" {
+                let args = &source["arguments"];
+                let mut command = args["program"].as_str().unwrap_or("process").to_owned();
+                for arg in args["args"].as_array().into_iter().flatten() {
+                    command.push(' ');
+                    command.push_str(&serde_json::to_string(arg).unwrap_or_default());
+                }
+                if let Some(exit) = artifact["receipt"]["exit_code"].as_i64() {
+                    command.push_str(&format!(" · exit {exit}"));
+                }
+                validations.insert(command);
+            }
+        }
+    }
+    if !files.is_empty() {
+        lines.push("Files written or edited (recorded evidence)".into());
+        lines.extend(files.into_iter().map(|path| format!("  {path}")));
+    }
+    if !validations.is_empty() {
+        lines.push("Commands run (recorded evidence)".into());
+        lines.extend(validations.into_iter().map(|command| format!("  {command}")));
+    }
     for item in value["requirements"].as_array().into_iter().flatten() {
         lines.push(format!(
             "O{} {} · {} · revision {}",
@@ -534,20 +581,7 @@ pub fn display_completion(value: &Value) -> String {
         for hash in item["evidence"].as_array().into_iter().flatten() {
             if let Some(hash) = hash.as_str() {
                 lines.push(format!("  artifact {hash}"));
-                if let Some(artifact) = value["artifacts"]
-                    .as_array()
-                    .and_then(|items| items.iter().find(|item| item["artifact"] == hash))
-                {
-                    for source in artifact["operations"].as_array().into_iter().flatten() {
-                        lines.push(format!(
-                            "  {} {} · {} · exit {}",
-                            source["capability"].as_str().unwrap_or("operation"),
-                            source["arguments"],
-                            source["state"].as_str().unwrap_or("unknown"),
-                            artifact["receipt"]["exit_code"]
-                        ));
-                    }
-                }
+
             }
         }
         if let Some(next) = item["superseded_by"].as_i64() {
@@ -555,6 +589,19 @@ pub fn display_completion(value: &Value) -> String {
                 "  replaced by O{next}: {}",
                 item["reason"].as_str().unwrap_or_default()
             ));
+        }
+    }
+    if value["artifacts"].as_array().is_some_and(|items| !items.is_empty()) {
+        lines.push("Evidence sources".into());
+    }
+    for artifact in value["artifacts"].as_array().into_iter().flatten() {
+        lines.push(format!("  artifact {}", artifact["artifact"].as_str().unwrap_or_default()));
+        for source in artifact["operations"].as_array().into_iter().flatten() {
+            let exit = artifact["receipt"]["exit_code"].as_i64()
+                .map(|code| format!(" · exit {code}")).unwrap_or_default();
+            lines.push(format!("    {} {} · {}{}",
+                source["capability"].as_str().unwrap_or("operation"),
+                source["arguments"], source["state"].as_str().unwrap_or("unknown"), exit));
         }
     }
     lines.push(format!(
