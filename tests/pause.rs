@@ -91,6 +91,13 @@ fn pause_waits_for_current_action_then_restart_resumes_same_contract() -> Result
         .output()?;
     assert!(stopped.status.success());
     assert_eq!(requests.load(Ordering::SeqCst), 1);
+    // Advance the simulated pause beyond the original wall deadline. The
+    // resumed native runner must still contact the model under the same budget.
+    let connection = rusqlite::Connection::open(root.join("runs.sqlite"))?;
+    let paused_at = arun::storage::unix_time() - 7200;
+    connection.execute("UPDATE run_projection SET started_at=?2 WHERE run_id=?1", rusqlite::params![original.id, paused_at - 2])?;
+    connection.execute("UPDATE pause_clock SET paused_at=?2 WHERE run_id=?1", rusqlite::params![original.id, paused_at])?;
+    drop(connection);
     let output = Command::new(env!("CARGO_BIN_EXE_arun"))
         .current_dir(directory.path())
         .args(["resume", &original.id, "--foreground"])

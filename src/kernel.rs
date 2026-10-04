@@ -1140,10 +1140,7 @@ fn dispatch(
 
 pub(crate) fn remaining_seconds(store: &Store, run: &Run) -> Result<u64> {
     let budget = run.budgets["wall_seconds"].as_u64().unwrap_or(3600);
-    let started = store
-        .run_started_at(&run.id)?
-        .unwrap_or_else(crate::storage::unix_time);
-    Ok(budget.saturating_sub(crate::storage::unix_time().saturating_sub(started) as u64))
+    Ok(budget.saturating_sub(store.execution_elapsed_seconds(&run.id)?))
 }
 
 pub(crate) fn commit_result(
@@ -1827,9 +1824,6 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
         return Ok(());
     }
     store.state(run_id, "running", json!({}))?;
-    let started_at = store
-        .run_started_at(run_id)?
-        .context("run start event missing")?;
     for operation in unresolved.iter().filter(|operation| {
         (operation.retry_safe || operation.state == "pending")
             && operation.capability != crate::acceptance::CAPABILITY
@@ -1866,11 +1860,6 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
         store.answer_run(run_id, &reply)?;
         return Ok(());
     }
-    let wall_seconds = run
-        .budgets
-        .get("wall_seconds")
-        .and_then(Value::as_u64)
-        .unwrap_or(3600);
     loop {
         if crate::pause::boundary(&mut store, run_id)? {
             break;
@@ -1878,7 +1867,7 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
         if store.run(run_id)?.state != "running" {
             break;
         }
-        if crate::storage::unix_time().saturating_sub(started_at) as u64 >= wall_seconds {
+        if remaining_seconds(&store, &run)? == 0 {
             store.state(
                 run_id,
                 "waiting_recovery",
@@ -2051,8 +2040,7 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
                             response.usage.is_some() && response.shape["json"].is_boolean()
                         })
                     && !format_retry_state(&store.recent_events(run_id, 12)?).0
-                    && (crate::storage::unix_time().saturating_sub(started_at) as u64)
-                        < wall_seconds;
+                    && remaining_seconds(&store, &run)? > 0;
                 if format_retry {
                     store.event(
                         run_id,
@@ -2065,7 +2053,7 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
                     run_id,
                     "waiting_recovery",
                     json!({"reason": model_wait_reason(interrupted, model_started.elapsed(), timeout,
-                        (crate::storage::unix_time().saturating_sub(started_at) as u64) >= wall_seconds)}),
+                        remaining_seconds(&store, &run)? == 0)}),
                 )?;
                 break;
             }
