@@ -134,9 +134,11 @@ fn native_powershell_output_is_saved_and_displayed_before_completion() -> Result
         let state = http::state(body)?;
         let action = match observed.fetch_add(1, Ordering::SeqCst) {
             0 => json!({"kind":"invoke","capability":"mcp.windows-host.powershell","args":{
-                "script":"[Console]::WriteLine(('NATIVE_' + 'LIVE_Київ_🦀')); $end = [DateTime]::UtcNow.AddSeconds(12); while (!(Test-Path 'release.txt')) { if ([DateTime]::UtcNow -gt $end) { throw 'Fixture release deadline' }; Start-Sleep -Milliseconds 25 }; [Console]::WriteLine('RELEASED')",
+                "script":"[Console]::WriteLine(('NATIVE_' + 'LIVE_Київ_🦀')); $end = [DateTime]::UtcNow.AddSeconds(12); while (!(Test-Path '.arun/release.txt')) { if ([DateTime]::UtcNow -gt $end) { throw 'Fixture release deadline' }; Start-Sleep -Milliseconds 25 }; [Console]::WriteLine('RELEASED')",
                 "timeout_seconds":15}}),
             1 => {
+                assert_eq!(state["workspace_revision"], 0);
+                assert_eq!(state["recent_operation_outcomes"][0]["successful_current_evidence"], true);
                 json!({"kind":"finish","summary":"Native output verified","evidence":[state["recent_operation_outcomes"][0]["artifact"]]})
             }
             _ => anyhow::bail!("unexpected additional model request"),
@@ -146,7 +148,7 @@ fn native_powershell_output_is_saved_and_displayed_before_completion() -> Result
             json!({"choices":[{"message":{"content":action.to_string()}}],"usage":{"prompt_tokens":10,"completion_tokens":2}}),
         ))
     })?;
-    let display = directory.path().join("foreground.log");
+    let display = root.join("foreground.log");
     let file = std::fs::File::create(&display)?;
     let mut command = Command::new(&binary);
     command
@@ -204,7 +206,7 @@ fn native_powershell_output_is_saved_and_displayed_before_completion() -> Result
         );
         std::thread::sleep(Duration::from_millis(25));
     }
-    std::fs::write(directory.path().join("release.txt"), "release")?;
+    std::fs::write(root.join("release.txt"), "release")?;
     while child.try_wait()?.is_none() {
         anyhow::ensure!(
             Instant::now() < deadline + Duration::from_secs(10),

@@ -138,7 +138,11 @@ fn native_shell_edits_create_and_delete_files_before_the_tool_finishes() -> Resu
                 "script":"function Wait-Release($stage) { $end = [DateTime]::UtcNow.AddSeconds(20); while (!(Test-Path \".arun/release-$stage\")) { if ([DateTime]::UtcNow -gt $end) { throw 'Release deadline' }; Start-Sleep -Milliseconds 25 } }; [IO.File]::WriteAllText((Join-Path (Get-Location).Path 'code.rs'), \"new code`n\"); Wait-Release 1; [IO.File]::WriteAllText((Join-Path (Get-Location).Path 'added.rs'), \"added code`n\"); Wait-Release 2; Remove-Item -LiteralPath 'removed.rs'; Wait-Release 3",
                 "timeout_seconds":60}}),
             ),
-            1 => response(
+            1 => {
+                assert_eq!(state["recent_operation_outcomes"][0]["successful_current_evidence"], false);
+                response(json!({"kind":"invoke","capability":"workspace.read","args":{"path":"code.rs"}}))
+            }
+            2 => response(
                 json!({"kind":"finish","summary":"Live edits verified","evidence":[state["recent_operation_outcomes"][0]["artifact"]]}),
             ),
             _ => anyhow::bail!("unexpected model request"),
@@ -220,8 +224,10 @@ fn native_shell_edits_create_and_delete_files_before_the_tool_finishes() -> Resu
     let run = store.runs()?.remove(0);
     assert_eq!(run.state, "completed");
     assert_eq!(store.event_count(&run.id, "operation.diff")?, 3);
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
-    assert_eq!(store.model_tokens(&run.id)?, 24);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(store.model_tokens(&run.id)?, 36);
+    assert_eq!(fs::read_to_string(directory.path().join("code.rs"))?, "new code\n");
+    assert_eq!(fs::read_to_string(directory.path().join("added.rs"))?, "added code\n");
     assert!(!directory.path().join("removed.rs").exists());
     Ok(())
 }

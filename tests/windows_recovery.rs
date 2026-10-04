@@ -188,7 +188,13 @@ fn native_committed_write_survives_runner_death_without_repeating_the_effect() -
                             == "Keep the committed Windows write; never repeat it")
                 );
                 assert_eq!(state["recent_operation_outcomes"][0]["state"], "succeeded");
-                json!({"kind":"finish","summary":"Recovered the existing native write receipt","evidence":[state["recent_operation_outcomes"][0]["artifact"]]})
+                assert_eq!(state["recent_operation_outcomes"][0]["successful_current_evidence"], false);
+                json!({"kind":"invoke","capability":"mcp.windows-host.powershell","args":{"script":"Get-Content -LiteralPath 'effects.txt'","timeout_seconds":10}})
+            }
+            5 => {
+                assert_eq!(state["recent_operation_outcomes"][0]["successful_current_evidence"], true);
+                assert!(state["recent_events"].as_array().unwrap().iter().any(|event| event["kind"]=="operation.succeeded" && event["payload"]["artifact"]==state["recent_operation_outcomes"][0]["artifact"] && event["payload"]["command"]["stdout"].as_str().is_some_and(|text|text.trim()=="effect")));
+                json!({"kind":"finish","summary":"Recovered the existing native write and verified it without repeating the effect","evidence":[state["recent_operation_outcomes"][0]["artifact"]]})
             }
             _ => anyhow::bail!("Unexpected model turn after native recovery"),
         };
@@ -248,14 +254,15 @@ fn native_committed_write_survives_runner_death_without_repeating_the_effect() -
     assert_eq!(run.budgets, original.budgets);
     assert_eq!(run.grants, original.grants);
     let operations = store.operations(&run.id)?;
-    assert_eq!(operations.len(), 1);
+    assert_eq!(operations.len(), 2);
     assert_eq!(operations[0].id, committed[0].id);
     assert_eq!(operations[0].artifact, committed[0].artifact);
-    assert_eq!(store.event_count(&run.id, "operation.executing")?, 1);
-    assert_eq!(store.event_count(&run.id, "operation.succeeded")?, 1);
+    assert_eq!(operations[1].arguments["script"], "Get-Content -LiteralPath 'effects.txt'");
+    assert_eq!(store.event_count(&run.id, "operation.executing")?, 2);
+    assert_eq!(store.event_count(&run.id, "operation.succeeded")?, 2);
     assert_eq!(store.unknown_count(&run.id)?, 0);
-    assert_eq!(store.model_tokens(&run.id)?, 48);
-    assert_eq!(calls.load(Ordering::SeqCst), 5);
+    assert_eq!(store.model_tokens(&run.id)?, 60);
+    assert_eq!(calls.load(Ordering::SeqCst), 6);
     assert_eq!(
         std::fs::read_to_string(directory.path().join("effects.txt"))?
             .lines()

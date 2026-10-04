@@ -57,7 +57,13 @@ pub fn recent_operation_outcomes(store: &Store, run_id: &str) -> Result<Value> {
             } else {
                 None
             };
-            outcomes.insert(position,json!({"operation":id,"capability":capability,"target":target,"state":state,"artifact":hash,"revision":revision,"current":revision.is_some() && revision==current,"successful_current_evidence":state=="succeeded" && revision.is_some() && revision==current,"receipt":receipt}));
+            let successful_current = if state == "succeeded" && revision == current {
+                match current {
+                    Some(revision) => crate::obligations::current_evidence(&store.connection, run_id, revision, &hash)?,
+                    None => false,
+                }
+            } else { false };
+            outcomes.insert(position,json!({"operation":id,"capability":capability,"target":target,"state":state,"artifact":hash,"revision":revision,"current":revision.is_some() && revision==current,"successful_current_evidence":successful_current,"receipt":receipt}));
         }
     }
     Ok(json!(outcomes.into_values().rev().collect::<Vec<_>>()))

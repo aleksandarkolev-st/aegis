@@ -2317,8 +2317,10 @@ mod tests {
         let changed = store.put_artifact(b"source edited")?;
         store.operation_state(&command, "succeeded", Some(&changed), json!({}))?;
         assert!(store.validate_completion(&run.id, &[changed]).is_err());
+        assert_eq!(crate::control::recent_operation_outcomes(&store, &run.id)?[0]["successful_current_evidence"], false);
         let current = current_file_receipt(&mut store, &run, "source.txt")?;
         store.validate_completion(&run.id, &[current])?;
+        assert_eq!(crate::control::recent_operation_outcomes(&store, &run.id)?[0]["successful_current_evidence"], true);
         Ok(())
     }
 
