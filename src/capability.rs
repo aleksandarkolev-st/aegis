@@ -107,24 +107,63 @@ fn words(text: &str) -> Vec<String> {
         .collect()
 }
 
+fn search_terms(text: &str) -> std::collections::BTreeSet<String> {
+    words(text)
+        .into_iter()
+        .filter_map(|word| {
+            let term = match word.as_str() {
+                "writing" | "writes" => "write",
+                "reading" | "reads" => "read",
+                "patching" | "patches" => "patch",
+                "running" | "runs" => "run",
+                "editing" | "edits" => "edit",
+                "files" => "file",
+                "commands" => "command",
+                "tools" => "tool",
+                "a" | "an" | "and" | "as" | "at" | "be" | "by" | "for" | "from" | "in" | "into"
+                | "is" | "it" | "of" | "on" | "or" | "such" | "that" | "the" | "their" | "this"
+                | "to" | "using" | "with" => return None,
+                term => term,
+            };
+            Some(term.to_owned())
+        })
+        .collect()
+}
+
+fn query_terms(query: &str) -> std::collections::BTreeSet<String> {
+    // A repeated filler word must not outrank an operation name. Ignore the
+    // immediate keyword in explicit "not <keyword>" phrases as well.
+    let words = words(query);
+    let negated: std::collections::BTreeSet<_> = words
+        .windows(2)
+        .filter(|pair| pair[0] == "not")
+        .flat_map(|pair| search_terms(&pair[1]))
+        .collect();
+    search_terms(query).difference(&negated).cloned().collect()
+}
+
 pub fn resolve(
     store: &Store,
     query: &str,
     grants: &[String],
     limit: usize,
 ) -> Result<Vec<Manifest>> {
-    let terms = words(query);
+    let terms = query_terms(query);
     let mut candidates: Vec<_> = all(store)?
         .into_iter()
         .filter(|manifest| grants.iter().any(|grant| grant == &manifest.permission))
         .map(|manifest| {
-            let name = words(&manifest.id);
-            let purpose = words(&manifest.purpose);
+            let name = search_terms(&manifest.id);
+            let purpose = search_terms(&manifest.purpose);
             let score: usize = terms
                 .iter()
                 .map(|term| {
                     if name.contains(term) {
-                        3
+                        if matches!(term.as_str(), "workspace" | "mcp" | "host") {
+                            2
+                        } else {
+                            12
+                        }
                     } else if purpose.contains(term) {
                         1
                     } else {
@@ -185,6 +224,58 @@ pub fn validate_arguments(manifest: &Manifest, arguments: &Value) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prose_discovery_queries_rank_requested_write_patch_and_native_tools() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let server = crate::mcp::Server {
+            name: "windows-host".into(),
+            command: "node".into(),
+            args: vec![],
+            policy: crate::mcp::Policy {
+                trusted_host: true,
+                ..Default::default()
+            },
+        };
+        let tool = crate::mcp::Tool { server:server.name.clone(), name:"powershell".into(), description:"Run native Windows PowerShell on the trusted host. This is not a sandbox. Output is bounded; all child processes terminate with the invocation. Use app_launch for an app that must remain open.".into(), input_schema:json!({"type":"object"}), version:1 };
+        store.register_mcp(&server, &[tool])?;
+        let grants = vec![
+            "workspace.read".into(),
+            "workspace.write".into(),
+            "mcp:windows-host:powershell".into(),
+        ];
+        let query = "Find granted capabilities for directly writing or patching workspace code files and running PowerShell commands such as node --test. Do not search for file-listing tools.";
+        let found: std::collections::BTreeSet<_> = resolve(&store, query, &grants, 3)?
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(
+            found,
+            std::collections::BTreeSet::from([
+                "workspace.write".into(),
+                "workspace.patch".into(),
+                "mcp.windows-host.powershell".into()
+            ])
+        );
+        assert_eq!(
+            resolve(&store, "Read a file in the workspace", &grants, 1)?[0].id,
+            "workspace.read"
+        );
+        assert_eq!(
+            resolve(
+                &store,
+                "the the the the workspace writing writing file file",
+                &grants,
+                1
+            )?[0]
+                .id,
+            "workspace.write"
+        );
+        let denied = resolve(&store, query, &["workspace.read".into()], 3)?;
+        assert!(denied.iter().all(|m| m.permission == "workspace.read"));
+        Ok(())
+    }
 
     #[test]
     fn filters_before_ranking_overlapping_tools() {
