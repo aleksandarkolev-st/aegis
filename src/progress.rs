@@ -119,7 +119,16 @@ pub(crate) fn observe(
     if maintenance {
         key_action = json!({"maintenance":true});
     }
-    let signature = digest(&json!({"action":key_action,"outcome":outcome,"epoch":epoch}));
+    let failed = error.is_some()
+        || outcome["state"] == "failed"
+        || outcome["result"]["exit_code"]
+            .as_i64()
+            .is_some_and(|code| code != 0)
+        || outcome["result"]["isError"] == true;
+    // Equivalent failures are the same blocker even if a retry changes its
+    // arguments. Successful exploratory actions still retain their full key.
+    let signature_action = if failed { json!({"failure":true}) } else { key_action.clone() };
+    let signature = digest(&json!({"action":signature_action,"outcome":outcome,"epoch":epoch}));
     let transaction = store.connection.unchecked_transaction()?;
     let previous: Option<(String, i64)> = transaction
         .query_row(
@@ -140,12 +149,6 @@ pub(crate) fn observe(
         previous.map(|(_, count)| count).unwrap_or(0) + 1
     };
     transaction.execute("INSERT INTO loop_progress(run_id,epoch,unchanged,last_error) VALUES (?1,?2,?3,?4) ON CONFLICT(run_id) DO UPDATE SET epoch=excluded.epoch,unchanged=excluded.unchanged,last_error=excluded.last_error",params![run.id,epoch,unchanged,error])?;
-    let failed = error.is_some()
-        || outcome["state"] == "failed"
-        || outcome["result"]["exit_code"]
-            .as_i64()
-            .is_some_and(|code| code != 0)
-        || outcome["result"]["isError"] == true;
     let limit = if failed { 2 } else { 4 };
     if unchanged >= limit {
         append_event(
@@ -180,6 +183,26 @@ pub(crate) fn add_context(store: &Store, run: &Run, context: &mut Value) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changed_retry_arguments_cannot_disguise_the_same_permission_blocker() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run("Explore", directory.path(), "custom", json!([]), json!({}), "")?;
+        store.state(&run.id, "running", json!({}))?;
+        for retry in 0..8 {
+            observe(&mut store, &run, &Action::Invoke {
+                capability: format!("unavailable.{retry}"), args: json!({"retry":retry}),
+            }, Some("capability not granted"))?;
+        }
+        assert_eq!(store.run(&run.id)?.state, "waiting_recovery");
+        assert_eq!(store.event_count(&run.id, "loop.stalled")?, 1);
+        store.state(&run.id, "running", json!({}))?;
+        store.steer(&run.id, "Use the newly granted alternate approach")?;
+        observe(&mut store, &run, &Action::Invoke { capability: "alternate".into(), args: json!({}) }, Some("capability not granted"))?;
+        assert_eq!(store.run(&run.id)?.state, "running");
+        Ok(())
+    }
 
     #[test]
     fn unchanged_rejections_pause_and_the_guard_survives_restart() -> Result<()> {
