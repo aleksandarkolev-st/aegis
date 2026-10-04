@@ -145,8 +145,19 @@ pub(crate) fn append_event(
     } else {
         0
     };
-    let estimated = if payload["usage"]["source"] == "estimated" { tokens }else{0};
-    let unclassified = if tokens>0 && payload["usage"]["source"] != "estimated" && payload["usage"]["source"] != "provider" { tokens }else{0};
+    let estimated = if payload["usage"]["source"] == "estimated" {
+        tokens
+    } else {
+        0
+    };
+    let unclassified = if tokens > 0
+        && payload["usage"]["source"] != "estimated"
+        && payload["usage"]["source"] != "provider"
+    {
+        tokens
+    } else {
+        0
+    };
     transaction.execute("INSERT INTO usage_source_projection(run_id,estimated_tokens,unclassified_tokens) VALUES (?1,?2,?3) ON CONFLICT(run_id) DO UPDATE SET estimated_tokens=MIN(9223372036854775807,estimated_tokens+excluded.estimated_tokens),unclassified_tokens=MIN(9223372036854775807,unclassified_tokens+excluded.unclassified_tokens)",params![run_id,estimated,unclassified])?;
     transaction.execute("UPDATE run_projection SET last_seq = last_seq + 1,
         model_tokens = MIN(9223372036854775807, model_tokens + ?2),
@@ -161,9 +172,13 @@ pub(crate) fn append_event(
         params![run_id, kind],
     )?;
     crate::questions::track_state(transaction, run_id, kind, &payload)?;
-    let seq: i64 = transaction.query_row("SELECT last_seq FROM run_projection WHERE run_id=?1",[run_id],|row|row.get(0))?;
-    crate::steering::track(transaction,run_id,seq,kind,&payload,timestamp)?;
-    crate::memory::track(transaction,run_id,seq,kind,&payload)?;
+    let seq: i64 = transaction.query_row(
+        "SELECT last_seq FROM run_projection WHERE run_id=?1",
+        [run_id],
+        |row| row.get(0),
+    )?;
+    crate::steering::track(transaction, run_id, seq, kind, &payload, timestamp)?;
+    crate::memory::track(transaction, run_id, seq, kind, &payload)?;
     Ok(())
 }
 
@@ -584,6 +599,23 @@ impl Store {
         }
         store.connection.execute_batch("CREATE TABLE IF NOT EXISTS pause_requests (run_id TEXT PRIMARY KEY REFERENCES runs(id), pending INTEGER NOT NULL)")?;
         store.connection.execute_batch("CREATE TABLE IF NOT EXISTS observed_files (run_id TEXT NOT NULL REFERENCES runs(id), path TEXT NOT NULL, hash TEXT NOT NULL, PRIMARY KEY(run_id,path))")?;
+        let observed_columns = {
+            let mut query = store
+                .connection
+                .prepare("PRAGMA table_info(observed_files)")?;
+            query
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if !observed_columns
+            .iter()
+            .any(|column| column == "changed_seq")
+        {
+            store.connection.execute_batch(
+                "ALTER TABLE observed_files ADD COLUMN changed_seq INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
+        store.connection.execute_batch("CREATE INDEX IF NOT EXISTS observed_files_change ON observed_files(run_id,changed_seq)")?;
         store.connection.execute_batch("CREATE TABLE IF NOT EXISTS workspace_fingerprints (run_id TEXT PRIMARY KEY REFERENCES runs(id), fingerprint TEXT NOT NULL, revision INTEGER NOT NULL)")?;
         store.connection.execute_batch("CREATE TABLE IF NOT EXISTS file_hash_cache (workspace TEXT NOT NULL,path TEXT NOT NULL,stamp TEXT NOT NULL,digest TEXT NOT NULL,PRIMARY KEY(workspace,path))")?;
         store.restore_usage_sources()?;
@@ -596,37 +628,73 @@ impl Store {
     fn restore_usage_sources(&self) -> Result<()> {
         self.connection.execute_batch("CREATE TABLE IF NOT EXISTS usage_source_projection (run_id TEXT PRIMARY KEY REFERENCES runs(id),estimated_tokens INTEGER NOT NULL DEFAULT 0,unclassified_tokens INTEGER NOT NULL DEFAULT 0)")?;
         let missing: bool=self.connection.query_row("SELECT EXISTS(SELECT 1 FROM runs WHERE id NOT IN (SELECT run_id FROM usage_source_projection))",[],|row|row.get(0))?;
-        if !missing { return Ok(()); }
-        let ids=self.connection.prepare("SELECT id FROM runs WHERE id NOT IN (SELECT run_id FROM usage_source_projection)")?.query_map([],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        if !missing {
+            return Ok(());
+        }
+        let ids = self
+            .connection
+            .prepare(
+                "SELECT id FROM runs WHERE id NOT IN (SELECT run_id FROM usage_source_projection)",
+            )?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         for id in ids {
-          loop {
-            // events() opens its own consistent replay transaction, including archives.
-            let events=self.events(&id)?;
-            let observed_sequence=events.last().map(|event|event.seq).unwrap_or(0);
-            let mut estimated=0_u64;
-            let mut unclassified=0_u64;
-            for event in events.iter().filter(|event|matches!(event.kind.as_str(),"model.response"|"model.failed")) {
-                let tokens=event.payload["usage"]["input_tokens"].as_u64().unwrap_or(0).saturating_add(event.payload["usage"]["output_tokens"].as_u64().unwrap_or(0));
-                match event.payload["usage"]["source"].as_str() {
-                    Some("provider")=>{},
-                    Some("estimated")=>estimated=estimated.saturating_add(tokens).min(i64::MAX as u64),
-                    _=>unclassified=unclassified.saturating_add(tokens).min(i64::MAX as u64),
+            loop {
+                // events() opens its own consistent replay transaction, including archives.
+                let events = self.events(&id)?;
+                let observed_sequence = events.last().map(|event| event.seq).unwrap_or(0);
+                let mut estimated = 0_u64;
+                let mut unclassified = 0_u64;
+                for event in events.iter().filter(|event| {
+                    matches!(event.kind.as_str(), "model.response" | "model.failed")
+                }) {
+                    let tokens = event.payload["usage"]["input_tokens"]
+                        .as_u64()
+                        .unwrap_or(0)
+                        .saturating_add(
+                            event.payload["usage"]["output_tokens"]
+                                .as_u64()
+                                .unwrap_or(0),
+                        );
+                    match event.payload["usage"]["source"].as_str() {
+                        Some("provider") => {}
+                        Some("estimated") => {
+                            estimated = estimated.saturating_add(tokens).min(i64::MAX as u64)
+                        }
+                        _ => {
+                            unclassified = unclassified.saturating_add(tokens).min(i64::MAX as u64)
+                        }
+                    }
                 }
+                let transaction = rusqlite::Transaction::new_unchecked(
+                    &self.connection,
+                    TransactionBehavior::Immediate,
+                )?;
+                let restored: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM usage_source_projection WHERE run_id=?1)",
+                    [&id],
+                    |row| row.get(0),
+                )?;
+                if restored {
+                    break;
+                }
+                let current_sequence: i64 = transaction.query_row(
+                    "SELECT last_seq FROM run_projection WHERE run_id=?1",
+                    [&id],
+                    |row| row.get(0),
+                )?;
+                if current_sequence != observed_sequence {
+                    continue;
+                }
+                transaction.execute("INSERT INTO usage_source_projection(run_id,estimated_tokens,unclassified_tokens) VALUES (?1,?2,?3)",params![id,estimated as i64,unclassified as i64])?;
+                transaction.commit()?;
+                break;
             }
-            let transaction=rusqlite::Transaction::new_unchecked(&self.connection,TransactionBehavior::Immediate)?;
-            let restored:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM usage_source_projection WHERE run_id=?1)",[&id],|row|row.get(0))?;
-            if restored { break; }
-            let current_sequence:i64=transaction.query_row("SELECT last_seq FROM run_projection WHERE run_id=?1",[&id],|row|row.get(0))?;
-            if current_sequence!=observed_sequence {continue;}
-            transaction.execute("INSERT INTO usage_source_projection(run_id,estimated_tokens,unclassified_tokens) VALUES (?1,?2,?3)",params![id,estimated as i64,unclassified as i64])?;
-            transaction.commit()?;
-            break;
-          }
         }
         Ok(())
     }
 
-    pub fn usage_source_tokens(&self, id: &str) -> Result<(u64,u64)> {
+    pub fn usage_source_tokens(&self, id: &str) -> Result<(u64, u64)> {
         Ok(self.connection.query_row("SELECT COALESCE((SELECT estimated_tokens FROM usage_source_projection WHERE run_id=?1),0),COALESCE((SELECT unclassified_tokens FROM usage_source_projection WHERE run_id=?1),0)",[id],|row|Ok((row.get(0)?,row.get(1)?)))?)
     }
 
@@ -874,7 +942,7 @@ impl Store {
     }
 
     pub fn pending_steering(&self, run_id: &str) -> Result<Vec<Event>> {
-        self.steering_messages(run_id,false)
+        self.steering_messages(run_id, false)
     }
 
     pub fn events_since(&self, run_id: &str, seq: i64) -> Result<Vec<Event>> {
@@ -1712,9 +1780,11 @@ impl Store {
         let may_have_run =
             state == "succeeded" || matches!(previous.as_str(), "dispatched" | "executing");
         let mut fingerprint_invalidated = false;
+        let mut fingerprint_checked_unchanged = false;
         let mut fingerprint_to_save: Option<String> = None;
         if terminal_operation_state(state)
-            && canonical.capability == "process.run"
+            && (canonical.capability == "process.run" || canonical.capability.starts_with("mcp."))
+            && fingerprint_capture.is_some()
             && !resolving_unknown
             && may_have_run
         {
@@ -1734,13 +1804,18 @@ impl Store {
                             json!({
                                 "operation": canonical.id,
                                 "capability": canonical.capability,
-                                "reason": if baseline.is_none() {"process finished without a start fingerprint"} else {"scoped workspace changed while process.run was executing"},
+                                "reason": if baseline.is_none() {"command finished without a start fingerprint"} else {"scoped workspace changed while the command was executing"},
                                 "fingerprint_scope": crate::freshness::WORKSPACE_FINGERPRINT_SCOPE
                             }),
                         )?;
                         fingerprint_invalidated = true;
+                        detail["workspace_fingerprint"] = json!(
+                            "changed during command execution; this operation's evidence is stale"
+                        );
+                    } else if state == "succeeded" {
+                        fingerprint_checked_unchanged = true;
                         detail["workspace_fingerprint"] =
-                            json!("changed during process.run; this operation's evidence is stale");
+                            json!("unchanged checked source; prior proofs retained");
                     }
                     fingerprint_to_save = Some(fingerprint.clone());
                 }
@@ -1748,7 +1823,7 @@ impl Store {
                     crate::obligations::invalidate_workspace(
                         &transaction,
                         &canonical.run_id,
-                        json!({"operation":canonical.id,"capability":canonical.capability,"reason":"workspace fingerprint could not be checked after process.run"}),
+                        json!({"operation":canonical.id,"capability":canonical.capability,"reason":"workspace fingerprint could not be checked after command execution"}),
                     )?;
                     fingerprint_invalidated = true;
                     detail["workspace_fingerprint_error"] = json!(error);
@@ -1811,7 +1886,8 @@ impl Store {
                     &transaction,
                     &canonical,
                     may_have_run,
-                    fingerprint_invalidated,
+                    fingerprint_invalidated || fingerprint_checked_unchanged,
+                    fingerprint_checked_unchanged,
                 )?;
             }
             if let Some(fingerprint) = fingerprint_to_save.as_deref() {
@@ -1846,9 +1922,6 @@ impl Store {
         // Advance external changes before assigning the new reader's epoch.
         // Otherwise a valid fresh read would be invalidated by its own receipt.
         self.refresh_observed_files_cached(&existing.run_id)?;
-        let start_fingerprint = (existing.capability == "process.run")
-            .then(|| self.capture_workspace_fingerprint(&existing.run_id))
-            .transpose()?;
         let has_workspace_write =
             self.run(&existing.run_id)?
                 .grants
@@ -1858,6 +1931,10 @@ impl Store {
                         .iter()
                         .any(|grant| grant.as_str() == Some("workspace.write"))
                 });
+        let start_fingerprint = (existing.capability == "process.run"
+            || (existing.capability.starts_with("mcp.") && has_workspace_write))
+            .then(|| self.capture_workspace_fingerprint(&existing.run_id))
+            .transpose()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1885,14 +1962,14 @@ impl Store {
             let changed_before_start = baseline
                 .as_ref()
                 .is_some_and(|(previous, _)| previous != fingerprint);
-            if !has_workspace_write && (missing_legacy_baseline || changed_before_start) {
+            if missing_legacy_baseline || changed_before_start {
                 crate::obligations::invalidate_workspace(
                     &transaction,
                     &operation.run_id,
                     json!({
                         "operation": operation.id,
                         "capability": capability,
-                        "reason": if missing_legacy_baseline {"existing process evidence had no start fingerprint"} else {"scoped workspace changed before process.run started"},
+                        "reason": if missing_legacy_baseline {"existing command evidence had no start fingerprint"} else {"scoped workspace changed before the command started"},
                         "fingerprint_scope": crate::freshness::WORKSPACE_FINGERPRINT_SCOPE
                     }),
                 )?;
@@ -1903,6 +1980,7 @@ impl Store {
             &operation.run_id,
             &operation.id,
             &capability,
+            start_fingerprint.is_some(),
         )?;
         let changed = transaction.execute(
             "UPDATE operations SET state = 'executing', started_revision = ?3 WHERE id = ?1 AND run_id = ?2 AND state = 'dispatched' AND EXISTS (SELECT 1 FROM runs WHERE id = ?2 AND state = 'running')",
@@ -2130,6 +2208,209 @@ pub(crate) fn claim_test_operation(store: &mut Store, operation: &Operation) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn current_file_receipt(store: &mut Store, run: &Run, path: &str) -> Result<String> {
+        let content = fs::read(Path::new(&run.workspace).join(path))?;
+        let operation =
+            store.begin_operation(&run.id, "workspace.read", json!({"path":path}), true)?;
+        claim_test_operation(store, &operation)?;
+        let artifact=store.put_artifact(&serde_json::to_vec(&json!({"content":String::from_utf8(content.clone())?,"sha256":hex::encode(Sha256::digest(&content))}))?)?;
+        store.operation_state(&operation, "succeeded", Some(&artifact), json!({}))?;
+        Ok(artifact)
+    }
+
+    #[test]
+    fn unchanged_process_and_mcp_commands_preserve_verified_proofs_without_retesting() -> Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("source.txt"), "unchanged source")?;
+        let mut store = Store::open(&directory.path().join(".arun"))?;
+        let run = store.create_run(
+            "Explore commands",
+            directory.path(),
+            "custom",
+            json!(["workspace.read", "workspace.write", "process.run"]),
+            json!({"obligations":["Read source"]}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let old = current_file_receipt(&mut store, &run, "source.txt")?;
+        store.verify_obligation(&run.id, 1, &[old.clone()])?;
+        for capability in ["process.run", "mcp.fixture.inspect", "mcp.fixture.inspect"] {
+            let operation = store.begin_operation(
+                &run.id,
+                capability,
+                json!({"query":"inspect source"}),
+                true,
+            )?;
+            claim_test_operation(&mut store, &operation)?;
+            assert_eq!(store.workspace_revision(&run.id)?, Some(0));
+            assert!(
+                store.validate_completion(&run.id, &[old.clone()]).is_err(),
+                "In-flight command must still block completion"
+            );
+            let artifact = store.put_artifact(&serde_json::to_vec(
+                &json!({"exit_code":0,"text":"unchanged inspection"}),
+            )?)?;
+            store.operation_state(&operation, "succeeded", Some(&artifact), json!({}))?;
+            assert_eq!(store.workspace_revision(&run.id)?, Some(0));
+            assert_eq!(store.obligations(&run.id)?[1].state, "verified");
+            store.validate_completion(&run.id, &[old.clone(), artifact])?;
+        }
+        store.complete_run(&run.id, "Read current source", &[old])?;
+        Ok(())
+    }
+
+    #[test]
+    fn unchanged_command_cannot_adopt_an_intervening_peers_revision() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("source.txt"), "original")?;
+        let mut store = Store::open(&directory.path().join(".arun"))?;
+        let first = store.create_run(
+            "Check source",
+            directory.path(),
+            "custom",
+            json!(["workspace.read", "workspace.write"]),
+            json!({}),
+            "",
+        )?;
+        let peer = store.create_run(
+            "Observe source",
+            directory.path(),
+            "custom",
+            json!(["workspace.read"]),
+            json!({}),
+            "",
+        )?;
+        store.state(&first.id, "running", json!({}))?;
+        store.state(&peer.id, "running", json!({}))?;
+        current_file_receipt(&mut store, &peer, "source.txt")?;
+        let command = store.begin_operation(&first.id, "mcp.fixture.inspect", json!({}), true)?;
+        claim_test_operation(&mut store, &command)?;
+        fs::write(directory.path().join("source.txt"), "peer change")?;
+        assert!(store.refresh_observed_files(&peer.id)?);
+        fs::write(directory.path().join("source.txt"), "original")?;
+        let artifact = store.put_artifact(b"command finished after peer revision")?;
+        store.operation_state(&command, "succeeded", Some(&artifact), json!({}))?;
+        assert_eq!(store.workspace_revision(&first.id)?, Some(1));
+        assert!(store.validate_completion(&first.id, &[artifact]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_source_changes_make_its_own_receipt_stale_until_fresh_verification() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("source.txt"), "before")?;
+        let mut store = Store::open(&directory.path().join(".arun"))?;
+        let run = store.create_run(
+            "Modify source",
+            directory.path(),
+            "custom",
+            json!(["workspace.read", "workspace.write"]),
+            json!({}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let command = store.begin_operation(&run.id, "mcp.fixture.edit", json!({}), false)?;
+        claim_test_operation(&mut store, &command)?;
+        fs::write(directory.path().join("source.txt"), "after")?;
+        let changed = store.put_artifact(b"source edited")?;
+        store.operation_state(&command, "succeeded", Some(&changed), json!({}))?;
+        assert!(store.validate_completion(&run.id, &[changed]).is_err());
+        let current = current_file_receipt(&mut store, &run, "source.txt")?;
+        store.validate_completion(&run.id, &[current])?;
+        Ok(())
+    }
+
+    #[test]
+    fn unrelated_scoped_peer_edits_preserve_proofs_and_allow_completion() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("first.txt"), "first source")?;
+        fs::write(directory.path().join("second.txt"), "second source")?;
+        let mut store = Store::open(&directory.path().join(".arun"))?;
+        let first = store.create_run("Read first", directory.path(), "custom", json!(["workspace.read"]), json!({"filesystem_scopes":{"read":["first.txt"],"write":[]},"obligations":["Read first"]}), "")?;
+        let peer = store.create_run(
+            "Edit second",
+            directory.path(),
+            "custom",
+            json!(["workspace.read", "workspace.write"]),
+            json!({}),
+            "",
+        )?;
+        for run in [&first, &peer] {
+            store.state(&run.id, "running", json!({}))?;
+        }
+        let proof = current_file_receipt(&mut store, &first, "first.txt")?;
+        store.verify_obligation(&first.id, 1, &[proof.clone()])?;
+        let edit = store.begin_operation(
+            &peer.id,
+            "workspace.write",
+            json!({"path":"second.txt","content":"updated"}),
+            false,
+        )?;
+        claim_test_operation(&mut store, &edit)?;
+        store.validate_completion(&first.id, &[proof.clone()])?;
+        fs::write(directory.path().join("second.txt"), "updated")?;
+        let artifact = store.put_artifact(b"second source updated")?;
+        store.operation_state(&edit, "succeeded", Some(&artifact), json!({}))?;
+        assert_eq!(store.workspace_revision(&first.id)?, Some(0));
+        assert_eq!(store.obligations(&first.id)?[1].state, "verified");
+        store.complete_run(&first.id, "Read first source", &[proof])?;
+        Ok(())
+    }
+
+    #[test]
+    fn hard_linked_peer_edits_still_block_and_invalidate_scoped_proofs() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("first.txt"), "shared source")?;
+        fs::hard_link(
+            directory.path().join("first.txt"),
+            directory.path().join("alias.txt"),
+        )?;
+        let mut store = Store::open(&directory.path().join(".arun"))?;
+        let first = store.create_run(
+            "Read first",
+            directory.path(),
+            "custom",
+            json!(["workspace.read"]),
+            json!({"filesystem_scopes":{"read":["first.txt"],"write":[]}}),
+            "",
+        )?;
+        let peer = store.create_run(
+            "Edit alias",
+            directory.path(),
+            "custom",
+            json!(["workspace.write"]),
+            json!({}),
+            "",
+        )?;
+        for run in [&first, &peer] {
+            store.state(&run.id, "running", json!({}))?;
+        }
+        let proof = current_file_receipt(&mut store, &first, "first.txt")?;
+        let edit = store.begin_operation(
+            &peer.id,
+            "workspace.write",
+            json!({"path":"alias.txt","content":"updated"}),
+            false,
+        )?;
+        claim_test_operation(&mut store, &edit)?;
+        assert!(store.workspace_revision(&first.id)?.unwrap() > 0);
+        assert!(crate::obligations::workspace_mutation_in_flight(
+            &store.connection,
+            &first.id
+        )?);
+        assert!(
+            store
+                .validate_completion(&first.id, &[proof.clone()])
+                .is_err()
+        );
+        fs::write(directory.path().join("alias.txt"), "updated")?;
+        let artifact = store.put_artifact(b"shared source updated")?;
+        store.operation_state(&edit, "succeeded", Some(&artifact), json!({}))?;
+        assert!(store.validate_completion(&first.id, &[proof]).is_err());
+        Ok(())
+    }
 
     fn create_fingerprint_test_run(
         store: &mut Store,

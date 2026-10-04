@@ -124,7 +124,8 @@ pub(crate) fn record_operation(
     transaction: &Transaction<'_>,
     operation: &Operation,
     may_have_run: bool,
-    workspace_already_invalidated: bool,
+    workspace_revision_handled: bool,
+    unchanged_source: bool,
 ) -> Result<()> {
     let Some(current) = transaction
         .query_row(
@@ -136,10 +137,18 @@ pub(crate) fn record_operation(
     else {
         return Ok(());
     };
-    let invalidates = !workspace_already_invalidated
+    let invalidates = !workspace_revision_handled
         && may_have_run
         && might_mutate_workspace(transaction, &operation.run_id, &operation.capability)?;
-    let revision = if invalidates {
+    let revision = if unchanged_source {
+        // Never let an intervening peer revision be mistaken for this command's
+        // own edit. An unchanged result belongs to its exact claim epoch.
+        transaction.query_row(
+            "SELECT COALESCE(started_revision,?2) FROM operations WHERE id=?1",
+            params![operation.id, current],
+            |row| row.get(0),
+        )?
+    } else if invalidates {
         current
             .checked_add(1)
             .context("workspace revision overflow")?
@@ -150,7 +159,12 @@ pub(crate) fn record_operation(
         invalidate_workspace(
             transaction,
             &operation.run_id,
-            serde_json::json!({"operation":operation.id,"capability":operation.capability}),
+            mutation_detail(
+                transaction,
+                &operation.id,
+                &operation.capability,
+                "finished",
+            )?,
         )?;
     }
     transaction.execute(
@@ -274,16 +288,13 @@ pub(crate) fn claim_operation_revision(
     run_id: &str,
     operation_id: &str,
     capability: &str,
+    fingerprint_checked: bool,
 ) -> Result<Option<i64>> {
-    if might_mutate_workspace(transaction, run_id, capability)? {
+    if !fingerprint_checked && might_mutate_workspace(transaction, run_id, capability)? {
         invalidate_workspace(
             transaction,
             run_id,
-            serde_json::json!({
-                "operation":operation_id,
-                "capability":capability,
-                "phase":"claimed"
-            }),
+            mutation_detail(transaction, operation_id, capability, "claimed")?,
         )?;
     }
     transaction
@@ -296,18 +307,158 @@ pub(crate) fn claim_operation_revision(
         .map_err(Into::into)
 }
 
+fn mutation_detail(
+    transaction: &Transaction<'_>,
+    id: &str,
+    capability: &str,
+    phase: &str,
+) -> Result<Value> {
+    let mut detail = serde_json::json!({"operation":id,"capability":capability,"phase":phase});
+    if matches!(capability, "workspace.write" | "workspace.patch") {
+        let (source, path): (String, Option<String>) = transaction.query_row(
+            "SELECT run_id,json_extract(arguments,'$.path') FROM operations WHERE id=?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if let Some(path) = path {
+            if let Some(path) = independent_path(transaction, &source, &path)? {
+                detail["paths"] = serde_json::json!([path]);
+            }
+        }
+    }
+    Ok(detail)
+}
+
+fn independent_path(connection: &Connection, source: &str, path: &str) -> Result<Option<String>> {
+    let Ok(path) = crate::filesystem::path_name(path) else {
+        return Ok(None);
+    };
+    let workspace: String =
+        connection.query_row("SELECT workspace FROM runs WHERE id=?1", [source], |row| {
+            row.get(0)
+        })?;
+    let root = std::path::Path::new(&workspace);
+    let target = root.join(&path);
+    let canonical = match std::fs::symlink_metadata(&target) {
+        Ok(metadata) => {
+            if !metadata.is_file() || crate::filesystem::linked(&metadata) {
+                return Ok(None);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.nlink() != 1 {
+                    return Ok(None);
+                }
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::AsRawHandle;
+                let Ok(file) = std::fs::File::open(&target) else {
+                    return Ok(None);
+                };
+                // The handle is live and the output is a zero-initialized POD.
+                let mut information:windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION=unsafe {std::mem::zeroed()};
+                if unsafe {
+                    windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle(
+                        file.as_raw_handle() as _,
+                        &mut information,
+                    )
+                } == 0
+                    || information.nNumberOfLinks != 1
+                {
+                    return Ok(None);
+                }
+            }
+            match dunce::canonicalize(&target) {
+                Ok(path) => path,
+                Err(_) => return Ok(None),
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let Some(parent) = target.parent() else {
+                return Ok(None);
+            };
+            let Ok(parent) = dunce::canonicalize(parent) else {
+                return Ok(None);
+            };
+            let Some(name) = target.file_name() else {
+                return Ok(None);
+            };
+            parent.join(name)
+        }
+        Err(_) => return Ok(None),
+    };
+    Ok(canonical
+        .strip_prefix(root)
+        .ok()
+        .and_then(|path| crate::filesystem::path_name(&path.to_string_lossy()).ok()))
+}
+
+fn affected_by_paths(configuration: &Value, paths: Option<&[String]>) -> bool {
+    let Some(paths) = paths else { return true };
+    let Ok(Some(mut scopes)) = crate::filesystem::FileScopes::from_configuration(configuration)
+    else {
+        return true;
+    };
+    #[cfg(windows)]
+    {
+        // Keep uncertain Unicode/short-name aliases conservative. Final proof
+        // validation also hashes the peer's actual scoped files independently.
+        if paths
+            .iter()
+            .any(|path| !path.is_ascii() || path.contains('~'))
+            || scopes
+                .read
+                .iter()
+                .any(|path| !path.is_ascii() || path.contains('~'))
+        {
+            return true;
+        }
+        scopes.read = scopes
+            .read
+            .into_iter()
+            .map(|path| path.to_ascii_lowercase())
+            .collect();
+        return paths
+            .iter()
+            .any(|path| scopes.permits(&path.to_ascii_lowercase(), false));
+    }
+    #[cfg(not(windows))]
+    paths.iter().any(|path| scopes.permits(path, false))
+}
+
+fn reported_paths(detail: &Value) -> Option<Vec<String>> {
+    let values = detail["paths"].as_array().cloned().or_else(|| {
+        detail["path"]
+            .as_str()
+            .map(|path| vec![serde_json::json!(path)])
+    })?;
+    if values.is_empty() {
+        return None;
+    }
+    values
+        .into_iter()
+        .map(|value| crate::filesystem::path_name(value.as_str()?).ok())
+        .collect()
+}
+
 pub(crate) fn workspace_mutation_in_flight(
     connection: &rusqlite::Connection,
     run_id: &str,
 ) -> Result<bool> {
-    Ok(connection.query_row(
-        "SELECT EXISTS(
-            SELECT 1
+    let configuration: String =
+        connection.query_row("SELECT budgets FROM runs WHERE id=?1", [run_id], |row| {
+            row.get(0)
+        })?;
+    let configuration: Value = serde_json::from_str(&configuration)?;
+    let mut query = connection.prepare(
+        "SELECT operation.run_id,operation.capability,operation.arguments
             FROM runs AS source
             JOIN runs AS peer ON peer.workspace = source.workspace
             JOIN operations AS operation ON operation.run_id = peer.id
             WHERE source.id = ?1
-              AND operation.state = 'executing'
+              AND operation.state IN ('executing','outcome_unknown')
               AND (
                   operation.capability IN ('workspace.write', 'workspace.patch')
                   OR (
@@ -318,10 +469,33 @@ pub(crate) fn workspace_mutation_in_flight(
                       )
                   )
               )
-        )",
-        [run_id],
-        |row| row.get(0),
-    )?)
+        ",
+    )?;
+    let rows = query.query_map([run_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (source, capability, args) = row?;
+        if source == run_id {
+            return Ok(true);
+        }
+        let paths = if matches!(capability.as_str(), "workspace.write" | "workspace.patch") {
+            match serde_json::from_str::<Value>(&args)?["path"].as_str() {
+                Some(path) => independent_path(connection, &source, path)?.map(|path| vec![path]),
+                None => None,
+            }
+        } else {
+            None
+        };
+        if affected_by_paths(&configuration, paths.as_deref()) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn invalidate_workspace(
@@ -330,14 +504,27 @@ pub(crate) fn invalidate_workspace(
     detail: Value,
 ) -> Result<()> {
     let affected = {
-        let mut statement=transaction.prepare("SELECT run.id, revision.revision FROM runs AS run JOIN workspace_revisions AS revision ON revision.run_id=run.id WHERE run.workspace=(SELECT workspace FROM runs WHERE id=?1) AND (run.id=?1 OR run.state NOT IN ('completed','answered','cancelled','failed'))")?;
+        let mut statement=transaction.prepare("SELECT run.id, revision.revision,run.budgets FROM runs AS run JOIN workspace_revisions AS revision ON revision.run_id=run.id WHERE run.workspace=(SELECT workspace FROM runs WHERE id=?1) AND (run.id=?1 OR run.state NOT IN ('completed','answered','cancelled','failed'))")?;
         statement
             .query_map([source], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
-    for (id, previous) in affected {
+    let paths = reported_paths(&detail);
+    for (id, previous, configuration) in affected {
+        if id != source
+            && !affected_by_paths(
+                &serde_json::from_str(&configuration).unwrap_or(Value::Null),
+                paths.as_deref(),
+            )
+        {
+            continue;
+        }
         let next = previous
             .checked_add(1)
             .context("workspace revision overflow")?;

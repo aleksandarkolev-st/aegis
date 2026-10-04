@@ -1036,7 +1036,7 @@ pub(crate) fn record(
                 json!({"reason":"observed file changed since its prior receipt","path":path}),
             )?;
         }
-        transaction.execute("INSERT INTO observed_files(run_id,path,hash) VALUES (?1,?2,?3) ON CONFLICT(run_id,path) DO UPDATE SET hash=excluded.hash",params![operation.run_id,path,hash])?;
+        transaction.execute("INSERT INTO observed_files(run_id,path,hash,changed_seq) VALUES (?1,?2,?3,(SELECT last_seq FROM run_projection WHERE run_id=?1)) ON CONFLICT(run_id,path) DO UPDATE SET changed_seq=CASE WHEN hash!=excluded.hash THEN excluded.changed_seq ELSE changed_seq END,hash=excluded.hash",params![operation.run_id,path,hash])?;
     }
     Ok(())
 }
@@ -1133,7 +1133,7 @@ impl Store {
         let mut paths = Vec::new();
         for (path, expected, actual) in changed {
             let count = transaction.execute(
-                "UPDATE observed_files SET hash=?4 WHERE run_id=?1 AND path=?2 AND hash=?3",
+                "UPDATE observed_files SET hash=?4,changed_seq=(SELECT last_seq FROM run_projection WHERE run_id=?1) WHERE run_id=?1 AND path=?2 AND hash=?3",
                 params![id, path, expected, actual],
             )?;
             if count > 0 {
@@ -1251,7 +1251,7 @@ pub(crate) fn workspace_fingerprint_baseline(
 pub(crate) fn workspace_has_process_evidence(connection: &Connection, id: &str) -> Result<bool> {
     connection
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM operations WHERE run_id=?1 AND capability='process.run' AND state='succeeded')",
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE run_id=?1 AND state='succeeded' AND (capability='process.run' OR (capability LIKE 'mcp.%' AND EXISTS(SELECT 1 FROM runs,json_each(runs.grants) AS grant_item WHERE runs.id=?1 AND grant_item.value='workspace.write'))))",
             [id],
             |row| row.get(0),
         )

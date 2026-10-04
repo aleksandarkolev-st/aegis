@@ -97,7 +97,20 @@ pub(crate) fn observe(
         [&run.id],
         |row| row.get(0),
     )?;
-    let epoch = digest(&json!({"revision":store.workspace_revision(&run.id)?,"owner":owner}));
+    let observed: i64 = store.connection.query_row(
+        "SELECT COALESCE(MAX(changed_seq),0) FROM observed_files WHERE run_id=?1",
+        [&run.id],
+        |row| row.get(0),
+    )?;
+    let source: Option<String> = store
+        .connection
+        .query_row(
+            "SELECT fingerprint FROM workspace_fingerprints WHERE run_id=?1",
+            [&run.id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let epoch = digest(&json!({"source":source,"observed":observed,"owner":owner}));
     let mut key_action = serde_json::to_value(action)?;
     // Model-authored prose is not new environmental evidence. A different
     // checkpoint wording must not disguise a loop with no new observations.
@@ -127,7 +140,13 @@ pub(crate) fn observe(
         previous.map(|(_, count)| count).unwrap_or(0) + 1
     };
     transaction.execute("INSERT INTO loop_progress(run_id,epoch,unchanged,last_error) VALUES (?1,?2,?3,?4) ON CONFLICT(run_id) DO UPDATE SET epoch=excluded.epoch,unchanged=excluded.unchanged,last_error=excluded.last_error",params![run.id,epoch,unchanged,error])?;
-    let limit = if error.is_some() { 2 } else { 4 };
+    let failed = error.is_some()
+        || outcome["state"] == "failed"
+        || outcome["result"]["exit_code"]
+            .as_i64()
+            .is_some_and(|code| code != 0)
+        || outcome["result"]["isError"] == true;
+    let limit = if failed { 2 } else { 4 };
     if unchanged >= limit {
         append_event(
             &transaction,
@@ -222,6 +241,58 @@ mod tests {
             observe(&mut store, &run, &action, None)?;
         }
         assert_eq!(store.run(&run.id)?.state, "waiting_recovery");
+        Ok(())
+    }
+
+    #[test]
+    fn unchanged_failed_commands_stall_despite_conservative_revision_bumps() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join("source.txt"), "original")?;
+        let mut store = Store::open(&directory.path().join(".arun"))?;
+        let run = store.create_run(
+            "Diagnose a failing command",
+            directory.path(),
+            "custom",
+            json!(["workspace.read", "workspace.write", "process.run"]),
+            json!({}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let action = Action::Invoke {
+            capability: "process.run".into(),
+            args: json!({"command":"failing fixture"}),
+        };
+        for _ in 0..3 {
+            let operation = store.begin_operation(
+                &run.id,
+                "process.run",
+                json!({"command":"failing fixture"}),
+                true,
+            )?;
+            crate::storage::claim_test_operation(&mut store, &operation)?;
+            let artifact = store.put_artifact(br#"{"exit_code":1,"stderr":"same failure"}"#)?;
+            store.operation_state(&operation, "failed", Some(&artifact), json!({}))?;
+            observe(&mut store, &run, &action, None)?;
+        }
+        assert_eq!(store.run(&run.id)?.state, "waiting_recovery");
+        assert!(store.workspace_revision(&run.id)?.unwrap() > 0);
+        store.state(&run.id, "running", json!({}))?;
+        std::fs::write(directory.path().join("source.txt"), "fixed source")?;
+        let operation = store.begin_operation(
+            &run.id,
+            "process.run",
+            json!({"command":"failing fixture"}),
+            true,
+        )?;
+        crate::storage::claim_test_operation(&mut store, &operation)?;
+        let artifact = store.put_artifact(br#"{"exit_code":1,"stderr":"same failure"}"#)?;
+        store.operation_state(&operation, "failed", Some(&artifact), json!({}))?;
+        observe(&mut store, &run, &action, None)?;
+        assert_eq!(
+            store.run(&run.id)?.state,
+            "running",
+            "An actual source change permits a fresh attempt"
+        );
         Ok(())
     }
 }
