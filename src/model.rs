@@ -84,7 +84,7 @@ pub(crate) fn schema() -> Result<Value> {
         "JSON object string; empty metadata is \"{}\". Omit fields supplied by args_text or args_edits."
     );
     schema["properties"]["artifact"]["description"] = serde_json::json!(
-        "Exact receipt artifact or read_history.artifact for inspect_result; never a file sha256 or invented ID."
+        "inspect_result: supplied handle, never file sha256. remember: user:<owner_batch_through>."
     );
     schema["properties"]["args_text_field"] = serde_json::json!({"type":"string","enum":["","content","script"],"description":"Argument supplied by args_text; otherwise empty."});
     schema["properties"]["args_text"] = serde_json::json!({"type":"string","description":"Selected content/script; escape once, omit from args."});

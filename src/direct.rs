@@ -1901,8 +1901,9 @@ mod tests {
                     .as_array()
                     .unwrap()
                     .len(),
-                8
+                9
             );
+            assert!(format["schema"]["properties"]["kind"]["enum"].as_array().unwrap().contains(&json!("remember")));
             assert!(!request.to_string().contains("skills_instructions"));
             assert!(!request.to_string().contains("multi_agent"));
             assert!(!request.to_string().contains("collaboration_mode"));

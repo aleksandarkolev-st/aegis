@@ -386,6 +386,7 @@ fn context_with_images(
     let answers = crate::memory::bound_answers(store,&run.id)?;
     if !answers.is_empty() {
         context["user_answers"] = json!(answers);
+        context["user_answers_policy"] = json!("Bounded previews; exact answer:<id> sources contain full questions and answers. inspect_result('answers',query) searches saved answers; '@after seq' pages their index. Use ordinary slice/line queries on a source for missing text.");
     }
     let milestones = context["milestones"]
         .as_array()
@@ -1651,7 +1652,7 @@ fn apply(store: &mut Store, root: &Path, run: &Run, action: Action) -> Result<bo
             if let Some((bytes,full_owner))=crate::memory::inspect(store,run,&artifact,&query)? {
                 let excerpt=if full_owner {
                     serde_json::from_slice::<Value>(&bytes)?["content"].as_str().context("owner text missing")?.to_owned()
-                } else {inspect(&bytes,if artifact=="user" || artifact=="work" {""} else {&query})};
+                } else {inspect(&bytes,if matches!(artifact.as_str(),"user"|"work"|"answers") {""} else {&query})};
                 store.event(&run.id,if full_owner {"owner.source_read"} else {"memory.inspected"},if full_owner {json!({"handle":artifact,"text":excerpt})} else {json!({"hash":artifact,"query":query,"excerpt":excerpt})})?;
                 return Ok(false);
             }
@@ -1890,16 +1891,20 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
                 break;
             }
         }
-        let images = crate::image::latest_successful_mcp_images(&store, run_id)?;
-        let steering_through = crate::memory::delivery_cursor(&store,run_id)?;
-        let prompt = match context_with_images(&store, &run, &images) {
-            Ok(prompt)=>prompt,
+        let prepared = (|| -> Result<_> {
+            let images = crate::image::latest_successful_mcp_images(&store, run_id)?;
+            let steering_through = crate::memory::delivery_cursor(&store, run_id)?;
+            let prompt = context_with_images(&store, &run, &images)?;
+            let manifests = visible_manifests(&store, &run)?;
+            Ok((images, steering_through, prompt, manifests))
+        })();
+        let (images, steering_through, prompt, manifests) = match prepared {
+            Ok(prepared)=>prepared,
             Err(error)=>{
                 store.state(run_id,"waiting_recovery",json!({"reason":"working context could not be restored","error":error.to_string()}))?;
                 break;
             }
         };
-        let manifests = visible_manifests(&store, &run)?;
         let prompt_chars = prompt.chars().count();
         let context_limit = run
             .budgets
@@ -4332,6 +4337,24 @@ mod tests {
         drive(directory.path(),&run.id)?;
         assert_eq!(store.run(&run.id)?.state,"waiting_recovery");
         assert_eq!(store.event_count(&run.id,"model.started")?,0);
+        assert!(store.events(&run.id)?.iter().any(|event|event.kind=="run.waiting_recovery" && event.payload["reason"]=="working context could not be restored"));
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_visual_source_pauses_before_inference() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run("Continue visual inspection", directory.path(), "custom", json!([]), json!({"mode":"durable"}), "")?;
+        store.state(&run.id, "running", json!({}))?;
+        let operation = store.begin_operation(&run.id, "mcp.fixture.capture", json!({}), true)?;
+        crate::storage::claim_test_operation(&mut store, &operation)?;
+        let artifact = store.put_artifact(br#"{"content":[]}"#)?;
+        store.operation_state(&operation, "succeeded", Some(&artifact), json!({"output_preview":{"image_count":1}}))?;
+        std::fs::write(directory.path().join("artifacts").join(&artifact), "corrupted")?;
+        drive(directory.path(), &run.id)?;
+        assert_eq!(store.run(&run.id)?.state, "waiting_recovery");
+        assert_eq!(store.event_count(&run.id, "model.started")?, 0);
         assert!(store.events(&run.id)?.iter().any(|event|event.kind=="run.waiting_recovery" && event.payload["reason"]=="working context could not be restored"));
         Ok(())
     }

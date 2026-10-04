@@ -301,6 +301,27 @@ pub(crate) fn inspect(
     handle: &str,
     query: &str,
 ) -> Result<Option<(Vec<u8>, bool)>> {
+    if handle == "answers" {
+        let after = query
+            .strip_prefix("@after ")
+            .map(str::parse::<i64>)
+            .transpose()?;
+        let mut statement = store.connection.prepare("SELECT rowid,id,text,answer FROM user_questions WHERE run_id=?1 AND answer IS NOT NULL AND (?2 IS NULL OR rowid>?2) AND (?2 IS NOT NULL OR instr(lower(text || char(10) || answer),lower(?3))>0) ORDER BY rowid LIMIT 8")?;
+        let rows = statement.query_map(params![run.id,after,query], |row| Ok(json!({"seq":row.get::<_,i64>(0)?,"handle":format!("answer:{}",row.get::<_,String>(1)?),"question":row.get::<_,String>(2)?.chars().take(240).collect::<String>(),"answer":row.get::<_,String>(3)?.chars().take(240).collect::<String>()})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        return Ok(Some((
+            serde_json::to_vec(&json!({"content":serde_json::to_string(&rows)?}))?,
+            false,
+        )));
+    }
+    if let Some(id) = handle.strip_prefix("answer:") {
+        let (question, answer):(String,String) = store.connection.query_row("SELECT text,answer FROM user_questions WHERE run_id=?1 AND id=?2 AND answer IS NOT NULL",params![run.id,id],|row|Ok((row.get(0)?,row.get(1)?))).optional()?.context("question-answer source does not belong to this run")?;
+        return Ok(Some((
+            serde_json::to_vec(
+                &json!({"content":format!("Question:\n{question}\nAnswer:\n{answer}")}),
+            )?,
+            false,
+        )));
+    }
     if handle == "work" {
         return Ok(Some((
             serde_json::to_vec(
@@ -354,7 +375,9 @@ pub(crate) fn bound_answers(store: &Store, id: &str) -> Result<Vec<Value>> {
     let mut statement=store.connection.prepare("SELECT id,text,answer FROM user_questions WHERE run_id=?1 AND answer IS NOT NULL ORDER BY created_at DESC,rowid DESC LIMIT 8")?;
     let mut rows=statement.query_map([id],|row| {
         let answer:String=row.get(2)?;
-        Ok(json!({"id":row.get::<_,String>(0)?,"question":row.get::<_,String>(1)?.chars().take(512).collect::<String>(),"answer":answer.chars().take(512).collect::<String>(),"clipped":answer.chars().count()>512}))
+        let question:String=row.get(1)?;
+        let id:String=row.get(0)?;
+        Ok(json!({"id":id,"handle":format!("answer:{id}"),"question":question.chars().take(512).collect::<String>(),"answer":answer.chars().take(512).collect::<String>(),"clipped":answer.chars().count()>512 || question.chars().count()>512}))
     })?.collect::<rusqlite::Result<Vec<_>>>()?;
     rows.reverse();
     Ok(rows)
@@ -416,6 +439,43 @@ pub(crate) fn compact_results(context: &mut Value, limit: usize, hard_limit: usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipped_questions_have_lossless_same_run_sources_and_a_searchable_index() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "Explore",
+            directory.path(),
+            "custom",
+            json!([]),
+            json!({}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        store.ask_user(&run.id, &format!("{}QUESTION_TAIL", "Q".repeat(1000)))?;
+        store.steer(&run.id, &format!("{}ANSWER_TAIL", "A".repeat(1000)))?;
+        let answers = bound_answers(&store, &run.id)?;
+        assert_eq!(answers[0]["clipped"], true);
+        let handle = answers[0]["handle"].as_str().unwrap();
+        let (bytes, full_owner) = inspect(&store, &run, handle, "")?.unwrap();
+        assert!(!full_owner);
+        let text: Value = serde_json::from_slice(&bytes)?;
+        assert!(text["content"].as_str().unwrap().contains("QUESTION_TAIL"));
+        assert!(text["content"].as_str().unwrap().ends_with("ANSWER_TAIL"));
+        let (bytes, _) = inspect(&store, &run, "answers", "QUESTION_TAIL")?.unwrap();
+        assert!(String::from_utf8(bytes)?.contains(handle));
+        let other = store.create_run(
+            "Other task",
+            directory.path(),
+            "custom",
+            json!([]),
+            json!({}),
+            "",
+        )?;
+        assert!(inspect(&store, &other, handle, "").is_err());
+        Ok(())
+    }
 
     #[test]
     fn clipped_messages_require_full_sources_and_memory_is_same_run_only() -> Result<()> {

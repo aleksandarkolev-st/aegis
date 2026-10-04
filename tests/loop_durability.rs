@@ -7,6 +7,118 @@ use std::sync::{Arc, Mutex};
 mod http;
 
 #[test]
+fn native_exploration_survives_memory_cadence_archival_and_driver_restart() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join(".arun");
+    for index in 0..70 {
+        std::fs::write(
+            directory.path().join(format!("part_{index:03}.txt")),
+            format!("SOURCE_FRAGMENT_{index}"),
+        )?;
+    }
+    let progress = Arc::new(Mutex::new((0usize, 0usize, false)));
+    let observed = progress.clone();
+    let endpoint = http::Endpoint::start(move |body| {
+        let state = http::state(body)?;
+        ensure!(
+            body.to_string().chars().count() < 60_000,
+            "Working prompt grew with exploration history"
+        );
+        let mut progress = observed.lock().unwrap();
+        let (reads, memories, paused) = &mut *progress;
+        if *memories > 0 {
+            ensure!(
+                state["working_memory"]["summary"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Preserve public APIs"),
+                "Constraint lost after compaction/restart"
+            );
+        }
+        if *reads > 0 && !(*reads == 35 && *paused) {
+            ensure!(
+                state["recent_events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["kind"] == "operation.succeeded"
+                        && (event["payload"]["content"]
+                            == format!("SOURCE_FRAGMENT_{}", *reads - 1)
+                            || event["payload"]["result"]["content"]
+                                == format!("SOURCE_FRAGMENT_{}", *reads - 1))),
+                "Latest full file result was lost after read {reads}"
+            );
+        }
+        let action = if state["working_memory"]["checkpoint_due"] == true {
+            *memories += 1;
+            json!({"kind":"remember","summary":format!("Preserve public APIs. Explored {reads} distinct source fragments; continue with part_{reads:03}.txt. Earlier receipts are indexed in work."),"artifact":format!("user:{}",state["working_memory"]["owner_batch_through"].as_i64().unwrap())})
+        } else if *reads == 35 && !*paused {
+            *paused = true;
+            json!({"kind":"blocked","reason":"Restart boundary for local endurance fixture"})
+        } else if *reads < 70 {
+            let action = json!({"kind":"invoke","capability":"workspace.read","args":{"path":format!("part_{reads:03}.txt")}});
+            *reads += 1;
+            action
+        } else {
+            let hash = state["read_history"][0]["artifact"].as_str().unwrap();
+            json!({"kind":"finish","summary":"Explored all 70 fragments while preserving public APIs","evidence":[hash]})
+        };
+        Ok((
+            200,
+            json!({"choices":[{"message":{"content":action.to_string()}}],"usage":{"prompt_tokens":10,"completion_tokens":2}}),
+        ))
+    })?;
+    let mut store = Store::open(&root)?;
+    let run = store.create_run("Explore the source fragments", directory.path(), "custom", json!(["workspace.read"]), json!({"mode":"durable","model":"fixture","endpoint":{"base_url":endpoint.url,"api_key_env":null},"wall_seconds":180}), "")?;
+    store.activate(&run.id, "workspace.read", 1)?;
+    store.steer(&run.id, "Preserve public APIs throughout exploration")?;
+    drop(store);
+    let drive = || -> Result<()> {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_arun"))
+            .current_dir(directory.path())
+            .args(["resume", &run.id, "--foreground"])
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    };
+    drive()?;
+    let mut store = Store::open(&root)?;
+    assert_eq!(store.run(&run.id)?.state, "waiting_recovery");
+    for _ in 0..1100 {
+        store.event(&run.id, "telemetry", json!({}))?;
+    }
+    store.maintain_history(&run.id)?;
+    assert!(store.event_count(&run.id, "history.archived")? > 0);
+    drop(store);
+    drive()?;
+    endpoint.finish()?;
+    let store = Store::open(&root)?;
+    assert_eq!(*progress.lock().unwrap(), (70, 2, true));
+    assert_eq!(store.run(&run.id)?.state, "completed");
+    assert_eq!(store.operations(&run.id)?.len(), 70);
+    assert!(
+        store
+            .operations(&run.id)?
+            .iter()
+            .all(|operation| operation.state == "succeeded")
+    );
+    assert_eq!(store.event_count(&run.id, "action.rejected")?, 0);
+    assert_eq!(store.event_count(&run.id, "loop.stalled")?, 0);
+    assert_eq!(store.event_count(&run.id, "memory.saved")?, 2);
+    assert!(
+        kernel::normalized_handoff(&store, &store.run(&run.id)?)?["working_memory"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("Preserve public APIs")
+    );
+    Ok(())
+}
+
+#[test]
 fn repeated_invalid_actions_pause_before_an_eighth_wasted_turn() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let root = directory.path().join(".arun");
