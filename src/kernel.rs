@@ -1866,12 +1866,8 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
         .and_then(Value::as_u64)
         .unwrap_or(3600);
     loop {
-        store.refresh_observed_files(run_id)?;
         if crate::pause::boundary(&mut store, run_id)? {
             break;
-        }
-        if mode(&run) == "durable" {
-            store.maintain_history(run_id)?;
         }
         if store.run(run_id)?.state != "running" {
             break;
@@ -1884,9 +1880,25 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
             )?;
             break;
         }
+        if let Err(error)=store.refresh_observed_files_cached(run_id) {
+            store.state(run_id,"waiting_recovery",json!({"reason":"workspace freshness could not be checked","error":error.to_string()}))?;
+            break;
+        }
+        if mode(&run) == "durable" {
+            if let Err(error)=store.maintain_history(run_id) {
+                store.state(run_id,"waiting_recovery",json!({"reason":"history maintenance failed","error":error.to_string()}))?;
+                break;
+            }
+        }
         let images = crate::image::latest_successful_mcp_images(&store, run_id)?;
         let steering_through = crate::memory::delivery_cursor(&store,run_id)?;
-        let prompt = context_with_images(&store, &run, &images)?;
+        let prompt = match context_with_images(&store, &run, &images) {
+            Ok(prompt)=>prompt,
+            Err(error)=>{
+                store.state(run_id,"waiting_recovery",json!({"reason":"working context could not be restored","error":error.to_string()}))?;
+                break;
+            }
+        };
         let manifests = visible_manifests(&store, &run)?;
         let prompt_chars = prompt.chars().count();
         let context_limit = run
@@ -4305,6 +4317,22 @@ mod tests {
         assert_eq!(store.run(&run.id)?.state, "waiting_recovery");
         assert_eq!(store.event_count(&run.id, "context.over_limit")?, 1);
         assert_eq!(store.event_count(&run.id, "model.started")?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_recent_file_receipt_pauses_durably_instead_of_leaving_a_running_task() -> Result<()> {
+        let directory=tempfile::tempdir()?;
+        let mut store=Store::open(directory.path())?;
+        let run=store.create_run("Continue investigation",directory.path(),"custom",json!(["workspace.read"]),json!({"mode":"durable"}),"")?;
+        store.state(&run.id,"running",json!({}))?;
+        let artifact=store.put_artifact(&serde_json::to_vec(&json!({"content":"source"}))?)?;
+        store.event(&run.id,"operation.succeeded",json!({"artifact":artifact,"detail":{"capability":"workspace.read"}}))?;
+        std::fs::write(directory.path().join("artifacts").join(&artifact),"corrupted")?;
+        drive(directory.path(),&run.id)?;
+        assert_eq!(store.run(&run.id)?.state,"waiting_recovery");
+        assert_eq!(store.event_count(&run.id,"model.started")?,0);
+        assert!(store.events(&run.id)?.iter().any(|event|event.kind=="run.waiting_recovery" && event.payload["reason"]=="working context could not be restored"));
         Ok(())
     }
 

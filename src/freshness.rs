@@ -3,17 +3,153 @@ use crate::{
     filesystem::FileScopes,
     storage::{Operation, Run, Store},
 };
-use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, bail};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File},
     io::{BufRead, BufReader, Read},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
 };
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Stamp {
+    size: u64,
+    modified: std::time::SystemTime,
+    created: Option<std::time::SystemTime>,
+    permissions: u64,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64),
+}
+
+fn stamp(metadata: &fs::Metadata) -> Option<Stamp> {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    Some(Stamp {
+        size: metadata.len(),
+        modified: metadata.modified().ok()?,
+        created: metadata.created().ok(),
+        permissions: permission_bits(metadata),
+        #[cfg(unix)]
+        identity: (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        ),
+    })
+}
+
+#[derive(Default)]
+pub(crate) struct Cache {
+    files: HashMap<PathBuf, (Stamp, [u8; 32])>,
+    bytes_hashed: u64,
+    hits: u64,
+    workspace: Option<String>,
+    dirty: HashSet<PathBuf>,
+}
+
+impl Cache {
+    fn load(&mut self, connection: &Connection, workspace: &str) -> Result<()> {
+        if self.workspace.as_deref() == Some(workspace) {
+            return Ok(());
+        }
+        self.files.clear();
+        self.dirty.clear();
+        let mut query=connection.prepare("SELECT path,stamp,digest FROM file_hash_cache WHERE workspace=?1 ORDER BY rowid DESC LIMIT 100000")?;
+        let rows = query.query_map([workspace], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (path, metadata, digest) = row?;
+            if let (Ok(stamp), Ok(bytes)) = (
+                serde_json::from_str::<Stamp>(&metadata),
+                hex::decode(&digest),
+            ) {
+                if let Ok(digest) = <[u8; 32]>::try_from(bytes.as_slice()) {
+                    self.files.insert(PathBuf::from(path), (stamp, digest));
+                }
+            }
+        }
+        self.workspace = Some(workspace.into());
+        Ok(())
+    }
+
+    fn save(&mut self, connection: &Connection) -> Result<()> {
+        if self.dirty.is_empty() {
+            return Ok(());
+        }
+        let Some(workspace) = self.workspace.as_deref() else {
+            return Ok(());
+        };
+        let transaction = if connection.is_autocommit() {
+            Some(connection.unchecked_transaction()?)
+        } else {
+            None
+        };
+        {
+            let mut insert=connection.prepare("INSERT INTO file_hash_cache(workspace,path,stamp,digest) VALUES (?1,?2,?3,?4) ON CONFLICT(workspace,path) DO UPDATE SET stamp=excluded.stamp,digest=excluded.digest")?;
+            for path in &self.dirty {
+                if let Some((stamp, digest)) = self.files.get(path) {
+                    insert.execute(params![
+                        workspace,
+                        path.to_string_lossy(),
+                        serde_json::to_string(stamp)?,
+                        hex::encode(digest)
+                    ])?;
+                }
+            }
+        }
+        let count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM file_hash_cache WHERE workspace=?1",
+            [workspace],
+            |row| row.get(0),
+        )?;
+        if count > MAX_WORKSPACE_FINGERPRINT_ENTRIES as i64 {
+            connection.execute("DELETE FROM file_hash_cache WHERE workspace=?1 AND rowid NOT IN (SELECT rowid FROM file_hash_cache WHERE workspace=?1 ORDER BY rowid DESC LIMIT 100000)",[workspace])?;
+        }
+        if let Some(transaction) = transaction {
+            transaction.commit()?;
+        }
+        self.dirty.clear();
+        Ok(())
+    }
+    fn get(&mut self, path: &Path, metadata: &fs::Metadata) -> Option<[u8; 32]> {
+        let stamp = stamp(metadata)?;
+        let (previous, digest) = self.files.get(path)?;
+        if previous != &stamp {
+            return None;
+        }
+        self.hits = self.hits.saturating_add(1);
+        Some(*digest)
+    }
+
+    fn insert(&mut self, path: &Path, metadata: &fs::Metadata, digest: [u8; 32]) {
+        if let Some(stamp) = stamp(metadata) {
+            self.bytes_hashed = self.bytes_hashed.saturating_add(metadata.len());
+            if self
+                .files
+                .get(path)
+                .is_some_and(|(old, hash)| old == &stamp && hash == &digest)
+            {
+                return;
+            }
+            if self.files.len() >= MAX_WORKSPACE_FINGERPRINT_ENTRIES {
+                self.files.clear();
+            }
+            self.files.insert(path.to_path_buf(), (stamp, digest));
+            self.dirty.insert(path.to_path_buf());
+        }
+    }
+}
 
 const MAX_WORKSPACE_FINGERPRINT_ENTRIES: usize = 100_000;
 const MAX_WORKSPACE_FINGERPRINT_BYTES: u64 = 512 * 1024 * 1024;
@@ -28,15 +164,17 @@ struct FingerprintEntry {
     content_hash: Option<[u8; 32]>,
 }
 
-struct WorkspaceFingerprintBuilder {
+struct WorkspaceFingerprintBuilder<'a> {
     entries: BTreeMap<String, FingerprintEntry>,
     visited: HashSet<String>,
     bytes: u64,
     max_entries: usize,
     max_bytes: u64,
+    cache: Option<&'a mut Cache>,
+    reuse_hashes: bool,
 }
 
-impl WorkspaceFingerprintBuilder {
+impl WorkspaceFingerprintBuilder<'_> {
     fn new(max_entries: usize, max_bytes: u64) -> Self {
         Self {
             entries: BTreeMap::new(),
@@ -44,6 +182,8 @@ impl WorkspaceFingerprintBuilder {
             bytes: 0,
             max_entries,
             max_bytes,
+            cache: None,
+            reuse_hashes: true,
         }
     }
 
@@ -106,6 +246,24 @@ impl WorkspaceFingerprintBuilder {
                     self.max_bytes
                 );
             }
+            if let Some(digest) = self
+                .cache
+                .as_deref_mut()
+                .filter(|_| self.reuse_hashes)
+                .and_then(|cache| cache.get(&path, &before))
+            {
+                self.bytes += before.len();
+                self.entries.insert(
+                    name,
+                    FingerprintEntry {
+                        kind: b'f',
+                        size: before.len(),
+                        permissions: permission_bits(&before),
+                        content_hash: Some(digest),
+                    },
+                );
+                continue;
+            }
             let mut content = Sha256::new();
             let mut buffer = [0; WORKSPACE_FINGERPRINT_BUFFER_BYTES];
             let mut size = 0_u64;
@@ -136,13 +294,17 @@ impl WorkspaceFingerprintBuilder {
                 .bytes
                 .checked_add(size)
                 .context("workspace fingerprint byte count overflow")?;
+            let digest: [u8; 32] = content.finalize().into();
+            if let Some(cache) = self.cache.as_deref_mut() {
+                cache.insert(&path, &after, digest);
+            }
             self.entries.insert(
                 name,
                 FingerprintEntry {
                     kind: b'f',
                     size,
                     permissions: permission_bits(&after),
-                    content_hash: Some(content.finalize().into()),
+                    content_hash: Some(digest),
                 },
             );
         }
@@ -220,6 +382,7 @@ fn permission_bits(_: &fs::Metadata) -> u64 {
     0
 }
 
+#[cfg(test)]
 pub(crate) fn workspace_fingerprint(run: &Run) -> Result<String> {
     workspace_fingerprint_with_limits(
         run,
@@ -228,14 +391,45 @@ pub(crate) fn workspace_fingerprint(run: &Run) -> Result<String> {
     )
 }
 
+#[cfg(test)]
 fn workspace_fingerprint_with_limits(
     run: &Run,
     max_entries: usize,
     max_bytes: u64,
 ) -> Result<String> {
+    fingerprint_with_builder(
+        run,
+        WorkspaceFingerprintBuilder::new(max_entries, max_bytes),
+        max_entries,
+    )
+}
+
+#[cfg(test)]
+fn workspace_fingerprint_cached(run: &Run, cache: &mut Cache) -> Result<String> {
+    workspace_fingerprint_scanned(run, cache, true)
+}
+
+fn workspace_fingerprint_scanned(
+    run: &Run,
+    cache: &mut Cache,
+    reuse_hashes: bool,
+) -> Result<String> {
+    let mut builder = WorkspaceFingerprintBuilder::new(
+        MAX_WORKSPACE_FINGERPRINT_ENTRIES,
+        MAX_WORKSPACE_FINGERPRINT_BYTES,
+    );
+    builder.cache = Some(cache);
+    builder.reuse_hashes = reuse_hashes;
+    fingerprint_with_builder(run, builder, MAX_WORKSPACE_FINGERPRINT_ENTRIES)
+}
+
+fn fingerprint_with_builder(
+    run: &Run,
+    mut builder: WorkspaceFingerprintBuilder<'_>,
+    max_entries: usize,
+) -> Result<String> {
     let workspace = Path::new(&run.workspace);
     let scopes = crate::filesystem::FileScopes::from_configuration(&run.budgets)?;
-    let mut builder = WorkspaceFingerprintBuilder::new(max_entries, max_bytes);
     let mut read = scopes
         .as_ref()
         .map(|scopes| scopes.read.clone())
@@ -481,6 +675,159 @@ mod tests {
     }
 
     #[test]
+    fn cached_workspace_scans_hash_only_changed_content_and_keep_strict_fingerprints() -> Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        for index in 0..64 {
+            fs::write(
+                directory.path().join(format!("source-{index}.txt")),
+                vec![index as u8; 32 * 1024],
+            )?;
+        }
+        let run = run(directory.path(), &["**"]);
+        let mut cache = Cache::default();
+        let first = workspace_fingerprint_cached(&run, &mut cache)?;
+        assert_eq!(cache.bytes_hashed, 64 * 32 * 1024);
+        let bytes = cache.bytes_hashed;
+        assert_eq!(workspace_fingerprint_cached(&run, &mut cache)?, first);
+        assert_eq!(cache.bytes_hashed, bytes);
+        assert_eq!(cache.hits, 64);
+        let changed = directory.path().join("source-0.txt");
+        let modified = fs::metadata(&changed)?.modified()?;
+        fs::write(&changed, vec![255; 32 * 1024])?;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&changed)?
+            .set_times(
+                fs::FileTimes::new().set_modified(modified + std::time::Duration::from_secs(1)),
+            )?;
+        let next = workspace_fingerprint_cached(&run, &mut cache)?;
+        assert_ne!(next, first);
+        assert_eq!(cache.bytes_hashed - bytes, 32 * 1024);
+        assert_eq!(next, workspace_fingerprint(&run)?);
+        fs::write(directory.path().join("new.txt"), "new source")?;
+        let added = workspace_fingerprint_cached(&run, &mut cache)?;
+        assert_ne!(added, next);
+        fs::remove_file(directory.path().join("new.txt"))?;
+        assert_eq!(workspace_fingerprint_cached(&run, &mut cache)?, next);
+        println!(
+            "background fingerprint fixture: initial bytes hashed={bytes}; unchanged scan=0; one changed file={}",
+            32 * 1024
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn strict_proof_validation_rejects_same_size_edits_with_restored_timestamps() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(".arun");
+        let source = directory.path().join("source.txt");
+        fs::write(&source, "old bytes")?;
+        let mut store = Store::open(&root)?;
+        let run = store.create_run(
+            "Read source",
+            directory.path(),
+            "custom",
+            json!(["workspace.read"]),
+            json!({"obligations":["Read current source"]}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let operation = store.begin_operation(
+            &run.id,
+            "workspace.read",
+            json!({"path":"source.txt"}),
+            true,
+        )?;
+        store.operation_state(&operation, "dispatched", None, json!({}))?;
+        store.claim_operation(&operation)?;
+        let artifact = store.put_artifact(&serde_json::to_vec(
+            &json!({"content":"old bytes","sha256":hex::encode(Sha256::digest(b"old bytes"))}),
+        )?)?;
+        store.operation_state(&operation, "succeeded", Some(&artifact), json!({}))?;
+        store.verify_obligation(&run.id, 1, &[artifact.clone()])?;
+        assert!(!store.refresh_observed_files_cached(&run.id)?);
+        let modified = fs::metadata(&source)?.modified()?;
+        fs::write(&source, "new bytes")?;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&source)?
+            .set_times(fs::FileTimes::new().set_modified(modified))?;
+        #[cfg(windows)]
+        assert!(
+            !store.refresh_observed_files_cached(&run.id)?,
+            "This fixture must exercise a provisional metadata cache hit"
+        );
+        assert!(
+            store
+                .verify_obligation(&run.id, 1, &[artifact.clone()])
+                .is_err()
+        );
+        assert!(store.complete_run(&run.id, "Done", &[artifact]).is_err());
+        assert_eq!(store.obligations(&run.id)?[1].state, "stale");
+        Ok(())
+    }
+
+    #[test]
+    fn cold_worker_claims_reuse_persisted_hashes_and_exploration_exceeds_1024_paths() -> Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(".arun");
+        let mut store = Store::open(&root)?;
+        let run = store.create_run(
+            "Explore many sources",
+            directory.path(),
+            "custom",
+            json!(["workspace.read"]),
+            json!({}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let mut selected = Vec::new();
+        let content = "source bytes";
+        let digest = hex::encode(Sha256::digest(content.as_bytes()));
+        for index in 0..1056 {
+            let path = format!("source-{index}.txt");
+            fs::write(directory.path().join(&path), content)?;
+            selected.push(json!({"path":path,"sha256":digest,"content":content,"offset":0,"next_offset":content.len(),"total_characters":content.len()}));
+            if selected.len() == 32 {
+                let operation=store.begin_operation(&run.id,"workspace.read_batch",json!({"selections":selected.iter().map(|entry|json!({"path":entry["path"],"offset":0,"length":content.len()})).collect::<Vec<_>>()}),true)?;
+                store.operation_state(&operation, "dispatched", None, json!({}))?;
+                store.claim_operation(&operation)?;
+                let artifact =
+                    store.put_artifact(&serde_json::to_vec(&json!({"selected":selected}))?)?;
+                store.operation_state(&operation, "succeeded", Some(&artifact), json!({}))?;
+                selected.clear();
+            }
+        }
+        assert!(!store.refresh_observed_files_cached(&run.id)?);
+        let count: i64 = store.connection.query_row(
+            "SELECT COUNT(*) FROM observed_files WHERE run_id=?1",
+            [&run.id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 1056);
+        drop(store);
+        let mut store = Store::open(&root)?;
+        let next = store.begin_operation(
+            &run.id,
+            "workspace.read",
+            json!({"path":"source-0.txt"}),
+            true,
+        )?;
+        store.operation_state(&next, "dispatched", None, json!({}))?;
+        store.claim_operation(&next)?;
+        assert_eq!(
+            store.freshness_cache.borrow().bytes_hashed,
+            0,
+            "A cold worker must not rehash the accumulated read ledger"
+        );
+        assert_eq!(store.freshness_cache.borrow().hits, 1056);
+        assert!(store.changed_observed_files(&run.id)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn scoped_workspace_fingerprint_detects_changes_additions_and_deletions() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let workspace = directory.path();
@@ -541,8 +888,8 @@ mod tests {
     }
 
     #[test]
-    fn git_fingerprint_includes_tracked_and_unignored_scoped_files_but_skips_ignored_outputs(
-    ) -> Result<()> {
+    fn git_fingerprint_includes_tracked_and_unignored_scoped_files_but_skips_ignored_outputs()
+    -> Result<()> {
         if Command::new("git").arg("--version").output().is_err() {
             return Ok(());
         }
@@ -608,18 +955,22 @@ mod tests {
         fs::write(workspace.join("src/lib.rs"), b"nested source")?;
         fs::write(workspace.join("src/target/cache.bin"), vec![3; 16 * 1024])?;
         fs::write(repository.join("outside/huge.bin"), vec![4; 16 * 1024])?;
-        assert!(Command::new("git")
-            .arg("-C")
-            .arg(repository)
-            .args(["init", "--quiet"])
-            .status()?
-            .success());
-        assert!(Command::new("git")
-            .arg("-C")
-            .arg(repository)
-            .args(["add", "--", ".gitignore", "project/src/lib.rs"])
-            .status()?
-            .success());
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(repository)
+                .args(["init", "--quiet"])
+                .status()?
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(repository)
+                .args(["add", "--", ".gitignore", "project/src/lib.rs"])
+                .status()?
+                .success()
+        );
 
         let run = run(&workspace, &["src/**"]);
         let initial = workspace_fingerprint_with_limits(&run, 20, 64)?;
@@ -685,18 +1036,6 @@ pub(crate) fn record(
                 json!({"reason":"observed file changed since its prior receipt","path":path}),
             )?;
         }
-        if previous.is_none() {
-            let count: i64 = transaction.query_row(
-                "SELECT COUNT(*) FROM observed_files WHERE run_id=?1",
-                [&operation.run_id],
-                |row| row.get(0),
-            )?;
-            if count >= 1024 {
-                bail!(
-                    "File freshness ledger is bounded to 1024 observed paths; split the task before observing more"
-                );
-            }
-        }
         transaction.execute("INSERT INTO observed_files(run_id,path,hash) VALUES (?1,?2,?3) ON CONFLICT(run_id,path) DO UPDATE SET hash=excluded.hash",params![operation.run_id,path,hash])?;
     }
     Ok(())
@@ -704,10 +1043,21 @@ pub(crate) fn record(
 
 impl Store {
     pub(crate) fn changed_observed_files(&self, id: &str) -> Result<Vec<(String, String, String)>> {
+        self.changed_observed_files_mode(id, false)
+    }
+
+    fn changed_observed_files_mode(
+        &self,
+        id: &str,
+        cached: bool,
+    ) -> Result<Vec<(String, String, String)>> {
         let run = self.run(id)?;
         if run.is_terminal() {
             return Ok(Vec::new());
         }
+        self.freshness_cache
+            .borrow_mut()
+            .load(&self.connection, &run.workspace)?;
         let sources = {
             let mut statement = self
                 .connection
@@ -726,29 +1076,54 @@ impl Store {
         for (path, expected) in sources {
             let digest = (|| -> Result<String> {
                 let target = scopes.checked_path(Path::new(&run.workspace), &path, false)?;
-                let file = File::open(target)?;
+                let file = File::open(&target)?;
                 let metadata = file.metadata()?;
                 if !metadata.is_file() || metadata.len() > 2 * 1024 * 1024 {
                     bail!("Observed source is no longer a bounded regular file");
+                }
+                if cached {
+                    if let Some(digest) = self.freshness_cache.borrow_mut().get(&target, &metadata)
+                    {
+                        return Ok(hex::encode(digest));
+                    }
                 }
                 let mut bytes = Vec::new();
                 file.take(2 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
                 if bytes.len() > 2 * 1024 * 1024 {
                     bail!("Observed source grew beyond its bound");
                 }
-                Ok(hex::encode(Sha256::digest(&bytes)))
+                let after = fs::metadata(&target)?;
+                if after.len() != metadata.len() || after.modified()? != metadata.modified()? {
+                    bail!("Observed source changed while checking freshness")
+                }
+                let digest: [u8; 32] = Sha256::digest(&bytes).into();
+                self.freshness_cache
+                    .borrow_mut()
+                    .insert(&target, &after, digest);
+                Ok(hex::encode(digest))
             })();
             let actual = digest.unwrap_or_else(|_| "unavailable".into());
             if actual != expected {
                 changed.push((path, expected, actual));
             }
         }
+        self.freshness_cache.borrow_mut().save(&self.connection)?;
         Ok(changed)
     }
 
     pub fn refresh_observed_files(&mut self, id: &str) -> Result<bool> {
-        let workspace_changed = self.refresh_workspace_fingerprint(id)?;
-        let changed = self.changed_observed_files(id)?;
+        self.refresh_observed_files_mode(id, false)
+    }
+
+    // Cached scans are provisional. Proof verification and completion use the
+    // strict entry point and never trust unchanged timestamps as evidence.
+    pub(crate) fn refresh_observed_files_cached(&mut self, id: &str) -> Result<bool> {
+        self.refresh_observed_files_mode(id, true)
+    }
+
+    fn refresh_observed_files_mode(&mut self, id: &str, cached: bool) -> Result<bool> {
+        let workspace_changed = self.refresh_workspace_fingerprint_mode(id, cached)?;
+        let changed = self.changed_observed_files_mode(id, cached)?;
         if changed.is_empty() {
             return Ok(workspace_changed);
         }
@@ -787,19 +1162,28 @@ impl Store {
     }
 
     pub(crate) fn capture_workspace_fingerprint(&self, id: &str) -> Result<String> {
-        workspace_fingerprint(&self.run(id)?)
+        self.scan_workspace_fingerprint(id, false)
+    }
+
+    fn scan_workspace_fingerprint(&self, id: &str, cached: bool) -> Result<String> {
+        let run = self.run(id)?;
+        let mut cache = self.freshness_cache.borrow_mut();
+        cache.load(&self.connection, &run.workspace)?;
+        let fingerprint = workspace_fingerprint_scanned(&run, &mut cache, cached)?;
+        cache.save(&self.connection)?;
+        Ok(fingerprint)
     }
 
     pub(crate) fn workspace_fingerprint_baseline(&self, id: &str) -> Result<Option<(String, i64)>> {
         workspace_fingerprint_baseline(&self.connection, id)
     }
 
-    pub(crate) fn refresh_workspace_fingerprint(&mut self, id: &str) -> Result<bool> {
+    fn refresh_workspace_fingerprint_mode(&mut self, id: &str, cached: bool) -> Result<bool> {
         let baseline = self.workspace_fingerprint_baseline(id)?;
         if baseline.is_none() && !workspace_has_process_evidence(&self.connection, id)? {
             return Ok(false);
         }
-        let fingerprint = self.capture_workspace_fingerprint(id)?;
+        let fingerprint = self.scan_workspace_fingerprint(id, cached)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -828,18 +1212,23 @@ impl Store {
     pub(crate) fn check_workspace_fingerprint(&self, id: &str) -> Result<()> {
         let Some((expected, baseline_revision)) = self.workspace_fingerprint_baseline(id)? else {
             if workspace_has_process_evidence(&self.connection, id)? {
-                bail!("Existing process evidence predates scoped workspace fingerprinting; refresh the workspace and gather fresh evidence before verifying or completing");
+                bail!(
+                    "Existing process evidence predates scoped workspace fingerprinting; refresh the workspace and gather fresh evidence before verifying or completing"
+                );
             }
             return Ok(());
         };
-        let run = self.run(id)?;
-        let actual = workspace_fingerprint(&run)?;
+        let actual = self.capture_workspace_fingerprint(id)?;
         let revision = workspace_revision(&self.connection, id)?;
         if actual != expected {
-            bail!("Scoped workspace content changed since process evidence was captured; run process.run again before verifying or completing");
+            bail!(
+                "Scoped workspace content changed since process evidence was captured; run process.run again before verifying or completing"
+            );
         }
         if revision != baseline_revision {
-            bail!("Scoped workspace fingerprint is not synchronized with the current workspace revision; refresh evidence before verifying or completing");
+            bail!(
+                "Scoped workspace fingerprint is not synchronized with the current workspace revision; refresh evidence before verifying or completing"
+            );
         }
         Ok(())
     }

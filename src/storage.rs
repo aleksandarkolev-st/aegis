@@ -66,6 +66,7 @@ pub struct Operation {
 pub struct Store {
     pub(crate) connection: Connection,
     artifacts: PathBuf,
+    pub(crate) freshness_cache: std::cell::RefCell<crate::freshness::Cache>,
 }
 
 pub(crate) fn now() -> i64 {
@@ -512,6 +513,7 @@ impl Store {
         let store = Self {
             connection,
             artifacts,
+            freshness_cache: Default::default(),
         };
         if schema_version < 7 {
             store.migrate_failed_model_usage()?;
@@ -583,6 +585,7 @@ impl Store {
         store.connection.execute_batch("CREATE TABLE IF NOT EXISTS pause_requests (run_id TEXT PRIMARY KEY REFERENCES runs(id), pending INTEGER NOT NULL)")?;
         store.connection.execute_batch("CREATE TABLE IF NOT EXISTS observed_files (run_id TEXT NOT NULL REFERENCES runs(id), path TEXT NOT NULL, hash TEXT NOT NULL, PRIMARY KEY(run_id,path))")?;
         store.connection.execute_batch("CREATE TABLE IF NOT EXISTS workspace_fingerprints (run_id TEXT PRIMARY KEY REFERENCES runs(id), fingerprint TEXT NOT NULL, revision INTEGER NOT NULL)")?;
+        store.connection.execute_batch("CREATE TABLE IF NOT EXISTS file_hash_cache (workspace TEXT NOT NULL,path TEXT NOT NULL,stamp TEXT NOT NULL,digest TEXT NOT NULL,PRIMARY KEY(workspace,path))")?;
         store.restore_usage_sources()?;
         crate::questions::restore_waits(&store)?;
         crate::steering::restore(&store)?;
@@ -1842,7 +1845,7 @@ impl Store {
         }
         // Advance external changes before assigning the new reader's epoch.
         // Otherwise a valid fresh read would be invalidated by its own receipt.
-        self.refresh_observed_files(&existing.run_id)?;
+        self.refresh_observed_files_cached(&existing.run_id)?;
         let start_fingerprint = (existing.capability == "process.run")
             .then(|| self.capture_workspace_fingerprint(&existing.run_id))
             .transpose()?;
