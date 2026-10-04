@@ -70,12 +70,11 @@ pub fn recent_operation_outcomes(store: &Store, run_id: &str) -> Result<Value> {
 }
 
 fn usage(store: &Store, run: &Run) -> Result<Value> {
-    let elapsed = store.run_started_at(&run.id)?.map(|start| {
-        let end: Option<i64> = store.connection.query_row(
-            "SELECT MAX(created_at) FROM events WHERE run_id = ?1 AND kind IN ('run.completed','run.answered','run.cancelled','run.failed')", [&run.id], |row| row.get(0),
-        ).unwrap_or(None);
-        end.unwrap_or(crate::storage::unix_time()).saturating_sub(start).max(0) as u64
-    });
+    let elapsed = if store.run_started_at(&run.id)?.is_some() {
+        Some(store.execution_elapsed_seconds(&run.id)?)
+    } else {
+        None
+    };
     let mut result = json!({});
     for (name, used, limit) in [
         (
@@ -455,7 +454,7 @@ pub fn display(command: &str, value: &Value) -> String {
                 tool_tokens["used"]
             ));
             lines.push(format!(
-                "Wall time: {}s elapsed / {}s limit / {}s remaining",
+                "Execution time (safe pauses excluded): {}s elapsed / {}s limit / {}s remaining",
                 wall["used"], wall["limit"], wall["remaining"]
             ));
             lines.push(format!(
