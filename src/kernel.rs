@@ -1155,7 +1155,14 @@ pub(crate) fn commit_result(
     let bytes = serde_json::to_vec(&result)?;
     let hash = store.put_artifact(&bytes)?;
     let mut detail = result_detail(operation, &result, bytes.len(), elapsed_ms);
-    let state = if operation.capability.starts_with("mcp.") && result["isError"] == true {
+    let state = if operation.capability == "process.run"
+        && result["exit_code"].as_i64() != Some(0)
+    {
+        detail["error"] = json!(
+            "Process did not exit successfully; inspect its result artifact. It is not successful completion evidence."
+        );
+        "failed"
+    } else if operation.capability.starts_with("mcp.") && result["isError"] == true {
         detail["error"] = json!(
             "MCP tool reported an error; inspect its result artifact. It is not successful completion evidence."
         );
@@ -2118,6 +2125,68 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_failure_receipts_are_diagnostics_never_completion_proof() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(&directory.path().join(".arun"))?;
+        for code in [json!(7), Value::Null, json!(0)] {
+            let run = store.create_run(
+                "Tests pass\nRequirements:\n- Tests pass",
+                directory.path(),
+                "custom",
+                json!([]),
+                json!({}),
+                "",
+            )?;
+            store.state(&run.id, "running", json!({}))?;
+            let operation = store.begin_operation(
+                &run.id,
+                "process.run",
+                json!({"program":"fixture"}),
+                true,
+            )?;
+            crate::storage::claim_test_operation(&mut store, &operation)?;
+            let result = json!({"exit_code":code,"preview":"test diagnostics"});
+            commit_result(&mut store, &operation, result.clone(), 1)?;
+            let saved = store.operation(&operation.id)?;
+            let hash = saved.artifact.unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&store.artifact(&hash)?)?,
+                result
+            );
+            assert!(store.has_operation_artifact(&run.id, &hash)?);
+            if code == 0 {
+                assert_eq!(saved.state, "succeeded");
+                store.verify_obligations(
+                    &run.id,
+                    &[crate::obligations::Proof {
+                        id: 1,
+                        evidence: vec![hash.clone()],
+                    }],
+                )?;
+                store.complete_run(&run.id, "Tests pass", &[hash])?;
+            } else {
+                assert_eq!(saved.state, "failed");
+                assert!(!store.has_evidence(&run.id, &hash)?);
+                assert!(
+                    store
+                        .verify_obligations(
+                            &run.id,
+                            &[crate::obligations::Proof {
+                                id: 1,
+                                evidence: vec![hash.clone()]
+                            }]
+                        )
+                        .is_err()
+                );
+                assert!(store.complete_run(&run.id, "Tests pass", &[hash]).is_err());
+            }
+        }
+        Ok(())
+    }
+
+
 
     #[test]
     fn native_mcp_recovery_never_routes_to_docker_cleanup() -> Result<()> {
