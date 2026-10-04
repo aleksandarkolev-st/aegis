@@ -8,12 +8,12 @@ Typing `/` at the task prompt opens the searchable command menu. Scroll or type 
 | `/goal history` | Requirement additions, verifications, staleness and replacements, including archived events |
 | `/goal add` | Review and confirm a new requirement with a reason |
 | `/goal replace O2` | Review and confirm a replacement; retain O2, its reason and successor ID |
-| `/status` | Current route, accounting, elapsed wall time, revision, requirement counts, active milestone and last operation |
+| `/status` | Current route, accounting, elapsed execution time with safe pauses excluded, revision, requirement counts, active milestone and last operation |
 | `/why` | Saved next action, unresolved requirements and checkpoint; no hidden reasoning |
 | `/evidence O3` | Artifact hashes, integrity, source operations, arguments, receipts, revisions and freshness |
 | `/verify` | Outstanding requirements, stale or invalid proofs, unresolved operations and acceptance blockers |
 | `/provider`, `/provider history` | Primary, current and fallback routes; transitions with reason and recorded turn |
-| `/budget` | Recorded model responses, model tokens and tool-result tokens without aggregate caps; elapsed and remaining wall time; provider input/cached/output when measured |
+| `/budget` | Recorded model responses, model tokens and tool-result tokens without aggregate caps; elapsed and remaining execution time with safe pauses excluded; provider input/cached/output when measured |
 | `/handoff` | The normalized provider-neutral state used by the next model call |
 | `/pause` | Persist a pause request; finish the current safe action boundary, save a checkpoint and stop inference |
 | `/resume` | Continue the same run, contract, evidence, accounting and provider route |
