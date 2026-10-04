@@ -20,6 +20,94 @@ fn native_runtime() -> (String, PathBuf) {
 }
 
 #[test]
+fn durable_native_command_text_reaches_the_next_decision_without_inspection() -> Result<()> {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let directory = tempfile::tempdir()?;
+    let (binary, script) = native_runtime();
+    let registered = Command::new(&binary)
+        .current_dir(directory.path())
+        .args(["mcp", "add", "windows-host", "--trusted-host", "node"])
+        .arg(script)
+        .arg("--trusted-host")
+        .output()?;
+    assert!(
+        registered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&registered.stderr)
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let endpoint = http::Endpoint::start(move |body| {
+        let state = http::state(body)?;
+        let action = match observed.fetch_add(1, Ordering::SeqCst) {
+            0 => json!({"kind":"search_capabilities","query":"mcp.windows-host.powershell"}),
+            1 => {
+                json!({"kind":"invoke","capability":"mcp.windows-host.powershell","args":{"script":"[Console]::WriteLine('COMMITTED_CONTEXT_RESULT')"}})
+            }
+            2 => {
+                let payload = &state["recent_events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["kind"] == "operation.succeeded")
+                    .unwrap()["payload"];
+                assert_eq!(payload["command"]["exit_code"], 0);
+                assert_eq!(payload["command"]["timed_out"], false);
+                assert!(
+                    payload["command"]["stdout"]
+                        .as_str()
+                        .unwrap()
+                        .contains("COMMITTED_CONTEXT_RESULT")
+                );
+                assert_eq!(payload["text_complete"], true);
+                assert_eq!(payload["isError"], false);
+                json!({"kind":"finish","summary":"Native result used without inspection","evidence":[payload["artifact"]]})
+            }
+            _ => anyhow::bail!("unexpected result inspection or extra model request"),
+        };
+        Ok((
+            200,
+            json!({"choices":[{"message":{"content":action.to_string()}}],"usage":{"prompt_tokens":10,"completion_tokens":2}}),
+        ))
+    })?;
+    let output = Command::new(&binary)
+        .current_dir(directory.path())
+        .args([
+            "run",
+            "Inspect native command output",
+            "--provider",
+            "custom",
+            "--model",
+            "fixture",
+            "--endpoint",
+            &endpoint.url,
+            "--mode",
+            "durable",
+            "--allow-mcp",
+            "windows-host:powershell",
+            "--foreground",
+        ])
+        .output()?;
+    endpoint.finish()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let store = Store::open(&directory.path().join(".arun"))?;
+    let run = store.runs()?.remove(0);
+    assert_eq!(run.state, "completed");
+    assert_eq!(store.operations(&run.id)?.len(), 1);
+    assert_eq!(store.event_count(&run.id, "artifact.inspected")?, 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(store.model_tokens(&run.id)?, 36);
+    Ok(())
+}
+
+#[test]
 fn native_powershell_output_is_saved_and_displayed_before_completion() -> Result<()> {
     use std::sync::{
         Arc,
