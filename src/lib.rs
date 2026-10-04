@@ -46,6 +46,7 @@ mod selection;
 pub mod session;
 pub mod signin;
 pub mod storage;
+mod steering;
 pub mod terminal;
 pub mod terminal_input;
 pub mod text;

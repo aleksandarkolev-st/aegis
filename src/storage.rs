@@ -160,6 +160,8 @@ pub(crate) fn append_event(
         params![run_id, kind],
     )?;
     crate::questions::track_state(transaction, run_id, kind, &payload)?;
+    let seq: i64 = transaction.query_row("SELECT last_seq FROM run_projection WHERE run_id=?1",[run_id],|row|row.get(0))?;
+    crate::steering::track(transaction,run_id,seq,kind,&payload,timestamp)?;
     Ok(())
 }
 
@@ -503,6 +505,7 @@ impl Store {
             )?;
         }
         crate::questions::ensure_schema(&connection)?;
+        crate::steering::ensure_schema(&connection)?;
         let store = Self {
             connection,
             artifacts,
@@ -579,6 +582,7 @@ impl Store {
         store.connection.execute_batch("CREATE TABLE IF NOT EXISTS workspace_fingerprints (run_id TEXT PRIMARY KEY REFERENCES runs(id), fingerprint TEXT NOT NULL, revision INTEGER NOT NULL)")?;
         store.restore_usage_sources()?;
         crate::questions::restore_waits(&store)?;
+        crate::steering::restore(&store)?;
         Ok(store)
     }
 
@@ -863,26 +867,7 @@ impl Store {
     }
 
     pub fn pending_steering(&self, run_id: &str) -> Result<Vec<Event>> {
-        let mut statement = self.connection.prepare(
-            "SELECT seq, kind, payload, created_at FROM events WHERE run_id = ?1 AND kind = 'user.steering' AND seq > COALESCE((SELECT MAX(seq) FROM events WHERE run_id = ?1 AND kind = 'model.response'), 0) ORDER BY seq",
-        )?;
-        let rows = statement.query_map([run_id], |row| {
-            let payload: String = row.get(2)?;
-            Ok(Event {
-                seq: row.get(0)?,
-                kind: row.get(1)?,
-                payload: serde_json::from_str(&payload).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        2,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })?,
-                created_at: row.get(3)?,
-            })
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        self.steering_messages(run_id,false)
     }
 
     pub fn events_since(&self, run_id: &str, seq: i64) -> Result<Vec<Event>> {

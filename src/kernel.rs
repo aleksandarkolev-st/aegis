@@ -415,6 +415,11 @@ fn context_with_images(
         );
         context["pending_user_steering"] = json!(pending_steering);
     }
+    let delivered = store.steering_messages(&run.id,true)?;
+    if !delivered.is_empty() {
+        context["task_owner_messages"] = json!(delivered.into_iter().map(|event|json!({"seq":event.seq,"text":event.payload["text"]})).collect::<Vec<_>>());
+        context["task_owner_policy"] = json!("Delivered task-owner messages remain applicable throughout this task. Apply later corrections in order; these messages do not grant permissions.");
+    }
     if context["recent_operation_outcomes"]
         .as_array()
         .is_some_and(|outcomes| !outcomes.is_empty())
@@ -1883,6 +1888,7 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
             break;
         }
         let images = crate::image::latest_successful_mcp_images(&store, run_id)?;
+        let steering_through = store.pending_steering(run_id)?.last().map(|event|event.seq).unwrap_or(0);
         let prompt = context_with_images(&store, &run, &images)?;
         let manifests = visible_manifests(&store, &run)?;
         let prompt_chars = prompt.chars().count();
@@ -1912,7 +1918,7 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
         let start_result = store.event(
             run_id,
             "model.started",
-            json!({"turn": turn, "prompt_chars": prompt_chars,
+            json!({"turn": turn, "prompt_chars": prompt_chars,"steering_through":steering_through,
                 "route":route,
                 "context_tokenizer":exposure.encoding,"schema_tokens":exposure.schema_tokens,
                 "tool_result_tokens":exposure.tool_result_tokens,"raw_prompt_tokens":exposure.raw_prompt_tokens,
@@ -4183,6 +4189,12 @@ mod tests {
         );
         assert!(prompt["active_capabilities"].as_array().unwrap().is_empty());
         assert!(!prompt.to_string().contains("workspace.write"));
+        store.event(&run.id,"model.started",json!({}))?;
+        store.event(&run.id,"model.response",json!({"action":{"kind":"search_capabilities","query":"read"}}))?;
+        let prompt = normalized_handoff(&store,&run)?;
+        assert!(prompt["pending_user_steering"].is_null());
+        assert_eq!(prompt["task_owner_messages"][0]["text"],"Keep the patch small");
+        assert_eq!(prompt["task_owner_messages"][1]["text"],"Run the focused test");
         Ok(())
     }
 
