@@ -366,6 +366,7 @@ fn context_with_images(
         context["read_history"] = json!(reads);
         context["read_policy"] = json!("Read history lists already fetched artifacts/ranges, including archived work. It is historical metadata, not proof that a file is unchanged. Use mapped text without inspecting it again. Exploratory tasks should gather relevant information and findings until the requested exploration is satisfied; do not invent an edit requirement. For requested edits, read the target and necessary references, then write and verify. Prefer workspace.read for a whole target through 65536 characters; read_batch paginates larger needed ranges at 65536 actual characters. Continue from next_offset. Scope heading/reference searches with path. When rewriting documentation, preserve factual availability, publication, platform and provider limitations; shorter prose cannot turn a pending feature into a supported one.");
     }
+    crate::image::add_context(store, &run.id, &mut context)?;
     if !images.is_empty() {
         context["visual_inputs"] = json!(
             images
@@ -1886,7 +1887,7 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
             }
         }
         let prepared = (|| -> Result<_> {
-            let images = crate::image::latest_successful_mcp_images(&store, run_id)?;
+            let images = crate::image::latest_successful_mcp_images(&mut store, run_id)?;
             let steering_through = crate::memory::delivery_cursor(&store, run_id)?;
             let prompt = context_with_images(&store, &run, &images)?;
             let manifests = visible_manifests(&store, &run)?;
@@ -3396,7 +3397,7 @@ mod tests {
             }]});
             commit_result(&mut store, &operation, result, 10)?;
 
-            let images = crate::image::latest_successful_mcp_images(&store, &run.id)?;
+            let images = crate::image::latest_successful_mcp_images(&mut store, &run.id)?;
             assert_eq!(images.len(), 1);
             let prompt = context_with_images(&store, &run, &images)?;
             assert!(!prompt.contains(&encoded));
