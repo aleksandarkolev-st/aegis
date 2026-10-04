@@ -508,6 +508,7 @@ impl Store {
         crate::questions::ensure_schema(&connection)?;
         crate::steering::ensure_schema(&connection)?;
         crate::memory::ensure_schema(&connection)?;
+        crate::progress::ensure_schema(&connection)?;
         let store = Self {
             connection,
             artifacts,

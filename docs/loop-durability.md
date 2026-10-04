@@ -20,3 +20,9 @@ cargo test --offline --test loop_durability --test user_questions
 ```
 
 The local HTTP fixture processes five legal 65,536-byte answers with five distinct trailing API constraints, retrieves each full source once, saves each constraint into successive memory, continues discovery, archives history, and reopens the store. It verifies all five constraints survive, prompt growth stays bounded, and there are no context-limit or rejected-action events. The fixture makes no hosted calls. Other tests cover archival migration, delivery races, same-run source isolation, mandatory memory cadence, and old checkpoint retrieval.
+
+## Progress guard
+
+The guard hashes canonical actions and full results locally, ignoring volatile elapsed-time fields. Only digests enter its observation ledger; image changes still count as new information. New searches, files, ranges, results, real workspace revisions and task-owner messages reset stagnation. Reworded checkpoints are not environmental progress. Repeated known outcomes produce strategy feedback; a third identical rejection, or four consecutive steps without new information, pauses the task in durable recovery instead of spending indefinitely. The counters survive process restarts. This is an exact-observation guard, not a claim to recognize every semantic loop.
+
+In the local five-answer fixture, the twelve complete prompts measured 73,329 tokens using the pinned `o200k_base` tokenizer. Reinserting only the old full-answer field twelve times would measure 247,056 tokens, before adding any other prompt content. This is controlled prompt-exposure evidence, not a hosted-model endurance benchmark or a universal savings rate. The fixture enforces a threefold reduction against that reference while preserving all five distinct constraints.

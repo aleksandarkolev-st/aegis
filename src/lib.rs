@@ -33,6 +33,7 @@ pub mod patch;
 pub mod pause;
 pub mod policy;
 pub mod process;
+mod progress;
 pub mod provider;
 pub mod provider_catalog;
 pub mod questions;

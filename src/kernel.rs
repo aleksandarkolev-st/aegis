@@ -402,6 +402,7 @@ fn context_with_images(
         }
     }
     crate::memory::add_context(store,run,&mut context)?;
+    crate::progress::add_context(store,run,&mut context)?;
     if context["recent_operation_outcomes"]
         .as_array()
         .is_some_and(|outcomes| !outcomes.is_empty())
@@ -2081,14 +2082,17 @@ pub fn drive(root: &Path, run_id: &str) -> Result<()> {
                 "elapsed_ms": model_started.elapsed().as_millis()}),
         )?;
         store.acknowledge_interrupt(run_id, crate::interrupt::Scope::Model, &model_target)?;
-        if let Err(error) = apply(&mut store, root, &run, action) {
+        if let Err(error) = apply(&mut store, root, &run, action.clone()) {
             store.event(
                 run_id,
                 "action.rejected",
                 json!({"error": error.to_string()}),
             )?;
+            crate::progress::observe(&mut store,&run,&action,Some(&error.to_string()))?;
         } else if store.run(run_id)?.state != "running" {
             break;
+        } else {
+            crate::progress::observe(&mut store,&run,&action,None)?;
         }
     }
     if mode(&run) == "durable" {
