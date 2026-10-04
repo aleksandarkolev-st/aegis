@@ -1,8 +1,7 @@
-use std::collections::HashMap;
-
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use serde_json::{Value, json};
+use rusqlite::{Connection, Transaction, params};
 
 use crate::storage::Store;
 
@@ -47,75 +46,82 @@ impl InputImage {
     }
 }
 
-/// Extracts visual inputs from the newest successful MCP image result. Only that
-/// artifact is attached; it remains available until a newer image is returned.
+pub(crate) fn ensure_schema(connection: &Connection) -> Result<()> {
+    connection.execute_batch("CREATE TABLE IF NOT EXISTS image_sources (
+        run_id TEXT NOT NULL REFERENCES runs(id), seq INTEGER NOT NULL,
+        operation_id TEXT NOT NULL, artifact TEXT NOT NULL, detail TEXT NOT NULL,
+        PRIMARY KEY(run_id,seq)
+    );
+    CREATE TABLE IF NOT EXISTS image_migrations(run_id TEXT PRIMARY KEY REFERENCES runs(id));")?;
+    Ok(())
+}
+
+pub(crate) fn track(transaction: &Transaction<'_>, run_id: &str, seq: i64, kind: &str, payload: &Value) -> Result<()> {
+    if kind == "run.created" {
+        transaction.execute("INSERT OR IGNORE INTO image_migrations(run_id) VALUES (?1)", [run_id])?;
+    }
+    if kind != "operation.succeeded" { return Ok(()); }
+    let Some(id) = payload["id"].as_str() else { return Ok(()); };
+    let Some(hash) = payload["artifact"].as_str() else { return Ok(()); };
+    let detail = &payload["detail"];
+    let count = image_count(detail);
+    if count == Some(0) { return Ok(()); }
+    transaction.execute("INSERT OR IGNORE INTO image_sources(run_id,seq,operation_id,artifact,detail)
+        SELECT ?1,?2,id,?4,?5 FROM operations WHERE id=?3 AND run_id=?1 AND capability LIKE 'mcp.%'",
+        params![run_id,seq,id,hash,detail.to_string()])?;
+    Ok(())
+}
+
+fn image_count(detail: &Value) -> Option<u64> {
+    detail["output_preview"]["image_count"].as_u64()
+        .or_else(|| detail["output_preview"]["images"]["image_count"].as_u64())
+}
+
+pub(crate) fn restore(store: &Store) -> Result<()> {
+    let ids = store.connection.prepare("SELECT id FROM runs WHERE NOT EXISTS(SELECT 1 FROM image_migrations WHERE run_id=runs.id)")?
+        .query_map([], |row| row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in ids {
+        loop {
+            let events = store.events(&id)?;
+            let seq = events.last().map_or(0, |event| event.seq);
+            let transaction = rusqlite::Transaction::new_unchecked(&store.connection, rusqlite::TransactionBehavior::Immediate)?;
+            let current: i64 = transaction.query_row("SELECT last_seq FROM run_projection WHERE run_id=?1", [&id], |row| row.get(0))?;
+            if seq != current { continue; }
+            if transaction.execute("INSERT OR IGNORE INTO image_migrations(run_id) VALUES (?1)", [&id])? == 1 {
+                for event in events { track(&transaction, &id, event.seq, &event.kind, &event.payload)?; }
+            }
+            transaction.commit()?;
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Read a bounded indexed window rather than replaying the event archive.
 pub(crate) fn latest_successful_mcp_images(store: &Store, run_id: &str) -> Result<Vec<InputImage>> {
-    let events = store.events(run_id)?;
-    let operations: HashMap<_, _> = store
-        .operations(run_id)?
-        .into_iter()
-        .map(|operation| (operation.id.clone(), operation))
-        .collect();
-
+    let sources = store.connection.prepare("SELECT source.artifact,source.detail FROM image_sources AS source
+        JOIN operations AS operation ON operation.id=source.operation_id AND operation.run_id=source.run_id
+        WHERE source.run_id=?1 AND operation.state='succeeded' AND operation.artifact=source.artifact
+        ORDER BY source.seq DESC LIMIT ?2")?
+        .query_map(params![run_id, MAX_UNMARKED_ARTIFACTS_TO_SCAN + 1], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut scanned = 0usize;
-    for event in events
-        .iter()
-        .rev()
-        .filter(|event| event.kind == "operation.succeeded")
-    {
-        let Some(operation_id) = event.payload["id"].as_str() else {
-            continue;
-        };
-        let Some(operation) = operations.get(operation_id) else {
-            continue;
-        };
-        let Some(hash) = event.payload["artifact"].as_str() else {
-            continue;
-        };
-        if operation.state != "succeeded"
-            || !operation.capability.starts_with("mcp.")
-            || operation.artifact.as_deref() != Some(hash)
-        {
-            continue;
-        }
-        let recorded_size = event.payload["detail"]["bytes"].as_u64();
-        let preview = &event.payload["detail"]["output_preview"];
-        let preview_count = preview["image_count"]
-            .as_u64()
-            .or_else(|| preview["images"]["image_count"].as_u64());
-        if preview_count == Some(0) {
-            continue;
-        }
-        if preview_count.is_none() {
+    for (hash, detail) in sources {
+        let detail: Value = serde_json::from_str(&detail)?;
+        if image_count(&detail).is_none() {
             scanned += 1;
-            if scanned > MAX_UNMARKED_ARTIFACTS_TO_SCAN {
-                break;
-            }
+            if scanned > MAX_UNMARKED_ARTIFACTS_TO_SCAN { break; }
         }
-        if recorded_size.is_some_and(|size| size > MAX_IMAGE_ARTIFACT_BYTES as u64) {
-            if preview_count.is_none_or(|count| count > 0) {
-                bail!(
-                    "MCP image result artifact exceeds the 12 MiB visual input limit; capture or return a smaller image"
-                );
-            }
-            continue;
+        if detail["bytes"].as_u64().is_some_and(|size| size > MAX_IMAGE_ARTIFACT_BYTES as u64) {
+            bail!("MCP image result artifact exceeds the 12 MiB visual input limit; capture or return a smaller image");
         }
-
-        let bytes = store.artifact(hash)?;
+        let bytes = store.artifact(&hash)?;
         if bytes.len() > MAX_IMAGE_ARTIFACT_BYTES {
-            if preview_count.is_none_or(|count| count > 0) {
-                bail!(
-                    "MCP image result artifact exceeds the 12 MiB visual input limit; capture or return a smaller image"
-                );
-            }
-            continue;
+            bail!("MCP image result artifact exceeds the 12 MiB visual input limit; capture or return a smaller image");
         }
-        let result: Value = serde_json::from_slice(&bytes)
-            .context("successful MCP result artifact is not valid JSON")?;
-        let images = extract_images(hash, &result)?;
-        if !images.is_empty() {
-            return Ok(images);
-        }
+        let result: Value = serde_json::from_slice(&bytes).context("successful MCP result artifact is not valid JSON")?;
+        let images = extract_images(&hash, &result)?;
+        if !images.is_empty() { return Ok(images); }
     }
     Ok(Vec::new())
 }
@@ -278,6 +284,42 @@ mod tests {
         let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
         bytes.extend_from_slice(extra);
         base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn image_lookup_is_independent_of_twelve_thousand_archived_outputs_even_after_migration() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(".arun");
+        let mut store = Store::open(&root)?;
+        for visual in [false, true] {
+            let run = store.create_run("Inspect", directory.path(), "custom", json!([]), json!({}), "")?;
+            store.state(&run.id, "running", json!({}))?;
+            let operation = store.begin_operation(&run.id, "mcp.fixture.inspect", json!({}), true)?;
+            crate::storage::claim_test_operation(&mut store, &operation)?;
+            let result = if visual { json!({"content":[{"type":"image","mimeType":"image/png","data":encoded_png(b"scene")}]}) }
+                else { json!({"content":[{"type":"text","text":"plain output"}]}) };
+            crate::kernel::commit_result(&mut store, &operation, result, 1)?;
+            let transaction = store.connection.unchecked_transaction()?;
+            for _ in 0..12_000 {
+                crate::storage::append_event(&transaction, &run.id, "operation.output", json!({"text":"output"}))?;
+            }
+            transaction.commit()?;
+            store.maintain_history(&run.id)?;
+            store.connection.execute("DELETE FROM image_sources WHERE run_id=?1", [&run.id])?;
+            store.connection.execute("DELETE FROM image_migrations WHERE run_id=?1", [&run.id])?;
+            drop(store);
+            store = Store::open(&root)?;
+            assert_eq!(latest_successful_mcp_images(&store, &run.id)?.len(), usize::from(visual));
+            let original: String = store.connection.query_row("SELECT artifact FROM event_archives WHERE run_id=?1 LIMIT 1", [&run.id], |row| row.get(0))?;
+            let corrupt_archive = store.put_artifact(b"not an event archive")?;
+            store.connection.execute("UPDATE event_archives SET artifact=?2 WHERE run_id=?1 AND artifact=?3", params![run.id,corrupt_archive,original])?;
+            assert!(store.events(&run.id).is_err(), "control: full replay reads the archive");
+            for _ in 0..10 {
+                assert_eq!(latest_successful_mcp_images(&store, &run.id)?.len(), usize::from(visual));
+            }
+            store.connection.execute("UPDATE event_archives SET artifact=?2 WHERE run_id=?1 AND artifact=?3", params![run.id,original,corrupt_archive])?;
+        }
+        Ok(())
     }
 
     #[test]

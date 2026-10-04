@@ -180,6 +180,7 @@ pub(crate) fn append_event(
     crate::steering::track(transaction, run_id, seq, kind, &payload, timestamp)?;
     crate::memory::track(transaction, run_id, seq, kind, &payload)?;
     crate::pause::track_clock(transaction, run_id, kind, timestamp)?;
+    crate::image::track(transaction, run_id, seq, kind, &payload)?;
     Ok(())
 }
 
@@ -527,6 +528,7 @@ impl Store {
         crate::memory::ensure_schema(&connection)?;
         crate::progress::ensure_schema(&connection)?;
         crate::pause::ensure_clock_schema(&connection)?;
+        crate::image::ensure_schema(&connection)?;
         let store = Self {
             connection,
             artifacts,
@@ -625,6 +627,7 @@ impl Store {
         crate::steering::restore(&store)?;
         crate::memory::restore(&store)?;
         crate::pause::restore_clock(&store)?;
+        crate::image::restore(&store)?;
         Ok(store)
     }
 
