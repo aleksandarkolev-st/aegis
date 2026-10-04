@@ -76,16 +76,20 @@ const SCHEMA: &str = r#"{"type":"object","properties":{"kind":{"type":"string","
 pub(crate) fn schema() -> Result<Value> {
     let mut schema: Value = serde_json::from_str(SCHEMA)?;
     schema["properties"]["args"]["description"] = serde_json::json!(
-        "Invoke metadata encoded as a JSON object string. Use \"{}\" when empty. Omit content/script when supplied through args_text."
+        "JSON object string; empty metadata is \"{}\". Omit fields supplied by args_text or args_edits."
     );
-    schema["properties"]["artifact"]["description"] = serde_json::json!("For inspect_result, use the exact successful operation artifact field from a receipt or read_history.artifact. A file sha256 is a content digest, not an artifact handle. Never invent or shorten IDs.");
-    schema["properties"]["args_text_field"] = serde_json::json!({"type":"string","enum":["","content","script"],"description":"For invoke with file content or a script, select its argument name here. Otherwise empty."});
-    schema["properties"]["args_text"] = serde_json::json!({"type":"string","description":"The selected content/script as a plain string, with only this outer JSON escaping. Never encode it inside args as well."});
+    schema["properties"]["artifact"]["description"] = serde_json::json!(
+        "Exact receipt artifact or read_history.artifact for inspect_result; never a file sha256 or invented ID."
+    );
+    schema["properties"]["args_text_field"] = serde_json::json!({"type":"string","enum":["","content","script"],"description":"Argument supplied by args_text; otherwise empty."});
+    schema["properties"]["args_text"] = serde_json::json!({"type":"string","description":"Selected content/script; escape once, omit from args."});
+    schema["properties"]["args_edits"] = serde_json::json!({"type":"array","maxItems":32,"items":{"type":"object","additionalProperties":false,"properties":{"old":{"type":"string","minLength":1},"new":{"type":"string"}},"required":["old","new"]},"description":"workspace.patch replacements; escape once, omit edits from args. Otherwise empty."});
     let required = schema["required"]
         .as_array_mut()
         .context("action schema required fields")?;
     required.push(serde_json::json!("args_text_field"));
     required.push(serde_json::json!("args_text"));
+    required.push(serde_json::json!("args_edits"));
     Ok(schema)
 }
 
@@ -138,6 +142,7 @@ impl Serialize for WireValue<'_> {
             "capability",
             "args_text_field",
             "args_text",
+            "args_edits",
             "args",
             "query",
             "artifact",
@@ -254,7 +259,35 @@ pub(crate) fn parse_action(raw: &str) -> Result<Action> {
             if arguments.contains_key(&text_field) {
                 bail!("conflicting argument text fields");
             }
-            arguments.insert(text_field, Value::String(text));
+            arguments.insert(text_field.clone(), Value::String(text));
+        }
+        if let Some(edits) = value.get("args_edits") {
+            let edits = edits.as_array().context("args_edits must be an array")?;
+            if !edits.is_empty() {
+                if value["kind"] != "invoke"
+                    || value["capability"] != "workspace.patch"
+                    || !text_field.is_empty()
+                {
+                    bail!("separated edits require workspace.patch without args_text");
+                }
+                if edits.len() > 32
+                    || edits.iter().any(|edit| {
+                        edit.as_object().is_none_or(|fields| fields.len() != 2)
+                            || edit["old"].as_str().is_none_or(str::is_empty)
+                            || !edit["new"].is_string()
+                    })
+                {
+                    bail!("separated edits require one to 32 exact old/new string pairs");
+                }
+                let edits = Value::Array(edits.clone());
+                let arguments = value["args"]
+                    .as_object_mut()
+                    .context("separated edits require object args")?;
+                if arguments.contains_key("edits") {
+                    bail!("conflicting argument edits fields");
+                }
+                arguments.insert("edits".into(), edits);
+            }
         }
         return serde_json::from_value(value).context("invalid model action");
     }
@@ -544,6 +577,55 @@ mod tests {
             assert!(parse_action(&invalid.to_string()).is_err());
         }
         assert_eq!(schema()?["additionalProperties"], false);
+        Ok(())
+    }
+
+    #[test]
+    fn separated_patch_edits_preserve_code_and_reject_ambiguous_inputs() -> Result<()> {
+        let old = "export function encodeRow(fields) { return fields.join(','); }\n";
+        let new = "export function encodeRow(fields) {\n  return fields.map(s => /[,\"\\r\\n]/.test(s) ? '\"' + s.replaceAll('\"', '\"\"') + '\"' : s).join(',');\n}\n";
+        let edits = serde_json::json!([{ "old":old,"new":new }]);
+        let raw = serde_json::json!({"kind":"invoke","capability":"workspace.patch","args":"{\"path\":\"csv.mjs\"}","args_edits":edits});
+        assert_eq!(
+            parse_action(&raw.to_string())?,
+            Action::Invoke {
+                capability: "workspace.patch".into(),
+                args: serde_json::json!({"path":"csv.mjs","edits":edits})
+            }
+        );
+        for changes in [
+            serde_json::json!({"capability":"workspace.write"}),
+            serde_json::json!({"args":"{\"path\":\"csv.mjs\",\"edits\":[]}"}),
+            serde_json::json!({"args":[]}),
+            serde_json::json!({"args_edits":{}}),
+            serde_json::json!({"args_edits":[{"old":"","new":"code"}]}),
+            serde_json::json!({"args_edits":[{"old":"code","new":1}]}),
+            serde_json::json!({"args_edits":[{"old":"code","new":"","extra":true}]}),
+            serde_json::json!({"args_edits":vec![serde_json::json!({"old":"a","new":"b"});33]}),
+            serde_json::json!({"args_text_field":"script","args_text":"code"}),
+        ] {
+            let mut invalid = raw.clone();
+            for (key, value) in changes.as_object().unwrap() {
+                invalid[key] = value.clone();
+            }
+            assert!(parse_action(&invalid.to_string()).is_err(), "{changes}");
+        }
+        // The additive wire format does not change persisted Action or legacy object args.
+        let legacy = serde_json::json!({"kind":"invoke","capability":"workspace.patch","args":{"path":"csv.mjs","edits":edits}});
+        assert_eq!(
+            parse_action(&legacy.to_string())?,
+            parse_action(&raw.to_string())?
+        );
+        let mut empty = legacy.clone();
+        empty["args_edits"] = serde_json::json!([]);
+        assert_eq!(
+            parse_action(&empty.to_string())?,
+            parse_action(&raw.to_string())?
+        );
+        assert_eq!(
+            schema()?["properties"]["args_edits"]["items"]["additionalProperties"],
+            false
+        );
         Ok(())
     }
 

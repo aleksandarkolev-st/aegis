@@ -37,7 +37,7 @@ fn writes_and_patch_removals_display_diffs_without_an_extra_model_request() -> R
                 json!({"kind":"invoke","capability":"workspace.write","args":{"path":"code.rs","content":"fn keep() {}\nfn remove() {}\n"}}),
             ),
             1 => response(
-                json!({"kind":"invoke","capability":"workspace.patch","args":{"path":"code.rs","edits":[{"old":"fn remove() {}\n","new":""}]}}),
+                json!({"kind":"invoke","capability":"workspace.patch","args":"{\"path\":\"code.rs\"}","args_edits":[{"old":"fn remove() {}\n","new":""}]}),
             ),
             2 => {
                 assert!(!body.to_string().contains("Observed workspace change"));

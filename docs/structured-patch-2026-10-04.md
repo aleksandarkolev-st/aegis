@@ -1,0 +1,13 @@
+# Code patches with a single JSON escaping layer
+
+The delayed-answer trial exposed two malformed nested argument JSON responses while generating a CSV replacement. Direct file writes and shell scripts already had a plain text wire field; exact patch replacements still had to be encoded inside another JSON string.
+
+Provider requests now expose `args_edits`, a typed array of exact `old`/`new` strings, before the metadata string. The parser inserts those replacements into the ordinary `workspace.patch` arguments. Normal capability schema checks, grants, expected-file hashes, unique-match validation and execution remain unchanged. Ambiguous duplicate edits, arbitrary capabilities, extra keys, non-string replacements, empty search strings and more than 32 replacements are rejected. Legacy persisted actions and object arguments still work.
+
+Schema descriptions and the fixed decision instructions were shortened so the existing no-tool context and instruction-token bounds continue to pass. No read, turn or aggregate token cap was introduced.
+
+The focused library, format-retry and live-diff checks passed 427 tests, with three optional ignores, in `.arun/structured-patch-regressions-20261004.log`. The live-diff case exercises the new wire format through the actual decision/worker path and still sees removals before successful operation receipts, with no added model call.
+
+Hosted run `b080fbfc-d0dc-42b5-845e-bd677e8e23b4` completed in 134 seconds on executable SHA-256 `35184a4268a5df12651201fcdd82764e16a02aa56f003d0944a0636a050ed428`. Its receipt and replay are `.arun/native-interaction-tXuWLp/receipt.json` and `events.json`. It explored the repository, waited for the separator answer, resumed the original task, used one `args_edits` replacement, added regressions, emitted two diffs and completed with zero rejected actions. The independent grader passed seven CSV cases, export-removal and original-fixture preservation checks, then a separate `node --test` run passed. Seventeen model attempts reported 68,629 tokens; one interrupted attempt has unreported usage. This is scoped hosted interaction evidence, not a universal efficiency claim.
+
+That hosted executable precedes the description-only compaction. The compacted package is `.arun/package-smoke-9LsuNZ/receipt.json`, executable SHA-256 `acc7ca3dda9a53609f99d9d0a54cee6f000e2746d243c7058441cd892eaeafea`. Installation and later validation must be recorded against their exact hashes; earlier coding and endurance trials are not relabeled as checks of this package.
