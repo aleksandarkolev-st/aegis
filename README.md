@@ -16,7 +16,14 @@ target/release/arun login chatgpt
 target/release/arun run "Inspect this repository" --provider chatgpt
 ```
 
-The npm package supports Windows x64 and Linux x64/arm64; macOS is unsupported. Local native builds require Node 20+ and Rust. Published packages download a platform-specific runtime, but public npm publication is not yet claimed. See [npm publishing](docs/npm-publishing.md).
+The npm package `aegis-arun@0.2.0` is published on npm. Install it globally and launch either command:
+
+```sh
+npm install --global aegis-arun
+aegis
+```
+
+The package supports Windows x64 and Linux x64/arm64; macOS is unsupported. Published packages download a platform-specific runtime. Local native builds require Node 20+ and Rust. See [npm publishing](docs/npm-publishing.md) for package and release details.
 
 ## Working in the terminal
 
