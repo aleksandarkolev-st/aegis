@@ -17,7 +17,7 @@ use std::{
 const MAX_FILE: u64 = 2 * 1024 * 1024;
 const MAX_SNAPSHOT: usize = 16 * 1024 * 1024;
 const MAX_ENTRIES: usize = 10_000;
-const MAX_DISPLAY: usize = 64 * 1024;
+const MAX_DIFF_CHUNK: usize = 64 * 1024;
 
 #[derive(Clone)]
 struct File {
@@ -32,8 +32,6 @@ pub(crate) struct Watch {
     exact: Option<String>,
     files: BTreeMap<String, File>,
     next_poll: Instant,
-    displayed: usize,
-    updates: usize,
 }
 
 impl Watch {
@@ -66,8 +64,6 @@ impl Watch {
             exact,
             files: BTreeMap::new(),
             next_poll: Instant::now(),
-            displayed: 0,
-            updates: 0,
         };
         watch.files = watch.snapshot(true)?;
         Ok(Some(watch))
@@ -195,9 +191,6 @@ impl Watch {
         operation: &Operation,
         final_poll: bool,
     ) -> Result<()> {
-        if self.displayed >= MAX_DISPLAY || self.updates >= 128 {
-            return Ok(());
-        }
         if !final_poll && Instant::now() < self.next_poll {
             return Ok(());
         }
@@ -222,21 +215,20 @@ impl Watch {
                 continue;
             }
             let artifact = store.put_artifact(diff.as_bytes())?;
-            let mut end = (MAX_DISPLAY - self.displayed).min(diff.len());
-            while !diff.is_char_boundary(end) {
-                end -= 1;
-            }
-            let text = &diff[..end];
-            self.displayed += text.len();
-            self.updates += 1;
-            let truncated =
-                end < diff.len() || self.displayed >= MAX_DISPLAY || self.updates >= 128;
-            store.event(&operation.run_id, "operation.diff", json!({
-                "id":operation.id,"path":path,"text":text,"artifact":artifact,"truncated":truncated,
-                "verification_scope":"Observed workspace change during this operation; not execution or completion proof"
-            }))?;
-            if truncated {
-                break;
+            let mut start = 0;
+            while start < diff.len() {
+                let mut end = start.saturating_add(MAX_DIFF_CHUNK).min(diff.len());
+                while !diff.is_char_boundary(end) { end -= 1; }
+                // Prefer complete lines; a single long line can span chunks.
+                if end < diff.len() && let Some(newline) = diff[start..end].rfind('\n') {
+                    end = start + newline + 1;
+                }
+                store.event(&operation.run_id, "operation.diff", json!({
+                    "id":operation.id,"path":path,"text":&diff[start..end],"artifact":artifact,"truncated":false,
+                    "offset":start,"total_bytes":diff.len(),"final_chunk":end==diff.len(),
+                    "verification_scope":"Observed workspace change during this operation; not execution or completion proof"
+                }))?;
+                start = end;
             }
         }
         self.files = current;
@@ -576,18 +568,24 @@ mod tests {
             format!("{}\nFINAL_MARKER\n", "🦀".repeat(20_000)),
         )?;
         watch.poll(&mut store, &op, true)?;
-        let event = store
-            .events(&run.id)?
-            .into_iter()
-            .find(|e| e.kind == "operation.diff")
-            .unwrap();
-        assert!(event.payload["text"].as_str().unwrap().len() <= MAX_DISPLAY);
-        assert_eq!(event.payload["truncated"], true);
-        let full = String::from_utf8(store.artifact(event.payload["artifact"].as_str().unwrap())?)?;
+        let chunks: Vec<_> = store.events(&run.id)?.into_iter().filter(|e| e.kind == "operation.diff").collect();
+        assert!(chunks.len() > 1);
+        for event in &chunks {
+            assert!(event.payload["text"].as_str().unwrap().len() <= MAX_DIFF_CHUNK);
+            assert_eq!(event.payload["truncated"], false);
+        }
+        let full = String::from_utf8(store.artifact(chunks[0].payload["artifact"].as_str().unwrap())?)?;
+        assert_eq!(chunks.iter().map(|e|e.payload["text"].as_str().unwrap()).collect::<String>(), full);
         assert!(full.contains("+FINAL_MARKER\n"));
-        fs::write(dir.path().join("code.rs"), "too late\n")?;
-        watch.poll(&mut store, &op, true)?;
-        assert_eq!(store.event_count(&run.id, "operation.diff")?, 1);
+        let through = chunks.last().unwrap().seq;
+        // More than 128 subsequent changes must continue to arrive live.
+        for index in 0..140 {
+            fs::write(dir.path().join("code.rs"), format!("later edit {index} ??\n"))?;
+            watch.poll(&mut store, &op, true)?;
+        }
+        let later: Vec<_> = store.events_since(&run.id, through)?.into_iter().filter(|e|e.kind == "operation.diff").collect();
+        assert!(later.len() >= 140);
+        assert!(later.last().unwrap().payload["text"].as_str().unwrap().contains("+later edit 139 ??\n"));
         Ok(())
     }
 }
