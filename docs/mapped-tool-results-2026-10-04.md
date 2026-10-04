@@ -1,0 +1,11 @@
+# Avoiding unnecessary tool-result inspection
+
+Durable and artifact modes now place up to 4,000 Unicode characters of committed MCP text into the next decision context. Native PowerShell results retain structured exit status, timeout and capture-truncation fields alongside bounded stdout/stderr. The shared text allowance applies across all blocks and streams. Images retain metadata only; original results remain in their artifacts. Error results are visible but cannot prove successful completion.
+
+The exploration policy explicitly preserves information-gathering tasks without inventing an edit requirement. Pending questions permit useful independent work, then direct the model to the existing answer-wait boundary when further progress depends on the reply. Neither policy adds a read, turn or token cap.
+
+The complete source suite is recorded in `.arun/mapped-tool-results-all-targets-20261004.log`. The focused library/native/question/budget/read regressions passed 428 tests with three optional ignores. All thirteen npm tests and twelve offline package checks passed. The package receipt is `.arun/package-smoke-R3jiM8/receipt.json`; its installed executable is SHA-256 `f62932fe404e2212f04902c64a364751f0125d66ae1aa1956eddceac2d613561`. Nine installed terminal, live-diff and native-host tests passed in `.arun/mapped-tool-results-installed-20261004.log`, including a real native command whose text reaches the next decision without `inspect_result`.
+
+`native_interaction_probe --live <binary> [model] --wait-for-answer` withholds the answer until exploration has reached a persisted question wait, then answers and resumes the same task. The controller now rereads state after answering instead of evaluating the obsolete pre-answer snapshot.
+
+Two hosted diagnostics remain failures. `.arun/native-interaction-VBggcF/` reached the proper wait boundary, but the controller's stale-state check aborted its resumed process; that test bug is corrected. `.arun/native-interaction-FrsbKx/` reached the wait, resumed and consumed the answer, then encountered two invalid nested argument JSON responses while attempting a code patch. Its failure is a separate protocol reliability issue, not successful completion or evidence of an exploration loop. The recorded response shapes retain syntax positions and usage without retaining rejected code or credentials.

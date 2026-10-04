@@ -55,6 +55,7 @@ fn main() -> Result<()> {
     );
     let binary = dunce::canonicalize(args.get(1).context("provide the actual Aegis executable")?)?;
     let model = args.get(2).map(String::as_str).unwrap_or("gpt-6-luna");
+    let wait_for_answer_boundary = args.iter().any(|arg| arg == "--wait-for-answer");
     let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let trial = tempfile::Builder::new()
         .prefix("native-interaction-")
@@ -84,7 +85,7 @@ fn main() -> Result<()> {
             "--trusted-host",
         ],
     )?;
-    let mut receipt = json!({"phase":"running","started_at":chrono::Utc::now().to_rfc3339(),"directory":trial,"binary":binary,"binary_sha256":binary_hash,"model":model,"reasoning_effort":"high","task":TASK,"followup":FOLLOWUP,"fixtures":{"csv.mjs":digest(SOURCE.as_bytes()),"csv.test.mjs":digest(TESTS.as_bytes())},"controller_sha256":digest(include_bytes!("native_interaction_probe.rs")),"helper_sha256":digest(&fs::read(host)?)});
+    let mut receipt = json!({"phase":"running","started_at":chrono::Utc::now().to_rfc3339(),"directory":trial,"binary":binary,"binary_sha256":binary_hash,"model":model,"reasoning_effort":"high","wait_for_answer_boundary":wait_for_answer_boundary,"task":TASK,"followup":FOLLOWUP,"fixtures":{"csv.mjs":digest(SOURCE.as_bytes()),"csv.test.mjs":digest(TESTS.as_bytes())},"controller_sha256":digest(include_bytes!("native_interaction_probe.rs")),"helper_sha256":digest(&fs::read(host)?)});
     fs::write(
         trial.join("receipt.json"),
         serde_json::to_vec_pretty(&receipt)?,
@@ -177,7 +178,11 @@ fn main() -> Result<()> {
                                 }))
                 })
             });
-            if !answered && !store.pending_questions(&run_id)?.is_empty() && explored {
+            if !answered
+                && !store.pending_questions(&run_id)?.is_empty()
+                && explored
+                && (!wait_for_answer_boundary || store.waiting_for_answer(&run_id)?)
+            {
                 let waiting = store.waiting_for_answer(&run_id)?;
                 receipt["answer_state"] = json!(run.state);
                 if waiting {
@@ -208,6 +213,9 @@ fn main() -> Result<()> {
                 println!(
                     "Answered the persisted question on the same task (wait boundary: {waiting})"
                 );
+                // Steering changed the authoritative state. Do not evaluate the
+                // pre-answer wait snapshot against an already answered question.
+                continue;
             }
             if run.state == "completed" {
                 break;
