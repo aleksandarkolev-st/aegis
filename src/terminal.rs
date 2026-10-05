@@ -361,10 +361,12 @@ impl TerminalSize {
     }
 
     fn current() -> Self {
-        Self::measured().unwrap_or(Self {
-            columns: 80,
-            rows: 24,
-        })
+        Self::measured()
+            .filter(|size| size.columns >= HOME_MIN_COLUMNS && size.rows >= COMPOSER_MIN_ROWS)
+            .unwrap_or(Self {
+                columns: 80,
+                rows: 24,
+            })
     }
 
     fn from_event(event: &Event) -> Option<Self> {
@@ -382,7 +384,16 @@ fn measured_terminal_resize(
     previous: TerminalSize,
     measured: Option<TerminalSize>,
 ) -> (TerminalSize, bool) {
-    measured.map_or((previous, false), |size| (size, size != previous))
+    // terminal::size() succeeds with a degenerate 1x1 when stdout is not a
+    // terminal, so a successful read is not proof of a usable console. Treat
+    // implausible measurements as absent and keep the last good size, or the
+    // composer silently disappears and the task never starts.
+    match measured.filter(|size| {
+        size.columns >= HOME_MIN_COLUMNS && size.rows >= COMPOSER_MIN_ROWS
+    }) {
+        Some(size) => (size, size != previous),
+        None => (previous, false),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
