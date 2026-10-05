@@ -100,4 +100,7 @@ jobs:
             echo "expected exactly one npm tarball, found ${#tarballs[@]}"
             exit 1
           fi
-          npm publish "${tarballs[0]}"
+          # Prefix with ./ so npm reads the argument as a file. A bare relative
+          # path looks like a package name, and npm then resolves it as a GitHub
+          # shorthand and tries to clone the repository over SSH.
+          npm publish "./${tarballs[0]}"
