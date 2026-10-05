@@ -18,6 +18,7 @@ fn native_exploration_survives_memory_cadence_archival_and_driver_restart() -> R
     }
     let progress = Arc::new(Mutex::new((0usize, 0usize, false)));
     let observed = progress.clone();
+    let mut reported_reads = 0;
     let endpoint = http::Endpoint::start(move |body| {
         let state = http::state(body)?;
         ensure!(
@@ -52,6 +53,17 @@ fn native_exploration_survives_memory_cadence_archival_and_driver_restart() -> R
         let action = if state["working_memory"]["checkpoint_due"] == true {
             *memories += 1;
             json!({"kind":"remember","summary":format!("Preserve public APIs. Explored {reads} distinct source fragments; continue with part_{reads:03}.txt. Earlier receipts are indexed in work."),"artifact":format!("user:{}",state["working_memory"]["owner_batch_through"].as_i64().unwrap())})
+        } else if *reads > reported_reads && *reads % 12 == 0 {
+            // Long investigations must publish supported findings, rather than
+            // renewing exploration merely by visiting more files. Keep all 70
+            // reads, memory cadence and the archival/restart boundary intact.
+            reported_reads = *reads;
+            let index = *reads - 1;
+            let hash = state["read_history"][0]["artifact"].as_str().unwrap();
+            let mut milestones: Vec<_> = state["milestones"].as_array().unwrap().iter()
+                .filter(|item| item["title"] != "Task request").cloned().collect();
+            milestones.push(json!({"title":format!("Located SOURCE_FRAGMENT_{index} in part_{index:03}.txt"),"state":"completed","evidence":[hash]}));
+            json!({"kind":"checkpoint","checkpoint":{"decisions":[format!("Located SOURCE_FRAGMENT_{index}; preserve public APIs")],"unresolved":[format!("Inspect the remaining fragments from part_{reads:03}.txt")],"next_action":format!("Read part_{reads:03}.txt"),"milestones":milestones}})
         } else if *reads == 35 && !*paused {
             *paused = true;
             json!({"kind":"blocked","reason":"Restart boundary for local endurance fixture"})
@@ -108,6 +120,8 @@ fn native_exploration_survives_memory_cadence_archival_and_driver_restart() -> R
     );
     assert_eq!(store.event_count(&run.id, "action.rejected")?, 0);
     assert_eq!(store.event_count(&run.id, "loop.stalled")?, 0);
+    assert_eq!(store.event_count(&run.id, "loop.exploration_exhausted")?, 0);
+    assert_eq!(store.event_count(&run.id, "checkpoint.created")?, 5);
     assert_eq!(store.event_count(&run.id, "memory.saved")?, 2);
     assert!(
         kernel::normalized_handoff(&store, &store.run(&run.id)?)?["working_memory"]["summary"]

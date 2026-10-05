@@ -9,6 +9,8 @@ use crate::{
     storage::{Run, Store, append_event},
 };
 
+const EXPLORATION_LIMIT: i64 = 24;
+
 pub(crate) fn ensure_schema(connection: &Connection) -> Result<()> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS loop_progress (
@@ -23,9 +25,78 @@ pub(crate) fn ensure_schema(connection: &Connection) -> Result<()> {
         run_id TEXT NOT NULL REFERENCES runs(id), source TEXT NOT NULL,
         start INTEGER NOT NULL, end INTEGER NOT NULL,
         PRIMARY KEY(run_id,source,start,end)
+    );
+    CREATE TABLE IF NOT EXISTS loop_exploration (
+        run_id TEXT PRIMARY KEY REFERENCES runs(id), epoch TEXT NOT NULL,
+        actions INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS loop_findings (
+        run_id TEXT NOT NULL REFERENCES runs(id), signature TEXT NOT NULL,
+        PRIMARY KEY(run_id,signature)
     );",
     )?;
     Ok(())
+}
+
+// Only kernel-accepted, evidence-backed findings can renew exploration. Prose,
+// new milestone titles and repeated use of an old receipt cannot renew it.
+fn finding_signatures(store: &Store, run: &Run, action: &Action) -> Result<Vec<String>> {
+    let hashes: Vec<String> = match action {
+        Action::Checkpoint { .. } => store
+            .milestones(&run.id)?
+            .into_iter()
+            .filter(|milestone| milestone.state == "completed")
+            .flat_map(|milestone| milestone.evidence)
+            .collect(),
+        Action::VerifyObligations { obligations } => {
+            let mut hashes = Vec::new();
+            for proof in obligations {
+                let evidence: Option<String> = store.connection.query_row(
+                    "SELECT evidence FROM obligations WHERE run_id=?1 AND id=?2 AND state='verified'",
+                    params![run.id,proof.id], |row| row.get(0)).optional()?;
+                if let Some(evidence) = evidence {
+                    hashes.extend(serde_json::from_str::<Vec<String>>(&evidence)?);
+                }
+            }
+            hashes
+        }
+        _ => return Ok(vec![]),
+    };
+    let mut signatures = Vec::new();
+    for hash in hashes {
+        let operation: Option<(String,String)> = store.connection.query_row(
+            "SELECT CASE WHEN operation.artifact=?2 THEN operation.capability ELSE 'linked' END,operation.arguments FROM operations AS operation WHERE operation.run_id=?1 AND operation.state='succeeded' AND (operation.artifact=?2 OR EXISTS(SELECT 1 FROM operation_artifacts AS linked WHERE linked.operation_id=operation.id AND linked.hash=?2)) ORDER BY operation.rowid DESC LIMIT 1",
+            params![run.id,hash],|row| Ok((row.get(0)?,row.get(1)?))).optional()?;
+        let Some((capability, args)) = operation else {
+            continue;
+        };
+        let args: Value = serde_json::from_str(&args)?;
+        let bytes = store.artifact(&hash)?;
+        let mut value: Value =
+            serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({"artifact":hash}));
+        stable(&mut value);
+        let mut evidence = Evidence::default();
+        match capability.as_str() {
+            "workspace.read" => evidence
+                .facts
+                .push(json!({"path":args["path"],"sha256":value["sha256"]})),
+            "workspace.read_batch" => {
+                for entry in value["selected"].as_array().into_iter().flatten() {
+                    if entry["text"]
+                        .as_str()
+                        .is_some_and(|text| !text.trim().is_empty())
+                    {
+                        evidence
+                            .facts
+                            .push(json!({"path":entry["path"],"sha256":entry["sha256"]}));
+                    }
+                }
+            }
+            _ => evidence.results("finding", &value),
+        }
+        signatures.extend(evidence.facts.iter().map(digest));
+    }
+    Ok(signatures)
 }
 
 fn digest(value: &Value) -> String {
@@ -275,6 +346,10 @@ pub(crate) fn observe(
         )
         .optional()?;
     let epoch = digest(&json!({"source":source,"observed":observed,"owner":owner}));
+    // Discovering another file changes observed_files but must not replenish a
+    // finite exploration allowance. Only changed workspace content/owner input
+    // or an accepted finding can do that.
+    let exploration_epoch = digest(&json!({"source":source,"owner":owner}));
     let mut key_action = serde_json::to_value(action)?;
     // Model-authored prose is not new environmental evidence. A different
     // checkpoint wording must not disguise a loop with no new observations.
@@ -297,6 +372,11 @@ pub(crate) fn observe(
             ranges: vec![],
         };
     }
+    let findings = if failed {
+        vec![]
+    } else {
+        finding_signatures(store, run, action)?
+    };
     let transaction = store.connection.unchecked_transaction()?;
     let previous: Option<(String, i64)> = transaction
         .query_row(
@@ -314,13 +394,48 @@ pub(crate) fn observe(
         previous.map(|(_, count)| count).unwrap_or(0) + 1
     };
     transaction.execute("INSERT INTO loop_progress(run_id,epoch,unchanged,last_error) VALUES (?1,?2,?3,?4) ON CONFLICT(run_id) DO UPDATE SET epoch=excluded.epoch,unchanged=excluded.unchanged,last_error=excluded.last_error",params![run.id,epoch,unchanged,error])?;
+    let mut finding = false;
+    for signature in findings {
+        finding |= transaction.execute(
+            "INSERT OR IGNORE INTO loop_findings(run_id,signature) VALUES (?1,?2)",
+            params![run.id, signature],
+        )? == 1;
+    }
+    let previous_exploration: Option<(String, i64)> = transaction
+        .query_row(
+            "SELECT epoch,actions FROM loop_exploration WHERE run_id=?1",
+            [&run.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let explored = if finding {
+        0
+    } else if let Some((old, count)) = previous_exploration {
+        if old == exploration_epoch {
+            count + 1
+        } else {
+            1
+        }
+    } else {
+        1
+    };
+    transaction.execute("INSERT INTO loop_exploration(run_id,epoch,actions) VALUES (?1,?2,?3) ON CONFLICT(run_id) DO UPDATE SET epoch=excluded.epoch,actions=excluded.actions",params![run.id,exploration_epoch,explored])?;
     let limit = if failed { 2 } else { 4 };
-    if unchanged >= limit {
+    let exploration_exhausted = explored >= EXPLORATION_LIMIT;
+    if unchanged >= limit || exploration_exhausted {
+        if exploration_exhausted {
+            append_event(
+                &transaction,
+                &run.id,
+                "loop.exploration_exhausted",
+                json!({"actions":explored,"limit":EXPLORATION_LIMIT,"reason":"exploration needs an evidence-backed finding or a concrete unresolved question"}),
+            )?;
+        }
         append_event(
             &transaction,
             &run.id,
             "loop.stalled",
-            json!({"unchanged":unchanged,"error":error,"action":key_action,"reason":"repeated actions produced no new information or verified workspace progress"}),
+            json!({"unchanged":unchanged,"error":error,"action":key_action,"reason":if exploration_exhausted { "exploration budget exhausted without a new evidence-backed finding" } else { "repeated actions produced no new information or verified workspace progress" }}),
         )?;
         transaction.execute(
             "UPDATE runs SET state='waiting_recovery' WHERE id=?1 AND state='running'",
@@ -330,7 +445,7 @@ pub(crate) fn observe(
             &transaction,
             &run.id,
             "run.waiting_recovery",
-            json!({"reason":"repeated unchanged actions; resume with a different approach or new task-owner input"}),
+            json!({"reason":if exploration_exhausted { "exploration budget exhausted; resume with a concrete unresolved question, evidence-backed findings or new task-owner input" } else { "repeated unchanged actions; resume with a different approach or new task-owner input" }}),
         )?;
     }
     transaction.commit()?;
@@ -342,12 +457,309 @@ pub(crate) fn add_context(store: &Store, run: &Run, context: &mut Value) -> Resu
     if let Some((unchanged, error)) = state {
         context["progress_guard"] = json!({"unchanged":unchanged,"last_error":error,"policy":"Recent actions added no new evidence. Reuse mapped information and choose a different approach. Different queries, arguments, or reordered/subset results are not progress. Exploration must return previously unseen evidence or unread source content; model-authored prose is not evidence. Do not invent edits for an exploratory task. If waiting for external state, use a bounded granted wait/poll tool or blocked instead of busy repetition. Unchanged retries will pause durably."});
     }
+    let explored: Option<i64> = store
+        .connection
+        .query_row(
+            "SELECT actions FROM loop_exploration WHERE run_id=?1",
+            [&run.id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(explored) = explored.filter(|count| *count >= EXPLORATION_LIMIT / 2) {
+        context["exploration_guard"] = json!({"actions_since_finding":explored,"limit":EXPLORATION_LIMIT,"remaining":(EXPLORATION_LIMIT-explored).max(0),"policy":"Exploration is finite even when every query returns new data. Finish with supported findings when the request is satisfied. Otherwise record an evidence-backed completed milestone or state a concrete unresolved question with ask_user/blocked. More searches and prose-only checkpoints do not renew this allowance. Reusing known proof cannot renew it. Exhaustion pauses durably; do not invent edits."});
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changed_workspace_content_renews_exploration_without_an_invented_finding() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join("source"), "before")?;
+        let mut store = Store::open(&directory.path().join(".arun"))?;
+        let run = store.create_run(
+            "Diagnose",
+            directory.path(),
+            "custom",
+            json!([]),
+            json!({}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        for _ in 0..2 {
+            invoke_result(
+                &mut store,
+                &run,
+                "process.run",
+                json!({"program":"fixture","args":[]}),
+                json!({"exit_code":0,"stdout":"same"}),
+            )?;
+        }
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT actions FROM loop_exploration WHERE run_id=?1",
+                [&run.id],
+                |row| row.get::<_, i64>(0)
+            )?,
+            2
+        );
+        std::fs::write(directory.path().join("source"), "after")?;
+        invoke_result(
+            &mut store,
+            &run,
+            "process.run",
+            json!({"program":"fixture","args":[]}),
+            json!({"exit_code":0,"stdout":"same"}),
+        )?;
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT actions FROM loop_exploration WHERE run_id=?1",
+                [&run.id],
+                |row| row.get::<_, i64>(0)
+            )?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn findings_can_use_linked_successful_operation_evidence() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "Explore",
+            directory.path(),
+            "custom",
+            json!([]),
+            json!({}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        invoke_result(
+            &mut store,
+            &run,
+            "workspace.search",
+            json!({"query":"cancel"}),
+            json!({"matches":[]}),
+        )?;
+        let operation = store.operations(&run.id)?.remove(0);
+        let artifact = store.put_artifact(b"Supported finding in linked output")?;
+        store.link_artifact(&operation.id, &artifact, "output")?;
+        let checkpoint = crate::model::Checkpoint {
+            decisions: vec![],
+            unresolved: vec![],
+            next_action: "Report".into(),
+            milestones: vec![crate::model::Milestone {
+                title: "Linked output finding".into(),
+                state: "completed".into(),
+                evidence: vec![artifact],
+            }],
+        };
+        store.save_checkpoint(&run.id, &checkpoint)?;
+        observe(&mut store, &run, &Action::Checkpoint { checkpoint }, None)?;
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT actions FROM loop_exploration WHERE run_id=?1",
+                [&run.id],
+                |row| row.get::<_, i64>(0)
+            )?,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_search_evidence_has_a_durable_finite_exploration_allowance() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "Find weaknesses",
+            directory.path(),
+            "custom",
+            json!([]),
+            json!({}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        for index in 0..EXPLORATION_LIMIT / 2 {
+            invoke_result(
+                &mut store,
+                &run,
+                "workspace.search",
+                json!({"query":index.to_string()}),
+                json!({"matches":[{"path":"a","line":index+1,"text":format!("evidence {index}")}]}),
+            )?;
+        }
+        drop(store);
+        let mut store = Store::open(directory.path())?;
+        let mut context = json!({});
+        add_context(&store, &run, &mut context)?;
+        assert_eq!(
+            context["exploration_guard"]["remaining"],
+            EXPLORATION_LIMIT / 2
+        );
+        for index in EXPLORATION_LIMIT / 2..EXPLORATION_LIMIT {
+            invoke_result(
+                &mut store,
+                &run,
+                "workspace.search",
+                json!({"query":index.to_string()}),
+                json!({"matches":[{"path":"a","line":index+1,"text":format!("evidence {index}")}]}),
+            )?;
+        }
+        assert_eq!(store.run(&run.id)?.state, "waiting_recovery");
+        assert_eq!(store.event_count(&run.id, "loop.exploration_exhausted")?, 1);
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT unchanged FROM loop_progress WHERE run_id=?1",
+                [&run.id],
+                |row| row.get::<_, i64>(0)
+            )?,
+            0,
+            "novel evidence cannot evade the separate budget"
+        );
+        // Restart/resume alone does not erase consumption; new owner input does.
+        store.state(&run.id, "running", json!({}))?;
+        store.steer(
+            &run.id,
+            "Investigate the specific cancellation question, then finish",
+        )?;
+        invoke_result(
+            &mut store,
+            &run,
+            "workspace.search",
+            json!({"query":"bounded"}),
+            json!({"matches":[{"path":"b","line":1,"text":"new"}]}),
+        )?;
+        assert_eq!(store.run(&run.id)?.state, "running");
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT actions FROM loop_exploration WHERE run_id=?1",
+                [&run.id],
+                |row| row.get::<_, i64>(0)
+            )?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn discovering_new_files_does_not_replenish_the_exploration_allowance() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        for index in 0..EXPLORATION_LIMIT {
+            std::fs::write(
+                directory.path().join(format!("file{index}")),
+                format!("source {index}"),
+            )?;
+        }
+        let mut store = Store::open(&directory.path().join(".arun"))?;
+        let run = store.create_run(
+            "Read weaknesses",
+            directory.path(),
+            "custom",
+            json!([]),
+            json!({}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        for index in 0..EXPLORATION_LIMIT {
+            let text = format!("source {index}");
+            invoke_result(
+                &mut store,
+                &run,
+                "workspace.read",
+                json!({"path":format!("file{index}")}),
+                json!({"sha256":hex::encode(Sha256::digest(text.as_bytes())),"content":text}),
+            )?;
+        }
+        assert_eq!(store.run(&run.id)?.state, "waiting_recovery");
+        assert_eq!(store.event_count(&run.id, "loop.exploration_exhausted")?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn accepted_findings_renew_exploration_but_reworded_or_repackaged_proof_does_not() -> Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run(
+            "Explore",
+            directory.path(),
+            "custom",
+            json!([]),
+            json!({}),
+            "",
+        )?;
+        store.state(&run.id, "running", json!({}))?;
+        let artifact = invoke_result(
+            &mut store,
+            &run,
+            "workspace.search",
+            json!({"query":"cancel"}),
+            json!({"matches":[{"path":"a","line":1,"text":"unsupported cancellation"}]}),
+        )?;
+        let checkpoint = crate::model::Checkpoint {
+            decisions: vec!["Cancellation is unsupported in a".into()],
+            unresolved: vec!["Check the other path".into()],
+            next_action: "Check b".into(),
+            milestones: vec![crate::model::Milestone {
+                title: "Found cancellation weakness".into(),
+                state: "completed".into(),
+                evidence: vec![artifact],
+            }],
+        };
+        store.save_checkpoint(&run.id, &checkpoint)?;
+        observe(
+            &mut store,
+            &run,
+            &Action::Checkpoint {
+                checkpoint: checkpoint.clone(),
+            },
+            None,
+        )?;
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT actions FROM loop_exploration WHERE run_id=?1",
+                [&run.id],
+                |row| row.get::<_, i64>(0)
+            )?,
+            0
+        );
+        drop(store);
+        let mut store = Store::open(directory.path())?;
+        // A new receipt wrapper and a new title are still the same evidence.
+        let artifact = invoke_result(
+            &mut store,
+            &run,
+            "workspace.search",
+            json!({"query":"cancellation"}),
+            json!({"matches":[{"path":"a","line":1,"text":"unsupported cancellation"}],"elapsed_ms":99}),
+        )?;
+        let mut repeated = checkpoint;
+        repeated.milestones[0].title = "Another wording".into();
+        repeated.milestones[0].evidence = vec![artifact];
+        store.save_checkpoint(&run.id, &repeated)?;
+        observe(
+            &mut store,
+            &run,
+            &Action::Checkpoint {
+                checkpoint: repeated,
+            },
+            None,
+        )?;
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT actions FROM loop_exploration WHERE run_id=?1",
+                [&run.id],
+                |row| row.get::<_, i64>(0)
+            )?,
+            2
+        );
+        Ok(())
+    }
 
     #[test]
     fn changed_retry_arguments_cannot_disguise_the_same_permission_blocker() -> Result<()> {
