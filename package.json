@@ -1,18 +1,44 @@
 {
   "name": "aegis-arun",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A durable terminal agent with direct account sign-in and custom endpoints",
   "type": "module",
   "license": "UNLICENSED",
-  "engines": { "node": ">=20" },
-  "bin": { "aegis": "bin/aegis.mjs", "arun": "bin/aegis.mjs" },
-  "files": ["bin", "scripts/install.mjs", "scripts/platform.mjs", "scripts/windows-host.mjs", "scripts/windows-host.ps1", "scripts/windows-host-install.mjs", "scripts/whatsapp-cli.mjs", "relay/local", "vendor", "README.md"],
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "aegis": "bin/aegis.mjs",
+    "arun": "bin/aegis.mjs"
+  },
+  "files": [
+    "bin",
+    "scripts/install.mjs",
+    "scripts/platform.mjs",
+    "scripts/windows-host.mjs",
+    "scripts/windows-host.ps1",
+    "scripts/windows-host-install.mjs",
+    "scripts/whatsapp-cli.mjs",
+    "relay/local",
+    "vendor",
+    "README.md"
+  ],
   "scripts": {
     "postinstall": "node scripts/install.mjs",
     "build:native": "node scripts/build-native.mjs",
     "test:package": "node scripts/package-smoke.mjs",
     "test": "node --test tests/npm/*.test.mjs"
   },
-  "repository": { "type": "git", "url": "https://github.com/aleksandarkolev-st/aegis.git" },
-  "keywords": ["agent", "terminal", "runtime", "codex", "claude", "grok"]
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aleksandarkolev-st/aegis.git"
+  },
+  "keywords": [
+    "agent",
+    "terminal",
+    "runtime",
+    "codex",
+    "claude",
+    "grok"
+  ]
 }
