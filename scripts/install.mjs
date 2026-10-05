@@ -22,7 +22,10 @@ async function download(url, limit) {
 
 export async function ensureNative({ packageRoot = root, baseUrl, platform = process.platform, architecture = process.arch } = {}) {
   const output = binaryPath(packageRoot, platform, architecture);
-  if (await stat(output).then(info => info.isFile()).catch(() => false)) return output;
+  if (await stat(output).then(info => info.isFile()).catch(() => false)) {
+    if (platform !== 'win32') await chmod(output, 0o755);
+    return output;
+  }
   const { version } = JSON.parse(await readFile(path.join(packageRoot, 'package.json'), 'utf8'));
   const info = platformTarget(platform, architecture);
   const release = baseUrl ?? 'https://github.com/aleksandarkolev-st/aegis/releases/download/v' + version;

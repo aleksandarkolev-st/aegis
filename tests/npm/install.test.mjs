@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -38,6 +38,22 @@ test('installs verified bytes and rejects checksum mismatches', async () => {
     await assert.rejects(ensureNative({ packageRoot: root, baseUrl, platform: 'win32', architecture: 'x64' }), /checksum/);
   } finally {
     await new Promise(resolve => server.close(resolve));
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('makes a prebundled Linux runtime executable', { skip: process.platform === 'win32' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'aegis-bundled-native-'));
+  const output = binaryPath(root, 'linux', 'x64');
+  try {
+    await mkdir(path.dirname(output), { recursive: true });
+    await writeFile(output, 'bundled-runtime');
+    await chmod(output, 0o644);
+
+    assert.equal(await ensureNative({ packageRoot: root, platform: 'linux', architecture: 'x64' }), output);
+    assert.ok((await stat(output)).mode & 0o111);
+    assert.equal(await readFile(output, 'utf8'), 'bundled-runtime');
+  } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
