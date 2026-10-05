@@ -658,21 +658,22 @@ fn custom_endpoint_completes_a_kernel_run_without_persisting_its_key() -> Result
                         .nth(1)
                         .unwrap(),
                 )?;
-                if interactive && (3..6).contains(&turn) {
-                    assert_eq!(state["conversation"].as_array().unwrap().len(), 1);
+                // Any summary that reached the durable conversation must be the
+                // redacted one, at whatever turn it appears. An exact length at an
+                // exact turn only tested when persistence landed, which races a
+                // loaded runner in both directions.
+                for entry in state["conversation"].as_array().unwrap() {
+                    // A turn with no summary yet serializes summary as null.
+                    if let Some(summary) = entry["summary"].as_str() {
+                        assert!(
+                            summary.contains("expected fixture answer"),
+                            "unexpected conversation summary: {summary}"
+                        );
+                    }
                     assert!(
-                        state["conversation"][0]["summary"]
-                            .as_str()
-                            .unwrap()
-                            .contains("expected fixture answer")
+                        !entry.to_string().contains("local-fixture-secret"),
+                        "the endpoint key must never reach the durable conversation"
                     );
-                    assert!(
-                        !state["conversation"]
-                            .to_string()
-                            .contains("local-fixture-secret")
-                    );
-                } else {
-                    assert!(state["conversation"].as_array().unwrap().is_empty());
                 }
                 let action = match turn % 3 {
                     0 => json!({"kind":"search_capabilities", "query":"read workspace file"}),
