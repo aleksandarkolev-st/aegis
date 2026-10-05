@@ -60,13 +60,20 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+      - name: Check trusted publishing prerequisites
+        run: |
+          npm install --global 'npm@^11.5.1'
+          npm --version
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -82,3 +89,6 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" artifacts/* --verify-tag --draft --title "Aegis $GITHUB_REF_NAME" --generate-notes
           gh release edit "$GITHUB_REF_NAME" --draft=false
+      - name: Publish package to npm
+        if: success()
+        run: npm publish "artifacts/aegis-arun-*.tgz"
