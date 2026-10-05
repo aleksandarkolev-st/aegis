@@ -40,5 +40,7 @@ Unlike `0.2.0`, every binary in this release is built and tested by CI on all th
 
 ## Known issues
 
-- `tests/endpoint.rs::custom_endpoint_completes_a_kernel_run_without_persisting_its_key` is flaky on loaded runners. The fixture writes all of its scripted stdin in a single write before the child reads any prompt, so prompt and answer can desynchronize. The app itself is not implicated: running the real binary on Linux dispatches all scripted tasks with the key bound correctly.
-- `src/oauth.rs::sign_out_waits_for_refresh_and_cannot_be_resurrected_by_its_completion` intermittently fails on Windows with `Could not atomically save Aegis sign-in (OS error 5)`. Sign-out and refresh both hold the same per-provider vault lock, so this is not a missing-lock bug; the mechanism is still unexplained and needs a local reproduction before any change to credential storage.
+Tracked as issues, with the evidence and the ruled-out theories:
+
+- [#1 - `oauth::sign_out_waits_for_refresh` fails on Windows with OS error 5](https://github.com/aleksandarkolev-st/aegis/issues/1)
+- [#2 - `endpoint::custom_endpoint_completes_a_kernel_run_without_persisting_its_key` is flaky on loaded runners](https://github.com/aleksandarkolev-st/aegis/issues/2)

@@ -38,7 +38,7 @@ The project was published as `UNLICENSED` with no licence text. It is now MIT.
 
 ## Known issues
 
-Unchanged from `0.2.2`:
+Tracked as issues, with the evidence and the ruled-out theories:
 
-- `tests/endpoint.rs::custom_endpoint_completes_a_kernel_run_without_persisting_its_key` is flaky on loaded runners. The fixture writes all scripted stdin before the child reads any prompt. The application itself is not implicated.
-- `src/oauth.rs::sign_out_waits_for_refresh_and_cannot_be_resurrected_by_its_completion` intermittently fails on Windows with `Could not atomically save Aegis sign-in (OS error 5)`. Sign-out and refresh hold the same per-provider lock, so this is not a missing-lock bug; the mechanism is still unexplained and needs a local reproduction before any change to credential storage.
+- [#1 - `oauth::sign_out_waits_for_refresh` fails on Windows with OS error 5](https://github.com/aleksandarkolev-st/aegis/issues/1)
+- [#2 - `endpoint::custom_endpoint_completes_a_kernel_run_without_persisting_its_key` is flaky on loaded runners](https://github.com/aleksandarkolev-st/aegis/issues/2)
