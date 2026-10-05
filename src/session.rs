@@ -2291,6 +2291,8 @@ struct FollowProgress {
     phase: String,
     context_status: crate::terminal::ContextStatus,
     follow_started: Instant,
+    runner_started: Instant,
+    spawn_pending: bool,
 }
 
 fn follow_task_is_active(state: &str) -> bool {
@@ -2321,16 +2323,16 @@ fn poll_follow_update(
     let state = store.run(id)?.state;
     let waiting = store.waiting_for_answer(id)?;
     let active = follow_task_is_active(&state) || waiting;
-    if state == "ready" && !kernel::is_active(root, id)? {
-        kernel::spawn(root, id, None)?;
-    }
+    let runner_missing = progress.check_runner(
+        &state,
+        waiting,
+        Instant::now(),
+        || kernel::is_active(root, id),
+        || kernel::spawn(root, id, None),
+    )?;
     if waiting {
         progress.phase = "Awaiting your answer".into();
     }
-    let runner_missing = active
-        && !waiting
-        && progress.follow_started.elapsed() > Duration::from_secs(3)
-        && !kernel::is_active(root, id)?;
     let elapsed = progress
         .task_started_at
         .map(|start| {
@@ -2381,7 +2383,35 @@ impl FollowProgress {
             phase: "Starting task".into(),
             context_status: crate::terminal::ContextStatus::default(),
             follow_started: Instant::now(),
+            runner_started: Instant::now(),
+            spawn_pending: false,
         })
+    }
+
+    // A spawned child acquires its run lock asynchronously. Give each startup
+    // its own grace period and avoid spawning duplicates while it starts.
+    fn check_runner(
+        &mut self,
+        state: &str,
+        waiting: bool,
+        now: Instant,
+        mut is_active: impl FnMut() -> Result<bool>,
+        mut spawn: impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        if waiting || !follow_task_is_active(state) {
+            self.spawn_pending = false;
+            return Ok(false);
+        }
+        if is_active()? {
+            self.spawn_pending = false;
+            return Ok(false);
+        }
+        if state == "ready" && !self.spawn_pending {
+            spawn()?;
+            self.runner_started = now;
+            self.spawn_pending = true;
+        }
+        Ok(now.saturating_duration_since(self.runner_started) > Duration::from_secs(3))
     }
 
     fn poll(
@@ -2662,9 +2692,13 @@ fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
         }
         let run = store.run(id)?;
         let waiting = store.waiting_for_answer(id)?;
-        if run.state == "ready" && !kernel::is_active(root, id)? {
-            kernel::spawn(root, id, None)?;
-        }
+        let runner_missing = progress.check_runner(
+            &run.state,
+            waiting,
+            Instant::now(),
+            || kernel::is_active(root, id),
+            || kernel::spawn(root, id, None),
+        )?;
         if !follow_task_is_active(&run.state) && !waiting {
             terminal.clear_activity()?;
             if let Some(events) = progress.poll(&store, id, terminal)? {
@@ -2673,7 +2707,7 @@ fn follow(root: &Path, id: &str, terminal: &mut Terminal) -> Result<()> {
             terminal.message(Tone::Quiet, "Task metrics", &crate::run_metrics::display(&crate::run_metrics::report(&store, id)?))?;
             return Ok(());
         }
-        if !waiting && started.elapsed() > Duration::from_secs(3) && !kernel::is_active(root, id)? {
+        if runner_missing {
             terminal.clear_activity()?;
             terminal.message(
                 Tone::Warning,
@@ -4485,6 +4519,45 @@ pub fn interactive(root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn answering_after_a_long_follow_gives_the_new_runner_time_to_acquire_its_lock() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run("Choose", directory.path(), "custom", json!([]), json!({}), "")?;
+        store.state(&run.id, "running", json!({}))?;
+        let mut progress = FollowProgress::new(&store, &run.id, &Terminal::default())?;
+        let now = progress.follow_started + Duration::from_secs(60);
+        assert!(!progress.check_runner("running", false, now, || Ok(true), || panic!("already running"))?);
+        store.ask_user(&run.id, "Which format?")?;
+        store.state(&run.id, "waiting_recovery", json!({"reason":"awaiting user answer"}))?;
+        assert!(!progress.check_runner("waiting_recovery", store.waiting_for_answer(&run.id)?, now, || panic!("waiting"), || panic!("waiting"))?);
+        store.steer(&run.id, "JSON")?;
+        assert_eq!(store.run(&run.id)?.state, "ready");
+        assert_eq!(store.question_answers(&run.id)?[0].answer, "JSON");
+        let mut spawns = 0;
+        for delay in [0, 1, 2] {
+            assert!(!progress.check_runner(&store.run(&run.id)?.state, false, now + Duration::from_secs(delay), || Ok(false), || { spawns += 1; Ok(()) })?);
+        }
+        assert_eq!(spawns, 1, "polls must not launch duplicate children");
+        store.state(&run.id, "running", json!({}))?;
+        assert!(!progress.check_runner("running", false, now + Duration::from_secs(4), || Ok(true), || panic!("runner acquired lock"))?);
+        // Once confirmed running, a lost lock is still detected.
+        assert!(progress.check_runner("running", false, now + Duration::from_secs(5), || Ok(false), || panic!("running"))?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_runner_that_never_acquires_its_lock_expires_without_repeated_spawns() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        let run = store.create_run("Start", directory.path(), "custom", json!([]), json!({}), "")?;
+        let mut progress = FollowProgress::new(&store, &run.id, &Terminal::default())?;
+        let now = progress.follow_started + Duration::from_secs(60);
+        assert!(!progress.check_runner("ready", false, now, || Ok(false), || Ok(()))?);
+        assert!(progress.check_runner("ready", false, now + Duration::from_secs(4), || Ok(false), || panic!("startup must be bounded"))?);
+        Ok(())
+    }
 
     #[test]
     fn ending_input_does_not_claim_paused_or_interrupted_work_completed() {
