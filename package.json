@@ -36,9 +36,13 @@
   "keywords": [
     "agent",
     "terminal",
-    "runtime",
+    "cli",
+    "mcp",
+    "rust",
+    "automation",
     "codex",
     "claude",
-    "grok"
+    "grok",
+    "whatsapp"
   ]
 }
