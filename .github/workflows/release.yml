@@ -91,4 +91,13 @@ jobs:
           gh release edit "$GITHUB_REF_NAME" --draft=false
       - name: Publish package to npm
         if: success()
-        run: npm publish "artifacts/aegis-arun-*.tgz"
+        run: |
+          # npm publish takes a single file, not a glob pattern. Resolve it in
+          # the shell first: a quoted pattern is read as a spec and npm tries to
+          # fetch it as a git URL.
+          mapfile -t tarballs < <(find artifacts -maxdepth 1 -name 'aegis-arun-*.tgz')
+          if [ "${#tarballs[@]}" -ne 1 ]; then
+            echo "expected exactly one npm tarball, found ${#tarballs[@]}"
+            exit 1
+          fi
+          npm publish "${tarballs[0]}"
