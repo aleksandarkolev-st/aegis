@@ -58,4 +58,8 @@ The ignored Docker test requires a running Docker daemon and the local `node:22-
 - [npm release process](docs/npm-publishing.md)
 - [Windows local setup](relay/local/README.md)
 
+## License
+
+MIT. See [LICENSE](LICENSE).
+
 Aegis is under active development. Provider compatibility, account access, packaging, and verification status can change; consult the linked evidence notes rather than assuming every documented path has been independently validated.

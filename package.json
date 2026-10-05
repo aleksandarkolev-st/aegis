@@ -3,7 +3,7 @@
   "version": "0.2.2",
   "description": "A durable terminal agent with direct account sign-in and custom endpoints",
   "type": "module",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "engines": {
     "node": ">=20"
   },
@@ -21,6 +21,7 @@
     "scripts/whatsapp-cli.mjs",
     "relay/local",
     "vendor",
+    "LICENSE",
     "README.md"
   ],
   "scripts": {

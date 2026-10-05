@@ -2,6 +2,7 @@
 name = "arun"
 version = "0.2.2"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 anyhow = "1"

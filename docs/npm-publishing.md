@@ -6,7 +6,7 @@ The npm package is `aegis-arun`; it installs the `aegis` and `arun` commands. np
 
 The GitHub release workflow supports Windows x64 and Linux x64 and arm64. macOS is unsupported. It checks that the tag, `package.json`, `package-lock.json`, and `Cargo.toml` all have the same version, then attaches the three binaries, checksums, and npm tarball to a GitHub release.
 
-1. Choose the intended package license. `package.json` currently says `UNLICENSED`.
+1. The package is MIT licensed. `package.json` says `MIT` and ships the `LICENSE` file; keep `Cargo.toml` and `package-lock.json` in agreement.
 2. Check that the npm package name is still available and that the version has not been released. At the time of this check, `aegis-arun` returned 404 from npm.
 3. Run the local checks:
 
