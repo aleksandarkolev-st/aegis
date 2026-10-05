@@ -368,22 +368,11 @@ mod tests {
         assert_eq!(budget["wall_seconds"]["used"], 10);
         assert_eq!(budget["wall_seconds"]["remaining"], 50);
         store.resume_paused(&run.id)?;
-        let after_first_resume = crate::kernel::remaining_seconds(&store, &run)?;
-        // Excluded pause time must not be charged, but the budget must also
-        // not be reset: 50 was available, so anything at or above the full
-        // 60 means the clock restarted.
-        assert!(
-            (47..=50).contains(&after_first_resume),
-            "resuming must keep the reduced budget, got {after_first_resume}"
-        );
+        assert!((49..=50).contains(&crate::kernel::remaining_seconds(&store, &run)?));
         drop(store);
         let mut store = Store::open(&root)?;
         store.resume_paused(&run.id)?;
-        let after_restart = crate::kernel::remaining_seconds(&store, &run)?;
-        assert!(
-            (47..=50).contains(&after_restart),
-            "a restart must not reset the budget, got {after_restart}"
-        );
+        assert!((49..=50).contains(&crate::kernel::remaining_seconds(&store, &run)?));
         // Real active time still exhausts the original allowance.
         store.connection.execute(
             "UPDATE run_projection SET started_at=started_at-51 WHERE run_id=?1",
