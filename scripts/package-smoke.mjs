@@ -63,7 +63,7 @@ const packed = await command([npmCli, 'pack', '--offline', '--json', '--pack-des
 const [manifest] = JSON.parse(packed.stdout);
 assert.equal(manifest.name, 'aegis-arun');
 for (const entry of manifest.files) {
-  assert.match(entry.path, /^(?:package\.json|README\.md|bin\/[^/]+|scripts\/(?:(?:install|platform|windows-host|windows-host-install|whatsapp-cli)\.mjs|windows-host\.ps1)|relay\/README\.md|relay\/local\/(?:README\.md|compose\.yaml|local-remote\.ps1|make-nats-certs\.ps1|nats-server\.conf)|vendor\/[^/]+\/(?:arun(?:\.exe)?|aegis-relay\.exe))$/,
+  assert.match(entry.path, /^(?:LICENSE|package\.json|README\.md|bin\/[^/]+|scripts\/(?:(?:install|platform|windows-host|windows-host-install|whatsapp-cli)\.mjs|windows-host\.ps1)|relay\/README\.md|relay\/local\/(?:README\.md|compose\.yaml|local-remote\.ps1|make-nats-certs\.ps1|nats-server\.conf)|vendor\/[^/]+\/(?:arun(?:\.exe)?|aegis-relay\.exe))$/,
     `Unexpected packaged file: ${entry.path}`);
 }
 assert.ok(manifest.files.some(entry => entry.path === path.relative(root, bundled).split(path.sep).join('/')));
