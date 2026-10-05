@@ -2187,8 +2187,33 @@ mod tests {
             .create(true)
             .write(true)
             .open(lock_path)?;
-        fs2::FileExt::try_lock_exclusive(&held_lock)?;
-        let active = store
+        // The earlier calls above opened and locked this same path. Their handles
+        // are released when they return, but the OS may still be tearing those
+        // file descriptions down, so this acquisition can briefly observe the
+        // contention instead of holding it. Retry until this test owns the lock;
+        // a bare EAGAIN here would abort the test before it asserts anything.
+        let mut acquired = false;
+        for _ in 0..200 {
+            match fs2::FileExt::try_lock_exclusive(&held_lock) {
+                Ok(()) => {
+                    acquired = true;
+                    break;
+                }
+                Err(error)
+                    if error.raw_os_error()
+                        == Some(fs2::lock_contended_error().raw_os_error().unwrap_or(-1)) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => return Err(error).context("Acquire the simulated active run lock"),
+            }
+        }
+        if !acquired {
+            bail!("could not take the run lock this test holds for adopt_legacy_contract");
+        }
+        // Prove the lock is really held, so this asserts production behavior
+        // rather than passing because the lock was never acquired.
+        let rejection = store
             .adopt_legacy_contract(
                 &run.id,
                 current_sequence,
@@ -2196,9 +2221,9 @@ mod tests {
                 &requirements,
                 None,
             )
-            .unwrap_err()
+            .expect_err("an active run lock must block adopting a legacy contract")
             .to_string();
-        assert!(active.contains("Pause the task"));
+        assert!(rejection.contains("Pause the task"), "{rejection}");
         assert!(store.needs_legacy_contract_adoption(&run.id)?);
         fs2::FileExt::unlock(&held_lock)?;
         Ok(())
