@@ -1,6 +1,6 @@
 {
   "name": "aegis-arun",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "A durable terminal agent with direct account sign-in and custom endpoints",
   "type": "module",
   "license": "MIT",

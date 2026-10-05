@@ -19,3 +19,14 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+## Retroactive application
+
+This licence applies retroactively to every earlier version of Aegis, including
+those published on npm as `aegis-arun` before this file existed. Versions
+`0.1.0`, `0.2.0`, and `0.2.2` were published with a `UNLICENSED` manifest
+because no licence had been chosen yet; npm does not allow a published
+version's licence to be changed afterwards, so those versions still display
+`UNLICENSED` on the registry. The grant above covers them all.

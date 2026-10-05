@@ -1,0 +1,67 @@
+name: Bug report
+description: Report a defect in Aegis
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting this. Scrub API keys, tokens, and private endpoint
+        URLs before submitting.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you observe, and what did you expect instead?
+      placeholder: The task stayed paused after the workspace edit completed.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      value: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Aegis version
+      placeholder: 0.2.2
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - windows-x64
+        - linux-x64
+        - linux-arm64
+        - other / not sure
+    validations:
+      required: true
+
+  - type: input
+    id: route
+    attributes:
+      label: Provider and route
+      description: For example custom endpoint, ChatGPT direct sign-in, Claude.
+      placeholder: custom endpoint
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Trace or error output
+      description: |
+        Relevant output from the trace view or terminal. Leave empty if none is
+        available; this is not required to file the issue.
+      render: shell
